@@ -3,6 +3,7 @@ import os
 import socket
 import subprocess
 import time
+import copy
 import sys
 
 
@@ -46,11 +47,40 @@ class ensemble_launcher:
             self.__progress_info["ensemble_names"].extend(new_names)
             self.__progress_info["tasks"].extend(new_tasks)
 
+    ###function sets the default values
+    def set_defaults(self,task:dict) -> dict:
+        ##some defaults
+        if "status" not in task.keys():
+            task["status"] = "ready"
+                
+        if "id" not in task.keys():
+            task["id"] = f"{task['ensemble_name']}-{task['local_id']}"
+
+        if "run_dir" not in task.keys():
+            task["run_dir"] = os.getcwd()
+                
+        if "task_type_cmd" not in task.keys():
+            task["task_type_cmd"] = ''
+                
+        if "task_type_options" not in task.keys():
+            task["task_type_options"] = {}
+                
+        if "bin_options" not in task.keys():
+            task["bin_options"] = {}
+        
+        return task
+        
+
     def generate_ensembles(self, ensembles):
         ensemble_names = []
         tasks = []
         # Generate tasks based on ensemble configuration
         for name,ensemble in ensembles.items():
+            ##assert some necessary vals
+            assert "task_type" in ensemble.keys()
+            assert "num_nodes" in ensemble.keys()
+            assert "bin" in ensemble.keys()
+            ###
             multipliers = []  # To hold keys that correspond to lists
             num_elements = 1  # Total number of tasks to generate
             task_dim = []  # Dimensions of the task grid
@@ -62,7 +92,7 @@ class ensemble_launcher:
                 else:
                     task_template["bin_options"] = {}
             # Process each key-value pair in the ensemble
-            for key, value in ensemble["bin_options"].items():
+            for key, value in ensemble.get("bin_options",{}).items():
                 if isinstance(value, list):
                     # If value is a list, it's a multiplier
                     multipliers.append(key)
@@ -76,16 +106,15 @@ class ensemble_launcher:
 
             # Iterate over all combinations of task parameters
             for i in range(num_elements):
-                task = {k: v for k, v in task_template.items()}  # Start with the task template
+                task = copy.deepcopy(task_template)  # Start with the task template
+                task["local_id"] = i
                 idx = unravel_index(i, task_dim)  # Get the indices for the current combination
 
                 # Assign values from the ensemble based on the indices
                 for j, key in zip(idx, multipliers):
-                    print(j,key)
                     task["bin_options"][key] = ensemble["bin_options"][key][j]
 
-                if "status" not in task.keys():
-                    task["status"] = "ready"
+                task = self.set_defaults(task)
                 # Append the generated task to the progress info
                 tasks.append(task)
         return ensemble_names,tasks
@@ -103,12 +132,12 @@ class ensemble_launcher:
         return node_list
     
     def build_task_cmd(self,task_info) -> None:
-        task_info["cmd"] = f"{task_info.get('task_type_cmd','')}"
+        task_info["cmd"] = f"{task_info['task_type_cmd']}"
         ##Here, key is the option and value is its option
-        for key,value in task_info.get("task_type_options",{}).items():
+        for key,value in task_info["task_type_options"].items():
             task_info["cmd"] += f" {key} {value}"
         task_info["cmd"] += f" {task_info['bin']}"
-        for key,value in task_info.get("bin_options",{}).items():
+        for key,value in task_info["bin_options"].items():
             task_info["cmd"] += f" {key} {value}"
 
     def launch_task(self, task_info:dict, assigned_nodes:list):
@@ -119,14 +148,18 @@ class ensemble_launcher:
             task_info["task_type_options"]["--hosts"] = hosts_str
 
         self.build_task_cmd(task_info)
+        ##check if run dir exists
+        os.makedirs(task_info["run_dir"],exist_ok=True)
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=open(os.path.join(task_info.get("run_dir",os.getcwd()),'job.out'),'wb'),
+                             stdout=open(os.path.join(task_info["run_dir"],f'job-{task_info["id"]}.out'),'wb'),
                              stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL,
                              cwd=task_info.get("run_dir",os.getcwd()),
                              env=os.environ.copy(),)
+        
+        self.__progress_info["busy_nodes"].extend(assigned_nodes)
         
         return p
     
@@ -170,7 +203,9 @@ class ensemble_launcher:
                     tasks[tid]["status"] = "failed"
 
                 self.__progress_info["running_tasks"].remove(tid)
-                self.__progress_info["free_nodes"] += tasks[tid]["assigned_nodes"]
+                for node in tasks[tid]["assigned_nodes"]:
+                    self.__progress_info["busy_nodes"].remove(node)
+                self.__progress_info["free_nodes"].extend(tasks[tid]["assigned_nodes"])
                 
                 print(f"Task {tid} returned in {tasks[tid]['end_time'] - tasks[tid]['start_time']} seconds with status {tasks[tid]['status']}")
                 self.report_status()
