@@ -1,0 +1,23 @@
+{
+    "poll_interval":600,
+    "update_interval_time": null,
+    "ensembles":{
+        "name1":{
+            "task_type":"",
+            "num_nodes":0,
+            "bin":"test_script.sh",
+            "bin_options":{
+                "-h": ["hello1", "hello2", "hello3", "hello4", "hello5"]
+            }
+        },
+        "name2":{
+            "task_type":"xargs",
+            "num_nodes":0,
+            "bin":"test_script.sh",
+            "bin_options":{
+                "-h": ["hello1", "hello2", "hello3", "hello4", "hello5"],
+                "-l": ["hello1", "hello2", "hello3", "hello4", "hello5"]
+            }
+        }
+    }
+}
