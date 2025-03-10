@@ -281,16 +281,5 @@ class ensemble_launcher:
             print(f"Tasks {state}: {len(state_tasks)} tasks")
         with open(os.getcwd()+f'/{out_dir}/tasks.json', 'w', encoding='utf-8') as f:
             json.dump(tasks, f, ensure_ascii=False, indent=4)
-    
-
-if __name__ == '__main__':
-    el = ensemble_launcher("config.json")
-    start_time = time.perf_counter()
-    print(f'Launching node is {socket.gethostname()}')
-    total_poll_time = el.run_tasks()
-    el.save_task_status()
-    end_time = time.perf_counter()
-    total_run_time = end_time - start_time
-    print(f"{total_run_time=}")
 
     

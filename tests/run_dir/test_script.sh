@@ -19,4 +19,4 @@ fi
 echo "Hello value: $HELLO_VALUE"
 
 # Sleep for 60 seconds
-sleep 60
+sleep 10
