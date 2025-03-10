@@ -5,7 +5,7 @@
         "name1":{
             "task_type":"linux",
             "num_nodes":1,
-            "num_cores":52,
+            "num_cores_per_node":1,
             "bin":"./test_script.sh",
             "run_dir":"./run_dir",
             "bin_options":{
@@ -15,6 +15,7 @@
         "name2":{
             "task_type":"linux",
             "num_nodes":1,
+            "num_cores_per_node":1,
             "run_dir":"./run_dir",
             "bin":"./test_script.sh",
             "bin_options":{

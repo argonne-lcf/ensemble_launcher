@@ -5,6 +5,7 @@ import subprocess
 import time
 import copy
 import sys
+import platform
 
 
 def unravel_index(flat_index, shape):
@@ -19,15 +20,17 @@ class ensemble_launcher:
         self.__progress_info = {}
         self.__progress_info["total_nodes"] = self.get_nodes()
         self.__progress_info["free_nodes"] = self.get_nodes()
-        self.__progress_info["busy_nodes"] = []
+        self.__progress_info["ncores_per_node"] = self.get_cores_per_node()
+        self.__progress_info["free_cores_per_node"] = {node:self.__progress_info["ncores_per_node"] for node in self.__progress_info["total_nodes"]}
+        self.__progress_info["busy_nodes"] = [] #this only has nodes with no cores free
         self.__progress_info["running_tasks"] = []
         self.__progress_info["finished_tasks"] = []
-
         ##
         self.__start_time = time.perf_counter()
         self.__last_update_time = time.perf_counter()
         self.__config_file = config_file
         self.read_input_file()
+        print(f"Total tasks: {len(self.__progress_info['tasks'])}")
         return None
 
     def read_input_file(self):
@@ -67,6 +70,9 @@ class ensemble_launcher:
                 
         if "bin_options" not in task.keys():
             task["bin_options"] = {}
+        
+        if "num_cores_per_node" not in task.keys():
+            task["num_cores_per_node"] = self.__progress_info["ncores_per_node"]
         
         return task
         
@@ -125,11 +131,19 @@ class ensemble_launcher:
     def get_nodes(self) -> list:
         node_list = []
         node_file = os.getenv("PBS_NODEFILE")
-        if node_file is not None:
-            with open(node_file,"r") as f:
+        if node_file is not None and os.path.exists(node_file):
+            with open(node_file, "r") as f:
                 node_list = f.readlines()
-                node_list = [node.split("\n")[0] for node in node_list]
+                node_list = [node.strip() for node in node_list]
+        else:
+            node_list = [socket.gethostname()]
         return node_list
+    
+    def get_cores_per_node(self):       
+        if os.getenv("NCPUS") is not None:
+            return os.getenv("NCPUS")
+        else:
+            return os.cpu_count()
     
     def build_task_cmd(self,task_info) -> None:
         task_info["cmd"] = f"{task_info['task_type_cmd']}"
@@ -159,26 +173,58 @@ class ensemble_launcher:
                              cwd=task_info.get("run_dir",os.getcwd()),
                              env=os.environ.copy(),)
         
-        self.__progress_info["busy_nodes"].extend(assigned_nodes)
-        
         return p
     
     def report_status(self):
-    
         n_nodes = len(self.__progress_info["total_nodes"])
         n_busy_nodes = len(self.__progress_info["busy_nodes"])
         n_todo_tasks = len(self.__progress_info["tasks"])
         n_running_tasks = len(self.__progress_info["running_tasks"])
         
         print(f"Nodes occupied {n_busy_nodes}/{n_nodes}, Tasks ready: {n_todo_tasks}, Tasks running: {n_running_tasks}")
+
+    
+    def assign_task_nodes(self,task) -> list:
+        assigned_nodes = []
+        for j in range(len(self.__progress_info["free_nodes"])):
+            if len(assigned_nodes) == task["num_nodes"]:
+                break
+            if self.__progress_info["free_cores_per_node"][self.__progress_info["free_nodes"][j]] >= task["num_cores_per_node"]\
+                and self.__progress_info["free_nodes"][j] not in self.__progress_info["busy_nodes"]:
+                node = self.__progress_info["free_nodes"][j]
+                self.__progress_info["free_cores_per_node"][node] -= task["num_cores_per_node"]
+                assigned_nodes.append(node)
+                if self.__progress_info["free_cores_per_node"][node] == 0:
+                    self.__progress_info["free_nodes"].remove(node)
+                    self.__progress_info["busy_nodes"].append(node)
+
+        if len(assigned_nodes) < task["num_nodes"]:
+            print(f"Task {task['id']} cannot be launched due to insufficient free nodes")
+            for node in assigned_nodes:
+                self.__progress_info["free_cores_per_node"][node] += task["num_cores_per_node"]
+                if node in self.__progress_info["busy_nodes"]:
+                    self.__progress_info["busy_nodes"].remove(node)
+                    self.__progress_info["free_nodes"].append(node)
+            assigned_nodes = []
+        return assigned_nodes
+
+    def free_task_nodes(self,task) -> None:
+        for node in task["assigned_nodes"]:
+            self.__progress_info["free_cores_per_node"][node] += task["num_cores_per_node"]
+            if node in self.__progress_info["busy_nodes"]:
+                self.__progress_info["busy_nodes"].remove(node)
+                self.__progress_info["free_nodes"].append(node)
+        return
     
     def launch_ready_tasks(self):
         # Launch ready tasks
         for tid,task in enumerate(self.__progress_info["tasks"]):
-            if task["status"] != "finished" and task["num_nodes"] <= len(self.__progress_info["free_nodes"]):        
-                assigned_nodes = []
-                for i in range(task["num_nodes"]):
-                    assigned_nodes.append(self.__progress_info["free_nodes"].pop(0))
+            if task["status"] != "finished" and \
+                task["num_nodes"] <= len(self.__progress_info["free_nodes"]) and \
+                tid not in self.__progress_info["running_tasks"]:        
+                assigned_nodes = self.assign_task_nodes(task)
+                if len(assigned_nodes) == 0:
+                    continue
                 task["process"] = self.launch_task(task, assigned_nodes=assigned_nodes)
                 task['start_time'] = time.perf_counter()
                 task['status'] = "running"
@@ -203,11 +249,9 @@ class ensemble_launcher:
                     tasks[tid]["status"] = "failed"
 
                 self.__progress_info["running_tasks"].remove(tid)
-                for node in tasks[tid]["assigned_nodes"]:
-                    self.__progress_info["busy_nodes"].remove(node)
-                self.__progress_info["free_nodes"].extend(tasks[tid]["assigned_nodes"])
+                self.free_task_nodes(tasks[tid])
                 
-                print(f"Task {tid} returned in {tasks[tid]['end_time'] - tasks[tid]['start_time']} seconds with status {tasks[tid]['status']}")
+                print(f"Task {tasks[tid]['id']} returned in {tasks[tid]['end_time'] - tasks[tid]['start_time']} seconds with status {tasks[tid]['status']}")
                 self.report_status()
         return
     
