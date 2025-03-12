@@ -9,7 +9,6 @@ if __name__ == '__main__':
     start_time = time.perf_counter()
     print(f'Launching node is {socket.gethostname()}')
     total_poll_time = el.run_tasks()
-    el.save_task_status()
     end_time = time.perf_counter()
     total_run_time = end_time - start_time
     print(f"{total_run_time=}")

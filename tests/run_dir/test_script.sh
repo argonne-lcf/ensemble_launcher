@@ -1,22 +1,16 @@
 #!/bin/bash
 
-# Parse options
-while getopts "h:" opt; do
-    case ${opt} in
-        h)
-            HELLO_VALUE=$OPTARG
-            ;;
-    esac
+# Iterate over command-line arguments
+args=($@)
+
+even_numbers=()
+
+for ((i=0; i<${#args[@]}; i++)); do
+    if [[ $((i % 2)) -eq 1 ]]; then
+        even_numbers+=("${args[i]}")
+    fi
 done
 
-# If no argument is passed for -h, show usage
-if [ -z "$HELLO_VALUE" ]; then
-    echo "Error: -h option is required"
-    exit
-fi
+echo "Even numbers from arguments: ${even_numbers[*]}"
 
-# Print the value for -h option
-echo "Hello value: $HELLO_VALUE"
-
-# Sleep for 60 seconds
-sleep 10
+sleep 60
