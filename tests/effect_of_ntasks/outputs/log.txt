@@ -1,0 +1,72 @@
+name1:launched 1 tasks!
+Proc 0: nfds 3/16384 Nodes fully occupied 0/1, Tasks ready: 19, Tasks running: 1
+name1:launched 2 tasks!
+Proc 0: nfds 7/16384 Nodes fully occupied 0/1, Tasks ready: 18, Tasks running: 2
+name1:launched 3 tasks!
+Proc 0: nfds 11/16384 Nodes fully occupied 0/1, Tasks ready: 17, Tasks running: 3
+name1:launched 4 tasks!
+Proc 0: nfds 24/16384 Nodes fully occupied 0/1, Tasks ready: 16, Tasks running: 4
+name1:launched 5 tasks!
+Proc 0: nfds 36/16384 Nodes fully occupied 0/1, Tasks ready: 15, Tasks running: 5
+name1:launched 6 tasks!
+Proc 0: nfds 50/16384 Nodes fully occupied 0/1, Tasks ready: 14, Tasks running: 6
+name1:launched 7 tasks!
+Proc 0: nfds 64/16384 Nodes fully occupied 0/1, Tasks ready: 13, Tasks running: 7
+name1:launched 8 tasks!
+Proc 0: nfds 76/16384 Nodes fully occupied 0/1, Tasks ready: 12, Tasks running: 8
+name1:launched 9 tasks!
+Proc 0: nfds 87/16384 Nodes fully occupied 0/1, Tasks ready: 11, Tasks running: 9
+name1:launched 10 tasks!
+Proc 0: nfds 101/16384 Nodes fully occupied 0/1, Tasks ready: 10, Tasks running: 10
+name2:launched 1 tasks!
+Proc 0: nfds 109/16384 Nodes fully occupied 0/1, Tasks ready: 9, Tasks running: 11
+name2:launched 2 tasks!
+Proc 0: nfds 125/16384 Nodes fully occupied 0/1, Tasks ready: 8, Tasks running: 12
+name2:launched 3 tasks!
+Proc 0: nfds 145/16384 Nodes fully occupied 0/1, Tasks ready: 7, Tasks running: 13
+name2:launched 4 tasks!
+Proc 0: nfds 154/16384 Nodes fully occupied 0/1, Tasks ready: 6, Tasks running: 14
+name2:launched 5 tasks!
+Proc 0: nfds 174/16384 Nodes fully occupied 0/1, Tasks ready: 5, Tasks running: 15
+name2:launched 6 tasks!
+Proc 0: nfds 192/16384 Nodes fully occupied 0/1, Tasks ready: 4, Tasks running: 16
+name2:launched 7 tasks!
+Proc 0: nfds 205/16384 Nodes fully occupied 0/1, Tasks ready: 3, Tasks running: 17
+name2:launched 8 tasks!
+Proc 0: nfds 214/16384 Nodes fully occupied 0/1, Tasks ready: 2, Tasks running: 18
+name2:launched 9 tasks!
+Proc 0: nfds 226/16384 Nodes fully occupied 0/1, Tasks ready: 1, Tasks running: 19
+name2:launched 10 tasks!
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 242/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 240/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 20
+Proc 0: nfds 204/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 17
+Proc 0: nfds 0/16384 Nodes fully occupied 0/1, Tasks ready: 0, Tasks running: 0

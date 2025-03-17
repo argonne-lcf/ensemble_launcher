@@ -1,0 +1,252 @@
+{
+    "name2--h-hello11": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello11"
+        },
+        "status": "finished",
+        "id": "name2--h-hello11",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello11",
+        "assigned_nodes": [],
+        "start_time": 2068137.384535739,
+        "end_time": 2068168.548583412,
+        "stdout": "Even numbers from arguments: hello11\n",
+        "stderr": ""
+    },
+    "name2--h-hello12": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello12"
+        },
+        "status": "finished",
+        "id": "name2--h-hello12",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello12",
+        "assigned_nodes": [],
+        "start_time": 2068137.387299673,
+        "end_time": 2068168.55054812,
+        "stdout": "Even numbers from arguments: hello12\n",
+        "stderr": ""
+    },
+    "name2--h-hello13": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello13"
+        },
+        "status": "finished",
+        "id": "name2--h-hello13",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello13",
+        "assigned_nodes": [],
+        "start_time": 2068137.390110173,
+        "end_time": 2068168.552555547,
+        "stdout": "Even numbers from arguments: hello13\n",
+        "stderr": ""
+    },
+    "name2--h-hello14": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello14"
+        },
+        "status": "finished",
+        "id": "name2--h-hello14",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello14",
+        "assigned_nodes": [],
+        "start_time": 2068137.392870179,
+        "end_time": 2068168.554564738,
+        "stdout": "Even numbers from arguments: hello14\n",
+        "stderr": ""
+    },
+    "name2--h-hello15": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello15"
+        },
+        "status": "finished",
+        "id": "name2--h-hello15",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello15",
+        "assigned_nodes": [],
+        "start_time": 2068137.39572883,
+        "end_time": 2068168.556491895,
+        "stdout": "Even numbers from arguments: hello15\n",
+        "stderr": ""
+    },
+    "name2--h-hello16": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello16"
+        },
+        "status": "finished",
+        "id": "name2--h-hello16",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello16",
+        "assigned_nodes": [],
+        "start_time": 2068137.398990114,
+        "end_time": 2068168.558275454,
+        "stdout": "Even numbers from arguments: hello16\n",
+        "stderr": ""
+    },
+    "name2--h-hello17": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello17"
+        },
+        "status": "finished",
+        "id": "name2--h-hello17",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello17",
+        "assigned_nodes": [],
+        "start_time": 2068137.40191036,
+        "end_time": 2068168.560053111,
+        "stdout": "Even numbers from arguments: hello17\n",
+        "stderr": ""
+    },
+    "name2--h-hello18": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello18"
+        },
+        "status": "finished",
+        "id": "name2--h-hello18",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello18",
+        "assigned_nodes": [],
+        "start_time": 2068137.404888415,
+        "end_time": 2068168.561936297,
+        "stdout": "Even numbers from arguments: hello18\n",
+        "stderr": ""
+    },
+    "name2--h-hello19": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello19"
+        },
+        "status": "finished",
+        "id": "name2--h-hello19",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello19",
+        "assigned_nodes": [],
+        "start_time": 2068137.407979981,
+        "end_time": 2068168.563873332,
+        "stdout": "Even numbers from arguments: hello19\n",
+        "stderr": ""
+    },
+    "name2--h-hello20": {
+        "ensemble_name": "name2",
+        "task_type": "mpi",
+        "task_type_cmd": "mpirun",
+        "task_type_options": {
+            "-np": 1,
+            "--hosts": "x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov"
+        },
+        "num_nodes": 1,
+        "num_cores_per_node": 1,
+        "run_dir": "./run_dir",
+        "bin": "./test_script.sh",
+        "bin_options": {
+            "-h": "hello20"
+        },
+        "status": "finished",
+        "id": "name2--h-hello20",
+        "pid": 0,
+        "cmd": "mpirun -np 1 --hosts x3110c0s19b0n0.hsn.cm.polaris.alcf.anl.gov ./test_script.sh -h hello20",
+        "assigned_nodes": [],
+        "start_time": 2068137.411290247,
+        "end_time": 2068168.565548318,
+        "stdout": "Even numbers from arguments: hello20\n",
+        "stderr": ""
+    }
+}

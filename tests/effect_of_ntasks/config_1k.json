@@ -1,0 +1,39 @@
+{
+    "poll_interval":1,
+    "update_interval": null,
+    "logfile":"log_1k.txt",
+    "ensembles":{
+        "name1":{
+            "task_type":"mpi",
+            "task_type_cmd":"mpirun",
+            "task_type_options":{
+                "-np":1
+            },
+            "num_nodes":1,
+            "num_cores_per_node":1,
+            "bin":"./test_script.sh",
+            "run_dir":"./run_dir",
+            "bin_options":{
+                "-h": ["hello1", "hello2", "hello3", "hello4", "hello5","hello6", "hello7", "hello8", "hello9", "hello10"],
+                "-r": ["bye1", "bye2", "bye3", "bye4", "bye5","bye6", "bye7", "bye8", "bye9", "bye10"],
+                "-k": ["goodbye1", "goodbye2", "goodbye3", "goodbye4", "goodbye5","goodbye6", "goodbye7", "goodbye8", "goodbye9", "goodbye10"]
+            }
+        },
+        "name2":{
+            "task_type":"mpi",
+            "task_type_cmd":"mpirun",
+            "task_type_options":{
+                "-np":1
+            },
+            "num_nodes":1,
+            "num_cores_per_node":1,
+            "run_dir":"./run_dir",
+            "bin":"./test_script.sh",
+            "bin_options":{
+                "-h": ["hello11", "hello12", "hello13", "hello14", "hello15","hello16", "hello17", "hello18", "hello19", "hello20"],
+                "-r": ["bye11", "bye12", "bye13", "bye14", "bye15","bye16", "bye17", "bye18", "bye19", "bye20"],
+                "-k": ["goodbye1", "goodbye2", "goodbye3", "goodbye4", "goodbye5","goodbye6", "goodbye7", "goodbye8", "goodbye9", "goodbye10"]
+            }
+        }
+    }
+}
