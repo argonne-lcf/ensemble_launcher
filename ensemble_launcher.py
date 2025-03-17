@@ -4,8 +4,11 @@ import socket
 import subprocess
 import time
 import copy
+import multiprocessing as mp
+import psutil
 import sys
 import platform
+import resource
 
 
 def unravel_index(flat_index, shape):
@@ -17,7 +20,7 @@ def unravel_index(flat_index, shape):
 
 ##NOTE: all the tasks need to be modified through ensemble object
 class ensemble:
-    def __init__(self,ensemble_name:str,ensemble_info:dict) -> None:
+    def __init__(self,ensemble_name:str,ensemble_info:dict,nparallel:int=1) -> None:
         self.__ensemble_name = ensemble_name
         self.__ensemble_info = ensemble_info
         self.__tasks = {}
@@ -26,13 +29,21 @@ class ensemble:
         ##this just fills the tasks list
         self.__tasks = self.__generate_ensemble()
         self.__ensemble_state = {}
-        self.__ensemble_state["ready_task_ids"] = {task["id"]:"ready" for task in self.__tasks.values()}
-        self.__ensemble_state["running_task_ids"] = {}
+        self.__ntasks = len(self.__tasks)
+        self.__np = nparallel
+        self.__ensemble_state = {}
+        self.__local_tasks = {}
+        self.__split_tasks() ##this is dictionary of type pid: local_tasks.
+        self.__initialize_ensemble_state()
         return None
 
     @property
     def ensemble_name(self):
         return self.__ensemble_name
+    
+    @property
+    def ntasks(self):
+        return self.__ntasks
     
     def __generate_ensemble(self) -> dict:
         tasks = []
@@ -112,51 +123,97 @@ class ensemble:
         
         return task
 
-    def get_task_ids(self):
-        return list(self.__tasks.keys())
+    def __split_tasks(self)->None:
+        local_tasks = {}
+        ntasks = [self.__ntasks//self.__np for pid in range(self.__np)]
+        ntasks[-1] += sum(ntasks)%self.__np
+        task_ids = self.get_task_ids()
+        for pid in range(self.__np):
+            self.__local_tasks[pid] = task_ids[sum(ntasks[:pid]):sum(ntasks[:pid])+ntasks[pid]]
+            for task_id in self.__local_tasks[pid]:
+                self.__tasks[task_id]["pid"] = pid
+        return None
+
+    def __initialize_ensemble_state(self) -> None:
+        self.__ensemble_state = {}
+        for pid in range(self.__np):
+            self.__ensemble_state[pid] = {
+                "ready_task_ids": {task_id: "ready" for task_id in self.__local_tasks[pid] if self.__tasks[task_id]["status"] == "ready"},
+                "running_task_ids": {task_id: "running" for task_id in self.__local_tasks[pid] if self.__tasks[task_id]["status"] == "running"}
+            }
+        return None
+ 
+    ##this is when ensemble itself decides the mapping
+    def set_np(self,np:int)->None:
+        self.__np = np
+        self.__split_tasks()
+        self.__initialize_ensemble_state()
+        return None
     
-    def get_task_info(self,task_id:str):
+    ###this when user wants to decide the mappings
+    def set_local_tasks(self,local_tasks:dict)->None:
+        self.__local_tasks = local_tasks
+        self.__np = len(self.__local_tasks)
+        for pid,task_ids in self.__local_tasks.itesm():
+            for task_id in task_ids:
+                self.__tasks[task_id]["pid"] = pid
+        self.__initialize_ensemble_state()
+        return None
+
+    def get_task_ids(self,pid:int=None)->list:
+        if pid is not None:
+            return self.__local_tasks[pid]
+        else:
+            return list(self.__tasks.keys())
+    
+    def get_task_info(self,task_id:str)->dict:
         return self.__tasks[task_id]
     
-    def get_finished_task_ids(self):
-        tasks_ids = []
-        for task_id,task in self.__tasks.items():
-            if task["status"] == "finished":
-                tasks_ids.append(task_id)
-        return tasks_ids
+    def get_finished_task_ids(self, pid: int = 0)->list:
+        task_ids = []
+        for task_id in self.__local_tasks[pid]:
+            if self.__tasks[task_id]["status"] == "finished":
+                task_ids.append(task_id)
+        return task_ids
     
-    def get_failed_task_ids(self):
-        tasks_ids = []
-        for task_id,task in self.__tasks.items():
-            if task["status"] == "failed":
-                tasks_ids.append(task_id)
-        return tasks_ids
+    def get_failed_task_ids(self, pid: int = 0)->list:
+        task_ids = []
+        if pid is not None:
+            for task_id in self.__local_tasks[pid]:
+                if self.__tasks[task_id]["status"] == "failed":
+                    task_ids.append(task_id)
+        return task_ids
     
-    def get_running_task_ids(self):
-        return list(self.__ensemble_state["running_task_ids"].keys())
+    def get_running_task_ids(self,pid:int=0)->list:
+        return list(self.__ensemble_state[pid]["running_task_ids"].keys())
     
-    def get_ready_task_ids(self):
-        return list(self.__ensemble_state["ready_task_ids"].keys())
+    def get_ready_task_ids(self,pid:int=0)->list:
+        return list(self.__ensemble_state[pid]["ready_task_ids"].keys())
     
-    def update_task_status(self,task_id:str,status:str) -> None:
+    def update_task_status(self, task_id: str, status: str, pid: int = 0) -> None:
         if status == "running":
-            self.__ensemble_state["running_task_ids"][task_id] = "running"
-            self.__ensemble_state["ready_task_ids"].pop(task_id)
+            assert self.__tasks[task_id]["status"] == "ready"
+            self.__ensemble_state[pid]["running_task_ids"][task_id] = "running"
+            self.__ensemble_state[pid]["ready_task_ids"].pop(task_id)
         elif status == "failed":
-            retries = self.__tasks[task_id].get("retries",0)
+            assert self.__tasks[task_id]["status"] == "running"
+            retries = self.__tasks[task_id].get("retries", 0)
             if retries < 1:
-                ##retry the task
-                self.__ensemble_state["ready_task_ids"][task_id] = "ready"
-                self.__ensemble_state["running_task_ids"].pop(task_id)
+                # Retry the task
+                self.__ensemble_state[pid]["ready_task_ids"][task_id] = "ready"
+                self.__ensemble_state[pid]["running_task_ids"].pop(task_id)
                 self.__tasks[task_id]["retries"] = retries + 1
+                self.__tasks[task_id]["status"] = "ready"
+                return None
             else:
                 self.__tasks[task_id]["status"] = "failed"
-                self.__ensemble_state["running_task_ids"].pop(task_id)
+                self.__ensemble_state[pid]["running_task_ids"].pop(task_id)
         elif status == "finished":
-            self.__ensemble_state["running_task_ids"].pop(task_id)
+            assert self.__tasks[task_id]["status"] == "running"
+            self.__ensemble_state[pid]["running_task_ids"].pop(task_id)
         elif status == "deleted":
-            self.__ensemble_state["running_task_ids"].pop(task_id,None)
-            self.__ensemble_state["ready_task_ids"].pop(task_id,None)
+            self.__ensemble_state[pid]["running_task_ids"].pop(task_id, None)
+            self.__ensemble_state[pid]["ready_task_ids"].pop(task_id, None)
             return None
         else:
             if status != "ready":
@@ -164,9 +221,10 @@ class ensemble:
         self.__tasks[task_id]["status"] = status
         return None
     
-    def update_task_info(self,task_id:str,info:dict) -> None:
+    def update_task_info(self,task_id:str,info:dict,pid:int=0) -> None:
         if "status" in info.keys():
-            self.update_task_status(task_id,info["status"])
+            self.update_task_status(task_id,info["status"],pid=pid)
+            info.pop("status")
         self.__tasks[task_id].update(info)
         return None
     
@@ -184,31 +242,44 @@ class ensemble:
             task_info["cmd"] += f" {key} {value}"
         return None
 
-    def get_next_ready_task(self):
-        if len(self.__ensemble_state["ready_task_ids"]) > 0:
-            return self.__ensemble_state["ready_task_ids"][0]
+    def get_next_ready_task(self,pid:int=0):
+        if len(self.__ensemble_state[pid]["ready_task_ids"]) > 0:
+            return self.__ensemble_state[pid]["ready_task_ids"][0]
         return None
     
-    def update_ensemble(self,ensemble_info:dict) -> list:
+    def update_ensemble(self,ensemble_info:dict,rebalance_tasks:bool=False) -> list:
         ##update the ensemble info
         self.__ensemble_info = ensemble_info
         ##regenerate the ensemble
-        new_tasks = self.__generate_ensemble()
+        updated_tasks = self.__generate_ensemble()
         old_tasks = self.__tasks
+        old_local_tasks = self.__local_tasks
         self.__tasks = {}
+        new_tasks = []
         # Remove tasks that are already in old_tasks
-        for task_id, task in new_tasks.items():
+        for task_id, task in updated_tasks.items():
             if task_id in old_tasks:
                 self.__tasks[task_id] = old_tasks.pop(task_id)
             else:
                 self.__tasks[task_id] = task
-        for old_task_id in old_tasks:
-            self.update_task_status(old_task_id,"deleted")
-        ##update the ready tasks
-        for task_id,task in self.__tasks.items():
-            if task["status"] == "ready":
-                if task_id not in self.__ensemble_state["ready_task_ids"]:
-                    self.__ensemble_state["ready_task_ids"][task_id] = "ready"
+                new_tasks.append(task_id)
+        self.__ntasks = len(self.__tasks.keys())
+        
+        
+        ##update ready tasks
+        ##delete the old tasks
+        for old_task_id,old_task in old_tasks.items():
+            self.update_task_status(old_task_id,"deleted",pid=old_task["pid"])
+        
+        if rebalance_tasks:
+            ##this will equally split the tasks among __np
+            self.__split_tasks()
+            self.__initialize_ensemble_state()
+        else:
+            ##if not, add new tasks to the pid=0
+            for task_id in new_tasks:
+                self.__ensemble_state[0]["ready_task_ids"][task_id] = "ready"
+
         return old_tasks
     
     def save_ensemble_status(self, out_dir="outputs"):
@@ -218,22 +289,29 @@ class ensemble:
 
 class ensemble_launcher:
     def __init__(self,config_file:str) -> None:
-        self.progress_info = {}
-        self.progress_info["total_nodes"] = self.get_nodes()
-        self.progress_info["free_nodes"] = self.get_nodes()
-        self.progress_info["ncores_per_node"] = self.get_cores_per_node()
-        self.progress_info["free_cores_per_node"] = {node:self.progress_info["ncores_per_node"] for node in self.progress_info["total_nodes"]}
-        self.progress_info["busy_nodes"] = [] #this only has nodes with no cores free
-        self.update_interval = None
-        self.poll_interval = 60
+        self.update_interval = None ##how often to update the ensembles in secs
+        self.poll_interval = 60 ##how often to poll the running tasks in secs
+        self.n_parallel = None ##number of parallel lacunchers in int
+        self.pids_per_ensemble = {} ##pids of an ensemble
         ##
         self.ensembles = {}
-        ##
         self.start_time = time.perf_counter()
         self.last_update_time = time.perf_counter()
         self.config_file = config_file
         self.read_input_file()
-
+        self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
+        if self.n_parallel > 1:
+            self.distribute_procs()
+        ##
+        self.progress_info = {}
+        self.progress_info["total_nodes"] = self.get_nodes()
+        self.progress_info["my_nodes"] = self.split_nodes() ##this will be list of lists. Access should be same as a dict
+        self.progress_info["my_free_nodes"] = self.progress_info["my_nodes"]
+        self.progress_info["ncores_per_node"] = self.get_cores_per_node()
+        self.progress_info["free_cores_per_node"] = {node:self.progress_info["ncores_per_node"] for node in self.progress_info["total_nodes"]}
+        self.progress_info["my_busy_nodes"] = [[] for i in range(self.n_parallel)] #this only has nodes with no cores free
+        ##
+        self.read_fd,self.write_fd = os.pipe()
         return None
     
     def read_input_file(self):
@@ -241,9 +319,27 @@ class ensemble_launcher:
             data = json.load(file)
             self.update_interval = data.get("update_interval",None)
             self.poll_interval = data.get("poll_interval",600)
+            self.n_parallel = data.get("n_parallel",1)
+            self.logfile = data.get("logfile","log.txt")
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():
                 self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info)
+        return None
+    
+    ##pool all the tasks and split them among available processes
+    def distribute_procs(self)->None:
+        ntasks_per_proc = sum([e.ntasks for e in self.ensembles.values()])//self.n_parallel
+        cum_tasks = 0
+        for en,e in self.ensembles.items():
+            start = cum_tasks//ntasks_per_proc
+            end = (cum_tasks+e.ntasks)//ntasks_per_proc + 1
+            if start == end:
+                self.pids_per_ensemble[en] = [start]
+            else:
+                self.pids_per_ensemble[en] = [i for i in range(start,end+1)]
+            self.pids_per_ensemble[en] = [i for i in self.pids_per_ensemble[en] if i < self.n_parallel]
+            self.ensembles[en].set_np(len(self.pids_per_ensemble[en]))
+            cum_tasks+=e.ntasks
         return None
 
 
@@ -258,60 +354,77 @@ class ensemble_launcher:
             node_list = [socket.gethostname()]
         return node_list
     
+    def split_nodes(self)->list:
+        my_nodes = []
+        nn = len(self.progress_info["total_nodes"])//self.n_parallel
+        for i in range(self.n_parallel):
+            my_nodes.append(self.progress_info["total_nodes"][i*nn:(i+1)*nn])
+        my_nodes[-1].extend(self.progress_info["total_nodes"][(i+1)*nn:])
+        return my_nodes
+    
     def get_cores_per_node(self):
         if os.getenv("NCPUS") is not None:
             return int(os.getenv("NCPUS"))
         else:
             return os.cpu_count()
     
-    def report_status(self):
+    def report_status(self,my_pid:int=0):
         n_nodes = len(self.progress_info["total_nodes"])
-        n_busy_nodes = len(self.progress_info["busy_nodes"])
+        n_busy_nodes = len(self.progress_info["my_busy_nodes"][my_pid])
         n_todo_tasks = 0
         n_running_tasks = 0
+        n_fds = 0
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
         for ensemble_name,ensemble in self.ensembles.items():
-            n_todo_tasks += len(ensemble.get_ready_task_ids())
-            n_running_tasks += len(ensemble.get_running_task_ids())
-        
-        print(f"Nodes fully occupied {n_busy_nodes}/{n_nodes}, Tasks ready: {n_todo_tasks}, Tasks running: {n_running_tasks}")
+            if my_pid in self.pids_per_ensemble[ensemble_name]:
+                running_task_ids = ensemble.get_running_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid))
+                n_todo_tasks += len(ensemble.get_ready_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
+                n_running_tasks += len(ensemble.get_running_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
+                for task_id in running_task_ids:
+                    task_info = ensemble.get_task_info(task_id)
+                    n_fds += self.get_nfd(task_info.get("process",None))
+
+        fname = os.path.join(os.getcwd(),"outputs",self.logfile)
+        with open(fname,"a") as f:
+            f.write(f"Proc {my_pid}: nfds {n_fds}/{soft_limit} Nodes fully occupied {n_busy_nodes}/{n_nodes}, Tasks ready: {n_todo_tasks}, Tasks running: {n_running_tasks}\n")
 
     
-    def assign_task_nodes(self,task_id:str,ensemble:ensemble) -> list:
+    def assign_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> list:
         assigned_nodes = []
         task = ensemble.get_task_info(task_id)
-        for j in range(len(self.progress_info["free_nodes"])):
+        for j in range(len(self.progress_info["my_free_nodes"][my_pid])):
             if len(assigned_nodes) == task["num_nodes"]:
                 break
-            if self.progress_info["free_cores_per_node"][self.progress_info["free_nodes"][j]] >= task["num_cores_per_node"]\
-                and self.progress_info["free_nodes"][j] not in self.progress_info["busy_nodes"]:
-                node = self.progress_info["free_nodes"][j]
+            if self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]] >= task["num_cores_per_node"]\
+                and self.progress_info["my_free_nodes"][my_pid][j] not in self.progress_info["my_busy_nodes"][my_pid]:
+                node = self.progress_info["my_free_nodes"][my_pid][j]
                 self.progress_info["free_cores_per_node"][node] -= task["num_cores_per_node"]
                 assigned_nodes.append(node)
                 if self.progress_info["free_cores_per_node"][node] == 0:
-                    self.progress_info["free_nodes"].remove(node)
-                    self.progress_info["busy_nodes"].append(node)
+                    self.progress_info["my_free_nodes"][my_pid].remove(node)
+                    self.progress_info["my_busy_nodes"][my_pid].append(node)
 
         if len(assigned_nodes) < task["num_nodes"]:
             for node in assigned_nodes:
                 self.progress_info["free_cores_per_node"][node] += task["num_cores_per_node"]
-                if node in self.progress_info["busy_nodes"]:
-                    self.progress_info["busy_nodes"].remove(node)
-                    self.progress_info["free_nodes"].append(node)
+                if node in self.progress_info["my_busy_nodes"][my_pid]:
+                    self.progress_info["my_busy_nodes"][my_pid].remove(node)
+                    self.progress_info["my_free_nodes"][my_pid].append(node)
             assigned_nodes = []
             
         return assigned_nodes
 
-    def free_task_nodes(self,task_id:str,ensemble:ensemble) -> None:
+    def free_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> None:
         task = ensemble.get_task_info(task_id)
-        self.free_task_nodes_base(task)
+        self.free_task_nodes_base(task,my_pid)
         return
     
-    def free_task_nodes_base(self,task_info:dict) -> None:
+    def free_task_nodes_base(self,task_info:dict,my_pid:int=0) -> None:
         for node in task_info["assigned_nodes"]:
             self.progress_info["free_cores_per_node"][node] += task_info["num_cores_per_node"]
-            if node in self.progress_info["busy_nodes"]:
-                self.progress_info["busy_nodes"].remove(node)
-                self.progress_info["free_nodes"].append(node)
+            if node in self.progress_info["my_busy_nodes"][my_pid]:
+                self.progress_info["my_busy_nodes"][my_pid].remove(node)
+                self.progress_info["my_free_nodes"][my_pid].append(node)
         return
 
     
@@ -322,19 +435,32 @@ class ensemble_launcher:
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=open(os.path.join(task_info["run_dir"],f'job-{task_info["id"]}.out'),'wb'),
-                             stderr=subprocess.STDOUT,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
                              stdin=subprocess.DEVNULL,
                              cwd=task_info.get("run_dir",os.getcwd()),
-                             env=os.environ.copy(),)
-        
+                             env=os.environ.copy(),
+                             close_fds = True,
+                             pass_fds=[self.read_fd,self.write_fd])
         return p
 
-    def launch_ready_tasks(self,ensemble:ensemble) -> None:
-        for task_id in ensemble.get_ready_task_ids():
-            assigned_nodes = self.assign_task_nodes(task_id,ensemble)
+    def get_nfd(self,process)->int:
+        if process is None:
+            return 0
+        pid = process.pid
+        fd_path = f'/proc/{pid}/fd'
+        try:
+            open_fds = os.listdir(fd_path)
+            return len(open_fds)
+        except:
+            return 0
+
+    def launch_ready_tasks(self,ensemble:ensemble,local_pid:int=0,my_pid:int=0) -> int:
+        launched_tasks = 0
+        for task_id in ensemble.get_ready_task_ids(pid=local_pid):
+            assigned_nodes = self.assign_task_nodes(task_id,ensemble,my_pid=my_pid)
             if len(assigned_nodes) == 0:
-                if len(self.progress_info["free_nodes"]) == 0:
+                if len(self.progress_info["my_free_nodes"][my_pid]) == 0:
                     break
                 else:
                     continue
@@ -343,35 +469,49 @@ class ensemble_launcher:
                 ensemble.update_host_nodes(task_id,assigned_nodes)
             ensemble.build_task_cmd(task_id)
             p = self.launch_task(task_id,ensemble)
+            launched_tasks += 1
+            fname = os.path.join(os.getcwd(),"outputs",self.logfile)
+            with open(fname,"a") as f:
+                f.write(f"{ensemble.ensemble_name}:launched {launched_tasks} tasks!\n")
             ensemble.update_task_info(task_id,{"process":p,
                                                 "assigned_nodes":assigned_nodes,
                                                 "start_time":time.perf_counter(),
-                                                "status":"running"})
-        return None
+                                                "status":"running"},pid=local_pid)
+            self.report_status()
+        return launched_tasks
     
-    def poll_running_tasks(self) -> None:
+    def poll_running_tasks(self,my_pid:int=0) -> None:
         for ensemble_name,ensemble in self.ensembles.items():
-            task_ids = ensemble.get_running_task_ids()
-            for task_id in task_ids:
-                task = ensemble.get_task_info(task_id)
-                popen_proc = task["process"]
-                if popen_proc.poll() is not None:
-                    if popen_proc.returncode == 0:
-                        status = "finished"
-                    else:
-                        status = "failed"
-                    self.free_task_nodes(task_id,ensemble)
-                    ensemble.update_task_info(task_id,{"end_time":time.perf_counter(),
-                                                       "status":status,
-                                                       "process":None,
-                                                       "assigned_nodes":[]})
+            for local_pid,pid in enumerate(self.pids_per_ensemble[ensemble_name]):
+                if pid == my_pid:
+                    task_ids = ensemble.get_running_task_ids(local_pid)
+                    for task_id in task_ids:
+                        task = ensemble.get_task_info(task_id)
+                        popen_proc = task["process"]
+                        if popen_proc.poll() is not None:
+                            if popen_proc.returncode == 0:
+                                status = "finished"
+                            else:
+                                status = "failed"
+                            out,err = popen_proc.communicate()
+                            self.free_task_nodes(task_id,ensemble)
+                            ensemble.update_task_info(task_id,{"end_time":time.perf_counter(),
+                                                               "status":status,
+                                                               "process":None,
+                                                               "assigned_nodes":[],
+                                                               "stdout":out.decode(),
+                                                               "stderr":err.decode()}
+                                                               ,pid=local_pid)
+                            ensemble.save_ensemble_status()
                     
         return None
     
-    def get_pending_tasks(self):
+    def get_pending_tasks(self,my_pid:int=0):
         pending_tasks = []
         for ensemble_name,ensemble in self.ensembles.items():
-            pending_tasks = pending_tasks + ensemble.get_ready_task_ids() + ensemble.get_running_task_ids()
+            for local_pid,pid in enumerate(self.pids_per_ensemble[ensemble_name]):
+                if pid == my_pid:
+                    pending_tasks = pending_tasks + ensemble.get_ready_task_ids(local_pid) + ensemble.get_running_task_ids(local_pid)
         return pending_tasks
     
     def delete_tasks(self,task_infos:dict) -> None:
@@ -391,23 +531,44 @@ class ensemble_launcher:
                 deleted_tasks.update(self.ensembles[ensemble_name].update_ensemble(ensemble_info))
         return deleted_tasks
 
-    def run_tasks(self) -> None:
+    def run_tasks_serial(self,my_pid:int=0) -> None:
         while True:
+            count = 0
             for ensemble_name,ensemble in self.ensembles.items():
-                self.launch_ready_tasks(ensemble)
-            self.poll_running_tasks()
-            self.report_status()
+                for local_pid,pid in enumerate(self.pids_per_ensemble[ensemble_name]):
+                    if my_pid == pid:
+                        launched_tasks = self.launch_ready_tasks(ensemble,local_pid=local_pid,my_pid=my_pid)
+            self.poll_running_tasks(my_pid=my_pid)
+            self.report_status(my_pid)
             if self.update_interval is not None:
                 if time.perf_counter() - self.last_update_time > self.update_interval:
                     deleted_tasks = self.update_ensembles()
                     self.delete_tasks(deleted_tasks)
                     self.last_update_time = time.perf_counter()
             time.sleep(self.poll_interval)
-            if len(self.get_pending_tasks()) == 0:
+            if len(self.get_pending_tasks(my_pid)) == 0:
                 for ensemble_name,ensemble in self.ensembles.items():
                     ensemble.save_ensemble_status()
                 break
 
         return None
+    
+    def run_tasks_parallel(self):
+        processes = []
+        for i in range(self.n_parallel):
+            p = mp.Process(target=self.run_tasks_serial,args=(i,))
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
 
     
+    def run_tasks(self) -> None:
+        fname = os.path.join(os.getcwd(),"outputs",self.logfile)
+        if os.path.exists(fname):
+            os.remove(fname)
+        if self.n_parallel == 1:
+            self.run_tasks_serial()
+        else:
+            self.run_tasks_parallel()
