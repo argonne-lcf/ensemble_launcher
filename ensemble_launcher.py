@@ -310,7 +310,7 @@ class ensemble:
             json.dump({tid:{k:v for k,v in self.__tasks[tid].items() if k != "process"} for tid in self.__tasks.keys()}, f, ensure_ascii=False, indent=4)
 
 class ensemble_launcher:
-    def __init__(self,config_file:str) -> None:
+    def __init__(self,config_file:str,ncores_per_node:int=None) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.n_parallel = None ##number of parallel lacunchers in int
@@ -329,7 +329,7 @@ class ensemble_launcher:
         self.progress_info["total_nodes"] = self.get_nodes()
         self.progress_info["my_nodes"] = self.split_nodes() ##this will be list of lists. Access should be same as a dict
         self.progress_info["my_free_nodes"] = self.progress_info["my_nodes"]
-        self.progress_info["ncores_per_node"] = self.get_cores_per_node()
+        self.progress_info["ncores_per_node"] = self.get_cores_per_node() if ncores_per_node is None else ncores_per_node
         self.progress_info["free_cores_per_node"] = {node:self.progress_info["ncores_per_node"] for node in self.progress_info["total_nodes"]}
         self.progress_info["my_busy_nodes"] = [[] for i in range(self.n_parallel)] #this only has nodes with no cores free
         ##
@@ -416,17 +416,22 @@ class ensemble_launcher:
     def assign_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> list:
         assigned_nodes = []
         task = ensemble.get_task_info(task_id)
-        for j in range(len(self.progress_info["my_free_nodes"][my_pid])):
-            if len(assigned_nodes) == task["num_nodes"]:
+        j = 0
+        while True:
+            if len(assigned_nodes) == task["num_nodes"] or \
+               len(self.progress_info["my_free_nodes"][my_pid]) == 0 or \
+               j > len(self.progress_info["my_free_nodes"][my_pid]):
                 break
             if self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]] >= task["num_processes_per_node"]\
                 and self.progress_info["my_free_nodes"][my_pid][j] not in self.progress_info["my_busy_nodes"][my_pid]:
                 node = self.progress_info["my_free_nodes"][my_pid][j]
                 self.progress_info["free_cores_per_node"][node] -= task["num_processes_per_node"]
                 assigned_nodes.append(node)
+                j += 1
                 if self.progress_info["free_cores_per_node"][node] == 0:
                     self.progress_info["my_free_nodes"][my_pid].remove(node)
                     self.progress_info["my_busy_nodes"][my_pid].append(node)
+                    j -= 1
 
         if len(assigned_nodes) < task["num_nodes"]:
             for node in assigned_nodes:
