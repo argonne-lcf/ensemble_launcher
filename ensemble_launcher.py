@@ -261,7 +261,7 @@ class ensemble:
                 
         else:
             if task_info["launcher"] != "bash":
-                raise ValueError(f"Unknown launcher {task_info["launcher"]}")
+                raise ValueError(f"Unknown launcher {task_info['launcher']}")
         return None
 
     def get_next_ready_task(self,pid:int=0):
