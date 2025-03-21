@@ -1,35 +1,15 @@
 {
     "poll_interval":5,
     "update_interval": null,
-    "n_parallel":2,
     "ensembles":{
         "name1":{
-            "task_type":"mpi",
-            "task_type_cmd":"mpirun",
-            "task_type_options":{
-                "-np":1
-            },
             "num_nodes":1,
-            "num_cores_per_node":1,
-            "bin":"./test_script.sh",
-            "run_dir":"./run_dir",
-            "bin_options":{
-                "-h": ["hello1", "hello2", "hello3", "hello4", "hello5","hello6", "hello7", "hello8", "hello9", "hello10"]
-            }
-        },
-        "name2":{
-            "task_type":"mpi",
-            "task_type_cmd":"mpirun",
-            "task_type_options":{
-                "-np":1
-            },
-            "num_nodes":1,
-            "num_cores_per_node":1,
-            "run_dir":"./run_dir",
-            "bin":"./test_script.sh",
-            "bin_options":{
-                "-h": ["hello11", "hello12", "hello13", "hello14", "hello15","hello16", "hello17", "hello18", "hello19", "hello20"]
-            }
+            "num_processes_per_node":1,
+            "launcher":"bash",
+            "relation":"one-to-one",
+            "cmd":"./test_script.sh -h {opts}",
+            "opts":["hello1", "hello2", "hello3", "hello4", "hello5","hello6", "hello7", "hello8", "hello9", "hello10"],
+            "run_dir":"./run_dir"
         }
     }
 }

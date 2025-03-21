@@ -25,15 +25,15 @@ class ensemble:
         self.__ensemble_info = ensemble_info
         self.__tasks = {}
         ##this is to make sure the task id is unique
-        self.__bin_options_ordered = tuple(ensemble_info.get("bin_options").keys())
+        self.__list_options = None
         ##this just fills the tasks list
         self.__tasks = self.__generate_ensemble()
         self.__ensemble_state = {}
         self.__ntasks = len(self.__tasks)
         self.__np = nparallel
         self.__ensemble_state = {}
-        self.__local_tasks = {}
-        self.__split_tasks() ##this is dictionary of type pid: local_tasks.
+        self.__local_tasks = {}##this is dictionary of type pid: local_tasks.
+        self.__split_tasks() 
         self.__initialize_ensemble_state()
         return None
 
@@ -45,55 +45,77 @@ class ensemble:
     def ntasks(self):
         return self.__ntasks
     
-    def __generate_ensemble(self) -> dict:
-        tasks = []
+    ##this function checks if ensemble config is correct
+    def check_ensemble_info(self):
         ensemble = self.__ensemble_info
-        name = self.__ensemble_name
-        # Generate tasks based on ensemble configuration
         ##assert some necessary vals
-        assert "task_type" in ensemble.keys()
         assert "num_nodes" in ensemble.keys()
-        assert "bin" in ensemble.keys()
-        ###
-        multipliers = []  # To hold keys that correspond to lists
-        num_elements = 1  # Total number of tasks to generate
-        task_dim = []  # Dimensions of the task grid
-        task_template = {"ensemble_name":name}  # Template for the task (fixed part)
-        for key, value in ensemble.items():
-            if key != "bin_options":
-                task_template[key] = value
-            else:
-                task_template["bin_options"] = {}
-        # Process each key-value pair in the ensemble
-        for key, value in ensemble.get("bin_options",{}).items():
-            if isinstance(value, list):
-                # If value is a list, it's a multiplier
-                multipliers.append(key)
-                num_elements *= len(value)
-                task_dim.append(len(value))
-            else:
-                # If value is not a list, it's part of the template
-                task_template["bin_options"][key] = value
+        assert "launcher" in ensemble.keys()
+        assert "relation" in ensemble.keys()
+        assert "cmd" in ensemble.keys()
+
+    def __generate_ensemble(self) -> dict:
+        """check ensemble config
+        """
+        self.check_ensemble_info()
+        ensemble = self.__ensemble_info
+        relation = ensemble["relation"]
+        """this is one-to-one relationship between all the lists
+        """
+        if relation == "one-to-one":
+            list_options = []
+            non_list_options = []
+            ntasks = None
+            for key,value in ensemble.items():
+                if isinstance(value,list):
+                    list_options.append(key)
+                    if ntasks is None:
+                        ntasks = len(value)
+                    else:
+                        if len(ensemble[key]) != ntasks:
+                            raise ValueError(f"Invalid option length for {key}")
+                else:
+                    non_list_options.append(key)
             
-        task_dim = tuple(task_dim)  # Convert to tuple for easy unpacking
-
-        # Iterate over all combinations of task parameters
-        for i in range(num_elements):
-            task = copy.deepcopy(task_template)  # Start with the task template
-            idx = unravel_index(i, task_dim)  # Get the indices for the current combination
-
-            # Assign values from the ensemble based on the indices
-            for j, key in zip(idx, multipliers):
-                task["bin_options"][key] = ensemble["bin_options"][key][j]
-
-            task = self.__set_defaults(task)
-            # Append the generated task to the progress info
-            tasks.append(task)
-
+            self.__list_options = tuple(list_options)
+            tasks = []
+            for i in range(ntasks):
+                task = {"ensemble_name":self.__ensemble_name}
+                for opt in non_list_options:
+                    task[opt] = ensemble[opt]
+                for opt in list_options:
+                    task[opt] = ensemble[opt][i]
+                tasks.append(self.__set_defaults(task))
+        elif relation == "many-to-many":
+            list_options = []
+            non_list_options = []
+            ntasks = 1
+            dim = []
+            for key,value in ensemble.items():
+                if isinstance(value,list):
+                    list_options.append(key)
+                    ntasks *= len(value)
+                    dim.append(len(value))
+                else:
+                    non_list_options.append(key)
+            self.__list_options = tuple(list_options)
+            tasks = []
+            for tid in range(ntasks):
+                task = {"ensemble_name":self.__ensemble_name}
+                loc = unravel_index(tid,dim)
+                for id,opt in enumerate(list_options):
+                    task[opt] = ensemble[opt][loc[id]]
+                for opt in non_list_options:
+                    task[opt] = ensemble[opt]
+                tasks.append(self.__set_defaults(task))
+        else:
+            raise ValueError(f"Unknown relation {relation}")
+        
         return {task["id"]:task for task in tasks}
-    
+
     def __generate_task_id(self, task:dict) -> str:
-        bin_options_str = "-".join(f"{k}-{task['bin_options'][k]}" for k in self.__bin_options_ordered)
+        assert self.__list_options is not None
+        bin_options_str = "-".join(f"{k}-{task[k]}" for k in self.__list_options)
         ##NOTE: the string should always start with ensemble name
         unique_str = f"{task['ensemble_name']}-{bin_options_str}"
         return unique_str
@@ -108,18 +130,9 @@ class ensemble:
 
         if "run_dir" not in task.keys():
             task["run_dir"] = os.getcwd()
-                
-        if "task_type_cmd" not in task.keys():
-            task["task_type_cmd"] = ''
-                
-        if "task_type_options" not in task.keys():
-            task["task_type_options"] = {}
-                
-        if "bin_options" not in task.keys():
-            task["bin_options"] = {}
         
-        if "num_cores_per_node" not in task.keys():
-            task["num_cores_per_node"] = 1
+        if "num_processes_per_node" not in task.keys():
+            task["num_processes_per_node"] = 1
         
         return task
 
@@ -233,13 +246,17 @@ class ensemble:
     
     def build_task_cmd(self,task_id:str) -> None:
         task_info = self.__tasks[task_id]
-        task_info["cmd"] = f"{task_info['task_type_cmd']}"
-        ##Here, key is the option and value is its option
-        for key,value in task_info["task_type_options"].items():
-            task_info["cmd"] += f" {key} {value}"
-        task_info["cmd"] += f" {task_info['bin']}"
-        for key,value in task_info["bin_options"].items():
-            task_info["cmd"] += f" {key} {value}"
+        open_braces = [i for i, char in enumerate(task_info["cmd"]) if char == "{"]
+        close_braces = [i for i, char in enumerate(task_info["cmd"]) if char == "}"]
+        placeholders = [task_info["cmd"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
+        for opt in placeholders:
+            task_info["cmd"] = task_info["cmd"].format(**{key: task_info[key] for key in placeholders})
+        if task_info["launcher"] == "mpi":
+            hosts = ",".join(task_info["assigned_nodes"])
+            task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} -ppn {task_info["num_processes_per_node"]} --hosts {hosts}" + task_info["cmd"]
+        else:
+            if task_info["launcher"] != "bash":
+                raise ValueError(f"Unknown launcher {task_info["launcher"]}")
         return None
 
     def get_next_ready_task(self,pid:int=0):
@@ -311,7 +328,6 @@ class ensemble_launcher:
         self.progress_info["free_cores_per_node"] = {node:self.progress_info["ncores_per_node"] for node in self.progress_info["total_nodes"]}
         self.progress_info["my_busy_nodes"] = [[] for i in range(self.n_parallel)] #this only has nodes with no cores free
         ##
-        self.read_fd,self.write_fd = os.pipe()
         return None
     
     def read_input_file(self):
@@ -340,6 +356,7 @@ class ensemble_launcher:
             self.pids_per_ensemble[en] = [i for i in self.pids_per_ensemble[en] if i < self.n_parallel]
             self.ensembles[en].set_np(len(self.pids_per_ensemble[en]))
             cum_tasks+=e.ntasks
+            e.save_ensemble_status()
         return None
 
 
@@ -356,6 +373,8 @@ class ensemble_launcher:
     
     def split_nodes(self)->list:
         my_nodes = []
+        if len(self.progress_info["total_nodes"])<self.n_parallel:
+            raise ValueError("Total number of nodes < number of parallel task launchers! Please set nparallel = 1")
         nn = len(self.progress_info["total_nodes"])//self.n_parallel
         for i in range(self.n_parallel):
             my_nodes.append(self.progress_info["total_nodes"][i*nn:(i+1)*nn])
@@ -395,10 +414,10 @@ class ensemble_launcher:
         for j in range(len(self.progress_info["my_free_nodes"][my_pid])):
             if len(assigned_nodes) == task["num_nodes"]:
                 break
-            if self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]] >= task["num_cores_per_node"]\
+            if self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]] >= task["num_processes_per_node"]\
                 and self.progress_info["my_free_nodes"][my_pid][j] not in self.progress_info["my_busy_nodes"][my_pid]:
                 node = self.progress_info["my_free_nodes"][my_pid][j]
-                self.progress_info["free_cores_per_node"][node] -= task["num_cores_per_node"]
+                self.progress_info["free_cores_per_node"][node] -= task["num_processes_per_node"]
                 assigned_nodes.append(node)
                 if self.progress_info["free_cores_per_node"][node] == 0:
                     self.progress_info["my_free_nodes"][my_pid].remove(node)
@@ -406,7 +425,7 @@ class ensemble_launcher:
 
         if len(assigned_nodes) < task["num_nodes"]:
             for node in assigned_nodes:
-                self.progress_info["free_cores_per_node"][node] += task["num_cores_per_node"]
+                self.progress_info["free_cores_per_node"][node] += task["num_processes_per_node"]
                 if node in self.progress_info["my_busy_nodes"][my_pid]:
                     self.progress_info["my_busy_nodes"][my_pid].remove(node)
                     self.progress_info["my_free_nodes"][my_pid].append(node)
@@ -421,7 +440,7 @@ class ensemble_launcher:
     
     def free_task_nodes_base(self,task_info:dict,my_pid:int=0) -> None:
         for node in task_info["assigned_nodes"]:
-            self.progress_info["free_cores_per_node"][node] += task_info["num_cores_per_node"]
+            self.progress_info["free_cores_per_node"][node] += task_info["num_processes_per_node"]
             if node in self.progress_info["my_busy_nodes"][my_pid]:
                 self.progress_info["my_busy_nodes"][my_pid].remove(node)
                 self.progress_info["my_free_nodes"][my_pid].append(node)
@@ -440,8 +459,7 @@ class ensemble_launcher:
                              stdin=subprocess.DEVNULL,
                              cwd=task_info.get("run_dir",os.getcwd()),
                              env=os.environ.copy(),
-                             close_fds = True,
-                             pass_fds=[self.read_fd,self.write_fd])
+                             close_fds = True)
         return p
 
     def get_nfd(self,process)->int:
@@ -464,9 +482,7 @@ class ensemble_launcher:
                     break
                 else:
                     continue
-            task_info = ensemble.get_task_info(task_id)
-            if task_info["task_type"] == "mpi":
-                ensemble.update_host_nodes(task_id,assigned_nodes)
+            ensemble.update_task_info(task_id,{ "assigned_nodes":assigned_nodes},pid=local_pid)
             ensemble.build_task_cmd(task_id)
             p = self.launch_task(task_id,ensemble)
             launched_tasks += 1
@@ -474,7 +490,6 @@ class ensemble_launcher:
             with open(fname,"a") as f:
                 f.write(f"{ensemble.ensemble_name}:launched {launched_tasks} tasks!\n")
             ensemble.update_task_info(task_id,{"process":p,
-                                                "assigned_nodes":assigned_nodes,
                                                 "start_time":time.perf_counter(),
                                                 "status":"running"},pid=local_pid)
             self.report_status()
