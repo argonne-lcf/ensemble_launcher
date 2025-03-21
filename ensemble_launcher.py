@@ -255,9 +255,9 @@ class ensemble:
             if "mpirun -np " not in task_info["cmd"]:
                 hosts = ",".join(task_info["assigned_nodes"])
                 if "alcfwl" in hosts:
-                    task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} " + task_info["cmd"]
+                    task_info["cmd"] = f"mpirun -np {task_info['num_nodes']*task_info['num_processes_per_node']} " + task_info["cmd"]
                 else:
-                    task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} -ppn {task_info["num_processes_per_node"]} --hosts {hosts} " + task_info["cmd"]
+                    task_info["cmd"] = f"mpirun -np {task_info['num_nodes']*task_info['num_processes_per_node']} -ppn {task_info['num_processes_per_node']} --hosts {hosts} " + task_info["cmd"]
                 
         else:
             if task_info["launcher"] != "bash":
