@@ -459,8 +459,8 @@ class ensemble_launcher:
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,
+                             stdout=open(os.path.join(task_info["run_dir"],"log.txt"),"w"),
+                             stderr=open(os.path.join(task_info["run_dir"],"err.txt"),"w"),
                              stdin=subprocess.DEVNULL,
                              cwd=task_info.get("run_dir",os.getcwd()),
                              env=os.environ.copy(),
@@ -518,9 +518,9 @@ class ensemble_launcher:
                             ensemble.update_task_info(task_id,{"end_time":time.perf_counter(),
                                                                "status":status,
                                                                "process":None,
-                                                               "assigned_nodes":[],
-                                                               "stdout":out.decode(),
-                                                               "stderr":err.decode()}
+                                                               "assigned_nodes":[],}
+                                                            #    "stdout":out.decode(),
+                                                            #    "stderr":err.decode()}
                                                                ,pid=local_pid)
                             ensemble.save_ensemble_status()
                     
