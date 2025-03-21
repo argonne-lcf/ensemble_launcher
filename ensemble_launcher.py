@@ -252,8 +252,13 @@ class ensemble:
         for opt in placeholders:
             task_info["cmd"] = task_info["cmd"].format(**{key: task_info[key] for key in placeholders})
         if task_info["launcher"] == "mpi":
-            hosts = ",".join(task_info["assigned_nodes"])
-            task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} -ppn {task_info["num_processes_per_node"]} --hosts {hosts}" + task_info["cmd"]
+            if "mpirun -np " not in task_info["cmd"]:
+                hosts = ",".join(task_info["assigned_nodes"])
+                if "alcfwl" in hosts:
+                    task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} " + task_info["cmd"]
+                else:
+                    task_info["cmd"] = f"mpirun -np {task_info["num_nodes"]*task_info["num_processes_per_node"]} -ppn {task_info["num_processes_per_node"]} --hosts {hosts} " + task_info["cmd"]
+                
         else:
             if task_info["launcher"] != "bash":
                 raise ValueError(f"Unknown launcher {task_info["launcher"]}")
@@ -583,6 +588,7 @@ class ensemble_launcher:
         fname = os.path.join(os.getcwd(),"outputs",self.logfile)
         if os.path.exists(fname):
             os.remove(fname)
+        os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
         if self.n_parallel == 1:
             self.run_tasks_serial()
         else:

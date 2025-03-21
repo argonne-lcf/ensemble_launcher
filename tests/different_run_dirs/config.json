@@ -1,0 +1,15 @@
+{
+    "poll_interval":5,
+    "update_interval": null,
+    "ensembles":{
+        "name1":{
+            "num_nodes":1,
+            "num_processes_per_node":1,
+            "launcher":"bash",
+            "relation":"one-to-one",
+            "cmd":"./test_script.sh -h {opts}",
+            "opts":["hello1", "hello2", "hello3", "hello4", "hello5"],
+            "run_dir":["./run_dir1","./run_dir2","./run_dir3","./run_dir4","./run_dir5"]
+        }
+    }
+}
