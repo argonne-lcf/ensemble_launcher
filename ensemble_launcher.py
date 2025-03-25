@@ -467,7 +467,7 @@ class ensemble_launcher:
                              stdout=open(os.path.join(task_info["run_dir"],"log.txt"),"w"),
                              stderr=open(os.path.join(task_info["run_dir"],"err.txt"),"w"),
                              stdin=subprocess.DEVNULL,
-                             cwd=task_info.get("run_dir",os.getcwd()),
+                             cwd=os.getcwd(),
                              env=os.environ.copy(),
                              close_fds = True)
         return p
