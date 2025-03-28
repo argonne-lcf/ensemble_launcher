@@ -451,14 +451,15 @@ class ensemble_launcher:
         while True:
             if len(assigned_nodes) == task["num_nodes"] or \
                len(self.progress_info["my_free_nodes"][my_pid]) == 0 or \
-               j > len(self.progress_info["my_free_nodes"][my_pid]):
+               j >= len(self.progress_info["my_free_nodes"][my_pid]):
                 break
+
             node = self.progress_info["my_free_nodes"][my_pid][j]
-            if len(self.progress_info["free_cores_per_node"][node]) >= task["num_processes_per_node"]\
-                and node not in self.progress_info["my_busy_nodes"][my_pid]:
-                if task.get("num_gpus_per_process",0) > 0 and \
-                    len(self.progress_info["free_gpus_per_node"][node]) < task["num_processes_per_node"]*task["num_gpus_per_process"]:
-                    continue
+            visit_node = len(self.progress_info["free_cores_per_node"][node]) >= task["num_processes_per_node"]
+            if task.get("num_gpus_per_process",0) > 0:
+                visit_node = visit_node and len(self.progress_info["free_gpus_per_node"][node]) >= task["num_processes_per_node"]*task["num_gpus_per_process"]
+
+            if visit_node:
                 assigned_cores[node] = []
                 ##smply pop the cores from the list at the start
                 for i in range(task["num_processes_per_node"]):
@@ -469,11 +470,13 @@ class ensemble_launcher:
                     for i in range(task["num_gpus_per_process"]*task["num_processes_per_node"]):
                         assigned_gpus[node].append(self.progress_info["free_gpus_per_node"][node].pop(0))
                 assigned_nodes.append(node)
-                j += 1
-                if len(self.progress_info["free_cores_per_node"][node]) == 0:
-                    self.progress_info["my_free_nodes"][my_pid].remove(node)
-                    self.progress_info["my_busy_nodes"][my_pid].append(node)
-                    j -= 1
+                print(f"Assigned {node} to task {task_id} with cores {assigned_cores[node]} and gpus {assigned_gpus[node]}")
+
+            j += 1
+            if len(self.progress_info["free_cores_per_node"][node]) == 0:
+                self.progress_info["my_free_nodes"][my_pid].remove(node)
+                self.progress_info["my_busy_nodes"][my_pid].append(node)
+                j -= 1
 
         if len(assigned_nodes) < task["num_nodes"]:
             for node in assigned_nodes:
@@ -579,8 +582,8 @@ class ensemble_launcher:
                             if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
                                 ##here you don't need any compilcated bash script 
                                 # you can just getaway with a simple environment variable
-                                launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]]} "
-                                # env.update({"ZE_AFFINITY_MASK": ",".join()})
+                                # launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]][0]} "
+                                env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
                             else:
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                                 os.makedirs(task_info["run_dir"], exist_ok=True)
