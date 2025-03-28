@@ -39,6 +39,9 @@ class ensemble:
     def ntasks(self):
         return self.__ntasks
     
+    def local_ntasks(self,pid:int):
+        return len(self.__local_tasks[pid])
+    
     ##this function checks if ensemble config is correct
     def check_ensemble_info(self):
         ensemble = self.__ensemble_info
@@ -409,20 +412,34 @@ class ensemble_launcher:
         n_busy_nodes = len(self.progress_info["my_busy_nodes"][my_pid])
         n_todo_tasks = 0
         n_running_tasks = 0
+        n_failed_tasks = 0
+        n_finished_tasks = 0
+        total_tasks = 0
         n_fds = 0
         soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
         for ensemble_name,ensemble in self.ensembles.items():
             if my_pid in self.pids_per_ensemble[ensemble_name]:
                 running_task_ids = ensemble.get_running_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid))
+                total_tasks += ensemble.local_ntasks(self.pids_per_ensemble[ensemble_name].index(my_pid))
                 n_todo_tasks += len(ensemble.get_ready_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
                 n_running_tasks += len(ensemble.get_running_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
+                n_failed_tasks += len(ensemble.get_failed_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
+                n_finished_tasks += len(ensemble.get_finished_task_ids(self.pids_per_ensemble[ensemble_name].index(my_pid)))
                 for task_id in running_task_ids:
                     task_info = ensemble.get_task_info(task_id)
                     n_fds += self.get_nfd(task_info.get("process",None))
 
         fname = os.path.join(os.getcwd(),"outputs",self.logfile)
-        with open(fname,"a") as f:
-            f.write(f"Proc {my_pid}: nfds {n_fds}/{soft_limit} Nodes fully occupied {n_busy_nodes}/{n_nodes}, Tasks ready: {n_todo_tasks}, Tasks running: {n_running_tasks}\n")
+
+        nfree_cores = sum([len(cores) for cores in self.progress_info["free_cores_per_node"].values()])
+        nfree_gpus = sum([len(gpus) for gpus in self.progress_info["free_gpus_per_node"].values()])
+        total_cores = self.sys_info["ncores_per_node"]*len(self.progress_info["total_nodes"])
+        total_gpu = self.sys_info["ngpus_per_node"]*len(self.progress_info["total_nodes"])
+
+        timestamp = time.time()
+        status_string = f"PID: {my_pid}, FDs: {n_fds}, Nodes: {n_busy_nodes}/{n_nodes}, Free Cores: {nfree_cores}/{total_cores}, Free GPUs: {nfree_gpus}/{total_gpu}, Tasks: {total_tasks}, ToDo: {n_todo_tasks}, Running: {n_running_tasks}, Failed: {n_failed_tasks}, Finished: {n_finished_tasks}"
+        with open(fname, "a") as f:
+            f.write(f"{timestamp},{status_string}\n")
 
     
     def assign_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> list:
