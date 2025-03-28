@@ -453,12 +453,12 @@ class ensemble_launcher:
                len(self.progress_info["my_free_nodes"][my_pid]) == 0 or \
                j > len(self.progress_info["my_free_nodes"][my_pid]):
                 break
-            if len(self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]]) >= task["num_processes_per_node"]\
-                and self.progress_info["my_free_nodes"][my_pid][j] not in self.progress_info["my_busy_nodes"][my_pid]:
+            node = self.progress_info["my_free_nodes"][my_pid][j]
+            if len(self.progress_info["free_cores_per_node"][node]) >= task["num_processes_per_node"]\
+                and node not in self.progress_info["my_busy_nodes"][my_pid]:
                 if task.get("num_gpus_per_process",0) > 0 and \
-                    len(self.progress_info["free_gpus_per_node"]) < task["num_processes_per_node"]*task["num_gpus_per_process"]:
+                    len(self.progress_info["free_gpus_per_node"][node]) < task["num_processes_per_node"]*task["num_gpus_per_process"]:
                     continue
-                node = self.progress_info["my_free_nodes"][my_pid][j]
                 assigned_cores[node] = []
                 ##smply pop the cores from the list at the start
                 for i in range(task["num_processes_per_node"]):
@@ -526,7 +526,7 @@ class ensemble_launcher:
         env = {}
         if task_info["launcher"] == "mpi":
             if task_info["system"] == "local":
-                launcher_cmd = f"mpirun -np {task_info["num_nodes"] * task_info["num_processes_per_node"]} "
+                launcher_cmd = f"mpirun -np {task_info['num_nodes'] * task_info['num_processes_per_node']} "
                 if "num_gpus_per_process" in task_info.keys():
                     raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
             else:
@@ -536,13 +536,13 @@ class ensemble_launcher:
 
                 if "np" in launcher_options:
                     if launcher_options["np"] != task_info["num_nodes"] * task_info["num_processes_per_node"]:
-                        raise ValueError("Mismatch in 'el' value between launcher_options and calculated options")
-                    launcher_cmd += f"-np {task_info['num_nodes']*task_info['num_processes_per_node']} "
+                        raise ValueError("Mismatch in 'np' value between launcher_options and calculated options")
+                launcher_cmd += f"-np {task_info['num_nodes']*task_info['num_processes_per_node']} "
                 
                 if "ppn" in launcher_options:
                     if launcher_options["ppn"] != task_info["num_processes_per_node"]:
                         raise ValueError("Mismatch in 'ppn' value between launcher_options and calculated options")
-                    launcher_cmd += f"-ppn {task_info['num_processes_per_node']} "
+                launcher_cmd += f"-ppn {task_info['num_processes_per_node']} "
 
                 launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
                 
@@ -567,7 +567,7 @@ class ensemble_launcher:
                     launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
                 
                 ##append all other launcher options that are not checked above
-                for key, value in task_info["launcher_options"].items():
+                for key, value in launcher_options.items():
                     if key != "np" and key != "ppn" and key != "hosts" and key != "cpu-bind" and key != "depth":
                         launcher_cmd += f"--{key} {value} "
                 
@@ -579,7 +579,8 @@ class ensemble_launcher:
                             if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
                                 ##here you don't need any compilcated bash script 
                                 # you can just getaway with a simple environment variable
-                                env.update({"ZE_AFFINITY_MASK": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
+                                launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]]} "
+                                # env.update({"ZE_AFFINITY_MASK": ",".join()})
                             else:
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                                 os.makedirs(task_info["run_dir"], exist_ok=True)
@@ -623,8 +624,10 @@ class ensemble_launcher:
     
     def launch_task(self, task_info:dict):
         ##check if run dir exists
-        env = (os.environ.copy()).update(task_info["env"])
+        env = os.environ.copy()
+        env.update(task_info["env"])
         os.makedirs(task_info["run_dir"],exist_ok=True)
+        print(f"{task_info['cmd']}")
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
