@@ -52,7 +52,10 @@ pip install -r requirements.txt
             "cmd_template": "./exe -a {arg1} -b {arg2}",
             "arg1": "linspace(0, 10, 5)",
             "arg2": "linspace(0, 1, 5)",
-            "run_dir": "./run_dir"
+            "run_dir": "./run_dir",
+            "env":{
+                "var":"value"
+            }
         }
     }
 }
@@ -81,6 +84,9 @@ pip install -r requirements.txt
     - **cmd_template**: Template for the command to execute, with placeholders for task-specific arguments. Variable arguments should be surrounded by `{}`.
     - **arg1**, **arg2**: Task-specific arguments, which can be defined using functions like `linspace`.
     - **run_dir**: Directory where task outputs and logs will be stored.
+    - **env**: A dictionary of environment variables to set for the tasks:
+      - **key**: Name of the environment variable.
+      - **value**: Value of the environment variable. Can be a static value or dynamically generated.
 
 2. **Run the Launcher**: Use the provided Python script to launch tasks:
     ```bash
