@@ -1,7 +1,7 @@
 import time
 import sys
 import socket
-sys.path.append('..')
+sys.path.append('../..')
 from ensemble_launcher import ensemble_launcher
 
 if __name__ == '__main__':

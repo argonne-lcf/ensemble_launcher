@@ -5,24 +5,17 @@ import subprocess
 import time
 import copy
 import multiprocessing as mp
-import psutil
-import sys
-import platform
 import resource
+from helper_functions import *
+import numpy as np
 
-
-def unravel_index(flat_index, shape):
-    unravel_result = []
-    for dim in reversed(shape):
-        flat_index, remainder = divmod(flat_index, dim)
-        unravel_result.append(remainder)
-    return tuple(reversed(unravel_result))
 
 ##NOTE: all the tasks need to be modified through ensemble object
 class ensemble:
-    def __init__(self,ensemble_name:str,ensemble_info:dict,nparallel:int=1) -> None:
+    def __init__(self,ensemble_name:str,ensemble_info:dict,nparallel:int=1,system:str="aurora") -> None:
         self.__ensemble_name = ensemble_name
         self.__ensemble_info = ensemble_info
+        self.system = system
         self.__tasks = {}
         ##this is to make sure the task id is unique
         self.__list_options = None
@@ -35,6 +28,7 @@ class ensemble:
         self.__local_tasks = {}##this is dictionary of type pid: local_tasks.
         self.__split_tasks() 
         self.__initialize_ensemble_state()
+        
         return None
 
     @property
@@ -52,7 +46,7 @@ class ensemble:
         assert "num_nodes" in ensemble.keys()
         assert "launcher" in ensemble.keys()
         assert "relation" in ensemble.keys()
-        assert "cmd" in ensemble.keys()
+        assert "cmd_template" in ensemble.keys()
 
     def __generate_ensemble(self) -> dict:
         """check ensemble config
@@ -60,6 +54,12 @@ class ensemble:
         self.check_ensemble_info()
         ensemble = self.__ensemble_info
         relation = ensemble["relation"]
+        """this is to generate the lists
+        """
+        for key,value in ensemble.items():
+            if isinstance(value, str) and value.startswith("linspace"):
+                args = eval(value[len("linspace"):])
+                ensemble[key] = np.linspace(*args).tolist()
         """this is one-to-one relationship between all the lists
         """
         if relation == "one-to-one":
@@ -102,7 +102,7 @@ class ensemble:
             tasks = []
             for tid in range(ntasks):
                 task = {"ensemble_name":self.__ensemble_name}
-                loc = unravel_index(tid,dim)
+                loc = np.unravel_index(tid,dim)
                 for id,opt in enumerate(list_options):
                     task[opt] = ensemble[opt][loc[id]]
                 for opt in non_list_options:
@@ -133,6 +133,11 @@ class ensemble:
         
         if "num_processes_per_node" not in task.keys():
             task["num_processes_per_node"] = 1
+        
+        if "env" not in task.keys():
+            task["env"] = {}
+
+        task["system"] = self.system
         
         return task
 
@@ -244,25 +249,6 @@ class ensemble:
     def update_host_nodes(self,task_id:str,hosts:list) -> None:
         self.__tasks[task_id]["task_type_options"]["--hosts"] = ",".join(hosts)
     
-    def build_task_cmd(self,task_id:str) -> None:
-        task_info = self.__tasks[task_id]
-        open_braces = [i for i, char in enumerate(task_info["cmd"]) if char == "{"]
-        close_braces = [i for i, char in enumerate(task_info["cmd"]) if char == "}"]
-        placeholders = [task_info["cmd"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
-        for opt in placeholders:
-            task_info["cmd"] = task_info["cmd"].format(**{key: task_info[key] for key in placeholders})
-        if task_info["launcher"] == "mpi":
-            if "mpirun -np " not in task_info["cmd"]:
-                hosts = ",".join(task_info["assigned_nodes"])
-                if "alcfwl" in hosts:
-                    task_info["cmd"] = f"mpirun -np {task_info['num_nodes']*task_info['num_processes_per_node']} " + task_info["cmd"]
-                else:
-                    task_info["cmd"] = f"mpirun -np {task_info['num_nodes']*task_info['num_processes_per_node']} -ppn {task_info['num_processes_per_node']} --hosts {hosts} " + task_info["cmd"]
-                
-        else:
-            if task_info["launcher"] != "bash":
-                raise ValueError(f"Unknown launcher {task_info['launcher']}")
-        return None
 
     def get_next_ready_task(self,pid:int=0):
         if len(self.__ensemble_state[pid]["ready_task_ids"]) > 0:
@@ -310,7 +296,7 @@ class ensemble:
             json.dump({tid:{k:v for k,v in self.__tasks[tid].items() if k != "process"} for tid in self.__tasks.keys()}, f, ensure_ascii=False, indent=4)
 
 class ensemble_launcher:
-    def __init__(self,config_file:str,ncores_per_node:int=None) -> None:
+    def __init__(self,config_file:str,ncores_per_node:int=None,ngpus_per_node:int=None) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.n_parallel = None ##number of parallel lacunchers in int
@@ -320,21 +306,41 @@ class ensemble_launcher:
         self.start_time = time.perf_counter()
         self.last_update_time = time.perf_counter()
         self.config_file = config_file
+        ##system info
+        self.sys_info = {}
         self.read_input_file()
         self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
         if self.n_parallel > 1:
             self.distribute_procs()
-        ##
+        ##update the system info. NOTE: precedence order config > inputs > functions
+        if "ncores_per_node" not in self.sys_info.keys():
+            self.sys_info["ncores_per_node"] = self.get_cores_per_node() if ncores_per_node is None else ncores_per_node
+        if "ngpus_per_node" not in self.sys_info.keys():
+            self.sys_info["ngpus_per_node"] = 0 if ngpus_per_node is None else ngpus_per_node
+
         self.progress_info = {}
         self.progress_info["total_nodes"] = self.get_nodes()
         self.progress_info["my_nodes"] = self.split_nodes() ##this will be list of lists. Access should be same as a dict
         self.progress_info["my_free_nodes"] = self.progress_info["my_nodes"]
-        self.progress_info["ncores_per_node"] = self.get_cores_per_node() if ncores_per_node is None else ncores_per_node
-        self.progress_info["free_cores_per_node"] = {node:self.progress_info["ncores_per_node"] for node in self.progress_info["total_nodes"]}
+        self.progress_info["free_cores_per_node"] = {node:list(range(self.sys_info["ncores_per_node"])) 
+                                                     for node in self.progress_info["total_nodes"]}
+        if self.sys_info["name"] == "aurora":
+            self.progress_info["free_gpus_per_node"] = {node:["{}.{}".format(*list(np.unravel_index(i,(6,2)))) 
+                                                              for i in range(self.sys_info["ngpus_per_node"])] 
+                                                              for node in self.progress_info["total_nodes"]}
+        else:
+            self.progress_info["free_gpus_per_node"] = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.progress_info["total_nodes"]}
+
         self.progress_info["my_busy_nodes"] = [[] for i in range(self.n_parallel)] #this only has nodes with no cores free
         ##
         return None
     
+    """
+    Function reads the input file and builds the ensembles
+    NOTES:
+    1. It is expected that when a system info is present in the input file. It should atleast have the name.
+        The reason for this is to know how to build the launch command.
+    """
     def read_input_file(self):
         with open(self.config_file, "r") as file:
             data = json.load(file)
@@ -342,9 +348,15 @@ class ensemble_launcher:
             self.poll_interval = data.get("poll_interval",600)
             self.n_parallel = data.get("n_parallel",1)
             self.logfile = data.get("logfile","log.txt")
+            if "sys_info" in data.keys():
+                assert "name" in data["sys_info"]
+                self.sys_info.update(data["sys_info"])
+            else:
+                self.sys_info["name"] = "local"
+            self.sys_info.update()
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():
-                self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info)
+                self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info,system=self.sys_info["name"])
         return None
     
     ##pool all the tasks and split them among available processes
@@ -367,11 +379,11 @@ class ensemble_launcher:
 
     def get_nodes(self) -> list:
         node_list = []
-        node_file = os.getenv("PBS_NODEFILE")
+        node_file = os.getenv("PBS_NODEFILE",None)
         if node_file is not None and os.path.exists(node_file):
             with open(node_file, "r") as f:
                 node_list = f.readlines()
-                node_list = [node.strip() for node in node_list]
+                node_list = [(node.split(".")[0]).strip() for node in node_list]
         else:
             node_list = [socket.gethostname()]
         return node_list
@@ -415,6 +427,8 @@ class ensemble_launcher:
     
     def assign_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> list:
         assigned_nodes = []
+        assigned_cores = {}
+        assigned_gpus = {}
         task = ensemble.get_task_info(task_id)
         j = 0
         while True:
@@ -422,26 +436,48 @@ class ensemble_launcher:
                len(self.progress_info["my_free_nodes"][my_pid]) == 0 or \
                j > len(self.progress_info["my_free_nodes"][my_pid]):
                 break
-            if self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]] >= task["num_processes_per_node"]\
+            if len(self.progress_info["free_cores_per_node"][self.progress_info["my_free_nodes"][my_pid][j]]) >= task["num_processes_per_node"]\
                 and self.progress_info["my_free_nodes"][my_pid][j] not in self.progress_info["my_busy_nodes"][my_pid]:
+                if task.get("num_gpus_per_process",0) > 0 and \
+                    len(self.progress_info["free_gpus_per_node"]) < task["num_processes_per_node"]*task["num_gpus_per_process"]:
+                    continue
                 node = self.progress_info["my_free_nodes"][my_pid][j]
-                self.progress_info["free_cores_per_node"][node] -= task["num_processes_per_node"]
+                assigned_cores[node] = []
+                ##smply pop the cores from the list at the start
+                for i in range(task["num_processes_per_node"]):
+                    assigned_cores[node].append(self.progress_info["free_cores_per_node"][node].pop(0))
+                
+                if task.get("num_gpus_per_process",0) > 0:
+                    assigned_gpus[node] = []
+                    for i in range(task["num_gpus_per_process"]*task["num_processes_per_node"]):
+                        assigned_gpus[node].append(self.progress_info["free_gpus_per_node"][node].pop(0))
                 assigned_nodes.append(node)
                 j += 1
-                if self.progress_info["free_cores_per_node"][node] == 0:
+                if len(self.progress_info["free_cores_per_node"][node]) == 0:
                     self.progress_info["my_free_nodes"][my_pid].remove(node)
                     self.progress_info["my_busy_nodes"][my_pid].append(node)
                     j -= 1
 
         if len(assigned_nodes) < task["num_nodes"]:
             for node in assigned_nodes:
-                self.progress_info["free_cores_per_node"][node] += task["num_processes_per_node"]
+                ##append the cores to the end
+                self.progress_info["free_cores_per_node"][node].extend(assigned_cores[node])
+                self.progress_info["free_cores_per_node"][node] = \
+                    sorted(self.progress_info["free_cores_per_node"][node])
+                del assigned_cores[node]
+
+                if task.get("num_gpus_per_process",0) > 0:
+                    self.progress_info["free_gpus_per_node"][node].extend(assigned_gpus[node])
+                    self.progress_info["free_gpus_per_node"][node] = \
+                        sorted(self.progress_info["free_gpus_per_node"][node])
+                    del assigned_gpus[node]
+
                 if node in self.progress_info["my_busy_nodes"][my_pid]:
                     self.progress_info["my_busy_nodes"][my_pid].remove(node)
                     self.progress_info["my_free_nodes"][my_pid].append(node)
             assigned_nodes = []
             
-        return assigned_nodes
+        return assigned_nodes,assigned_cores,assigned_gpus
 
     def free_task_nodes(self,task_id:str,ensemble:ensemble,my_pid:int=0) -> None:
         task = ensemble.get_task_info(task_id)
@@ -450,25 +486,136 @@ class ensemble_launcher:
     
     def free_task_nodes_base(self,task_info:dict,my_pid:int=0) -> None:
         for node in task_info["assigned_nodes"]:
-            self.progress_info["free_cores_per_node"][node] += task_info["num_processes_per_node"]
-            if node in self.progress_info["my_busy_nodes"][my_pid]:
-                self.progress_info["my_busy_nodes"][my_pid].remove(node)
-                self.progress_info["my_free_nodes"][my_pid].append(node)
+            ##append the cores to the end
+            self.progress_info["free_cores_per_node"][node].extend(task_info["assigned_cores"][node])
+            self.progress_info["free_cores_per_node"][node] = \
+                    sorted(self.progress_info["free_cores_per_node"][node])
+
+            if task_info.get("num_gpus_per_process",0) > 0:
+                self.progress_info["free_gpus_per_node"][node].extend(task_info["assigned_gpus"][node])
+                self.progress_info["free_gpus_per_node"][node] = \
+                        sorted(self.progress_info["free_gpus_per_node"][node])
+
+                if node in self.progress_info["my_busy_nodes"][my_pid]:
+                    self.progress_info["my_busy_nodes"][my_pid].remove(node)
+                    self.progress_info["my_free_nodes"][my_pid].append(node)
         return
 
-    
-    def launch_task(self, task_id:str,ensemble:ensemble):
-        ##check if run dir exists
+    """
+    Function modifies the task template based on the system and input values
+    """
+    def build_launcher_cmd(self, task_id: int, ensemble:ensemble) -> tuple:
+        task_info = ensemble.get_task_info(task_id=task_id)
+        env = {}
+        if task_info["launcher"] == "mpi":
+            if task_info["system"] == "local":
+                launcher_cmd = f"mpirun -np {task_info["num_nodes"] * task_info["num_processes_per_node"]} "
+                if "num_gpus_per_process" in task_info.keys():
+                    raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
+            else:
+                launcher_options = task_info.get("launcher_options", {})
+
+                launcher_cmd = "mpirun "
+
+                if "np" in launcher_options:
+                    if launcher_options["np"] != task_info["num_nodes"] * task_info["num_processes_per_node"]:
+                        raise ValueError("Mismatch in 'el' value between launcher_options and calculated options")
+                    launcher_cmd += f"-np {task_info['num_nodes']*task_info['num_processes_per_node']} "
+                
+                if "ppn" in launcher_options:
+                    if launcher_options["ppn"] != task_info["num_processes_per_node"]:
+                        raise ValueError("Mismatch in 'ppn' value between launcher_options and calculated options")
+                    launcher_cmd += f"-ppn {task_info['num_processes_per_node']} "
+
+                launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
+                
+                ###check for launcher options
+                if "cpu-bind" not in launcher_options or "depth" not in launcher_options:
+                    common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
+                    use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
+                    if use_common_cpus:
+                        cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
+                        launcher_cmd += f"--cpu-bind=list:{cores} "
+                    else:
+                        ###user rankfile option
+                        rankfile_path = os.path.join(task_info["run_dir"], "rankfile.txt")
+                        with open(rankfile_path, "w") as rankfile:
+                            rank = 0
+                            for node in task_info["assigned_nodes"]:
+                                for core_set in task_info["assigned_cores"][node]:
+                                    rankfile.write(f"rank {rank}={node} slot={core_set}\n")
+                                    rank += 1
+                        launcher_cmd += "--rankfile rankfile.txt "
+                else:
+                    launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
+                
+                ##append all other launcher options that are not checked above
+                for key, value in task_info["launcher_options"].items():
+                    if key != "np" and key != "ppn" and key != "hosts" and key != "cpu-bind" and key != "depth":
+                        launcher_cmd += f"--{key} {value} "
+                
+                if "num_gpus_per_process" in task_info.keys():
+                    if task_info["system"] == "aurora":
+                        common_gpus = set.intersection(*[set(gpus) for gpus in task_info["assigned_gpus"].values()])
+                        use_common_gpus = list(common_gpus) == task_info["assigned_gpus"][task_info["assigned_nodes"][0]]
+                        if use_common_gpus:
+                            if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
+                                ##here you don't need any compilcated bash script 
+                                # you can just getaway with a simple environment variable
+                                env.update({"ZE_AFFINITY_MASK": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
+                            else:
+                                bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
+                                os.makedirs(task_info["run_dir"], exist_ok=True)
+                                with open(os.path.join(task_info["run_dir"], "set_affinity.sh"), "w") as f:
+                                    f.write(bash_script)
+                                launcher_cmd += "set_affinity.sh "
+                                ##set environment variables
+                                env.update({"AVAILABLE_GPUS": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
+                        else:
+                            bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
+                            os.makedirs(task_info["run_dir"], exist_ok=True)
+                            with open(os.path.join(task_info["run_dir"], "set_affinity.sh"), "w") as f:
+                                f.write(bash_script)
+                            launcher_cmd += "set_affinity.sh "
+                            ##Here you need to set the environment variables for each node
+                            for node in task_info["assigned_nodes"]:
+                                env.update({f"AVAILABLE_GPUS_{node}": ",".join(task_info["assigned_gpus"][node])})
+                    else:
+                        raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
+                    
+        else:
+            if task_info["launcher"] != "bash":
+                raise ValueError(f"Unknown launcher {task_info['launcher']}")
+            else:
+                launcher_cmd = ""
+                env = {}
+
+        return launcher_cmd, env
+    """
+    Build the launch cmd based on cmd_template from the user
+    """
+    def build_task_cmd(self,task_id:int,ensemble:ensemble) -> tuple:
+        launcher_cmd, env = self.build_launcher_cmd(task_id, ensemble)
         task_info = ensemble.get_task_info(task_id)
+        open_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "{"]
+        close_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "}"]
+        placeholders = [task_info["cmd_template"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
+        ##put the options
+        cmd = task_info["cmd_template"].format(**{key: task_info[key] for key in placeholders})
+        return launcher_cmd+cmd, env
+    
+    def launch_task(self, task_info:dict):
+        ##check if run dir exists
+        env = (os.environ.copy()).update(task_info["env"])
         os.makedirs(task_info["run_dir"],exist_ok=True)
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=open(os.path.join(task_info["run_dir"],"log.txt"),"w"),
-                             stderr=open(os.path.join(task_info["run_dir"],"err.txt"),"w"),
+                             stdout=open(os.path.join(task_info["run_dir"],f"log.txt"),"a"),
+                             stderr=open(os.path.join(task_info["run_dir"],f"err.txt"),"a"),
                              stdin=subprocess.DEVNULL,
                              cwd=os.getcwd(),
-                             env=os.environ.copy(),
+                             env=env,
                              close_fds = True)
         return p
 
@@ -483,18 +630,43 @@ class ensemble_launcher:
         except:
             return 0
 
+    """
+    function checks if the requested resources are available on the node
+    """
+    def check_task_validity(self,task_info:dict)->bool:
+        return task_info["num_processes_per_node"] <= self.sys_info["ncores_per_node"] \
+            and task_info["num_processes_per_node"]*task_info.get("num_gpus_per_process",0) <= self.sys_info["ngpus_per_node"]
+
+    """
+    function loops through all the ready tasks and launches all the tasks that can be launched
+    WARNING: When running in parallel, this function doesn't check process given by my_pid is managing the ensemble
+    """
     def launch_ready_tasks(self,ensemble:ensemble,local_pid:int=0,my_pid:int=0) -> int:
         launched_tasks = 0
         for task_id in ensemble.get_ready_task_ids(pid=local_pid):
-            assigned_nodes = self.assign_task_nodes(task_id,ensemble,my_pid=my_pid)
+            task_info = ensemble.get_task_info(task_id=task_id)
+            ##idiot check
+            valid_task = self.check_task_validity(task_info)
+            if not valid_task:
+                ensemble.update_task_status(task_id,"running",pid=local_pid)
+                ensemble.update_task_status(task_id,"failed",pid=local_pid)
+                continue
+            assigned_nodes,assigned_cores,assigned_gpus = \
+                self.assign_task_nodes(task_id,ensemble,my_pid=my_pid)
             if len(assigned_nodes) == 0:
                 if len(self.progress_info["my_free_nodes"][my_pid]) == 0:
                     break
                 else:
                     continue
-            ensemble.update_task_info(task_id,{ "assigned_nodes":assigned_nodes},pid=local_pid)
-            ensemble.build_task_cmd(task_id)
-            p = self.launch_task(task_id,ensemble)
+
+            ensemble.update_task_info(task_id,{"assigned_nodes":assigned_nodes,
+                                                "assigned_cores":assigned_cores,
+                                                "assigned_gpus":assigned_gpus},pid=local_pid)
+            cmd,env = self.build_task_cmd(task_id,ensemble)
+            copy_env = copy.deepcopy(task_info["env"])
+            env.update(copy_env)
+            ensemble.update_task_info(task_id,{"cmd":cmd,"env":env},pid=local_pid)
+            p = self.launch_task(task_info)
             launched_tasks += 1
             fname = os.path.join(os.getcwd(),"outputs",self.logfile)
             with open(fname,"a") as f:
@@ -524,8 +696,6 @@ class ensemble_launcher:
                                                                "status":status,
                                                                "process":None,
                                                                "assigned_nodes":[],}
-                                                            #    "stdout":out.decode(),
-                                                            #    "stderr":err.decode()}
                                                                ,pid=local_pid)
                             ensemble.save_ensemble_status()
                     
