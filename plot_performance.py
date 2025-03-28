@@ -82,15 +82,17 @@ def plot_finished_jobs_vs_time(timestamps, finished_jobs, output_dir):
     fig.savefig(os.path.join(output_dir, "finished_jobs_vs_time.png"))
     plt.close(fig)
 
-def plot_utilization_vs_time(timestamps, free_cores, total_cores, output_dir):
-    """Plot percent utilization vs time using axes handle."""
-    utilization = [(1 - free / total_cores) * 100 for free in free_cores]
+def plot_utilization_vs_time(timestamps, free_cores, total_cores, free_gpus, total_gpus, output_dir):
+    """Plot percent utilization for both CPU and GPU vs time."""
+    cpu_utilization = [(1 - free / total_cores) * 100 for free in free_cores]
+    gpu_utilization = [(1 - free / total_gpus) * 100 for free in free_gpus]
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(timestamps, utilization, label="CPU Utilization (%)", color="green")
+    ax.plot(timestamps, cpu_utilization, label="CPU Utilization (%)", color="green")
+    ax.plot(timestamps, gpu_utilization, label="GPU Utilization (%)", color="orange")
     ax.set_xlabel("Time (s)", fontsize=16)  # Increased label size
     ax.set_ylabel("Percent Utilization (%)", fontsize=16)  # Increased label size
-    ax.set_title("CPU Utilization vs Time", fontsize=18)  # Increased title size
+    ax.set_title("CPU and GPU Utilization vs Time", fontsize=18)  # Increased title size
     ax.grid(True)
     ax.legend(fontsize=14)  # Increased legend font size
     ax.tick_params(axis='both', which='major', labelsize=14)  # Increased tick label size
@@ -112,10 +114,12 @@ def main(outputs_dir):
     finished_jobs = data["finished_jobs"]
     free_cores = data["free_cores"]
     total_cores = data["total_cores"]
+    free_gpus = data["free_gpus"]
+    total_gpus = data["total_gpus"]
 
     # Generate plots
     plot_finished_jobs_vs_time(timestamps, finished_jobs, outputs_dir)
-    plot_utilization_vs_time(timestamps, free_cores, total_cores, outputs_dir)
+    plot_utilization_vs_time(timestamps, free_cores, total_cores, free_gpus, total_gpus, outputs_dir)
     print(f"Plots saved in {outputs_dir}")
 
 if __name__ == "__main__":
