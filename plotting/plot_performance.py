@@ -19,7 +19,8 @@ def parse_log_file(log_file_path):
         "total_gpus": None,
         "running_tasks": [],
         "failed_tasks": [],
-        "todo_tasks": []
+        "todo_tasks": [],
+        "all_tasks":[]
     }
 
     with open(log_file_path, 'r') as file:
@@ -65,12 +66,19 @@ def parse_log_file(log_file_path):
                 if "todo_tasks" not in data:
                     data["todo_tasks"] = []
                 data["todo_tasks"].append(int(todo_match.group(1)))            
+            
+            all_tasks_match = re.search(r'Tasks: (\d+)', line)
+            if all_tasks_match:
+                if "all_tasks" not in data:
+                    data["all_tasks"] = []
+                data["all_tasks"].append(int(all_tasks_match.group(1)))            
     data["timestamps"] = [timestamp - data["timestamps"][0] for timestamp in data["timestamps"]]
     return data
 
-def plot_finished_jobs_vs_time(timestamps, finished_jobs, output_dir):
+def plot_finished_jobs_vs_time(timestamps, finished_jobs, output_dir, fig = None, ax = None):
     """Plot the number of finished jobs vs time using axes handle."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(timestamps, finished_jobs, label="Finished Jobs", color="blue")
     ax.set_xlabel("Time (s)", fontsize=16)  # Increased label size
     ax.set_ylabel("Number of Finished Jobs", fontsize=16)  # Increased label size
@@ -79,15 +87,17 @@ def plot_finished_jobs_vs_time(timestamps, finished_jobs, output_dir):
     ax.legend(fontsize=14)  # Increased legend font size
     ax.tick_params(axis='both', which='major', labelsize=14)  # Increased tick label size
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "finished_jobs_vs_time.png"))
-    plt.close(fig)
+    if fig is None:
+        fig.savefig(os.path.join(output_dir, "finished_jobs_vs_time.png"))
+        plt.close(fig)
 
-def plot_utilization_vs_time(timestamps, free_cores, total_cores, free_gpus, total_gpus, output_dir):
+def plot_utilization_vs_time(timestamps, free_cores, total_cores, free_gpus, total_gpus, output_dir, fig= None, ax = None):
     """Plot percent utilization for both CPU and GPU vs time."""
     cpu_utilization = [(1 - free / total_cores) * 100 for free in free_cores]
     gpu_utilization = [(1 - free / total_gpus) * 100 for free in free_gpus]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(timestamps, cpu_utilization, label="CPU Utilization (%)", color="green")
     ax.plot(timestamps, gpu_utilization, label="GPU Utilization (%)", color="orange")
     ax.set_xlabel("Time (s)", fontsize=16)  # Increased label size
@@ -97,8 +107,9 @@ def plot_utilization_vs_time(timestamps, free_cores, total_cores, free_gpus, tot
     ax.legend(fontsize=14)  # Increased legend font size
     ax.tick_params(axis='both', which='major', labelsize=14)  # Increased tick label size
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "utilization_vs_time.png"))
-    plt.close(fig)
+    if fig is None:
+        fig.savefig(os.path.join(output_dir, "utilization_vs_time.png"))
+        plt.close(fig)
 
 def main(outputs_dir):
     log_file_path = os.path.join(outputs_dir, "log.txt")
