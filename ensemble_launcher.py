@@ -1,5 +1,5 @@
 import json
-import os
+import os, stat
 import socket
 import subprocess
 import time
@@ -133,6 +133,13 @@ class ensemble:
 
         if "run_dir" not in task.keys():
             task["run_dir"] = os.getcwd()
+        else:
+            task["run_dir"] = os.path.join(os.getcwd(),task["run_dir"])
+
+        if "launch_dir" not in task.keys():
+            task["launch_dir"] = os.getcwd()
+        else:
+            task["launch_dir"] = os.path.join(os.getcwd(),task["launch_dir"])
         
         if "num_processes_per_node" not in task.keys():
             task["num_processes_per_node"] = 1
@@ -554,8 +561,14 @@ class ensemble_launcher:
                     common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
                     use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
                     if use_common_cpus:
-                        cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
-                        launcher_cmd += f"--cpu-bind=list:{cores} "
+                        if self.sys_info["name"] == "aurora":
+                            cores = []
+                            for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
+                                cores.append(f"{2*i},{2*i+1}")
+                            cores = ":".join(cores)
+                        else:
+                            cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
+                        launcher_cmd += f"--cpu-bind list:{cores} "
                     else:
                         ###user rankfile option
                         rankfile_path = os.path.join(task_info["run_dir"], "rankfile.txt")
@@ -577,7 +590,8 @@ class ensemble_launcher:
                 if "num_gpus_per_process" in task_info.keys():
                     if task_info["system"] == "aurora":
                         common_gpus = set.intersection(*[set(gpus) for gpus in task_info["assigned_gpus"].values()])
-                        use_common_gpus = list(common_gpus) == task_info["assigned_gpus"][task_info["assigned_nodes"][0]]
+                        # print("common_gpus",sorted(list(common_gpus)),task_info["assigned_gpus"][task_info["assigned_nodes"][0]])
+                        use_common_gpus = sorted(list(common_gpus)) == sorted(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])
                         if use_common_gpus:
                             if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
                                 ##here you don't need any compilcated bash script 
@@ -587,17 +601,23 @@ class ensemble_launcher:
                             else:
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                                 os.makedirs(task_info["run_dir"], exist_ok=True)
-                                with open(os.path.join(task_info["run_dir"], "set_affinity.sh"), "w") as f:
+                                fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
+                                with open(fname, "w") as f:
                                     f.write(bash_script)
-                                launcher_cmd += "set_affinity.sh "
+                                st = os.stat(fname)
+                                os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                                launcher_cmd += f"{fname} "
                                 ##set environment variables
                                 env.update({"AVAILABLE_GPUS": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
                         else:
                             bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
                             os.makedirs(task_info["run_dir"], exist_ok=True)
-                            with open(os.path.join(task_info["run_dir"], "set_affinity.sh"), "w") as f:
+                            fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
+                            with open(fname, "w") as f:
                                 f.write(bash_script)
-                            launcher_cmd += "set_affinity.sh "
+                            st = os.stat(fname)
+                            os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                            launcher_cmd += f"{fname} "
                             ##Here you need to set the environment variables for each node
                             for node in task_info["assigned_nodes"]:
                                 env.update({f"AVAILABLE_GPUS_{node}": ",".join(task_info["assigned_gpus"][node])})
@@ -637,7 +657,7 @@ class ensemble_launcher:
                              stdout=open(os.path.join(task_info["run_dir"],f"log.txt"),"a"),
                              stderr=open(os.path.join(task_info["run_dir"],f"err.txt"),"a"),
                              stdin=subprocess.DEVNULL,
-                             cwd=os.getcwd(),
+                             cwd=task_info["launch_dir"],
                              env=env,
                              close_fds = True)
         return p
@@ -686,6 +706,7 @@ class ensemble_launcher:
                                                 "assigned_cores":assigned_cores,
                                                 "assigned_gpus":assigned_gpus},pid=local_pid)
             cmd,env = self.build_task_cmd(task_id,ensemble)
+            print(f"cmd:{cmd}")
             copy_env = copy.deepcopy(task_info["env"])
             env.update(copy_env)
             ensemble.update_task_info(task_id,{"cmd":cmd,"env":env},pid=local_pid)
