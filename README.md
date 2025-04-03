@@ -75,13 +75,56 @@ pip install -r requirements.txt
       - **key**: Name of the environment variable.
       - **value**: Value of the environment variable. Can be a static value or dynamically generated.
 
-2. **Run the Launcher**: Use the provided Python script to launch tasks:
-    ```bash
-    cd tests/simple_test
-    python tests/simple_test/test_ensemble_launcher.py
-    ```
+2. **Write a launcher script**: Write a simple launcher script. An example is given below
+```python
+import time
+from ensemble_launcher import ensemble_launcher
 
-3. **Monitor Progress**: Check the `outputs` directory for logs and status updates.
+"""
+Instead of manual generation from step 1, config file can also be generated on the fly. For example,
+
+import json
+ntasks=1000
+config = {
+            "poll_interval":1,
+            "sys_info":{
+                "name":"aurora",
+                "ncores_per_node":104,
+                "ngpus_per_node":12
+            },
+            "ensembles":{
+                        "inference":{
+                                "num_nodes":1,
+                                "num_processes_per_node":1,
+                                "num_gpus_per_process":1,
+                                "launcher":"mpi",
+                                "relation":"one-to-one",
+                                "cmd_template":"<args> {opts}",
+                                "opts":list(range(ntasks)),
+                                "run_dir":[f"./run_dir/task_{i}" for i in range(ntasks)]
+                            }
+                    }
+        }
+fname = "./config.json"
+with open(fname,"w") as f:
+    json.dump(config, f, indent=4)
+"""
+
+
+if __name__ == '__main__':
+    el = ensemble_launcher("config.json")
+    start_time = time.perf_counter()
+    total_poll_time = el.run_tasks()
+    end_time = time.perf_counter()
+    total_run_time = end_time - start_time
+    print(f"{total_run_time=}")
+```
+
+3. **Run the launcher script**: To launch the script
+```bash
+python3 launcher_ensemble_launcher.py
+```
+4. **Monitor Progress**: Check the `outputs` directory for logs and status updates.
 
 ## Examples
 
