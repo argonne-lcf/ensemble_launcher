@@ -89,6 +89,12 @@ class ensemble:
                 for opt in list_options:
                     task[opt] = ensemble[opt][i]
                 tasks.append(self.__set_defaults(task))
+                if "run_dir" in list_options:
+                    task["log_file"] = os.path.join(task["run_dir"],f"log.txt")
+                    task["err_file"] = os.path.join(task["run_dir"],f"err.txt")
+                else:
+                    task["log_file"] = os.path.join(task["run_dir"],f"log_{i}.txt")
+                    task["err_file"] = os.path.join(task["run_dir"],f"err_{i}.txt")
         elif relation == "many-to-many":
             list_options = []
             non_list_options = []
@@ -111,6 +117,12 @@ class ensemble:
                 for opt in non_list_options:
                     task[opt] = ensemble[opt]
                 tasks.append(self.__set_defaults(task))
+                if "run_dir" in list_options:
+                    task["log_file"] = os.path.join(task["run_dir"],f"log.txt")
+                    task["err_file"] = os.path.join(task["run_dir"],f"err.txt")
+                else:
+                    task["log_file"] = os.path.join(task["run_dir"],f"log_{tid}.txt")
+                    task["err_file"] = os.path.join(task["run_dir"],f"err_{tid}.txt")
         else:
             raise ValueError(f"Unknown relation {relation}")
         
@@ -477,7 +489,7 @@ class ensemble_launcher:
                     for i in range(task["num_gpus_per_process"]*task["num_processes_per_node"]):
                         assigned_gpus[node].append(self.progress_info["free_gpus_per_node"][node].pop(0))
                 assigned_nodes.append(node)
-                print(f"Assigned {node} to task {task_id} with cores {assigned_cores[node]} and gpus {assigned_gpus[node]}")
+                print(f"Assigned {node} to task {task_id} with cores {assigned_cores[node]} and gpus {assigned_gpus.get(node,None)}")
 
             j += 1
             if len(self.progress_info["free_cores_per_node"][node]) == 0:
@@ -643,7 +655,13 @@ class ensemble_launcher:
         placeholders = [task_info["cmd_template"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
         ##put the options
         cmd = task_info["cmd_template"].format(**{key: task_info[key] for key in placeholders})
-        return launcher_cmd+cmd, env
+        ##pre launch cmd
+        pre_cmd = task_info.get("pre_launch_cmd", None)
+        if pre_cmd is not None:
+            return pre_cmd + ";"+launcher_cmd+cmd, env
+        else:
+            return launcher_cmd+cmd, env
+
     
     def launch_task(self, task_info:dict):
         ##check if run dir exists
@@ -654,8 +672,8 @@ class ensemble_launcher:
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=open(os.path.join(task_info["run_dir"],f"log.txt"),"a"),
-                             stderr=open(os.path.join(task_info["run_dir"],f"err.txt"),"a"),
+                             stdout=open(task_info["log_file"],"a"),
+                             stderr=open(task_info["err_file"],"a"),
                              stdin=subprocess.DEVNULL,
                              cwd=task_info["launch_dir"],
                              env=env,
@@ -709,12 +727,8 @@ class ensemble_launcher:
             print(f"cmd:{cmd}")
             copy_env = copy.deepcopy(task_info["env"])
             env.update(copy_env)
-            ensemble.update_task_info(task_id,{"cmd":cmd,"env":env},pid=local_pid)
+            ensemble.update_task_info(task_id,{"cmd":cmd,"env":env,"pre_launch_time":time.perf_counter()},pid=local_pid)
             p = self.launch_task(task_info)
-            launched_tasks += 1
-            fname = os.path.join(os.getcwd(),"outputs",self.logfile)
-            with open(fname,"a") as f:
-                f.write(f"{ensemble.ensemble_name}:launched {launched_tasks} tasks!\n")
             ensemble.update_task_info(task_id,{"process":p,
                                                 "start_time":time.perf_counter(),
                                                 "status":"running"},pid=local_pid)

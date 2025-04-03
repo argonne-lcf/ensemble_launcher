@@ -1,17 +1,5 @@
 # ensemble_launcher
-A lightweight tool for launching and managing ensembles with features like:
-
-- **Flexible Configurations**: Set up one-to-one or many-to-many task relationships effortlessly.
-- **Parallel Execution**: Run tasks across multiple processes for better performance.
-- **Custom Commands**: Define your own task-specific commands and environment settings.
-- **Smart Resource Management**: Automatically allocate nodes, cores, and GPUs as needed.
-- **Cluster Support**: Works seamlessly on local systems and clusters like Aurora, including GPU affinity.
-- **Resilience**: Retries failed tasks and cleans up resources automatically.
-- **Progress Logs**: Tracks task status and resource usage in real-time.
-- **Modular Design**: Easy to extend and integrate into your workflows.
-- **Simple Setup**: Use JSON files to configure tasks quickly.
-- **Flexible Launchers**: Supports both MPI and Bash for task execution.
-- **Live Updates**: Update ensembles on the fly while they’re running.
+A lightweight tool for launching and managing ensembles
 
 ## Installation
 
@@ -71,9 +59,9 @@ pip install -r requirements.txt
   - **ngpus_per_node**: Number of GPUs available per node.
 - **ensembles**: A dictionary defining the ensembles to be executed:
   - **example_ensemble**: Name of the ensemble.
-    - **num_nodes**: Number of nodes required for the ensemble. Can be varied for each task
-    - **num_processes_per_node**: Number of processes to run on each node.
-    - **num_gpus_per_process**: Number of GPUs allocated per process.
+    - **num_nodes**: Number of nodes required per task in the ensemble. Can be varied for each task
+    - **num_processes_per_node**: Number of processes per node used per task.
+    - **num_gpus_per_process**: Number of GPUs allocated per process per task.
     - **launcher**: Task launcher type (`mpi` or `bash`).
     - **launcher_options**: Additional options for the launcher:
       - **np**: Total number of processes.
@@ -81,6 +69,7 @@ pip install -r requirements.txt
       - **cpu-bind**: CPU binding strategy (e.g., `depth`, `list`).
       - **depth**: Depth of CPU binding.
     - **relation**: Relationship between task parameters (`one-to-one` or `many-to-many`).
+    - **pre_launch_cmd**: A linux cmd to be executed before launching running the below. (eg. cp -r * ./run_dir)
     - **cmd_template**: Template for the command to execute, with placeholders for task-specific arguments. Variable arguments should be surrounded by `{}`.
     - **arg1**, **arg2**: Task-specific arguments, which can be defined using functions like `linspace`.
     - **run_dir**: Directory where task outputs and logs will be stored.
@@ -98,8 +87,292 @@ pip install -r requirements.txt
 
 ## Examples
 
-- **Basic Example**: A simple one-to-one task configuration is available in `tests/simple_test/`.
-- **Advanced Example**: Can be found in `examples/`
+Following are example .json config files for various mpiexec commands used at ALCF
+
+Example 1: 2 nodes, 4 ranks/node, 1 thread/rank
+
+```bash
+  mpiexec -n 8 -ppn 4 --depth 1 --cpu-bind=depth <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 2,
+            "num_processes_per_node": 4,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "depth",
+                "depth": 1
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir",
+        }
+    }
+}
+```
+Example 2: 2 nodes, 2 ranks/node, 2 thread/rank
+```bash
+  OMP_PLACES=threads OMP_NUM_THREADS=2 mpiexec -n 4 -ppn 2 --depth 2 --cpu-bind=depth <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 2,
+            "num_processes_per_node": 2,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "depth",
+                "depth": 2
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir",
+            "env":{
+              "OMP_PLACES": "threads",
+              "OMP_NUM_THREADS": 2,
+            }
+        }
+    }
+}
+```
+Example 3: 2 nodes, 2 ranks/node, 1 thread/rank, compact fashion
+```bash
+  mpiexec -n 4 -ppn 2 --cpu-bind=list:0:104 <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 2,
+            "num_processes_per_node": 2,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "list:0:104"
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir"
+        }
+    }
+}
+```
+
+Example 4: 1 node, 12 ranks/node
+
+```bash
+  mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 12,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir"
+        }
+    }
+}
+```
+
+Example 5: 1 node, 12 ranks/node, 1 thread/rank, 1 rank/GPU tile
+
+```bash
+mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 gpu_tile_compact.sh <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 12,
+            "num_gpus_per_process":1,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir",
+            "env":{
+              "ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"
+            }
+        }
+    }
+}
+```
+
+Example 6: 1 node, 6 ranks/node, 1 thread/rank, 1 rank/GPU device
+
+```bash
+mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 gpu_dev_compact.sh <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 6,
+            "num_gpus_per_process":2,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir",
+            "env":{
+              "ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"
+            }
+        }
+    }
+}
+```
+
+Example 7: 1 node, 12 ranks/node, 1 thread/rank, and any other MPI options
+
+```bash
+mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 <other mpi options> <app> <app_args>
+```
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 12,
+            "launcher": "mpi",
+            "launcher_options": {
+                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
+            },
+            "relation": "one-to-one",
+            "cmd_template": "<any other mpi options> <app> <constant args> <variable args>",
+            "<variable args>": [1,2,....],
+            "run_dir": "./run_dir",
+        }
+    }
+}
+```
+
+Examples of other general ensembles
+
+Example 1: An ensemble with N tasks. Each task usese 1 node, 12 ranks/node, and they have identical args
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": [1,1,1,1,1........N],
+            "num_processes_per_node": 12,
+            "launcher": "mpi",
+            "relation": "one-to-one",
+            "cmd_template": "<any other mpi options> <app> <constant args>",
+            "run_dir": "./run_dir",
+        }
+    }
+}
+```
+
+Example 2: A scaling test using 1-128 nodes and 104 ranks/node
+
+```json
+{
+    "poll_interval": 1,
+    "update_interval": null,
+    "sys_info": {
+        "name": "aurora",
+        "ncores_per_nodes": 104,
+        "ngpus_per_node": 12
+    },
+    "ensembles": {
+        "example_ensemble": {
+            "num_nodes": [1,2,4,8,16,32,64,128],
+            "num_processes_per_node": 104,
+            "launcher": "mpi",
+            "relation": "one-to-one",
+            "cmd_template": "<app> <constant args> <variable args>",
+            "<variable_args>":[1,...]
+            "run_dir": ["./run_dir_1","./run_dir_2","./run_dir_4","./run_dir_8","./run_dir_16","./run_dir_32","./run_dir_64","./run_dir_128"],
+        }
+    }
+}
+```
 
 ## Contributing
 

@@ -7,6 +7,7 @@
             "num_processes_per_node":1,
             "launcher":"mpi",
             "relation":"one-to-one",
+            "pre_launch_cmd":"echo 'Pre-launch command executed'",
             "cmd_template":"./test_script.sh -l {opts1} -h {opts}",
             "opts1":"linspace(0, 1, 10)",
             "opts":"linspace(0, 2, 10)",
