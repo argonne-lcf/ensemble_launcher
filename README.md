@@ -64,8 +64,6 @@ pip install -r requirements.txt
     - **num_gpus_per_process**: Number of GPUs allocated per process per task.
     - **launcher**: Task launcher type (`mpi` or `bash`).
     - **launcher_options**: Additional options for the launcher:
-      - **np**: Total number of processes.
-      - **ppn**: Processes per node.
       - **cpu-bind**: CPU binding strategy (e.g., `depth`, `list`).
       - **depth**: Depth of CPU binding.
     - **relation**: Relationship between task parameters (`one-to-one` or `many-to-many`).
