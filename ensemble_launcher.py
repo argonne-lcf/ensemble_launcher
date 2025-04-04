@@ -325,8 +325,8 @@ class ensemble_launcher:
         self.pids_per_ensemble = {} ##pids of an ensemble
         ##
         self.ensembles = {}
-        self.start_time = time.perf_counter()
-        self.last_update_time = time.perf_counter()
+        self.start_time = time.time()
+        self.last_update_time = time.time()
         self.config_file = config_file
         ##system info
         self.sys_info = {}
@@ -727,10 +727,10 @@ class ensemble_launcher:
             print(f"cmd:{cmd}")
             copy_env = copy.deepcopy(task_info["env"])
             env.update(copy_env)
-            ensemble.update_task_info(task_id,{"cmd":cmd,"env":env,"pre_launch_time":time.perf_counter()},pid=local_pid)
+            ensemble.update_task_info(task_id,{"cmd":cmd,"env":env,"pre_launch_time":time.time()},pid=local_pid)
             p = self.launch_task(task_info)
             ensemble.update_task_info(task_id,{"process":p,
-                                                "start_time":time.perf_counter(),
+                                                "start_time":time.time(),
                                                 "status":"running"},pid=local_pid)
             self.report_status()
         return launched_tasks
@@ -750,7 +750,7 @@ class ensemble_launcher:
                                 status = "failed"
                             out,err = popen_proc.communicate()
                             self.free_task_nodes(task_id,ensemble)
-                            ensemble.update_task_info(task_id,{"end_time":time.perf_counter(),
+                            ensemble.update_task_info(task_id,{"end_time":time.time(),
                                                                "status":status,
                                                                "process":None,
                                                                "assigned_nodes":[],}
@@ -794,10 +794,10 @@ class ensemble_launcher:
             self.poll_running_tasks(my_pid=my_pid)
             self.report_status(my_pid)
             if self.update_interval is not None:
-                if time.perf_counter() - self.last_update_time > self.update_interval:
+                if time.time() - self.last_update_time > self.update_interval:
                     deleted_tasks = self.update_ensembles()
                     self.delete_tasks(deleted_tasks)
-                    self.last_update_time = time.perf_counter()
+                    self.last_update_time = time.time()
             time.sleep(self.poll_interval)
             if len(self.get_pending_tasks(my_pid)) == 0:
                 for ensemble_name,ensemble in self.ensembles.items():
