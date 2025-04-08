@@ -543,7 +543,7 @@ class ensemble_launcher:
     """
     Function modifies the task template based on the system and input values
     """
-    def build_launcher_cmd(self, task_id: int, ensemble:ensemble) -> tuple:
+    def build_launcher_cmd(self, task_id: int, ensemble:ensemble, cpu_bind = True) -> tuple:
         task_info = ensemble.get_task_info(task_id=task_id)
         env = {}
         if task_info["launcher"] == "mpi":
@@ -568,36 +568,37 @@ class ensemble_launcher:
 
                 launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
                 
-                ###check for launcher options
-                if "cpu-bind" in launcher_options:
-                    if launcher_options["cpu-bind"] == "depth":
-                        if "depth" not in launcher_options:
-                            raise ValueError("'cpu-bind' value is 'depth' but 'depth' is not in launcher_options")
-                        launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
-                    else:
-                        launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
-                else:
-                    common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
-                    use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
-                    if use_common_cpus:
-                        if self.sys_info["name"] == "aurora":
-                            cores = []
-                            for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
-                                cores.append(f"{2*i},{2*i+1}")
-                            cores = ":".join(cores)
+                if cpu_bind:
+                    ###check for launcher options
+                    if "cpu-bind" in launcher_options:
+                        if launcher_options["cpu-bind"] == "depth":
+                            if "depth" not in launcher_options:
+                                raise ValueError("'cpu-bind' value is 'depth' but 'depth' is not in launcher_options")
+                            launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
                         else:
-                            cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
-                        launcher_cmd += f"--cpu-bind list:{cores} "
+                            launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
                     else:
-                        ###user rankfile option
-                        rankfile_path = os.path.join(task_info["run_dir"], "rankfile.txt")
-                        with open(rankfile_path, "w") as rankfile:
-                            rank = 0
-                            for node in task_info["assigned_nodes"]:
-                                for core_set in task_info["assigned_cores"][node]:
-                                    rankfile.write(f"rank {rank}={node} slot={core_set}\n")
-                                    rank += 1
-                        launcher_cmd += "--rankfile rankfile.txt "
+                        common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
+                        use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
+                        if use_common_cpus:
+                            if self.sys_info["name"] == "aurora":
+                                cores = []
+                                for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
+                                    cores.append(f"{2*i},{2*i+1}")
+                                cores = ":".join(cores)
+                            else:
+                                cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
+                            launcher_cmd += f"--cpu-bind list:{cores} "
+                        else:
+                            ###user rankfile option
+                            rankfile_path = os.path.join(task_info["run_dir"], "rankfile.txt")
+                            with open(rankfile_path, "w") as rankfile:
+                                rank = 0
+                                for node in task_info["assigned_nodes"]:
+                                    for core_set in task_info["assigned_cores"][node]:
+                                        rankfile.write(f"rank {rank}={node} slot={core_set}\n")
+                                        rank += 1
+                            launcher_cmd += "--rankfile rankfile.txt "
                 
                 ##append all other launcher options that are not checked above
                 for key, value in launcher_options.items():
@@ -653,8 +654,8 @@ class ensemble_launcher:
     Build the launch cmd based on cmd_template from the user
     """
     def build_task_cmd(self,task_id:int,ensemble:ensemble) -> tuple:
-        launcher_cmd, env = self.build_launcher_cmd(task_id, ensemble)
         task_info = ensemble.get_task_info(task_id)
+        launcher_cmd, env = self.build_launcher_cmd(task_id, ensemble, cpu_bind = "cpu-bind" not in task_info["cmd_template"])
         open_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "{"]
         close_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "}"]
         placeholders = [task_info["cmd_template"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
