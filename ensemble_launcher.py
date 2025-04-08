@@ -705,6 +705,7 @@ class ensemble_launcher:
     def launch_ready_tasks(self,ensemble:ensemble,local_pid:int=0,my_pid:int=0) -> int:
         launched_tasks = 0
         for task_id in ensemble.get_ready_task_ids(pid=local_pid):
+            ensemble.update_task_info(task_id,{"pre_assignment_time":time.time()},pid=local_pid)
             task_info = ensemble.get_task_info(task_id=task_id)
             ##idiot check
             valid_task = self.check_task_validity(task_info)
@@ -732,7 +733,9 @@ class ensemble_launcher:
             ensemble.update_task_info(task_id,{"process":p,
                                                 "start_time":time.time(),
                                                 "status":"running"},pid=local_pid)
+            ensemble.update_task_info(task_id,{"pre_report_time":time.time()},pid=local_pid)
             self.report_status()
+            ensemble.update_task_info(task_id,{"post_report_time":time.time()},pid=local_pid)
         return launched_tasks
     
     def poll_running_tasks(self,my_pid:int=0) -> None:
