@@ -569,7 +569,14 @@ class ensemble_launcher:
                 launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
                 
                 ###check for launcher options
-                if "cpu-bind" not in launcher_options or "depth" not in launcher_options:
+                if "cpu-bind" in launcher_options:
+                    if launcher_options["cpu-bind"] == "depth":
+                        if "depth" not in launcher_options:
+                            raise ValueError("'cpu-bind' value is 'depth' but 'depth' is not in launcher_options")
+                        launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
+                    else:
+                        launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
+                else:
                     common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
                     use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
                     if use_common_cpus:
@@ -591,8 +598,6 @@ class ensemble_launcher:
                                     rankfile.write(f"rank {rank}={node} slot={core_set}\n")
                                     rank += 1
                         launcher_cmd += "--rankfile rankfile.txt "
-                else:
-                    launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
                 
                 ##append all other launcher options that are not checked above
                 for key, value in launcher_options.items():
