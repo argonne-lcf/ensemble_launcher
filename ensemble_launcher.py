@@ -84,6 +84,7 @@ class ensemble:
             tasks = []
             for i in range(ntasks):
                 task = {"ensemble_name":self.__ensemble_name}
+                task["index"] = i
                 for opt in non_list_options:
                     task[opt] = ensemble[opt]
                 for opt in list_options:
@@ -111,6 +112,7 @@ class ensemble:
             tasks = []
             for tid in range(ntasks):
                 task = {"ensemble_name":self.__ensemble_name}
+                task["index"] = tid
                 loc = np.unravel_index(tid,dim)
                 for id,opt in enumerate(list_options):
                     task[opt] = ensemble[opt][loc[id]]
@@ -125,14 +127,14 @@ class ensemble:
                     task["err_file"] = os.path.join(task["run_dir"],f"err_{tid}.txt")
         else:
             raise ValueError(f"Unknown relation {relation}")
-        
+
         return {task["id"]:task for task in tasks}
 
     def __generate_task_id(self, task:dict) -> str:
         assert self.__list_options is not None
         bin_options_str = "-".join(f"{k}-{task[k]}" for k in self.__list_options)
         ##NOTE: the string should always start with ensemble name
-        unique_str = f"{task['ensemble_name']}-{bin_options_str}"
+        unique_str = f"{task['ensemble_name']}-{task['index']}-{bin_options_str}"
         return unique_str
     
     ###function sets the default values for a task
