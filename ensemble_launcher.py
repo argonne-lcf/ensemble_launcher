@@ -452,10 +452,10 @@ class ensemble_launcher:
 
         fname = os.path.join(os.getcwd(),"outputs",self.logfile)
 
-        nfree_cores = sum([len(cores) for cores in self.progress_info["free_cores_per_node"].values()])
-        nfree_gpus = sum([len(gpus) for gpus in self.progress_info["free_gpus_per_node"].values()])
-        total_cores = self.sys_info["ncores_per_node"]*len(self.progress_info["total_nodes"])
-        total_gpu = self.sys_info["ngpus_per_node"]*len(self.progress_info["total_nodes"])
+        nfree_cores = sum([len(cores) for node,cores in self.progress_info["free_cores_per_node"].items() if node in self.progress_info["my_nodes"][my_pid]])
+        nfree_gpus = sum([len(gpus) for node,gpus in self.progress_info["free_gpus_per_node"].items() if node in self.progress_info["my_nodes"][my_pid]])
+        total_cores = self.sys_info["ncores_per_node"]*len(self.progress_info["my_nodes"][my_pid])
+        total_gpu = self.sys_info["ngpus_per_node"]*len(self.progress_info["my_nodes"][my_pid])
 
         timestamp = time.time()
         status_string = f"PID: {my_pid}, FDs: {n_fds}, Nodes: {n_busy_nodes}/{n_nodes}, Free Cores: {nfree_cores}/{total_cores}, Free GPUs: {nfree_gpus}/{total_gpu}, Tasks: {total_tasks}, ToDo: {n_todo_tasks}, Running: {n_running_tasks}, Failed: {n_failed_tasks}, Finished: {n_finished_tasks}"
@@ -617,6 +617,7 @@ class ensemble_launcher:
                                 ##here you don't need any compilcated bash script 
                                 # you can just getaway with a simple environment variable
                                 # launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]][0]} "
+                                env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
                                 env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
                             else:
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
