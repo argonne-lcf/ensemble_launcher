@@ -5,12 +5,14 @@ import subprocess
 import time
 import copy
 import multiprocessing as mp
+import dragon
 import resource
 from helper_functions import *
 import numpy as np
 from ensemble import *
 from worker import *
 from master import *
+import logging
 
 class ensemble_launcher:
     def __init__(self,
@@ -18,10 +20,13 @@ class ensemble_launcher:
                  ncores_per_node:int=None,
                  ngpus_per_node:int=None,
                  parallel_backend="multiprocessing") -> None:
-        assert parallel_backend == "multiprocessing"
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.n_parallel = None ##number of parallel lacunchers in int
+        self.parallel_backend = parallel_backend
+        assert parallel_backend in ["multiprocessing","dragon"]
+        if parallel_backend == "dragon":
+            mp.set_start_method("dragon")
         ##
         self.ensembles = {}
         self.start_time = time.time()
@@ -58,6 +63,7 @@ class ensemble_launcher:
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_parallel)]
         ##make output dir
         os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
+        self.configure_logger()
         return None
     
     """
@@ -84,6 +90,14 @@ class ensemble_launcher:
                 self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info,system=self.sys_info["name"])
         return None
     
+    def configure_logger(self):
+        self.logger = logging.getLogger(f"el")
+        handler = logging.FileHandler(f'./outputs/el_log.txt', mode='w')
+        formatter = logging.Formatter('%(asctime)s %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+
     ##pool all the tasks and split them among available processes
     def distribute_procs(self)->None:
         ntasks_per_proc = sum([e.ntasks for e in self.ensembles.values()])//self.n_parallel
@@ -146,8 +160,7 @@ class ensemble_launcher:
         fname = self.logfile
 
         status_string = f"FDs: {n_fds}, Nodes: {n_busy_nodes}/{n_nodes}, Free Cores: {nfree_cores}/{total_cores}, Free GPUs: {nfree_gpus}/{total_gpu}, Tasks: {total_tasks}, ToDo: {n_todo_tasks}, Running: {n_running_tasks}, Failed: {n_failed_tasks}, Finished: {n_finished_tasks}"
-        with open(fname, "a") as f:
-            f.write(f"{timestamp},{status_string}\n")
+        self.logger.info(status_string)
 
 
     def get_nfd(self,process)->int:
@@ -202,7 +215,7 @@ class ensemble_launcher:
             p.start()
             processes.append(p)
             for task_id,task_info in worker_tasks[pid].items():
-                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"})
+                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},pid=pid)
         
         ndone = 0
         while True:
@@ -215,9 +228,10 @@ class ensemble_launcher:
                     for task_id,task_info in tasks.items():
                         self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info)
                 else:
-                    ##receive metadata
-                    for k,v in msg.items():
-                        self.progress_info[k][pid] = v
+                    if msg is not None:
+                        ##receive metadata
+                        for k,v in msg.items():
+                            self.progress_info[k][pid] = v
             ##report status
             self.report_status()
             if ndone == self.n_parallel:

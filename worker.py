@@ -7,6 +7,7 @@ from helper_functions import *
 import numpy as np
 from Node import Node
 import sys
+import socket
 
 class worker(Node):
     def __init__(self,
@@ -359,6 +360,7 @@ class worker(Node):
 
     def run_tasks(self) -> None:
         self.configure_logger()
+        self.logger.info(f"Running on {socket.gethostname()}")
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
