@@ -56,7 +56,8 @@ class ensemble_launcher:
         self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_parallel)]
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_parallel)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_parallel)]
-        
+        ##make output dir
+        os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
         return None
     
     """
