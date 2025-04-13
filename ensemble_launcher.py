@@ -217,13 +217,17 @@ class ensemble_launcher:
                 self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},pid=pid)
         
         ndone = 0
+        done_workers = []
         while True:
             for pid in range(self.n_parallel):
+                if pid in done_workers:
+                    continue
                 ##there is default timeout of 60s
-                msg = my_master.recv_from_child(pid,timeout=5)
+                msg = my_master.recv_from_child(pid,timeout=0.5)
                 if msg == "DONE":
                     ndone += 1
-                    tasks = my_master.recv_from_child(pid,timeout=5)
+                    done_workers.append(pid)
+                    tasks = my_master.recv_from_child(pid,timeout=0.5)
                     if tasks is not None:
                         for task_id,task_info in tasks.items():
                             if task_id not in worker_tasks[pid].keys():
