@@ -8,6 +8,7 @@ import numpy as np
 from Node import Node
 import sys
 import socket
+import shutil
 
 class worker(Node):
     def __init__(self,
@@ -37,6 +38,8 @@ class worker(Node):
             self.free_gpus_per_node = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.my_nodes}
 
         self.my_busy_nodes = [] #this only has nodes with no cores free
+        self.tmp_dir = os.path.join(os.getcwd(),f".tmp/worker-{worker_id}")
+        os.makedirs(self.tmp_dir,exist_ok=True)
 
     def get_running_tasks(self) -> list:
         running_tasks = []
@@ -278,6 +281,7 @@ class worker(Node):
         env = os.environ.copy()
         env.update(task_info["env"])
         os.makedirs(task_info["run_dir"],exist_ok=True)
+        env["TMPDIR"] = self.tmp_dir
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
@@ -358,13 +362,14 @@ class worker(Node):
                 task["process"].wait()
                 self.free_task_nodes_base(task)
 
-    def run_tasks(self) -> None:
+    def run_tasks(self,parent_pipe) -> None:
         self.configure_logger()
+        self.add_parent(0,parent_pipe)
         self.logger.info(f"Running on {socket.gethostname()}")
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
-            print(f"launched {launched_tasks} tasks")
+            self.logger.info(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
             self.report_status_to_master()
             time.sleep(5)
@@ -377,6 +382,14 @@ class worker(Node):
                     break
                 else:
                     self.my_tasks = tasks
+
+        if os.path.exists(self.tmp_dir):
+            try:
+                self.logger.info(f"Deleting tmpdir")
+                shutil.rmtree(self.tmp_dir)
+                self.logger.info(f"Done deleting tmpdir")
+            except Exception as e:
+                self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
         return None
 
     def report_status_to_master(self):

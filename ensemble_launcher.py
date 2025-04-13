@@ -208,10 +208,9 @@ class ensemble_launcher:
             ##connect master and children
             parent_conn, child_conn = mp.Pipe()
             my_master.add_child(pid,parent_conn)
-            w.add_parent(0,child_conn)
             self.workers.append(w)
             ##
-            p = mp.Process(target=w.run_tasks)
+            p = mp.Process(target=w.run_tasks,args=(child_conn,))
             p.start()
             processes.append(p)
             for task_id,task_info in worker_tasks[pid].items():
@@ -221,20 +220,27 @@ class ensemble_launcher:
         while True:
             for pid in range(self.n_parallel):
                 ##there is default timeout of 60s
-                msg = my_master.recv_from_child(pid)
+                msg = my_master.recv_from_child(pid,timeout=5)
                 if msg == "DONE":
                     ndone += 1
-                    tasks = my_master.recv_from_child(pid)
-                    for task_id,task_info in tasks.items():
-                        self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info)
+                    tasks = my_master.recv_from_child(pid,timeout=5)
+                    if tasks is not None:
+                        for task_id,task_info in tasks.items():
+                            if task_id not in worker_tasks[pid].keys():
+                                self.logger.warning(f"{task_id} not in worker {pid}")
+                            else:
+                                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info,pid)
                 else:
                     if msg is not None:
-                        ##receive metadata
                         for k,v in msg.items():
                             self.progress_info[k][pid] = v
+                    else:
+                        self.logger.warning(f"No message received from worker {pid}")
             ##report status
             self.report_status()
             if ndone == self.n_parallel:
+                for p in processes:
+                    p.join()
                 for e in self.ensembles.values():
                     e.save_ensemble_status()
                 break
