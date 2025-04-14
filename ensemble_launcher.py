@@ -35,6 +35,11 @@ class ensemble_launcher:
         ##system info
         self.sys_info = {}
         self.read_input_file()
+        os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
+        self.configure_logger()
+        self.logger.info("Forcing number of masters to 1")
+        self.n_parallel = 1
+        
         ##update the system info. NOTE: precedence order config > inputs > functions
         if "ncores_per_node" not in self.sys_info.keys():
             self.sys_info["ncores_per_node"] = self.get_cores_per_node() if ncores_per_node is None else ncores_per_node
@@ -43,8 +48,8 @@ class ensemble_launcher:
         ##
         self.total_nodes = self.get_nodes()
         ###split available nodes among workers
-        self.worker_nodes = self.split_nodes()
-        print("worker nodes",self.worker_nodes)
+        self.master_nodes = self.split_nodes()
+        print("worker nodes",self.master_nodes)
         ##split tasks among available workers
         self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
         if self.n_parallel > 1:
@@ -62,8 +67,7 @@ class ensemble_launcher:
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_parallel)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_parallel)]
         ##make output dir
-        os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
-        self.configure_logger()
+        
         return None
     
     """
@@ -115,6 +119,15 @@ class ensemble_launcher:
             e.save_ensemble_status()
         return None
 
+    def split_nodes(self)->list:
+        my_nodes = []
+        if len(self.total_nodes)<self.n_parallel:
+            raise ValueError("Total number of nodes < number of parallel task launchers! Please set nparallel = 1")
+        nn = len(self.total_nodes)//self.n_parallel
+        for i in range(self.n_parallel):
+            my_nodes.append(self.total_nodes[i*nn:(i+1)*nn])
+        my_nodes[-1].extend(self.total_nodes[(i+1)*nn:])
+        return my_nodes
 
     def get_nodes(self) -> list:
         node_list = []
@@ -127,16 +140,6 @@ class ensemble_launcher:
             node_list = [socket.gethostname()]
         return node_list
     
-    def split_nodes(self)->list:
-        my_nodes = []
-        if len(self.total_nodes)<self.n_parallel:
-            raise ValueError("Total number of nodes < number of parallel task launchers! Please set nparallel = 1")
-        nn = len(self.total_nodes)//self.n_parallel
-        for i in range(self.n_parallel):
-            my_nodes.append(self.total_nodes[i*nn:(i+1)*nn])
-        my_nodes[-1].extend(self.total_nodes[(i+1)*nn:])
-        return my_nodes
-    
     def get_cores_per_node(self):
         if os.getenv("NCPUS") is not None:
             return int(os.getenv("NCPUS"))
@@ -147,7 +150,7 @@ class ensemble_launcher:
         timestamp = time.time()
         n_fds = self.get_nfd(mp.current_process())
         n_nodes = len(self.total_nodes)
-        n_busy_nodes = sum([1 for nodes in self.worker_nodes if len(nodes) > 0])
+        n_busy_nodes = sum([1 for nodes in self.master_nodes if len(nodes) > 0])
         total_cores = self.sys_info["ncores_per_node"] * n_nodes
         nfree_cores = sum(self.progress_info["nfree_cores"])
         total_gpu = self.sys_info["ngpus_per_node"] * n_nodes
@@ -173,7 +176,6 @@ class ensemble_launcher:
             return len(open_fds)
         except:
             return 0
-        
     
     def update_ensembles(self)-> dict:
         print("Updating ensembles")
@@ -187,50 +189,53 @@ class ensemble_launcher:
     
     ##this function creates and launches the workers
     def run_tasks(self):
+        self.logger.info("Started running tasks")
         ##get worker tasks
-        worker_tasks = {pid:{} for pid in range(self.n_parallel)}
+        master_tasks = {pid:{} for pid in range(self.n_parallel)}
         for en,e in self.ensembles.items():
             for local_id,pid in enumerate(self.pids_per_ensemble[en]):
-                worker_tasks[pid].update(e.get_task_infos(local_id))
+                master_tasks[pid].update(e.get_task_infos(local_id))
 
-        ##create master
-        my_master = master("master_0")
-        self.masters.append(my_master)
-
-        ##create workers and corresponding processes
-        processes = []
+        master_pipes = []
+        master_policies = []
+        master_processes = []
         for pid in range(self.n_parallel):
-            w = worker( f"worker_{pid}",
-                        worker_tasks[pid],
-                        self.worker_nodes[pid],
-                        my_master,
-                        self.sys_info)
-            ##connect master and children
+            ##create master
+            my_master = master(
+                                "master_0",
+                                master_tasks[pid],
+                                self.master_nodes[pid],
+                                self.sys_info,
+                                parallel_backend=self.parallel_backend,
+                            )
+            self.masters.append(my_master)
             parent_conn, child_conn = mp.Pipe()
-            my_master.add_child(pid,parent_conn)
-            self.workers.append(w)
-            ##
-            p = mp.Process(target=w.run_tasks,args=(child_conn,))
+            master_pipes.append(parent_conn)
+            p = mp.Process(target=my_master.run_tasks,args=(child_conn,))
             p.start()
-            processes.append(p)
-            for task_id,task_info in worker_tasks[pid].items():
+            master_processes.append(p)
+            for task_id,task_info in master_tasks[pid].items():
                 self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},pid=pid)
-        
+        self.logger.info("Done forking masters")
+
         ndone = 0
-        done_workers = []
+        done_masters = []
         while True:
             for pid in range(self.n_parallel):
-                if pid in done_workers:
+                if pid in done_masters:
                     continue
                 ##there is default timeout of 60s
-                msg = my_master.recv_from_child(pid,timeout=0.5)
+                if master_pipes[pid].poll(timeout=0.5):
+                    msg = master_pipes[pid].recv()
+                else:
+                    msg = None
                 if msg == "DONE":
                     ndone += 1
-                    done_workers.append(pid)
-                    tasks = my_master.recv_from_child(pid,timeout=0.5)
+                    done_masters.append(pid)
+                    tasks = master_pipes[pid].recv() if master_pipes[pid].poll(timeout=0.5) else None
                     if tasks is not None:
                         for task_id,task_info in tasks.items():
-                            if task_id not in worker_tasks[pid].keys():
+                            if task_id not in master_tasks[pid].keys():
                                 self.logger.warning(f"{task_id} not in worker {pid}")
                             else:
                                 self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info,pid)
@@ -240,14 +245,16 @@ class ensemble_launcher:
                             self.progress_info[k][pid] = v
                     else:
                         self.logger.warning(f"No message received from worker {pid}")
-            ##report status
             self.report_status()
             if ndone == self.n_parallel:
-                for p in processes:
+                for p in master_processes:
                     p.join()
                 for e in self.ensembles.values():
                     e.save_ensemble_status()
                 break
+        self.logger.info("Done running all tasks")
+
+        
             
                 
 
