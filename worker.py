@@ -15,14 +15,12 @@ class worker(Node):
                 worker_id:str,
                 my_tasks:dict,
                 my_nodes:list,
-                my_master:Node,
                 sys_info:dict,
                 comm_config:dict={"comm_layer":"multiprocessing",
                                   "parents":{},
                                   "children":{}}):
         super().__init__(worker_id,comm_config,logger=False)
         self.my_tasks = my_tasks
-        self.my_master = my_master
         self.sys_info = sys_info
         assert "name" in sys_info and "ncores_per_node" in sys_info and "ngpus_per_node" in sys_info
         ##resource info

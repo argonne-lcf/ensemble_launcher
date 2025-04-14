@@ -21,8 +21,6 @@ class master(Node):
         self.sys_info = sys_info
         self.parallel_backend = parallel_backend
         assert parallel_backend in ["multiprocessing","dragon"]
-        if parallel_backend == "dragon":
-            mp.set_start_method("dragon")
         ##for now I will just use n_workers = number of nodes
         self.n_workers = len(my_nodes)
         self.workers = []
@@ -72,20 +70,29 @@ class master(Node):
         self.configure_logger()
         self.add_parent(0,parent_pipe)
         self.logger.info("Started running tasks")
+        if self.parallel_backend == "dragon":
+            mp.set_start_method("dragon")
         ##create workers and corresponding processes
         processes = []
+        policies = []
         for pid in range(self.n_workers):
             w = worker( f"worker_{pid}",
                         self.worker_tasks[pid],
                         self.worker_nodes[pid],
-                        self,
                         self.sys_info)
             ##connect master and children
             parent_conn, child_conn = mp.Pipe()
             self.add_child(pid,parent_conn)
             self.workers.append(w)
             ##
-            p = mp.Process(target=w.run_tasks,args=(child_conn,))
+            if self.parallel_backend == "dragon":
+                policies.append(dragon.infrastructure.policy.Policy(
+                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
+                                        host_name=self.worker_nodes[pid][0]
+                                    ))
+                p = dragon.native.process.Process(target=w.run_tasks,args=(child_conn,),policy=policies[-1])
+            else:
+                p = mp.Process(target=w.run_tasks,args=(child_conn,))
             p.start()
             processes.append(p)
             for task_id,task_info in self.worker_tasks[pid].items():
@@ -93,6 +100,7 @@ class master(Node):
         self.logger.info("Done forking processes")
         ndone = 0
         done_workers = []
+        
         while True:
             for pid in range(self.n_workers):
                 if pid in done_workers:

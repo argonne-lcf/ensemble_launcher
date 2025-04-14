@@ -25,7 +25,7 @@ class ensemble_launcher:
         self.n_parallel = None ##number of parallel lacunchers in int
         self.parallel_backend = parallel_backend
         assert parallel_backend in ["multiprocessing","dragon"]
-        if parallel_backend == "dragon":
+        if self.parallel_backend == "dragon":
             mp.set_start_method("dragon")
         ##
         self.ensembles = {}
@@ -37,8 +37,6 @@ class ensemble_launcher:
         self.read_input_file()
         os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
         self.configure_logger()
-        self.logger.info("Forcing number of masters to 1")
-        self.n_parallel = 1
         
         ##update the system info. NOTE: precedence order config > inputs > functions
         if "ncores_per_node" not in self.sys_info.keys():
@@ -47,9 +45,11 @@ class ensemble_launcher:
             self.sys_info["ngpus_per_node"] = 0 if ngpus_per_node is None else ngpus_per_node
         ##
         self.total_nodes = self.get_nodes()
+        self.logger.info("Forcing number of masters to 1 per 32 nodes")
+        self.n_parallel = max(1, len(self.total_nodes) // 32 + (1 if len(self.total_nodes) % 32 != 0 else 0))
+        self.logger.info(f"Using {self.n_parallel} masters")
         ###split available nodes among workers
         self.master_nodes = self.split_nodes()
-        print("worker nodes",self.master_nodes)
         ##split tasks among available workers
         self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
         if self.n_parallel > 1:
@@ -178,7 +178,6 @@ class ensemble_launcher:
             return 0
     
     def update_ensembles(self)-> dict:
-        print("Updating ensembles")
         deleted_tasks = {}
         with open(self.config_file, "r") as file:
             data = json.load(file)
@@ -211,13 +210,21 @@ class ensemble_launcher:
             self.masters.append(my_master)
             parent_conn, child_conn = mp.Pipe()
             master_pipes.append(parent_conn)
-            p = mp.Process(target=my_master.run_tasks,args=(child_conn,))
+            if self.parallel_backend == "dragon":
+                master_policies.append(dragon.infrastructure.policy.Policy(
+                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
+                                        host_name=self.master_nodes[pid][0]
+                                    ))
+                env = os.environ.copy()
+                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
+                p = dragon.native.process.Process(target=my_master.run_tasks, args=(child_conn,), policy=master_policies[-1], env=env)
+            else:
+                p = mp.Process(target=my_master.run_tasks,args=(child_conn,))
             p.start()
             master_processes.append(p)
             for task_id,task_info in master_tasks[pid].items():
                 self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},pid=pid)
         self.logger.info("Done forking masters")
-
         ndone = 0
         done_masters = []
         while True:

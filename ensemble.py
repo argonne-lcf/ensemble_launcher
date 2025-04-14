@@ -233,9 +233,12 @@ class ensemble:
     
     def update_task_status(self, task_id: str, status: str, pid: int = 0) -> None:
         if status == "running":
-            assert self.__tasks[task_id]["status"] == "ready"
-            self.__ensemble_state[pid]["running_task_ids"][task_id] = "running"
-            self.__ensemble_state[pid]["ready_task_ids"].pop(task_id)
+            if self.__tasks[task_id]["status"] != "running":
+                assert self.__tasks[task_id]["status"] == "ready"
+                self.__ensemble_state[pid]["running_task_ids"][task_id] = "running"
+                self.__ensemble_state[pid]["ready_task_ids"].pop(task_id)
+            else:
+                return
         elif status == "failed":
             assert self.__tasks[task_id]["status"] == "running"
             retries = self.__tasks[task_id].get("retries", 0)
