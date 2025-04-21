@@ -231,16 +231,16 @@ class ensemble:
     def get_ready_task_ids(self,pid:int=0)->list:
         return list(self.__ensemble_state[pid]["ready_task_ids"].keys())
     
-    def update_task_status(self, task_id: str, status: str, pid: int = 0) -> None:
+    def update_task_status(self, task_id: str, status: str, pid: int = 0, force:bool=False) -> None:
         if status == "running":
             if self.__tasks[task_id]["status"] != "running":
-                assert self.__tasks[task_id]["status"] == "ready"
+                assert force or self.__tasks[task_id]["status"] == "ready"
                 self.__ensemble_state[pid]["running_task_ids"][task_id] = "running"
                 self.__ensemble_state[pid]["ready_task_ids"].pop(task_id)
             else:
                 return
         elif status == "failed":
-            assert self.__tasks[task_id]["status"] == "running"
+            assert force or self.__tasks[task_id]["status"] == "running"
             retries = self.__tasks[task_id].get("retries", 0)
             if retries < 1:
                 # Retry the task
@@ -253,7 +253,7 @@ class ensemble:
                 self.__tasks[task_id]["status"] = "failed"
                 self.__ensemble_state[pid]["running_task_ids"].pop(task_id)
         elif status == "finished":
-            assert self.__tasks[task_id]["status"] == "running"
+            assert force or self.__tasks[task_id]["status"] == "running"
             self.__ensemble_state[pid]["running_task_ids"].pop(task_id)
         elif status == "deleted":
             self.__ensemble_state[pid]["running_task_ids"].pop(task_id, None)
@@ -265,9 +265,9 @@ class ensemble:
         self.__tasks[task_id]["status"] = status
         return None
     
-    def update_task_info(self,task_id:str,info:dict,pid:int=0) -> None:
+    def update_task_info(self,task_id:str,info:dict,pid:int=0,force:bool=False) -> None:
         if "status" in info.keys():
-            self.update_task_status(task_id,info["status"],pid=pid)
+            self.update_task_status(task_id,info["status"],pid=pid,force=force)
             info.pop("status")
         self.__tasks[task_id].update(info)
         return None
