@@ -86,9 +86,13 @@ class ensemble:
                 if "run_dir" in list_options:
                     task["log_file"] = os.path.join(task["run_dir"],f"log.txt")
                     task["err_file"] = os.path.join(task["run_dir"],f"err.txt")
+                    task["gpu_affinity_file"] = os.path.join(task["run_dir"],f"set_affinity.sh")
+                    task["mpi_rankfile"] = os.path.join(task["run_dir"],f"rankfile.txt")
                 else:
                     task["log_file"] = os.path.join(task["run_dir"],f"log_{i}.txt")
                     task["err_file"] = os.path.join(task["run_dir"],f"err_{i}.txt")
+                    task["gpu_affinity_file"] = os.path.join(task["run_dir"],f"set_affinity_{i}.sh")
+                    task["mpi_rankfile"] = os.path.join(task["run_dir"],f"rankfile_{i}.txt")
         elif relation == "many-to-many":
             list_options = []
             non_list_options = []

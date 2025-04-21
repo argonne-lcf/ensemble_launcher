@@ -202,14 +202,15 @@ class worker(Node):
                             launcher_cmd += f"--cpu-bind list:{cores} "
                         else:
                             ###user rankfile option
-                            rankfile_path = os.path.join(task_info["run_dir"], "rankfile.txt")
+                            rankfile_path = task_info["mpi_rankfile"]
                             with open(rankfile_path, "w") as rankfile:
                                 rank = 0
                                 for node in task_info["assigned_nodes"]:
                                     for core_set in task_info["assigned_cores"][node]:
                                         rankfile.write(f"rank {rank}={node} slot={core_set}\n")
                                         rank += 1
-                            launcher_cmd += "--rankfile rankfile.txt "
+                            self.logger.info(f"Over subscribing cores")
+                            # launcher_cmd += f"--rankfile {rankfile_path} "
                 
                 ##append all other launcher options that are not checked above
                 for key, value in launcher_options.items():
@@ -230,7 +231,7 @@ class worker(Node):
                             else:
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                                 os.makedirs(task_info["run_dir"], exist_ok=True)
-                                fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
+                                fname = task_info["gpu_affinity_file"]
                                 if not os.path.exists(fname):
                                     with open(fname, "w") as f:
                                         f.write(bash_script)
@@ -242,7 +243,7 @@ class worker(Node):
                         else:
                             bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
                             os.makedirs(task_info["run_dir"], exist_ok=True)
-                            fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
+                            fname = task_info["gpu_affinity_file"]
                             if not os.path.exists(fname):
                                 with open(fname, "w") as f:
                                     f.write(bash_script)
