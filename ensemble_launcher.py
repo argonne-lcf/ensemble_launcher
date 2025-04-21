@@ -54,7 +54,13 @@ class ensemble_launcher:
             self.total_nodes,
             self.sys_info,
             parallel_backend=self.parallel_backend,
+            n_children= 1 if len(self.total_nodes) < 128 else None,
             max_children_nnodes=self.max_nodes_per_master)
+        
+        print(f"Total number of local masters: {self.global_master.n_children}")
+        for i in range(self.global_master.n_children):
+            print(f"Local master {i} has {len(self.global_master.children_tasks[i])} tasks and {len(self.global_master.children_nodes[i])} nodes")
+        sys.exit(0)
     
         self.comm_config = {}
         self.masters = []
@@ -190,7 +196,7 @@ class ensemble_launcher:
             p.start()
             master_processes.append(p)
             for task_id,task_info in self.global_master.children_tasks[pid].items():
-                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},pid=pid,force=True)
+                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},force=True)
         self.logger.info("Done forking masters")
         ndone = 0
         done_masters = []
@@ -212,7 +218,7 @@ class ensemble_launcher:
                             if task_id not in self.global_master.children_tasks[pid].keys():
                                 self.logger.warning(f"{task_id} not in worker {pid}")
                             else:
-                                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info,pid,force=True)
+                                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info,force=True)
                 else:
                     if msg is not None:
                         for k,v in msg.items():

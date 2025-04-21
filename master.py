@@ -11,6 +11,7 @@ class master(Node):
                  sys_info:dict,
                  my_master:Node=None,
                  parallel_backend="multiprocessing",
+                 n_children:int=None,
                  max_children_nnodes:int=None,
                  comm_config:dict={"comm_layer":"multiprocessing",
                                     "parents":{},
@@ -31,14 +32,14 @@ class master(Node):
         ##Note that this option will remove tasks that have num nodes > max_children_nnodes
         ##So, set this large enough to not remove any tasks
         self.max_children_nnodes = max_children_nnodes
-        children_assignments = self.assign_children(max_children_nnodes)
+        children_assignments = self.assign_children(n_children=n_children,max_children_nnodes=max_children_nnodes)
         self.n_children = len(children_assignments)
         self.children_nodes = []
         self.children_tasks = []
         total = 0
-        for assignment in children_assignments.values():
-            self.children_tasks = {task_id:self.my_tasks[task_id] for task_id in assignment["task_ids"]}
-            self.children_nodes = self.my_nodes[total : total + assignment["nnodes"]]
+        for cid,assignment in children_assignments.items():
+            self.children_tasks.append({task_id:self.my_tasks[task_id] for task_id in assignment["task_ids"]})
+            self.children_nodes.append(self.my_nodes[total : total + assignment["nnodes"]])
             total += assignment["nnodes"]
         ##
         self.progress_info = {}
@@ -50,7 +51,9 @@ class master(Node):
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
 
 
-    def assign_children(self,max_children_nnodes:int=None):
+    def assign_children(self,
+                        n_children:int=None,
+                        max_children_nnodes:int=None):
         """
         Assign tasks to workers based on resource requirements.
         """
@@ -62,24 +65,34 @@ class master(Node):
         ##when max_children_nnodes is not None, remove tasks that have num nodes > max_children_nnodes
         removed_tasks = []
         if max_children_nnodes is not None:
-            while sorted_tasks and sorted_tasks[0][1] > max_children_nnodes and sorted_tasks[0][1] > len(self.my_nodes):
+            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > max_children_nnodes and sorted_tasks[0][1]["num_nodes"] > len(self.my_nodes):
                 removed_tasks.append((sorted_tasks.pop(0))[0])
         else:
-            while sorted_tasks[0][1] > len(self.my_nodes):
+            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > len(self.my_nodes):
                 removed_tasks.append((sorted_tasks.pop(0))[0])
         
-        self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
+        if len(removed_tasks) > 0:
+            if self.logger:
+                self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
+            else:
+                print(f"Can't schedule {','.join(removed_tasks)}!")
 
         # Step 1: Calculate cumulative sum of nodes required for tasks
         cum_sum_nnodes = []
         for _, task in sorted_tasks:
             # Add the number of nodes required for the current task to the cumulative sum
-            cum_sum_nnodes.append(cum_sum_nnodes[-1] if len(cum_sum_nnodes) > 0 else 0 + task["num_nodes"])
+            cum_sum_nnodes.append(cum_sum_nnodes[-1] + task["num_nodes"] if len(cum_sum_nnodes) > 0 else 0 + task["num_nodes"])
         
+        print(f"cum_sum_nnodes = {cum_sum_nnodes}")
         # Step 2: Determine the number of workers
-        nworkers = 0
-        while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(self.my_nodes):
-            nworkers += 1
+        if n_children is not None:
+            nworkers = 0
+            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(self.my_nodes) and nworkers < n_children:
+                nworkers += 1
+        else:
+            nworkers = 0
+            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(self.my_nodes):
+                nworkers += 1
         
         # Step 3: Initialize worker assignments for the first set of tasks
         children_assignments = {
@@ -90,7 +103,12 @@ class master(Node):
             }
             for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
         }
-        
+
+        assigned_nnodes = sum([a["nnodes"] for _, a in children_assignments.items()])
+        if assigned_nnodes < len(self.my_nodes):
+            for i in range(len(self.my_nodes) - assigned_nnodes):
+                children_assignments[i % nworkers]["nnodes"] += 1
+
         # Step 4: Assign remaining tasks to workers in a round-robin fashion
         for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
             # Determine the worker ID in a round-robin manner
