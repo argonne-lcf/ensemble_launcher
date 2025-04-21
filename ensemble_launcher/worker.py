@@ -3,9 +3,9 @@ import subprocess
 import time
 import copy
 import multiprocessing as mp
-from helper_functions import *
+from .helper_functions import *
 import numpy as np
-from Node import Node
+from .Node import Node
 import sys
 import socket
 import shutil
@@ -25,7 +25,6 @@ class worker(Node):
         assert "name" in sys_info and "ncores_per_node" in sys_info and "ngpus_per_node" in sys_info
         ##resource info
         self.my_nodes = my_nodes
-        self.my_free_nodes = [node for node in self.my_nodes]
         self.free_cores_per_node = {node:list(range(self.sys_info["ncores_per_node"])) 
                                                      for node in self.my_nodes}
         if self.sys_info["name"] == "aurora":
@@ -35,7 +34,6 @@ class worker(Node):
         else:
             self.free_gpus_per_node = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.my_nodes}
 
-        self.my_busy_nodes = [] #this only has nodes with no cores free
         self.tmp_dir = os.path.join(os.getcwd(),f".tmp/worker-{worker_id}")
         os.makedirs(self.tmp_dir,exist_ok=True)
 
@@ -74,6 +72,22 @@ class worker(Node):
                 pending_tasks.append(task_id)
         return pending_tasks
 
+    @property
+    def my_free_nodes(self):
+        my_free_nodes = []
+        for node, cores in self.free_cores_per_node.items():
+            if len(cores) != 0:
+                my_free_nodes.append(node)
+        return my_free_nodes
+
+    @property
+    def my_busy_nodes(self):
+        my_busy_nodes = []
+        for node, cores in self.free_cores_per_node.items():
+            if len(cores) == 0:
+                my_busy_nodes.append(node)
+        return my_busy_nodes
+    
     def assign_task_nodes(self,task:dict) -> list:
         assigned_nodes = []
         assigned_cores = {}
@@ -83,6 +97,7 @@ class worker(Node):
             if len(assigned_nodes) == task["num_nodes"] or \
                len(self.my_free_nodes) == 0 or \
                j >= len(self.my_free_nodes):
+                self.logger.info(f"breaking out of loop {task['index']} {len(assigned_nodes)} {task['num_nodes']} {len(self.my_free_nodes)} {j}")
                 break
 
             node = self.my_free_nodes[j]
@@ -104,8 +119,6 @@ class worker(Node):
 
             j += 1
             if len(self.free_cores_per_node[node]) == 0:
-                self.my_free_nodes.remove(node)
-                self.my_busy_nodes.append(node)
                 j -= 1
 
         if len(assigned_nodes) < task["num_nodes"]:
@@ -122,9 +135,6 @@ class worker(Node):
                         sorted(self.free_gpus_per_node[node])
                     del assigned_gpus[node]
 
-                if node in self.my_busy_nodes:
-                    self.my_busy_nodes.remove(node)
-                    self.my_free_nodes.append(node)
             assigned_nodes = []
             
         return assigned_nodes,assigned_cores,assigned_gpus
@@ -140,10 +150,6 @@ class worker(Node):
                 self.free_gpus_per_node[node].extend(task_info["assigned_gpus"][node])
                 self.free_gpus_per_node[node] = \
                         sorted(self.free_gpus_per_node[node])
-
-                if node in self.my_busy_nodes:
-                    self.my_busy_nodes.remove(node)
-                    self.my_free_nodes.append(node)
         return
 
     """
@@ -225,10 +231,11 @@ class worker(Node):
                                 bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                                 os.makedirs(task_info["run_dir"], exist_ok=True)
                                 fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
-                                with open(fname, "w") as f:
-                                    f.write(bash_script)
-                                st = os.stat(fname)
-                                os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                                if not os.path.exists(fname):
+                                    with open(fname, "w") as f:
+                                        f.write(bash_script)
+                                    st = os.stat(fname)
+                                    os.chmod(fname,st.st_mode | stat.S_IEXEC)
                                 launcher_cmd += f"{fname} "
                                 ##set environment variables
                                 env.update({"AVAILABLE_GPUS": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
@@ -236,10 +243,11 @@ class worker(Node):
                             bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
                             os.makedirs(task_info["run_dir"], exist_ok=True)
                             fname = os.path.join(task_info["run_dir"], "set_affinity.sh")
-                            with open(fname, "w") as f:
-                                f.write(bash_script)
-                            st = os.stat(fname)
-                            os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                            if not os.path.exists(fname):
+                                with open(fname, "w") as f:
+                                    f.write(bash_script)
+                                st = os.stat(fname)
+                                os.chmod(fname,st.st_mode | stat.S_IEXEC)
                             launcher_cmd += f"{fname} "
                             ##Here you need to set the environment variables for each node
                             for node in task_info["assigned_nodes"]:
@@ -397,6 +405,13 @@ class worker(Node):
         num_ready = len(self.get_ready_tasks())
         nfree_cores = sum(len(cores) for cores in self.free_cores_per_node.values())
         nfree_gpus = sum(len(gpus) for gpus in self.free_gpus_per_node.values())
+        info = {"nfailed_tasks": num_failed, 
+                "nfinished_tasks": num_finished, 
+                "nrunning_tasks": num_running, 
+                "nready_tasks": num_ready,
+                "nfree_cores": nfree_cores,
+                "nfree_gpus": nfree_gpus}
+        self.logger.info(f"reporting status to master {info}")
         self.send_to_parent(0, {"nfailed_tasks": num_failed, 
                 "nfinished_tasks": num_finished, 
                 "nrunning_tasks": num_running, 

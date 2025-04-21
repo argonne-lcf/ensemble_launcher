@@ -12,5 +12,5 @@ for ((i=0; i<${#args[@]}; i++)); do
 done
 
 echo "Even numbers from arguments: ${even_numbers[*]}"
-
-sleep 10
+echo "started sleep"
+sleep 1

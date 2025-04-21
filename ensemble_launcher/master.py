@@ -1,5 +1,5 @@
-from worker import *
-from Node import *
+from .worker import *
+from .Node import *
 import dragon
 import multiprocessing as mp
 
@@ -130,6 +130,9 @@ class master(Node):
         self.configure_logger()
         self.add_parent(0,parent_pipe)
         self.logger.info("Started running tasks")
+        for wid in range(self.n_children):
+            self.logger.info(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
+
         if self.parallel_backend == "dragon":
             mp.set_start_method("dragon")
         ##create workers and corresponding processes

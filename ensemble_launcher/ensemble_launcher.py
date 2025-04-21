@@ -4,11 +4,11 @@ import socket
 import time
 import multiprocessing as mp
 import dragon
-from helper_functions import *
+from .helper_functions import *
 import numpy as np
-from ensemble import *
-from worker import *
-from master import *
+from .ensemble import *
+from .worker import *
+from .master import *
 import logging
 
 class ensemble_launcher:
@@ -60,7 +60,6 @@ class ensemble_launcher:
         print(f"Total number of local masters: {self.global_master.n_children}")
         for i in range(self.global_master.n_children):
             print(f"Local master {i} has {len(self.global_master.children_tasks[i])} tasks and {len(self.global_master.children_nodes[i])} nodes")
-        sys.exit(0)
     
         self.comm_config = {}
         self.masters = []
@@ -128,7 +127,7 @@ class ensemble_launcher:
         timestamp = time.time()
         n_fds = self.get_nfd(mp.current_process())
         n_nodes = len(self.total_nodes)
-        n_busy_nodes = sum([1 for nodes in self.master_nodes if len(nodes) > 0])
+        n_busy_nodes = sum([1 for nodes in self.total_nodes if len(nodes) > 0])
         total_cores = self.sys_info["ncores_per_node"] * n_nodes
         nfree_cores = sum(self.progress_info["nfree_cores"])
         total_gpu = self.sys_info["ngpus_per_node"] * n_nodes
@@ -174,7 +173,7 @@ class ensemble_launcher:
         for pid in range(self.global_master.n_children):
             ##create master
             local_master = master(
-                                "master_0",
+                                f"local_master_{pid}",
                                 self.global_master.children_tasks[pid],
                                 self.global_master.children_nodes[pid],
                                 self.sys_info,
