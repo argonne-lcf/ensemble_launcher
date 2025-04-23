@@ -15,7 +15,7 @@ class master(Node):
                  max_children_nnodes:int=None,
                  comm_config:dict={"comm_layer":"multiprocessing",
                                     "parents":{},
-                                    "children":{}}):
+                                    "children":{}},):
         super().__init__(master_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
@@ -124,11 +124,18 @@ class master(Node):
         progress_info = {}
         for k,v in self.progress_info.items():
             progress_info[k] = sum(v)
-        self.send_to_parent(0,progress_info)        
+        self.send_to_parent(0,progress_info)
+        nnodes = len(self.my_nodes)
+        progress_info["total_cores"] = self.sys_info["ncores_per_node"]*nnodes
+        progress_info["total_gpus"] = self.sys_info["ngpus_per_node"]*nnodes
+        status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
+        self.logger.info(f"{status_str}")
 
-    def run_workers(self,parent_pipe):
+
+    def run_workers(self,parent_pipe=None):
         self.configure_logger()
-        self.add_parent(0,parent_pipe)
+        if parent_pipe:
+            self.add_parent(0,parent_pipe)
         self.logger.info("Started running tasks")
         for wid in range(self.n_children):
             self.logger.info(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
@@ -160,6 +167,7 @@ class master(Node):
             processes.append(p)
             for task_id,task_info in self.children_tasks[pid].items():
                 self.my_tasks[task_id].update({"status":"running"})
+                task_info.update({"status":"running"})
         self.logger.info("Done forking processes")
         ndone = 0
         done_workers = []
@@ -179,15 +187,15 @@ class master(Node):
                             if task_id not in self.children_tasks[pid].keys():
                                 self.logger.warning(f"{task_id} not in worker {pid}")
                             else:
+                                self.children_tasks[pid][task_id].update(task_info)
                                 self.my_tasks[task_id].update(task_info)
                 else:
                     if msg is not None:
                         for k,v in msg.items():
                             self.progress_info[k][pid] = v
                     else:
-                        self.logger.warning(f"No message received from worker {pid}")
+                        self.logger.debug(f"No message received from worker {pid}")
             ##report status
-            self.logger.info("sending message to parent")
             self.report_status()
             if ndone == self.n_children:
                 for p in processes:
@@ -195,6 +203,79 @@ class master(Node):
                 break
         self.send_to_parent(0,"DONE")
         self.send_to_parent(0,self.my_tasks)
+        self.logger.info("Done running all tasks")
+    
+    ##this function creates and launches local masters
+    def run_local_masters(self,parent_pipe=None):
+        self.configure_logger()
+        if parent_pipe:
+            self.add_parent(0,parent_pipe)
+        self.logger.info("Started running tasks")
+
+        master_pipes = []
+        master_policies = []
+        master_processes = []
+        for pid in range(self.n_children):
+            ##create master
+            local_master = master(
+                                f"local_master_{pid}",
+                                self.children_tasks[pid],
+                                self.children_nodes[pid],
+                                self.sys_info,
+                                parallel_backend=self.parallel_backend,
+                            )
+            self.children.append(local_master)
+            parent_conn, child_conn = mp.Pipe()
+            master_pipes.append(parent_conn)
+            if self.parallel_backend == "dragon":
+                master_policies.append(dragon.infrastructure.policy.Policy(
+                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
+                                        host_name=self.children_nodes[pid][0]
+                                    ))
+                env = os.environ.copy()
+                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
+                p = dragon.native.process.Process(target=local_master.run_workers, args=(child_conn,), policy=master_policies[-1], env=env)
+            else:
+                p = mp.Process(target=local_master.run_workers,args=(child_conn,))
+            p.start()
+            master_processes.append(p)
+            for task_id,task_info in self.children_tasks[pid].items():
+                self.my_tasks[task_id].update({"status":"running"})
+                task_info.update({"status":"running"})
+        self.logger.info("Done forking masters")
+        ndone = 0
+        done_masters = []
+        while True:
+            for pid in range(self.n_children):
+                if pid in done_masters:
+                    continue
+                ##there is default timeout of 60s
+                if master_pipes[pid].poll(timeout=0.5):
+                    msg = master_pipes[pid].recv()
+                else:
+                    msg = None
+                if msg == "DONE":
+                    ndone += 1
+                    done_masters.append(pid)
+                    tasks = master_pipes[pid].recv() if master_pipes[pid].poll(timeout=0.5) else None
+                    if tasks is not None:
+                        for task_id,task_info in tasks.items():
+                            if task_id not in self.children_tasks[pid].keys():
+                                self.logger.warning(f"{task_id} not in worker {pid}")
+                            else:
+                                self.children_tasks[pid][task_id].update(task_info)
+                                self.my_tasks[task_id].update(task_info)
+                else:
+                    if msg is not None:
+                        for k,v in msg.items():
+                            self.progress_info[k][pid] = v
+                    else:
+                        self.logger.warning(f"No message received from worker {pid}")
+            self.report_status()
+            if ndone == self.n_children:
+                for p in master_processes:
+                    p.join()
+                break
         self.logger.info("Done running all tasks")
 
 

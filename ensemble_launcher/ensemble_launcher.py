@@ -54,7 +54,7 @@ class ensemble_launcher:
             self.total_nodes,
             self.sys_info,
             parallel_backend=self.parallel_backend,
-            n_children= 1 if len(self.total_nodes) < 128 else None,
+            n_children= None,
             max_children_nnodes=self.max_nodes_per_master)
         
         print(f"Total number of local masters: {self.global_master.n_children}")
@@ -124,23 +124,15 @@ class ensemble_launcher:
             return os.cpu_count()
     
     def report_status(self):
-        timestamp = time.time()
-        n_fds = self.get_nfd(mp.current_process())
-        n_nodes = len(self.total_nodes)
-        n_busy_nodes = sum([1 for nodes in self.total_nodes if len(nodes) > 0])
-        total_cores = self.sys_info["ncores_per_node"] * n_nodes
-        nfree_cores = sum(self.progress_info["nfree_cores"])
-        total_gpu = self.sys_info["ngpus_per_node"] * n_nodes
-        nfree_gpus = sum(self.progress_info["nfree_gpus"])
-        total_tasks = sum([e.ntasks for e in self.ensembles.values()])
-        n_todo_tasks = sum(self.progress_info["nready_tasks"])
-        n_running_tasks = sum(self.progress_info["nrunning_tasks"])
-        n_failed_tasks = sum(self.progress_info["nfailed_tasks"])
-        n_finished_tasks = sum(self.progress_info["nfinished_tasks"])
-        fname = self.logfile
 
-        status_string = f"FDs: {n_fds}, Nodes: {n_busy_nodes}/{n_nodes}, Free Cores: {nfree_cores}/{total_cores}, Free GPUs: {nfree_gpus}/{total_gpu}, Tasks: {total_tasks}, ToDo: {n_todo_tasks}, Running: {n_running_tasks}, Failed: {n_failed_tasks}, Finished: {n_finished_tasks}"
-        self.logger.info(status_string)
+        progress_info = {}
+        for k,v in self.progress_info.items():
+            progress_info[k] = sum(v)
+        nnodes = len(self.total_nodes)
+        progress_info["total_cores"] = self.sys_info["ncores_per_node"]*nnodes
+        progress_info["total_gpus"] = self.sys_info["ngpus_per_node"]*nnodes
+        status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
+        self.logger.info(status_str)
 
 
     def get_nfd(self,process)->int:
@@ -163,75 +155,14 @@ class ensemble_launcher:
                 deleted_tasks.update(self.ensembles[ensemble_name].update_ensemble(ensemble_info))
         return deleted_tasks
     
-    ##this function creates and launches the workers
     def run_tasks(self):
-        self.logger.info("Started running tasks")
-
-        master_pipes = []
-        master_policies = []
-        master_processes = []
-        for pid in range(self.global_master.n_children):
-            ##create master
-            local_master = master(
-                                f"local_master_{pid}",
-                                self.global_master.children_tasks[pid],
-                                self.global_master.children_nodes[pid],
-                                self.sys_info,
-                                parallel_backend=self.parallel_backend,
-                            )
-            self.masters.append(local_master)
-            parent_conn, child_conn = mp.Pipe()
-            master_pipes.append(parent_conn)
-            if self.parallel_backend == "dragon":
-                master_policies.append(dragon.infrastructure.policy.Policy(
-                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
-                                        host_name=self.master_nodes[pid][0]
-                                    ))
-                env = os.environ.copy()
-                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
-                p = dragon.native.process.Process(target=local_master.run_workers, args=(child_conn,), policy=master_policies[-1], env=env)
-            else:
-                p = mp.Process(target=local_master.run_workers,args=(child_conn,))
-            p.start()
-            master_processes.append(p)
-            for task_id,task_info in self.global_master.children_tasks[pid].items():
-                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,{"status":"running"},force=True)
-        self.logger.info("Done forking masters")
-        ndone = 0
-        done_masters = []
-        while True:
-            for pid in range(self.global_master.n_children):
-                if pid in done_masters:
-                    continue
-                ##there is default timeout of 60s
-                if master_pipes[pid].poll(timeout=0.5):
-                    msg = master_pipes[pid].recv()
-                else:
-                    msg = None
-                if msg == "DONE":
-                    ndone += 1
-                    done_masters.append(pid)
-                    tasks = master_pipes[pid].recv() if master_pipes[pid].poll(timeout=0.5) else None
-                    if tasks is not None:
-                        for task_id,task_info in tasks.items():
-                            if task_id not in self.global_master.children_tasks[pid].keys():
-                                self.logger.warning(f"{task_id} not in worker {pid}")
-                            else:
-                                self.ensembles[task_info["ensemble_name"]].update_task_info(task_id,task_info,force=True)
-                else:
-                    if msg is not None:
-                        for k,v in msg.items():
-                            self.progress_info[k][pid] = v
-                    else:
-                        self.logger.warning(f"No message received from worker {pid}")
-            self.report_status()
-            if ndone == self.global_master.n_children:
-                for p in master_processes:
-                    p.join()
-                for e in self.ensembles.values():
-                    e.save_ensemble_status()
-                break
-        self.logger.info("Done running all tasks")
+        if len(self.total_nodes) > 128:
+            self.logger.info("Running in multi level mode")
+            self.global_master.run_local_masters()
+        else:
+            self.logger.info("Running in single level mode")
+            self.global_master.run_workers()
+            
 
         
             

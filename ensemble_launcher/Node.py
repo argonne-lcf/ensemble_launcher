@@ -28,7 +28,7 @@ class Node:
         for parent_id, pipe in self.parent_pipes.items():
             pipe.send(data)
             if self.logger:
-                self.logger.info(f"Sent message to parent {parent_id}")
+                self.logger.debug(f"Sent message to parent {parent_id}")
         return 0
 
     def recv_from_parents(self, timeout: int = 60) -> list:
@@ -38,14 +38,14 @@ class Node:
                 msg = pipe.recv()
                 messages.append(msg)
                 if self.logger:
-                    self.logger.info(f"Received message from parent {parent_id}")
+                    self.logger.debug(f"Received message from parent {parent_id}")
         return messages
 
     def send_to_children(self, data) -> int:
         for child_id, pipe in self.child_pipes.items():
             pipe.send(data)
             if self.logger:
-                self.logger.info(f"Sent message to child {child_id}")
+                self.logger.debug(f"Sent message to child {child_id}")
         return 0
 
     def recv_from_children(self, timeout: int = 60) -> list:
@@ -55,14 +55,14 @@ class Node:
                 msg = pipe.recv()
                 messages.append(msg)
                 if self.logger:
-                    self.logger.info(f"Received message from child {child_id}")
+                    self.logger.debug(f"Received message from child {child_id}")
         return messages
 
     def send_to_parent(self, parent_id: int, data) -> int:
         if parent_id in self.parent_pipes:
             self.parent_pipes[parent_id].send(data)
             if self.logger:
-                self.logger.info(f"Sent message to parent {parent_id}")
+                self.logger.debug(f"Sent message to parent {parent_id}")
             return 0
         else:
             return 1
@@ -71,7 +71,7 @@ class Node:
         if parent_id in self.parent_pipes and self.parent_pipes[parent_id].poll(timeout):
             msg = self.parent_pipes[parent_id].recv()
             if self.logger:
-                self.logger.info(f"Received message from parent {parent_id}")
+                self.logger.debug(f"Received message from parent {parent_id}")
             return msg
         else:
             return None
@@ -80,7 +80,7 @@ class Node:
         if child_id in self.child_pipes:
             self.child_pipes[child_id].send(message)
             if self.logger:
-                self.logger.info(f"Sent message to child {child_id}")
+                self.logger.debug(f"Sent message to child {child_id}")
             return 0
         else:
             return 1
@@ -89,7 +89,7 @@ class Node:
         if child_id in self.child_pipes and self.child_pipes[child_id].poll(timeout):
             msg = self.child_pipes[child_id].recv()
             if self.logger:
-                self.logger.info(f"Received message from child {child_id}")
+                self.logger.debug(f"Received message from child {child_id}")
             return msg
         else:
             return None
@@ -98,34 +98,34 @@ class Node:
         if parent_id not in self.parent_pipes:
             self.parent_pipes[parent_id] = pipe
             if self.logger:
-                self.logger.info(f"Added parent {parent_id}")
+                self.logger.debug(f"Added parent {parent_id}")
         else:
             if self.logger:
-                self.logger.info(f"Parent {parent_id} already exists")
+                self.logger.debug(f"Parent {parent_id} already exists")
 
     def remove_parent(self, parent_id: int):
         if parent_id in self.parent_pipes:
             del self.parent_pipes[parent_id]
             if self.logger:
-                self.logger.info(f"Removed parent {parent_id}")
+                self.logger.debug(f"Removed parent {parent_id}")
         else:
             if self.logger:
-                self.logger.info(f"Parent {parent_id} does not exist")
+                self.logger.debug(f"Parent {parent_id} does not exist")
 
     def add_child(self, child_id: int, pipe):
         if child_id not in self.child_pipes:
             self.child_pipes[child_id] = pipe
             if self.logger:
-                self.logger.info(f"Added child {child_id}")
+                self.logger.debug(f"Added child {child_id}")
         else:
             if self.logger:
-                self.logger.info(f"Child {child_id} already exists")
+                self.logger.debug(f"Child {child_id} already exists")
 
     def remove_child(self, child_id: int):
         if child_id in self.child_pipes:
             del self.child_pipes[child_id]
             if self.logger:
-                self.logger.info(f"Removed child {child_id}")
+                self.logger.debug(f"Removed child {child_id}")
         else:
             if self.logger:
-                self.logger.info(f"Child {child_id} does not exist")
+                self.logger.debug(f"Child {child_id} does not exist")
