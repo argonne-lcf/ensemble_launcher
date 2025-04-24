@@ -378,21 +378,16 @@ class worker(Node):
             time.sleep(5)
             if len(self.get_pending_tasks()) == 0:
                 ###send signal to master
-                self.send_to_parent(0,"DONE")
-                self.send_to_parent(0,self.my_tasks)
-                tasks = self.recv_from_parent(0,timeout=10)
-                if tasks is None:
+                msg = self.recv_from_parent(0,timeout=60)
+                if msg == "NOTHING TO BE DONE":
+                    self.cleanup_resources()
+                    self.send_to_parent(0,"DONE")
+                    self.send_to_parent(0,self.my_tasks)
+                    ##close all the pipes
+                    self.close()
                     break
                 else:
-                    self.my_tasks = tasks
-        self.close()
-        if os.path.exists(self.tmp_dir):
-            try:
-                self.logger.info(f"Deleting tmpdir")
-                shutil.rmtree(self.tmp_dir)
-                self.logger.info(f"Done deleting tmpdir")
-            except Exception as e:
-                self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
+                    self.my_tasks = msg
         return None
 
     def report_status(self):
@@ -412,3 +407,23 @@ class worker(Node):
         self.logger.info(status_str)
         self.send_to_parent(0, info)
         return
+    
+    # cleanup_resources
+    def cleanup_resources(self):
+        self.logger.info("Cleaning up resources...")
+        ##kill the dangling processes
+        for task_id, task_info in self.my_tasks.items():
+            if "process" in task_info and task_info["process"]:
+                if task_info["process"].poll() is None:
+                    self.logger.info(f"Process of {task_id} is still running. So, killing it...")
+                    task_info["process"].kill()
+                    task_info["process"].wait(timeout=1)
+
+        if os.path.exists(self.tmp_dir):
+            try:
+                self.logger.info(f"Deleting tmpdir")
+                shutil.rmtree(self.tmp_dir)
+                self.logger.info(f"Done deleting tmpdir")
+            except Exception as e:
+                self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
+        

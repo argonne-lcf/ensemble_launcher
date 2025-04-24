@@ -279,6 +279,8 @@ class master(Node):
                     if msg is not None:
                         for k, v in msg.items():
                             self.progress_info[k][pid] = v
+                        if self.progress_info["nrunning_tasks"][pid] == 0:
+                            self.send_to_child(pid,"NOTHING TO BE DONE")
                     else:
                         self.logger.debug(f"No message received from child {pid}")
             ##report status
