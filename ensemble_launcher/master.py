@@ -2,6 +2,8 @@ from .worker import *
 from .Node import *
 import dragon
 import multiprocessing as mp
+import os
+import gc
 
 class master(Node):
     def __init__(self,
@@ -13,20 +15,25 @@ class master(Node):
                  parallel_backend="multiprocessing",
                  n_children:int=None,
                  max_children_nnodes:int=None,
-                 comm_config:dict={"comm_layer":"multiprocessing",
-                                    "parents":{},
-                                    "children":{}},):
+                 is_global_master:bool=False,
+                 comm_config:dict={"comm_layer":"multiprocessing"},):
         super().__init__(master_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
         self.my_master = my_master
         self.sys_info = sys_info
         self.parallel_backend = parallel_backend
+        self.is_global_master = is_global_master
         assert parallel_backend in ["multiprocessing","dragon"]
+        
+        # For tracking child processes and pipes
+        self.processes = []
+        self.policies = []
+        
         ##for now I will just use n_children = number of nodes
         ##here, I am using children instead of workers because, 
         # a master can have either workers or local masters as children
-        self.children = []
+        self.children_obj = []
         ##
         ###this will limit number of nodes assigned to each child. 
         ##Note that this option will remove tasks that have num nodes > max_children_nnodes
@@ -35,6 +42,7 @@ class master(Node):
         children_assignments = self.assign_children(n_children=n_children,max_children_nnodes=max_children_nnodes)
         self.n_children = len(children_assignments)
         self.children_nodes = []
+        self.child_pipes = []
         self.children_tasks = []
         total = 0
         for cid,assignment in children_assignments.items():
@@ -49,6 +57,45 @@ class master(Node):
         self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
+        
+        # Create appropriate children based on master type
+        self._initialize_children()
+
+
+    def _initialize_children(self):
+        """Initialize the appropriate children based on master type."""
+        for pid in range(self.n_children):
+            parent_conn, child_conn = mp.Pipe()
+            self.add_child(pid, parent_conn)
+            self.child_pipes.append(child_conn)
+            
+            if self.is_global_master:
+                # Create local masters as children
+                local_master = master(
+                    f"local_master_{pid}",
+                    self.children_tasks[pid],
+                    self.children_nodes[pid],
+                    self.sys_info,
+                    parallel_backend=self.parallel_backend,
+                    is_global_master=False,
+                )
+                self.children_obj.append(local_master)
+            else:
+                # Create workers as children
+                w = worker(
+                    f"worker_{pid}",
+                    self.children_tasks[pid],
+                    self.children_nodes[pid],
+                    self.sys_info
+                )
+                self.children_obj.append(w)
+            
+            if self.parallel_backend == "dragon":
+                policy = dragon.infrastructure.policy.Policy(
+                    placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
+                    host_name=self.children_nodes[pid][0]
+                )
+                self.policies.append(policy)
 
 
     def assign_children(self,
@@ -83,7 +130,6 @@ class master(Node):
             # Add the number of nodes required for the current task to the cumulative sum
             cum_sum_nnodes.append(cum_sum_nnodes[-1] + task["num_nodes"] if len(cum_sum_nnodes) > 0 else 0 + task["num_nodes"])
         
-        print(f"cum_sum_nnodes = {cum_sum_nnodes}")
         # Step 2: Determine the number of workers
         if n_children is not None:
             nworkers = 0
@@ -131,152 +177,158 @@ class master(Node):
         status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
         self.logger.info(f"{status_str}")
 
+    def run_children(self, parent_pipe=None):
+        """Wrapper function to run the appropriate type of children."""
+        if self.is_global_master:
+            return self._run_local_masters(parent_pipe)
+        else:
+            return self._run_workers(parent_pipe)
 
-    def run_workers(self,parent_pipe=None):
+    def _run_workers(self, parent_pipe=None):
+        """Run worker children (for local master)."""
         self.configure_logger()
         if parent_pipe:
-            self.add_parent(0,parent_pipe)
+            self.add_parent(0, parent_pipe)
         self.logger.info("Started running tasks")
+        
         for wid in range(self.n_children):
-            self.logger.info(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
-
-        if self.parallel_backend == "dragon":
-            mp.set_start_method("dragon")
-        ##create workers and corresponding processes
-        processes = []
-        policies = []
+            self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
+        
+        # Start all worker processes
         for pid in range(self.n_children):
-            w = worker( f"worker_{pid}",
-                        self.children_tasks[pid],
-                        self.children_nodes[pid],
-                        self.sys_info)
-            ##connect master and children
-            parent_conn, child_conn = mp.Pipe()
-            self.add_child(pid,parent_conn)
-            self.children.append(w)
-            ##
             if self.parallel_backend == "dragon":
-                policies.append(dragon.infrastructure.policy.Policy(
-                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
-                                        host_name=self.children_nodes[pid][0]
-                                    ))
-                p = dragon.native.process.Process(target=w.run_tasks,args=(child_conn,),policy=policies[-1])
+                p = dragon.native.process.Process(
+                    target=self.children_obj[pid].run_tasks, 
+                    args=(self.child_pipes[pid],), 
+                    policy=self.policies[pid]
+                )
             else:
-                p = mp.Process(target=w.run_tasks,args=(child_conn,))
+                p = mp.Process(
+                    target=self.children_obj[pid].run_tasks, 
+                    args=(self.child_pipes[pid],)
+                )
             p.start()
-            processes.append(p)
-            for task_id,task_info in self.children_tasks[pid].items():
+            self.processes.append(p)
+            
+            for task_id, task_info in self.children_tasks[pid].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
+                
         self.logger.info("Done forking processes")
-        ndone = 0
-        done_workers = []
         
+        # Monitor worker processes
+        return self._monitor_children()
+
+    def _run_local_masters(self, parent_pipe=None):
+        """Run local master children (for global master)."""
+        self.configure_logger()
+        if parent_pipe:
+            self.add_parent(0, parent_pipe)
+        self.logger.info("Started running tasks")
+        
+        # Start all local master processes
+        for pid in range(self.n_children):
+            if self.parallel_backend == "dragon":
+                env = os.environ.copy()
+                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
+                p = dragon.native.process.Process(
+                    target=self.children_obj[pid].run_children, 
+                    args=(self.child_pipes[pid],), 
+                    policy=self.policies[pid], 
+                    env=env
+                )
+            else:
+                p = mp.Process(
+                    target=self.children_obj[pid].run_children, 
+                    args=(self.child_pipes[pid],)
+                )
+            p.start()
+            self.processes.append(p)
+            
+            for task_id, task_info in self.children_tasks[pid].items():
+                self.my_tasks[task_id].update({"status":"running"})
+                task_info.update({"status":"running"})
+                
+        self.logger.info("Done forking masters")
+        
+        # Monitor local master processes
+        return self._monitor_children()
+    
+    def _monitor_children(self):
+        """Common monitoring code for both types of children."""
+        ndone = 0
+        done_children = []
         while True:
             for pid in range(self.n_children):
-                if pid in done_workers:
+                if pid in done_children:
                     continue
                 ##there is default timeout of 60s
-                msg = self.recv_from_child(pid,timeout=0.5)
+                msg = self.recv_from_child(pid, timeout=0.5)
                 if msg == "DONE":
                     ndone += 1
-                    done_workers.append(pid)
-                    tasks = self.recv_from_child(pid,timeout=0.5)
+                    done_children.append(pid)
+                    tasks = self.recv_from_child(pid, timeout=0.5)
                     if tasks is not None:
-                        for task_id,task_info in tasks.items():
+                        for task_id, task_info in tasks.items():
                             if task_id not in self.children_tasks[pid].keys():
-                                self.logger.warning(f"{task_id} not in worker {pid}")
+                                self.logger.warning(f"{task_id} not in child {pid}")
                             else:
                                 self.children_tasks[pid][task_id].update(task_info)
                                 self.my_tasks[task_id].update(task_info)
                 else:
                     if msg is not None:
-                        for k,v in msg.items():
+                        for k, v in msg.items():
                             self.progress_info[k][pid] = v
                     else:
-                        self.logger.debug(f"No message received from worker {pid}")
+                        self.logger.debug(f"No message received from child {pid}")
             ##report status
             self.report_status()
             if ndone == self.n_children:
-                for p in processes:
-                    p.join()
                 break
-        self.send_to_parent(0,"DONE")
-        self.send_to_parent(0,self.my_tasks)
+        self.send_to_parent(0, "DONE")
+        self.send_to_parent(0, self.my_tasks)
         self.logger.info("Done running all tasks")
-    
-    ##this function creates and launches local masters
-    def run_local_masters(self,parent_pipe=None):
-        self.configure_logger()
-        if parent_pipe:
-            self.add_parent(0,parent_pipe)
-        self.logger.info("Started running tasks")
+        self.cleanup_resources()
+        return
 
-        master_pipes = []
-        master_policies = []
-        master_processes = []
-        for pid in range(self.n_children):
-            ##create master
-            local_master = master(
-                                f"local_master_{pid}",
-                                self.children_tasks[pid],
-                                self.children_nodes[pid],
-                                self.sys_info,
-                                parallel_backend=self.parallel_backend,
-                            )
-            self.children.append(local_master)
-            parent_conn, child_conn = mp.Pipe()
-            master_pipes.append(parent_conn)
-            if self.parallel_backend == "dragon":
-                master_policies.append(dragon.infrastructure.policy.Policy(
-                                        placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
-                                        host_name=self.children_nodes[pid][0]
-                                    ))
-                env = os.environ.copy()
-                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
-                p = dragon.native.process.Process(target=local_master.run_workers, args=(child_conn,), policy=master_policies[-1], env=env)
-            else:
-                p = mp.Process(target=local_master.run_workers,args=(child_conn,))
-            p.start()
-            master_processes.append(p)
-            for task_id,task_info in self.children_tasks[pid].items():
-                self.my_tasks[task_id].update({"status":"running"})
-                task_info.update({"status":"running"})
-        self.logger.info("Done forking masters")
-        ndone = 0
-        done_masters = []
-        while True:
-            for pid in range(self.n_children):
-                if pid in done_masters:
-                    continue
-                ##there is default timeout of 60s
-                if master_pipes[pid].poll(timeout=0.5):
-                    msg = master_pipes[pid].recv()
-                else:
-                    msg = None
-                if msg == "DONE":
-                    ndone += 1
-                    done_masters.append(pid)
-                    tasks = master_pipes[pid].recv() if master_pipes[pid].poll(timeout=0.5) else None
-                    if tasks is not None:
-                        for task_id,task_info in tasks.items():
-                            if task_id not in self.children_tasks[pid].keys():
-                                self.logger.warning(f"{task_id} not in worker {pid}")
-                            else:
-                                self.children_tasks[pid][task_id].update(task_info)
-                                self.my_tasks[task_id].update(task_info)
-                else:
-                    if msg is not None:
-                        for k,v in msg.items():
-                            self.progress_info[k][pid] = v
-                    else:
-                        self.logger.warning(f"No message received from worker {pid}")
-            self.report_status()
-            if ndone == self.n_children:
-                for p in master_processes:
-                    p.join()
-                break
-        self.logger.info("Done running all tasks")
+    def cleanup_resources(self):
+        """Clean up all child processes and pipes"""
+        self.logger.info("Cleaning up resources...")
+    
+        # Terminate any running child processes
+        for i, p in enumerate(self.processes):
+            if p.is_alive():
+                try:
+                    self.logger.info(f"Terminating process {i}")
+                    p.kill()
+                    p.join(timeout=0.5)
+                except Exception as e:
+                    self.logger.error(f"Error terminating process {i}: {e}")
+        self.close()
+    
+        # Clear data structures
+        self.children_obj = []
+        self.children = {}
+        self.parents = {}
+        self.processes = []
+
+        gc.collect()  # Force garbage collection to free up memory
+        self.logger.info("Resource cleanup completed")
+    # For backward compatibility
+    def run_workers(self, parent_pipe=None):
+        return self._run_workers(parent_pipe)
+    
+    def run_local_masters(self, parent_pipe=None):
+        return self._run_local_masters(parent_pipe)
+    
+    ##there are to make sure that the cleanup_resources is called
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.cleanup_resources()
+        return False
+    
 
 
 

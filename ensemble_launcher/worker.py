@@ -16,9 +16,7 @@ class worker(Node):
                 my_tasks:dict,
                 my_nodes:list,
                 sys_info:dict,
-                comm_config:dict={"comm_layer":"multiprocessing",
-                                  "parents":{},
-                                  "children":{}}):
+                comm_config:dict={"comm_layer":"multiprocessing"}):
         super().__init__(worker_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.sys_info = sys_info
@@ -97,7 +95,6 @@ class worker(Node):
             if len(assigned_nodes) == task["num_nodes"] or \
                len(self.my_free_nodes) == 0 or \
                j >= len(self.my_free_nodes):
-                self.logger.info(f"breaking out of loop {task['index']} {len(assigned_nodes)} {task['num_nodes']} {len(self.my_free_nodes)} {j}")
                 break
 
             node = self.my_free_nodes[j]
@@ -209,7 +206,7 @@ class worker(Node):
                                     for core_set in task_info["assigned_cores"][node]:
                                         rankfile.write(f"rank {rank}={node} slot={core_set}\n")
                                         rank += 1
-                            self.logger.info(f"Over subscribing cores")
+                            self.logger.warning(f"Over subscribing cores")
                             # launcher_cmd += f"--rankfile {rankfile_path} "
                 
                 ##append all other launcher options that are not checked above
@@ -281,7 +278,6 @@ class worker(Node):
             return pre_cmd + ";"+launcher_cmd+cmd, env
         else:
             return launcher_cmd+cmd, env
-
     
     def launch_task(self, task_info:dict):
         ##check if run dir exists
@@ -376,9 +372,9 @@ class worker(Node):
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
-            self.logger.info(f"launched {launched_tasks} tasks")
+            self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
-            self.report_status_to_master()
+            self.report_status()
             time.sleep(5)
             if len(self.get_pending_tasks()) == 0:
                 ###send signal to master
@@ -389,7 +385,7 @@ class worker(Node):
                     break
                 else:
                     self.my_tasks = tasks
-
+        self.close()
         if os.path.exists(self.tmp_dir):
             try:
                 self.logger.info(f"Deleting tmpdir")
@@ -399,7 +395,7 @@ class worker(Node):
                 self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
         return None
 
-    def report_status_to_master(self):
+    def report_status(self):
         num_failed = len(self.get_failed_tasks())
         num_finished = len(self.get_finished_tasks())
         num_running = len(self.get_running_tasks())
@@ -412,11 +408,7 @@ class worker(Node):
                 "nready_tasks": num_ready,
                 "nfree_cores": nfree_cores,
                 "nfree_gpus": nfree_gpus}
-        self.logger.info(f"reporting status to master {info}")
-        self.send_to_parent(0, {"nfailed_tasks": num_failed, 
-                "nfinished_tasks": num_finished, 
-                "nrunning_tasks": num_running, 
-                "nready_tasks": num_ready,
-                "nfree_cores": nfree_cores,
-                "nfree_gpus": nfree_gpus})
+        status_str = ",".join([f"{k}:{v}" for k,v in info.items()])
+        self.logger.info(status_str)
+        self.send_to_parent(0, info)
         return

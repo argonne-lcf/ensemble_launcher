@@ -1,6 +1,3 @@
-import time
-import sys
-import socket
 import os
 from glob import glob
 from ensemble_launcher import ensemble_launcher
@@ -20,6 +17,8 @@ def get_num_nodes():
         return 1
 
 def test_cpu():
+    if os.path.exists("./run_dir"):
+        os.system("rm -rf ./run_dir")
     nprocs = 1
     ngpus = 0
 
@@ -80,7 +79,10 @@ def test_cpu():
         os.system("rm -rf ./run_dir")
 
 
+
 def test_gpu():
+    if os.path.exists("./run_dir"):
+        os.system("rm -rf ./run_dir")
     nprocs = 6
     ngpus = 1
 
@@ -143,6 +145,8 @@ def test_gpu():
         os.system("rm -rf ./run_dir")
 
 def test_cpu_and_gpu():
+    if os.path.exists("./run_dir"):
+        os.system("rm -rf ./run_dir")
     nprocs = 6
     ngpus = 1
 
@@ -205,6 +209,6 @@ def test_cpu_and_gpu():
 
     
 if __name__ == "__main__":
-    test_cpu()
     test_gpu()
+    test_cpu()
     test_cpu_and_gpu()

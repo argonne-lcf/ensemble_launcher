@@ -44,33 +44,9 @@ class ensemble_launcher:
         # self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
         # if self.global_master.n_children > 1:
         #     self.distribute_procs()
-        all_tasks = {}
+        self.all_tasks = {}
         for en,e in self.ensembles.items():
-            all_tasks.update(e.get_task_infos())
-        ##this is the global master. This is only used to split the tasks among local masters.
-        self.global_master = master(
-            "global_master",
-            all_tasks,
-            self.total_nodes,
-            self.sys_info,
-            parallel_backend=self.parallel_backend,
-            n_children= None,
-            max_children_nnodes=self.max_nodes_per_master)
-        
-        print(f"Total number of local masters: {self.global_master.n_children}")
-        for i in range(self.global_master.n_children):
-            print(f"Local master {i} has {len(self.global_master.children_tasks[i])} tasks and {len(self.global_master.children_nodes[i])} nodes")
-    
-        self.comm_config = {}
-        self.masters = []
-
-        self.progress_info = {}
-        self.progress_info["nrunning_tasks"] = [0 for i in range(self.global_master.n_children)]
-        self.progress_info["nready_tasks"] = [0 for i in range(self.global_master.n_children)]
-        self.progress_info["nfailed_tasks"] = [0 for i in range(self.global_master.n_children)]
-        self.progress_info["nfinished_tasks"] = [0 for i in range(self.global_master.n_children)]
-        self.progress_info["nfree_cores"] = [0 for i in range(self.global_master.n_children)]
-        self.progress_info["nfree_gpus"] = [0 for i in range(self.global_master.n_children)]
+            self.all_tasks.update(e.get_task_infos())
         
         return None
     
@@ -122,18 +98,6 @@ class ensemble_launcher:
             return int(os.getenv("NCPUS"))
         else:
             return os.cpu_count()
-    
-    def report_status(self):
-
-        progress_info = {}
-        for k,v in self.progress_info.items():
-            progress_info[k] = sum(v)
-        nnodes = len(self.total_nodes)
-        progress_info["total_cores"] = self.sys_info["ncores_per_node"]*nnodes
-        progress_info["total_gpus"] = self.sys_info["ngpus_per_node"]*nnodes
-        status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
-        self.logger.info(status_str)
-
 
     def get_nfd(self,process)->int:
         if process is None:
@@ -156,12 +120,33 @@ class ensemble_launcher:
         return deleted_tasks
     
     def run_tasks(self):
+
         if len(self.total_nodes) > 128:
             self.logger.info("Running in multi level mode")
-            self.global_master.run_local_masters()
+            with master(
+                "global_master",
+                self.all_tasks,
+                self.total_nodes,
+                self.sys_info,
+                parallel_backend=self.parallel_backend,
+                n_children=None,
+                max_children_nnodes=self.max_nodes_per_master,
+                is_global_master=True
+            ) as global_master:
+                global_master.run_children()
         else:
             self.logger.info("Running in single level mode")
-            self.global_master.run_workers()
+            with master(
+                "global_master",
+                self.all_tasks,
+                self.total_nodes,
+                self.sys_info,
+                parallel_backend=self.parallel_backend,
+                n_children=None,
+                max_children_nnodes=self.max_nodes_per_master,
+                is_global_master=False
+            ) as global_master:
+                global_master.run_children()
             
 
         
@@ -197,4 +182,3 @@ class ensemble_launcher:
     #         my_nodes.append(self.total_nodes[i*nn:(i+1)*nn])
     #     my_nodes[-1].extend(self.total_nodes[(i+1)*nn:])
     #     return my_nodes
-    
