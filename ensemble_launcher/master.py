@@ -17,7 +17,8 @@ class master(Node):
                  max_children_nnodes:int=None,
                  is_global_master:bool=False,
                  comm_config:dict={"comm_layer":"multiprocessing"},
-                 logging_level=logging.INFO):
+                 logging_level=logging.INFO,
+                 update_interval:int=None):
         super().__init__(master_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
@@ -26,6 +27,9 @@ class master(Node):
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
         assert parallel_backend in ["multiprocessing","dragon"]
+
+        ##used when updating my tasks
+        self.update_interval = update_interval
         
         # For tracking child processes and pipes
         self.processes = []
@@ -62,8 +66,6 @@ class master(Node):
         self.logging_level = logging_level        
         # Create appropriate children based on master type
         self._initialize_children()
-
-
 
     def _initialize_children(self):
         """Initialize the appropriate children based on master type."""
@@ -265,6 +267,7 @@ class master(Node):
         ndone = 0
         done_children = []
         while True:
+            ##First, tr
             for pid in range(self.n_children):
                 if pid in done_children:
                     continue
@@ -287,6 +290,7 @@ class master(Node):
                             self.progress_info[k][pid] = v
                     else:
                         self.logger.debug(f"No message received from child {pid}")
+            time.sleep(5)
             ##report status
             self.report_status()
             if ndone == self.n_children:
@@ -327,7 +331,10 @@ class master(Node):
     def run_local_masters(self, parent_pipe=None):
         return self._run_local_masters(parent_pipe)
     
-    ##there are to make sure that the cleanup_resources is called
+    def delete_tasks(self, deleted_tasks):
+        pass
+
+    ##these are to make sure that the cleanup_resources is called
     def __enter__(self):
         return self
     

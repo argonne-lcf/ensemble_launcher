@@ -1,10 +1,12 @@
 import multiprocessing
 import logging
+import abc
+import time
 
 """
 This class is written to abstract away the communications between workers and childs
 """
-class Node:
+class Node(abc.ABC):
     def __init__(self, node_id:str, comm_config:dict, logger=True):
         self.node_id = node_id
         self.comm_config = comm_config
@@ -139,3 +141,32 @@ class Node:
             pipe.close()
             if self.logger:
                 self.logger.debug(f"Closed child {child_id}")
+
+
+    @abc.abstractmethod
+    def delete_tasks(self, deleted_tasks: dict):
+        """
+        Abstract method that must be implemented by subclasses.
+        Deletes tasks specified in the deleted_tasks dictionary.
+        """
+        pass
+
+    def get_update_from_master(self,timeout=5):
+        ##the message is tuple of type ("UPDATE",deleted_tasks,new_tasks)
+        msg = self.recv_from_parent(0,timeout=timeout)
+        if msg is not None:
+            if isinstance(msg,tuple) and msg[0] == "UPDATE":
+                self.logger.debug(f"Started updating tasks. {msg[0]}")
+                deleted_tasks = msg[1]
+                ##delete the tasks
+                self.delete_tasks(deleted_tasks)
+                updated_tasks = msg[2]
+                for k,v in updated_tasks.items():
+                    if k not in self.my_tasks:
+                        ##make sure the status is ready
+                        v.update({"status":"ready"})
+                        self.my_tasks[k] = v
+                self.last_update_time = time.time()
+                self.logger.info("Done updating tasks...")
+        else:
+            self.logger.debug("No msg received. Skipping update...")

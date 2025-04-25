@@ -2,6 +2,7 @@ import json
 import os, stat
 import socket
 import time
+import threading
 import multiprocessing as mp
 import dragon
 from .helper_functions import *
@@ -120,12 +121,13 @@ class ensemble_launcher:
             for ensemble_name,ensemble_info in ensemble_infos.items():
                 deleted_tasks.update(self.ensembles[ensemble_name].update_ensemble(ensemble_info))
         return deleted_tasks
-    
-    def run_tasks(self):
 
+    def run_tasks(self):
+        self.last_update_time = time.time()
+        # Create the global_master outside of the context manager
         if len(self.total_nodes) > 128:
             self.logger.info("Running in multi level mode")
-            with master(
+            global_master = master(
                 "global_master",
                 self.all_tasks,
                 self.total_nodes,
@@ -135,11 +137,11 @@ class ensemble_launcher:
                 max_children_nnodes=self.max_nodes_per_master,
                 is_global_master=True,
                 logging_level=self.logging_level,
-            ) as global_master:
-                global_master.run_children()
+                update_interval=self.update_interval
+            )
         else:
             self.logger.info("Running in single level mode")
-            with master(
+            global_master = master(
                 "global_master",
                 self.all_tasks,
                 self.total_nodes,
@@ -149,8 +151,30 @@ class ensemble_launcher:
                 max_children_nnodes=self.max_nodes_per_master,
                 is_global_master=False,
                 logging_level=self.logging_level,
-            ) as global_master:
-                global_master.run_children()
+                update_interval=self.update_interval
+            )
+    
+        # Create and start the process
+        parent_conn,child_conn = mp.Pipe()
+        process = mp.Process(target=global_master.run_children)
+        process.start()
+        # if self.update_interval is not None:
+        #     while process.is_alive():
+        #         time.sleep(self.update_interval)
+        #         deleted_tasks = self.update_ensembles()
+        #         new_all_tasks = {}
+        #         for en,e in self.ensembles.items():
+        #             new_all_tasks.update(e.get_task_infos())
+        #         # Check if tasks have changed
+        #         if new_all_tasks != self.all_tasks:
+        #             self.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted.")
+        #             self.logger.info(f"Previous total tasks: {len(self.all_tasks)}, New total tasks: {len(new_all_tasks)}")
+        #             self.all_tasks = new_all_tasks
+        #         else:
+        #             self.logger.debug("No changes in tasks detected.")
+        process.join()
+    
+        return
             
 
         

@@ -18,7 +18,7 @@ class worker(Node):
                 my_nodes:list,
                 sys_info:dict,
                 comm_config:dict={"comm_layer":"multiprocessing"},
-                update_interval:int=5.0,
+                update_interval:int=None,
                 logging_level=logging.INFO):
         super().__init__(worker_id,comm_config,logger=False)
         self.my_tasks = my_tasks
@@ -385,8 +385,10 @@ class worker(Node):
             self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
             self.report_status()
+            time.sleep(5)
             ##function listens to master for updates in tasks
-            if time.time() - self.last_update_time > self.update_interval:
+            if self.update_interval is not None \
+                and time.time() - self.last_update_time > self.update_interval:
                 self.get_update_from_master()
 
             if len(self.get_pending_tasks()) == 0:
@@ -399,26 +401,6 @@ class worker(Node):
                 self.close()
                 break
         return None
-
-    def get_update_from_master(self,timeout=5):
-        ##the message is tuple of type ("UPDATE",deleted_tasks,new_tasks)
-        msg = self.recv_from_parent(0,timeout=timeout)
-        if msg is not None:
-            if isinstance(msg,tuple) and msg[0] == "UPDATE":
-                self.logger.debug(f"Started updating tasks. {msg[0]}")
-                deleted_tasks = msg[1]
-                ##delete the tasks
-                self.delete_tasks(deleted_tasks)
-                updated_tasks = msg[2]
-                for k,v in updated_tasks.items():
-                    if k not in self.my_tasks:
-                        ##make sure the status is ready
-                        v.update({"status":"ready"})
-                        self.my_tasks[k] = v
-                self.logger.info("Done updating tasks...")
-        else:
-            self.logger.debug("No msg received. Skipping update...")
-
 
 
     def report_status(self):
