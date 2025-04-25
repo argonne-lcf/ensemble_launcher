@@ -8,6 +8,7 @@ import numpy as np
 from .Node import Node
 import sys
 import socket
+import logging
 import shutil
 
 class worker(Node):
@@ -16,7 +17,9 @@ class worker(Node):
                 my_tasks:dict,
                 my_nodes:list,
                 sys_info:dict,
-                comm_config:dict={"comm_layer":"multiprocessing"}):
+                comm_config:dict={"comm_layer":"multiprocessing"},
+                update_interval:int=5.0,
+                logging_level=logging.INFO):
         super().__init__(worker_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.sys_info = sys_info
@@ -34,6 +37,9 @@ class worker(Node):
 
         self.tmp_dir = os.path.join(os.getcwd(),f".tmp/worker-{worker_id}")
         os.makedirs(self.tmp_dir,exist_ok=True)
+        self.last_update_time = time.time()
+        self.update_interval = update_interval
+        self.logging_level = logging_level
 
     def get_running_tasks(self) -> list:
         running_tasks = []
@@ -361,34 +367,59 @@ class worker(Node):
     def delete_tasks(self,task_infos:dict) -> None:
         for task in task_infos.values():
             if task["status"] == "running":
-                task["process"].terminate()
-                task["process"].wait()
+                task["process"].kill()
+                task["process"].wait(timeout=10)
                 self.free_task_nodes_base(task)
+            else:
+                for task_id in task_infos.keys():
+                    del self.my_tasks[task_id]
 
     def run_tasks(self,parent_pipe) -> None:
-        self.configure_logger()
+        self.configure_logger(self.logging_level)
         self.add_parent(0,parent_pipe)
         self.logger.info(f"Running on {socket.gethostname()}")
+        self.last_update_time = time.time()
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
             self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
             self.report_status()
-            time.sleep(5)
+            ##function listens to master for updates in tasks
+            if time.time() - self.last_update_time > self.update_interval:
+                self.get_update_from_master()
+
             if len(self.get_pending_tasks()) == 0:
-                ###send signal to master
-                msg = self.recv_from_parent(0,timeout=60)
-                if msg == "NOTHING TO BE DONE":
-                    self.cleanup_resources()
-                    self.send_to_parent(0,"DONE")
-                    self.send_to_parent(0,self.my_tasks)
-                    ##close all the pipes
-                    self.close()
-                    break
-                else:
-                    self.my_tasks = msg
+                ##wait a bit longer
+                self.get_update_from_master(timeout=30)
+                self.cleanup_resources()
+                self.send_to_parent(0,"DONE")
+                self.send_to_parent(0,self.my_tasks)
+                ##close all the pipes
+                self.close()
+                break
         return None
+
+    def get_update_from_master(self,timeout=5):
+        ##the message is tuple of type ("UPDATE",deleted_tasks,new_tasks)
+        msg = self.recv_from_parent(0,timeout=timeout)
+        if msg is not None:
+            if isinstance(msg,tuple) and msg[0] == "UPDATE":
+                self.logger.debug(f"Started updating tasks. {msg[0]}")
+                deleted_tasks = msg[1]
+                ##delete the tasks
+                self.delete_tasks(deleted_tasks)
+                updated_tasks = msg[2]
+                for k,v in updated_tasks.items():
+                    if k not in self.my_tasks:
+                        ##make sure the status is ready
+                        v.update({"status":"ready"})
+                        self.my_tasks[k] = v
+                self.logger.info("Done updating tasks...")
+        else:
+            self.logger.debug("No msg received. Skipping update...")
+
+
 
     def report_status(self):
         num_failed = len(self.get_failed_tasks())
@@ -417,7 +448,7 @@ class worker(Node):
                 if task_info["process"].poll() is None:
                     self.logger.info(f"Process of {task_id} is still running. So, killing it...")
                     task_info["process"].kill()
-                    task_info["process"].wait(timeout=1)
+                    task_info["process"].wait(timeout=10)
 
         if os.path.exists(self.tmp_dir):
             try:

@@ -16,7 +16,8 @@ class master(Node):
                  n_children:int=None,
                  max_children_nnodes:int=None,
                  is_global_master:bool=False,
-                 comm_config:dict={"comm_layer":"multiprocessing"},):
+                 comm_config:dict={"comm_layer":"multiprocessing"},
+                 logging_level=logging.INFO):
         super().__init__(master_id,comm_config,logger=False)
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
@@ -57,9 +58,11 @@ class master(Node):
         self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
-        
+
+        self.logging_level = logging_level        
         # Create appropriate children based on master type
         self._initialize_children()
+
 
 
     def _initialize_children(self):
@@ -78,6 +81,7 @@ class master(Node):
                     self.sys_info,
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
+                    logging_level=self.logging_level
                 )
                 self.children_obj.append(local_master)
             else:
@@ -86,7 +90,9 @@ class master(Node):
                     f"worker_{pid}",
                     self.children_tasks[pid],
                     self.children_nodes[pid],
-                    self.sys_info
+                    self.sys_info,
+                    update_interval=10,
+                    logging_level=self.logging_level
                 )
                 self.children_obj.append(w)
             
@@ -186,7 +192,7 @@ class master(Node):
 
     def _run_workers(self, parent_pipe=None):
         """Run worker children (for local master)."""
-        self.configure_logger()
+        self.configure_logger(self.logging_level)
         if parent_pipe:
             self.add_parent(0, parent_pipe)
         self.logger.info("Started running tasks")
@@ -221,7 +227,7 @@ class master(Node):
 
     def _run_local_masters(self, parent_pipe=None):
         """Run local master children (for global master)."""
-        self.configure_logger()
+        self.configure_logger(self.logging_level)
         if parent_pipe:
             self.add_parent(0, parent_pipe)
         self.logger.info("Started running tasks")
@@ -279,8 +285,6 @@ class master(Node):
                     if msg is not None:
                         for k, v in msg.items():
                             self.progress_info[k][pid] = v
-                        if self.progress_info["nrunning_tasks"][pid] == 0:
-                            self.send_to_child(pid,"NOTHING TO BE DONE")
                     else:
                         self.logger.debug(f"No message received from child {pid}")
             ##report status

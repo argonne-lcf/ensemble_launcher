@@ -2,6 +2,7 @@ import os
 from glob import glob
 from ensemble_launcher import ensemble_launcher
 import json
+import logging
 
 def get_num_nodes():
     """
@@ -58,7 +59,7 @@ def test_cpu():
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
 
-    el = ensemble_launcher("config.json")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -124,7 +125,7 @@ def test_gpu():
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
 
-    el = ensemble_launcher("config.json")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -187,7 +188,7 @@ def test_cpu_and_gpu():
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
 
-    el = ensemble_launcher("config.json")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -209,6 +210,6 @@ def test_cpu_and_gpu():
 
     
 if __name__ == "__main__":
-    test_gpu()
     test_cpu()
-    test_cpu_and_gpu()
+    # test_gpu()
+    # test_cpu_and_gpu()

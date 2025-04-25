@@ -16,10 +16,12 @@ class ensemble_launcher:
                  config_file:str,
                  ncores_per_node:int=None,
                  ngpus_per_node:int=None,
-                 parallel_backend="multiprocessing") -> None:
+                 parallel_backend="multiprocessing",
+                 logging_level=logging.INFO) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
+        self.logging_level = logging_level
         assert parallel_backend in ["multiprocessing","dragon"]
         if self.parallel_backend == "dragon":
             mp.set_start_method("dragon")
@@ -80,7 +82,7 @@ class ensemble_launcher:
         formatter = logging.Formatter('%(asctime)s %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(self.logging_level)
 
     def get_nodes(self) -> list:
         node_list = []
@@ -131,7 +133,8 @@ class ensemble_launcher:
                 parallel_backend=self.parallel_backend,
                 n_children=None,
                 max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=True
+                is_global_master=True,
+                logging_level=self.logging_level,
             ) as global_master:
                 global_master.run_children()
         else:
@@ -144,7 +147,8 @@ class ensemble_launcher:
                 parallel_backend=self.parallel_backend,
                 n_children=None,
                 max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=False
+                is_global_master=False,
+                logging_level=self.logging_level,
             ) as global_master:
                 global_master.run_children()
             

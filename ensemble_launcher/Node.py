@@ -16,13 +16,13 @@ class Node:
         else:
             self.logger = None
     
-    def configure_logger(self):
+    def configure_logger(self,logging_level=logging.INFO):
         self.logger = logging.getLogger(f"Node-{self.node_id}")
         handler = logging.FileHandler(f'./outputs/Node-{self.node_id}.txt', mode='w')
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging_level)
 
     def send_to_parents(self, data) -> int:
         for parent_id, pipe in self.parents.items():
