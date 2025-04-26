@@ -376,8 +376,10 @@ class worker(Node):
             launched_tasks = self.launch_ready_tasks()
             self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
-            self.report_status()
-            time.sleep(5)
+            if time.time() - self.last_update_time > 5:
+                ##report status
+                self.report_status()
+                self.last_update_time = time.time()
             kill_signal = False
             self.logger.debug(f"Update interval {self.update_interval}")
             ##function listens to master for updates in tasks

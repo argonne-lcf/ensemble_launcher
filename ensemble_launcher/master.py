@@ -77,19 +77,20 @@ class master(Node):
             if self.is_global_master:
                 # Create local masters as children
                 local_master = master(
-                    f"local_master_{pid}",
+                    f"{self.node_id}_local_master_{pid}",
                     self.children_tasks[pid],
                     self.children_nodes[pid],
                     self.sys_info,
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
-                    logging_level=self.logging_level
+                    logging_level=self.logging_level,
+                    update_interval=self.update_interval
                 )
                 self.children_obj.append(local_master)
             else:
                 # Create workers as children
                 w = worker(
-                    f"worker_{pid}",
+                    f"{self.node_id}_worker_{pid}",
                     self.children_tasks[pid],
                     self.children_nodes[pid],
                     self.sys_info,
@@ -268,12 +269,20 @@ class master(Node):
         done_children = []
         while True:
             ##First, recieve update from my master
-            if self.update_interval is not None and time.time() - self.last_update_time > self.update_interval:
+            if self.update_interval is not None:
                 msg = self.recv_from_parent(0,timeout=1)
                 if isinstance(msg,tuple) and msg[0] == "KILL":
                     self.send_to_children(("KILL",))
-                elif isinstance(msg,tuple) and msg[0] == "UPDATE":
-                    self.commit_task_update(msg[1],msg[2])
+                elif isinstance(msg,tuple) and msg[0] == "SYNC":
+                    self.logger.debug("Received a sync message from parent")
+                    self.send_to_parent(0,"SYNCED")
+                    msg = self.blocking_recv_from_parent(0)
+                    if isinstance(msg,tuple) and msg[0] == "UPDATE":
+                        successful = self.commit_task_update(msg[1],msg[2])
+                        if successful:
+                            self.send_to_parent(0,"UPDATE SUCCESSFUL")
+                        else:
+                            self.send_to_parent(0,"UPDATE UNSUCCESSFUL")
                 else:
                     self.logger.debug(f"Received unknown msg from parent: {msg}")
 
@@ -297,9 +306,11 @@ class master(Node):
                     if msg is not None:
                         for k, v in msg.items():
                             self.progress_info[k][pid] = v
-            time.sleep(5)
-            ##report status
-            self.report_status()
+            
+            if time.time() - self.last_update_time > 5:
+                ##report status
+                self.report_status()
+                self.last_update_time = time.time()
             if ndone == self.n_children:
                 break
         self.send_to_parent(0, "DONE")
@@ -369,6 +380,7 @@ class master(Node):
     def commit_task_update(self,deleted_tasks:dict,new_tasks:dict):
         deleted_children_tasks = self.delete_tasks(deleted_tasks)
         new_children_tasks = self.add_tasks(new_tasks)
+        nsuccess = 0
         for pid in range(self.n_children):
             self.logger.debug("Sending update to child "+str(pid))
             ###this block the child process
@@ -384,9 +396,10 @@ class master(Node):
             msg = self.recv_from_child(pid,timeout=300)
             if msg == "UPDATE SUCCESSFUL":
                 self.logger.info(f"Updating child {pid} successful")
+                nsuccess += 1
             else:
                 self.logger.warning(f"Update unsuccessful: {msg}")
-        return
+        return nsuccess == self.n_children
 
     ##these are to make sure that the cleanup_resources is called
     def __enter__(self):

@@ -179,13 +179,31 @@ class ensemble_launcher:
                 if len(deleted_tasks) > 0 or len(new_tasks) > 0:
                     self.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
                     ###update the global master tasks
-                    update_msg = ("UPDATE",deleted_tasks,new_tasks)
-                    parent_conn.send(update_msg)
+                    self.commit_update(parent_conn,deleted_tasks,new_tasks)
                 else:
                     self.logger.debug("No changes in tasks detected.")
         process.join()
     
         return
+
+    def commit_update(self,parent_conn,deleted_tasks:dict,new_tasks:dict):
+        nsuccess = 0
+        pid = 0
+        self.logger.debug("Sending update to global master")
+        ###this block the child process
+        parent_conn.send(("SYNC",))
+        msg = None
+        while msg != "SYNCED":
+            if parent_conn.poll(timeout=0.5):
+                msg=parent_conn.recv()
+        self.logger.debug(f"Synced with global master")
+        parent_conn.send(("UPDATE",
+                            deleted_tasks,
+                            new_tasks))
+        if parent_conn.poll(timeout=300):
+            msg = parent_conn.recv()
+        self.logger.info(f"Received {msg} from global master")
+
             
 
         

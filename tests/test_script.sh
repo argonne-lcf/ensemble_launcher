@@ -13,4 +13,4 @@ done
 
 echo "Even numbers from arguments: ${even_numbers[*]}"
 echo "started sleep"
-sleep 30
+sleep 60
