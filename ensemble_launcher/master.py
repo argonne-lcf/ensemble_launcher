@@ -19,18 +19,19 @@ class master(Node):
                  comm_config:dict={"comm_layer":"multiprocessing"},
                  logging_level=logging.INFO,
                  update_interval:int=None):
-        super().__init__(master_id,comm_config,logger=False)
-        self.my_tasks = my_tasks
-        self.my_nodes = my_nodes
+        super().__init__(master_id,
+                         my_tasks,
+                         my_nodes,
+                         sys_info,
+                         comm_config,
+                         logger=False,
+                         logging_level=logging_level,
+                         update_interval=update_interval)
         self.my_master = my_master
-        self.sys_info = sys_info
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
         assert parallel_backend in ["multiprocessing","dragon"]
 
-        ##used when updating my tasks
-        self.update_interval = update_interval
-        
         # For tracking child processes and pipes
         self.processes = []
         self.policies = []
@@ -62,8 +63,7 @@ class master(Node):
         self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
-
-        self.logging_level = logging_level        
+        
         # Create appropriate children based on master type
         self._initialize_children()
 
@@ -93,7 +93,7 @@ class master(Node):
                     self.children_tasks[pid],
                     self.children_nodes[pid],
                     self.sys_info,
-                    update_interval=10,
+                    update_interval=self.update_interval,
                     logging_level=self.logging_level
                 )
                 self.children_obj.append(w)
@@ -267,7 +267,16 @@ class master(Node):
         ndone = 0
         done_children = []
         while True:
-            ##First, tr
+            ##First, recieve update from my master
+            if self.update_interval is not None and time.time() - self.last_update_time > self.update_interval:
+                msg = self.recv_from_parent(0,timeout=1)
+                if isinstance(msg,tuple) and msg[0] == "KILL":
+                    self.send_to_children(("KILL",))
+                elif isinstance(msg,tuple) and msg[0] == "UPDATE":
+                    self.commit_task_update(msg[1],msg[2])
+                else:
+                    self.logger.debug(f"Received unknown msg from parent: {msg}")
+
             for pid in range(self.n_children):
                 if pid in done_children:
                     continue
@@ -288,8 +297,6 @@ class master(Node):
                     if msg is not None:
                         for k, v in msg.items():
                             self.progress_info[k][pid] = v
-                    else:
-                        self.logger.debug(f"No message received from child {pid}")
             time.sleep(5)
             ##report status
             self.report_status()
@@ -331,8 +338,55 @@ class master(Node):
     def run_local_masters(self, parent_pipe=None):
         return self._run_local_masters(parent_pipe)
     
-    def delete_tasks(self, deleted_tasks):
-        pass
+    def delete_tasks(self, deleted_tasks:dict)->dict:
+        children_deleted_tasks = {pid:{} for pid in range(self.n_children)}
+        for pid in range(self.n_children):
+            for task_id,task_info in self.children_tasks[pid].items():
+                if task_id in deleted_tasks:
+                    children_deleted_tasks[pid][task_id] = task_info
+            for task_id in children_deleted_tasks[pid]:
+                del self.my_tasks[task_id]
+                del self.children_tasks[pid][task_id]
+        return children_deleted_tasks
+
+
+    def add_tasks(self, new_tasks:dict):
+        sorted_new_task_ids = sorted(new_tasks.keys(),key=lambda x:new_tasks[x]["num_nodes"],reverse=True)
+        count = 0
+        new_tasks_children = {pid:{} for pid in range(self.n_children)}
+        for idx,task_id in enumerate(sorted_new_task_ids):
+            for pid in range(count%self.n_children,self.n_children):
+                if len(self.children_nodes[pid]) >= new_tasks[task_id]["num_nodes"]:
+                    new_tasks_children[pid][task_id] = new_tasks[task_id]
+                    self.children_tasks[pid][task_id] = new_tasks[task_id]
+                    count += 1
+                    self.my_tasks[task_id] = new_tasks[task_id]
+                    break
+            if pid == self.n_children:
+                self.logger.warning(f"Can't schedule task {task_id} {new_tasks[task_id]['num_nodes']} <= {len(self.children_nodes[0])}")
+        return new_tasks_children
+    
+    def commit_task_update(self,deleted_tasks:dict,new_tasks:dict):
+        deleted_children_tasks = self.delete_tasks(deleted_tasks)
+        new_children_tasks = self.add_tasks(new_tasks)
+        for pid in range(self.n_children):
+            self.logger.debug("Sending update to child "+str(pid))
+            ###this block the child process
+            self.send_to_child(pid,("SYNC",))
+            msg = None
+            while msg != "SYNCED":
+                msg=self.recv_from_child(pid,timeout=0.5)
+                self.logger.debug(f"Syncing with child {pid}:{msg}")
+            self.logger.debug(f"Synced with child {pid}:{msg}")
+            self.send_to_child(pid,("UPDATE",
+                                    deleted_children_tasks[pid],
+                                    new_children_tasks[pid]))
+            msg = self.recv_from_child(pid,timeout=300)
+            if msg == "UPDATE SUCCESSFUL":
+                self.logger.info(f"Updating child {pid} successful")
+            else:
+                self.logger.warning(f"Update unsuccessful: {msg}")
+        return
 
     ##these are to make sure that the cleanup_resources is called
     def __enter__(self):

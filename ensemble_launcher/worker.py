@@ -20,12 +20,17 @@ class worker(Node):
                 comm_config:dict={"comm_layer":"multiprocessing"},
                 update_interval:int=None,
                 logging_level=logging.INFO):
-        super().__init__(worker_id,comm_config,logger=False)
-        self.my_tasks = my_tasks
-        self.sys_info = sys_info
+        super().__init__(worker_id,
+                         my_tasks,
+                         my_nodes,
+                         sys_info,
+                         comm_config,
+                         logger=False,
+                         logging_level=logging_level,
+                         update_interval=update_interval)
+    
         assert "name" in sys_info and "ncores_per_node" in sys_info and "ngpus_per_node" in sys_info
         ##resource info
-        self.my_nodes = my_nodes
         self.free_cores_per_node = {node:list(range(self.sys_info["ncores_per_node"])) 
                                                      for node in self.my_nodes}
         if self.sys_info["name"] == "aurora":
@@ -37,9 +42,6 @@ class worker(Node):
 
         self.tmp_dir = os.path.join(os.getcwd(),f".tmp/worker-{worker_id}")
         os.makedirs(self.tmp_dir,exist_ok=True)
-        self.last_update_time = time.time()
-        self.update_interval = update_interval
-        self.logging_level = logging_level
 
     def get_running_tasks(self) -> list:
         running_tasks = []
@@ -364,16 +366,6 @@ class worker(Node):
                             "assigned_nodes":[]})
         return None
 
-    def delete_tasks(self,task_infos:dict) -> None:
-        for task in task_infos.values():
-            if task["status"] == "running":
-                task["process"].kill()
-                task["process"].wait(timeout=10)
-                self.free_task_nodes_base(task)
-            else:
-                for task_id in task_infos.keys():
-                    del self.my_tasks[task_id]
-
     def run_tasks(self,parent_pipe) -> None:
         self.configure_logger(self.logging_level)
         self.add_parent(0,parent_pipe)
@@ -386,14 +378,23 @@ class worker(Node):
             self.poll_running_tasks()
             self.report_status()
             time.sleep(5)
+            kill_signal = False
+            self.logger.debug(f"Update interval {self.update_interval}")
             ##function listens to master for updates in tasks
-            if self.update_interval is not None \
-                and time.time() - self.last_update_time > self.update_interval:
-                self.get_update_from_master()
+            if self.update_interval is not None:
+                msg = self.recv_from_parent(0,timeout=1)
+                if isinstance(msg,tuple) and msg[0] == "KILL":
+                    kill_signal = True
+                elif isinstance(msg,tuple) and msg[0] == "SYNC":
+                    self.send_to_parent(0,"SYNCED")
+                    msg = self.blocking_recv_from_parent(0)
+                    if isinstance(msg,tuple) and msg[0] == "UPDATE":
+                        self.commit_task_update(msg[1],msg[2])
+                        self.send_to_parent(0,"UPDATE SUCCESSFUL")
+                else:
+                    self.logger.debug(f"Received unknown msg from parent: {msg}")
 
-            if len(self.get_pending_tasks()) == 0:
-                ##wait a bit longer
-                self.get_update_from_master(timeout=30)
+            if kill_signal or len(self.get_pending_tasks()) == 0:
                 self.cleanup_resources()
                 self.send_to_parent(0,"DONE")
                 self.send_to_parent(0,self.my_tasks)
@@ -402,7 +403,24 @@ class worker(Node):
                 break
         return None
 
+    def delete_tasks(self,task_infos:dict) -> None:
+        task_ids = list(task_infos.keys())
+        for task_id in task_ids:
+            if self.my_tasks[task_id]["status"] == "running":
+                p = self.my_tasks[task_id]["process"]
+                p.kill()
+                p.wait(timeout=10)
+                self.free_task_nodes(self.my_tasks[task_id])
+            del self.my_tasks[task_id]
 
+    def add_tasks(self,new_tasks:dict):
+        self.my_tasks.update(new_tasks)
+    
+    def commit_task_update(self,deleted_tasks:dict,new_tasks:dict):
+        self.delete_tasks({task_id:self.my_tasks[task_id] for task_id in deleted_tasks})
+        self.logger.info(f"Got {len(new_tasks)} new task!!")
+        self.add_tasks(new_tasks)
+        
     def report_status(self):
         num_failed = len(self.get_failed_tasks())
         num_finished = len(self.get_finished_tasks())

@@ -7,8 +7,23 @@ import time
 This class is written to abstract away the communications between workers and childs
 """
 class Node(abc.ABC):
-    def __init__(self, node_id:str, comm_config:dict, logger=True):
+    def __init__(self, 
+                 node_id:str, 
+                 my_tasks:dict,
+                 my_nodes:list,
+                 sys_info:dict,
+                 comm_config:dict, 
+                 logger=True,
+                 logging_level=logging.INFO,
+                 update_interval:int=None):
         self.node_id = node_id
+        self.my_tasks = my_tasks
+        self.my_nodes = my_nodes
+        self.sys_info = sys_info
+        self.logging_level = logging_level
+        self.update_interval = update_interval
+        self.last_update_time =time.time()
+
         self.comm_config = comm_config
         assert comm_config["comm_layer"] in ["multiprocessing","dragon"]
         self.parents = {}
@@ -141,32 +156,77 @@ class Node(abc.ABC):
             pipe.close()
             if self.logger:
                 self.logger.debug(f"Closed child {child_id}")
+    
+    def blocking_recv_from_parent(self, parent_id: int):
+        """
+        Blocking receive from a specific parent. Waits indefinitely until a message is available.
+        """
+        if parent_id in self.parents:
+            msg = self.parents[parent_id].recv()  # This blocks until a message is available
+            if self.logger:
+                self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+            return msg
+        else:
+            if self.logger:
+                self.logger.debug(f"Cannot receive: Parent {parent_id} does not exist")
+            return None
+    
+    def blocking_recv_from_child(self, child_id: int):
+        """
+        Blocking receive from a specific child. Waits indefinitely until a message is available.
+        """
+        if child_id in self.children:
+            msg = self.children[child_id].recv()  # This blocks until a message is available
+            if self.logger:
+                self.logger.debug(f"Received message from parent {child_id} (blocking)")
+            return msg
+        else:
+            if self.logger:
+                self.logger.debug(f"Cannot receive: Parent {child_id} does not exist")
+            return None
+        
+    def flush_child_pipe(self, child_id: int) -> int:
+        """
+        Flush a child pipe by reading and discarding all available messages.
+        """
+        if child_id not in self.children:
+            if self.logger:
+                self.logger.debug(f"Cannot flush: Child {child_id} does not exist")
+            return -1
+        
+        count = 0
+        pipe = self.children[child_id]
+        
+        # Read all available messages without blocking
+        while pipe.poll(0):  # timeout of 0 means non-blocking
+            _ = pipe.recv()  # discard the received message
+            count += 1
+        
+        if self.logger:
+            self.logger.debug(f"Flushed {count} messages from child {child_id}")
+        
+        return count
 
 
     @abc.abstractmethod
-    def delete_tasks(self, deleted_tasks: dict):
+    def delete_tasks(self):
         """
         Abstract method that must be implemented by subclasses.
-        Deletes tasks specified in the deleted_tasks dictionary.
+        These should only modify the dictionaries
         """
         pass
 
-    def get_update_from_master(self,timeout=5):
-        ##the message is tuple of type ("UPDATE",deleted_tasks,new_tasks)
-        msg = self.recv_from_parent(0,timeout=timeout)
-        if msg is not None:
-            if isinstance(msg,tuple) and msg[0] == "UPDATE":
-                self.logger.debug(f"Started updating tasks. {msg[0]}")
-                deleted_tasks = msg[1]
-                ##delete the tasks
-                self.delete_tasks(deleted_tasks)
-                updated_tasks = msg[2]
-                for k,v in updated_tasks.items():
-                    if k not in self.my_tasks:
-                        ##make sure the status is ready
-                        v.update({"status":"ready"})
-                        self.my_tasks[k] = v
-                self.last_update_time = time.time()
-                self.logger.info("Done updating tasks...")
-        else:
-            self.logger.debug("No msg received. Skipping update...")
+    @abc.abstractmethod
+    def add_tasks(self):
+        """
+        Abstract method that adds tasks to children.
+        This should only modify the dictonaries
+        """
+        pass
+
+    @abc.abstractmethod
+    def commit_task_update(self):
+        """
+        abstract method that can send update signals to children to update tasks
+        """
+        pass

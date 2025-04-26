@@ -18,7 +18,8 @@ class ensemble_launcher:
                  ncores_per_node:int=None,
                  ngpus_per_node:int=None,
                  parallel_backend="multiprocessing",
-                 logging_level=logging.INFO) -> None:
+                 logging_level=logging.INFO,
+                 force_multi_level:bool=False) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
@@ -50,6 +51,36 @@ class ensemble_launcher:
         self.all_tasks = {}
         for en,e in self.ensembles.items():
             self.all_tasks.update(e.get_task_infos())
+        
+        # Create the global_master outside of the context manager
+        if len(self.total_nodes) > 128 or force_multi_level:
+            self.logger.info("Running in multi level mode")
+            self.global_master = master(
+                "global_master",
+                self.all_tasks,
+                self.total_nodes,
+                self.sys_info,
+                parallel_backend=self.parallel_backend,
+                n_children=None,
+                max_children_nnodes=self.max_nodes_per_master,
+                is_global_master=True,
+                logging_level=self.logging_level,
+                update_interval=self.update_interval
+            )
+        else:
+            self.logger.info("Running in single level mode")
+            self.global_master = master(
+                "global_master",
+                self.all_tasks,
+                self.total_nodes,
+                self.sys_info,
+                parallel_backend=self.parallel_backend,
+                n_children=None,
+                max_children_nnodes=self.max_nodes_per_master,
+                is_global_master=False,
+                logging_level=self.logging_level,
+                update_interval=self.update_interval
+            )
         
         return None
     
@@ -124,54 +155,34 @@ class ensemble_launcher:
 
     def run_tasks(self):
         self.last_update_time = time.time()
-        # Create the global_master outside of the context manager
-        if len(self.total_nodes) > 128:
-            self.logger.info("Running in multi level mode")
-            global_master = master(
-                "global_master",
-                self.all_tasks,
-                self.total_nodes,
-                self.sys_info,
-                parallel_backend=self.parallel_backend,
-                n_children=None,
-                max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=True,
-                logging_level=self.logging_level,
-                update_interval=self.update_interval
-            )
-        else:
-            self.logger.info("Running in single level mode")
-            global_master = master(
-                "global_master",
-                self.all_tasks,
-                self.total_nodes,
-                self.sys_info,
-                parallel_backend=self.parallel_backend,
-                n_children=None,
-                max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=False,
-                logging_level=self.logging_level,
-                update_interval=self.update_interval
-            )
     
         # Create and start the process
         parent_conn,child_conn = mp.Pipe()
-        process = mp.Process(target=global_master.run_children)
+        process = mp.Process(target=self.global_master.run_children,args=(child_conn,))
         process.start()
-        # if self.update_interval is not None:
-        #     while process.is_alive():
-        #         time.sleep(self.update_interval)
-        #         deleted_tasks = self.update_ensembles()
-        #         new_all_tasks = {}
-        #         for en,e in self.ensembles.items():
-        #             new_all_tasks.update(e.get_task_infos())
-        #         # Check if tasks have changed
-        #         if new_all_tasks != self.all_tasks:
-        #             self.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted.")
-        #             self.logger.info(f"Previous total tasks: {len(self.all_tasks)}, New total tasks: {len(new_all_tasks)}")
-        #             self.all_tasks = new_all_tasks
-        #         else:
-        #             self.logger.debug("No changes in tasks detected.")
+        if self.update_interval is not None:
+            while process.is_alive():
+                time.sleep(self.update_interval)
+                ##delete the tasks
+                deleted_tasks = self.update_ensembles()
+                for task_id in deleted_tasks:
+                    del self.all_tasks[task_id]
+                ##add any new tasks
+                new_tasks = {}
+                for en,e in self.ensembles.items():
+                    for task_id in e.get_task_ids():
+                        if task_id not in self.all_tasks:
+                            task_info = e.get_task_info(task_id)
+                            new_tasks[task_id] = task_info
+                            self.all_tasks[task_id] = task_info
+                # Check if tasks have changed
+                if len(deleted_tasks) > 0 or len(new_tasks) > 0:
+                    self.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
+                    ###update the global master tasks
+                    update_msg = ("UPDATE",deleted_tasks,new_tasks)
+                    parent_conn.send(update_msg)
+                else:
+                    self.logger.debug("No changes in tasks detected.")
         process.join()
     
         return
