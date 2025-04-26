@@ -19,7 +19,7 @@ class ensemble_launcher:
                  ngpus_per_node:int=None,
                  parallel_backend="multiprocessing",
                  logging_level=logging.INFO,
-                 force_multi_level:bool=False) -> None:
+                 force_level:str=None) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
@@ -52,38 +52,40 @@ class ensemble_launcher:
         for en,e in self.ensembles.items():
             self.all_tasks.update(e.get_task_infos())
         
-        # Create the global_master outside of the context manager
-        if len(self.total_nodes) > 128 or force_multi_level:
-            self.logger.info("Running in multi level mode")
-            self.global_master = master(
-                "global_master",
-                self.all_tasks,
-                self.total_nodes,
-                self.sys_info,
-                parallel_backend=self.parallel_backend,
-                n_children=None,
-                max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=True,
-                logging_level=self.logging_level,
-                update_interval=self.update_interval
-            )
+        if force_level is not None:
+            assert force_level in ["single","double"]
+            if force_level == "double":
+                self.global_master = self._init_global_master(True)
+            else:
+                self.global_master = self._init_global_master(False)
         else:
-            self.logger.info("Running in single level mode")
-            self.global_master = master(
-                "global_master",
-                self.all_tasks,
-                self.total_nodes,
-                self.sys_info,
-                parallel_backend=self.parallel_backend,
-                n_children=None,
-                max_children_nnodes=self.max_nodes_per_master,
-                is_global_master=False,
-                logging_level=self.logging_level,
-                update_interval=self.update_interval
-            )
+            if len(self.total_nodes) > 128:    
+                self.global_master = self._init_global_master(True)
+            else:
+                self.global_master = self._init_global_master(False)
         
         return None
     
+
+    def _init_global_master(self,is_global_master:bool):
+        if is_global_master:
+            self.logger.info("Running in multi level mode")
+        else:
+            self.logger.info("Running in single level mode")
+
+        return master(
+                "global_master",
+                self.all_tasks,
+                self.total_nodes,
+                self.sys_info,
+                parallel_backend=self.parallel_backend,
+                n_children=None,
+                max_children_nnodes=self.max_nodes_per_master,
+                is_global_master=is_global_master,
+                logging_level=self.logging_level,
+                update_interval=self.update_interval
+            )
+
     """
     Function reads the input file and builds the ensembles
     NOTES:

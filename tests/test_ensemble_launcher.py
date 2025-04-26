@@ -83,7 +83,7 @@ def test_cpu():
         os.system("rm -rf ./run_dir")
 
     ##forcing multilevel launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG, force_multi_level=True)
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG, force_level="double")
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -170,7 +170,7 @@ def test_gpu():
         os.system("rm -rf ./run_dir")
     
     ###forcing multi level launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_multi_level=True)
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double")
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -255,7 +255,7 @@ def test_cpu_and_gpu():
         os.system("rm -rf ./run_dir")
     
     ##forcing multilevel launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_multi_level=True)
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double")
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -344,7 +344,7 @@ def test_ensemble_update():
     ##forcing multilevel launcher
     # Create a function to run the ensemble launcher in a thread
     def run_ensemble_multi_level():
-        el = ensemble_launcher("config.json", logging_level=logging.DEBUG, force_multi_level=True)
+        el = ensemble_launcher("config.json", logging_level=logging.DEBUG, force_level="double")
         return el.run_tasks()
 
     write_ensemble(num_nodes,nprocs,ngpus)
