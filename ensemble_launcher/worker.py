@@ -376,7 +376,7 @@ class worker(Node):
             launched_tasks = self.launch_ready_tasks()
             self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
-            if time.time() - self.last_update_time > 5:
+            if time.time() - self.last_update_time > 1:
                 ##report status
                 self.report_status()
                 self.last_update_time = time.time()

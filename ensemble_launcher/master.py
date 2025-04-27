@@ -307,7 +307,7 @@ class master(Node):
                         for k, v in msg.items():
                             self.progress_info[k][pid] = v
             
-            if time.time() - self.last_update_time > 5:
+            if time.time() - self.last_update_time > 1:
                 ##report status
                 self.report_status()
                 self.last_update_time = time.time()
