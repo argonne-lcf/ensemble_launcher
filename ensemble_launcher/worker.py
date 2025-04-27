@@ -397,6 +397,7 @@ class worker(Node):
                     self.logger.debug(f"Received unknown msg from parent: {msg}")
 
             if kill_signal or len(self.get_pending_tasks()) == 0:
+                self.report_status()
                 self.cleanup_resources()
                 self.send_to_parent(0,"DONE")
                 self.send_to_parent(0,self.my_tasks)

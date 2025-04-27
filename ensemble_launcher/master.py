@@ -313,6 +313,7 @@ class master(Node):
                 self.last_update_time = time.time()
             if ndone == self.n_children:
                 break
+        self.report_status()
         self.send_to_parent(0, "DONE")
         self.send_to_parent(0, self.my_tasks)
         self.logger.info("Done running all tasks")
