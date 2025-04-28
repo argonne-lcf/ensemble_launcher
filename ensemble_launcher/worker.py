@@ -3,9 +3,9 @@ import subprocess
 import time
 import copy
 import multiprocessing as mp
-from .helper_functions import *
+from ensemble_launcher.helper_functions import *
 import numpy as np
-from .Node import Node
+from ensemble_launcher.Node import Node
 import sys
 import socket
 import logging

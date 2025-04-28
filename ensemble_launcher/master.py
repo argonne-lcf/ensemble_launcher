@@ -1,5 +1,5 @@
-from .worker import *
-from .Node import *
+from ensemble_launcher.worker import *
+from ensemble_launcher.Node import *
 import dragon
 import multiprocessing as mp
 import os
@@ -203,13 +203,16 @@ class master(Node):
         for wid in range(self.n_children):
             self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
         
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all worker processes
         for pid in range(self.n_children):
             if self.parallel_backend == "dragon":
                 p = dragon.native.process.Process(
                     target=self.children_obj[pid].run_tasks, 
                     args=(self.child_pipes[pid],), 
-                    policy=self.policies[pid]
+                    policy=self.policies[pid],
+                    env=env
                 )
             else:
                 p = mp.Process(
@@ -239,7 +242,7 @@ class master(Node):
         for pid in range(self.n_children):
             if self.parallel_backend == "dragon":
                 env = os.environ.copy()
-                env["PYTHONPATH"] = f"{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
+                env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
                 p = dragon.native.process.Process(
                     target=self.children_obj[pid].run_children, 
                     args=(self.child_pipes[pid],), 
@@ -326,7 +329,7 @@ class master(Node):
     
         # Terminate any running child processes
         for i, p in enumerate(self.processes):
-            if p.is_alive():
+            if p.is_alive:
                 try:
                     self.logger.info(f"Terminating process {i}")
                     p.kill()

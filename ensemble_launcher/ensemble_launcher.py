@@ -5,11 +5,11 @@ import time
 import threading
 import multiprocessing as mp
 import dragon
-from .helper_functions import *
+from ensemble_launcher.helper_functions import *
 import numpy as np
-from .ensemble import *
-from .worker import *
-from .master import *
+from ensemble_launcher.ensemble import *
+from ensemble_launcher.worker import *
+from ensemble_launcher.master import *
 import logging
 
 class ensemble_launcher:
