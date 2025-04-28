@@ -79,7 +79,7 @@ class ensemble_launcher:
                 self.total_nodes,
                 self.sys_info,
                 parallel_backend=self.parallel_backend,
-                n_children=None,
+                n_children=max(1,len(self.total_nodes)//128) if is_global_master else None,
                 max_children_nnodes=self.max_nodes_per_master,
                 is_global_master=is_global_master,
                 logging_level=self.logging_level,
