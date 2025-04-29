@@ -297,14 +297,14 @@ class master(Node):
                 if msg == "DONE":
                     ndone += 1
                     done_children.append(pid)
-                    tasks = self.recv_from_child(pid, timeout=0.5)
-                    if tasks is not None:
-                        for task_id, task_info in tasks.items():
-                            if task_id not in self.children_tasks[pid].keys():
-                                self.logger.warning(f"{task_id} not in child {pid}")
-                            else:
-                                self.children_tasks[pid][task_id].update(task_info)
-                                self.my_tasks[task_id].update(task_info)
+                    # tasks = self.recv_from_child(pid, timeout=0.5)
+                    # if tasks is not None:
+                    #     for task_id, task_info in tasks.items():
+                    #         if task_id not in self.children_tasks[pid].keys():
+                    #             self.logger.warning(f"{task_id} not in child {pid}")
+                    #         else:
+                    #             self.children_tasks[pid][task_id].update(task_info)
+                    #             self.my_tasks[task_id].update(task_info)
                 else:
                     if msg is not None:
                         for k, v in msg.items():
@@ -318,7 +318,7 @@ class master(Node):
                 break
         self.report_status()
         self.send_to_parent(0, "DONE")
-        self.send_to_parent(0, self.my_tasks)
+        # self.send_to_parent(0, self.my_tasks)
         self.logger.info("Done running all tasks")
         self.cleanup_resources()
         return

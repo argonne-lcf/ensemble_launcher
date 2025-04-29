@@ -40,8 +40,8 @@ class worker(Node):
         else:
             self.free_gpus_per_node = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.my_nodes}
 
-        self.tmp_dir = os.path.join(os.getcwd(),f".tmp/worker-{worker_id}")
-        os.makedirs(self.tmp_dir,exist_ok=True)
+        self.tmp_dir = f"/tmp/worker-{worker_id}"
+        
 
     def get_running_tasks(self) -> list:
         running_tasks = []
@@ -371,6 +371,7 @@ class worker(Node):
         self.add_parent(0,parent_pipe)
         self.logger.info(f"Running on {socket.gethostname()}")
         self.last_update_time = time.time()
+        os.makedirs(self.tmp_dir,exist_ok=True)
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
@@ -400,7 +401,7 @@ class worker(Node):
                 self.report_status()
                 self.cleanup_resources()
                 self.send_to_parent(0,"DONE")
-                self.send_to_parent(0,self.my_tasks)
+                # self.send_to_parent(0,self.my_tasks)
                 ##close all the pipes
                 self.close()
                 break
