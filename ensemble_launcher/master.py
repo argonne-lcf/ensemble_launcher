@@ -191,16 +191,16 @@ class master(Node):
         status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
         self.logger.info(f"{status_str}")
 
-    def run_children(self):
+    def run_children(self, logger=False):
         """Wrapper function to run the appropriate type of children."""
         if self.is_global_master:
-            return self._run_local_masters()
+            return self._run_local_masters(logger=logger)
         else:
-            return self._run_workers()
+            return self._run_workers(logger=logger)
 
-    def _run_workers(self):
+    def _run_workers(self,logger=False):
         """Run worker children (for local master)."""
-        self.configure_logger(self.logging_level)
+        if logger: self.configure_logger(self.logging_level)
         self.logger.info("Started running tasks")
         
         for wid in range(self.n_children):
@@ -232,9 +232,9 @@ class master(Node):
         # Monitor worker processes
         return self._monitor_children()
 
-    def _run_local_masters(self):
+    def _run_local_masters(self,logger=False):
         """Run local master children (for global master)."""
-        self.configure_logger(self.logging_level)
+        if logger: self.configure_logger(self.logging_level)
         self.logger.info("Started running tasks")
 
         # Start all local master processes

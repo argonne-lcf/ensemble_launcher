@@ -166,7 +166,7 @@ class ensemble_launcher:
     
         # Create and start the process
         parent_conn,child_conn = mp.Pipe()
-        process = mp.Process(target=self.global_master.run_children)#,args=(child_conn,))
+        process = mp.Process(target=self.global_master.run_children,args=(True,))
         process.start()
         if self.update_interval is not None:
             while process.is_alive():
