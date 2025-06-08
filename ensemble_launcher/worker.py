@@ -366,9 +366,8 @@ class worker(Node):
                             "assigned_nodes":[]})
         return None
 
-    def run_tasks(self,parent_pipe) -> None:
+    def run_tasks(self) -> None:
         self.configure_logger(self.logging_level)
-        self.add_parent(0,parent_pipe)
         self.logger.info(f"Running on {socket.gethostname()}")
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir,exist_ok=True)

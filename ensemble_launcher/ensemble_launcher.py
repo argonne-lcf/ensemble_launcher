@@ -4,7 +4,11 @@ import socket
 import time
 import threading
 import multiprocessing as mp
-import dragon
+try:
+    import dragon
+    DRAGON_AVAILABLE = True
+except ImportError:
+    DRAGON_AVAILABLE = False
 from ensemble_launcher.helper_functions import *
 import numpy as np
 from ensemble_launcher.ensemble import *
@@ -26,6 +30,8 @@ class ensemble_launcher:
         self.logging_level = logging_level
         assert parallel_backend in ["multiprocessing","dragon"]
         if self.parallel_backend == "dragon":
+            if not DRAGON_AVAILABLE:
+                raise ImportError("Dragon is not available. Please install dragon to use this backend.")
             mp.set_start_method("dragon")
         ##
         self.ensembles = {}
@@ -160,7 +166,7 @@ class ensemble_launcher:
     
         # Create and start the process
         parent_conn,child_conn = mp.Pipe()
-        process = mp.Process(target=self.global_master.run_children,args=(child_conn,))
+        process = mp.Process(target=self.global_master.run_children)#,args=(child_conn,))
         process.start()
         if self.update_interval is not None:
             while process.is_alive():

@@ -1,6 +1,11 @@
 from ensemble_launcher.worker import *
 from ensemble_launcher.Node import *
-import dragon
+try:
+    import dragon
+    DRAGON_AVAILABLE = True
+except ImportError:
+    DRAGON_AVAILABLE = False
+
 import multiprocessing as mp
 import os
 import gc
@@ -31,15 +36,16 @@ class master(Node):
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
         assert parallel_backend in ["multiprocessing","dragon"]
+        if self.parallel_backend == "dragon":
+            if not DRAGON_AVAILABLE:
+                raise ImportError("Dragon is not available. Please install dragon to use the dragon backend.")
+            mp.set_start_method("dragon")
 
         # For tracking child processes and pipes
         self.processes = []
         self.policies = []
         
-        ##for now I will just use n_children = number of nodes
-        ##here, I am using children instead of workers because, 
-        # a master can have either workers or local masters as children
-        self.children_obj = []
+
         ##
         ###this will limit number of nodes assigned to each child. 
         ##Note that this option will remove tasks that have num nodes > max_children_nnodes
@@ -70,9 +76,6 @@ class master(Node):
     def _initialize_children(self):
         """Initialize the appropriate children based on master type."""
         for pid in range(self.n_children):
-            parent_conn, child_conn = mp.Pipe()
-            self.add_child(pid, parent_conn)
-            self.child_pipes.append(child_conn)
             
             if self.is_global_master:
                 # Create local masters as children
@@ -81,12 +84,13 @@ class master(Node):
                     self.children_tasks[pid],
                     self.children_nodes[pid],
                     self.sys_info,
+                    comm_config=self.comm_config,
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
                     logging_level=self.logging_level,
                     update_interval=self.update_interval
                 )
-                self.children_obj.append(local_master)
+                self.add_child(pid,local_master)
             else:
                 # Create workers as children
                 w = worker(
@@ -94,11 +98,12 @@ class master(Node):
                     self.children_tasks[pid],
                     self.children_nodes[pid],
                     self.sys_info,
+                    comm_config=self.comm_config,
                     update_interval=self.update_interval,
                     logging_level=self.logging_level
                 )
-                self.children_obj.append(w)
-            
+                self.add_child(pid,w)
+
             if self.parallel_backend == "dragon":
                 policy = dragon.infrastructure.policy.Policy(
                     placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
@@ -186,18 +191,16 @@ class master(Node):
         status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
         self.logger.info(f"{status_str}")
 
-    def run_children(self, parent_pipe=None):
+    def run_children(self):
         """Wrapper function to run the appropriate type of children."""
         if self.is_global_master:
-            return self._run_local_masters(parent_pipe)
+            return self._run_local_masters()
         else:
-            return self._run_workers(parent_pipe)
+            return self._run_workers()
 
-    def _run_workers(self, parent_pipe=None):
+    def _run_workers(self):
         """Run worker children (for local master)."""
         self.configure_logger(self.logging_level)
-        if parent_pipe:
-            self.add_parent(0, parent_pipe)
         self.logger.info("Started running tasks")
         
         for wid in range(self.n_children):
@@ -209,15 +212,13 @@ class master(Node):
         for pid in range(self.n_children):
             if self.parallel_backend == "dragon":
                 p = dragon.native.process.Process(
-                    target=self.children_obj[pid].run_tasks, 
-                    args=(self.child_pipes[pid],), 
+                    target=self.children[pid].run_tasks, 
                     policy=self.policies[pid],
                     env=env
                 )
             else:
                 p = mp.Process(
-                    target=self.children_obj[pid].run_tasks, 
-                    args=(self.child_pipes[pid],)
+                    target=self.children[pid].run_tasks
                 )
             p.start()
             self.processes.append(p)
@@ -231,28 +232,24 @@ class master(Node):
         # Monitor worker processes
         return self._monitor_children()
 
-    def _run_local_masters(self, parent_pipe=None):
+    def _run_local_masters(self):
         """Run local master children (for global master)."""
         self.configure_logger(self.logging_level)
-        if parent_pipe:
-            self.add_parent(0, parent_pipe)
         self.logger.info("Started running tasks")
-        
+
         # Start all local master processes
         for pid in range(self.n_children):
             if self.parallel_backend == "dragon":
                 env = os.environ.copy()
                 env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
                 p = dragon.native.process.Process(
-                    target=self.children_obj[pid].run_children, 
-                    args=(self.child_pipes[pid],), 
+                    target=self.children[pid].run_children, 
                     policy=self.policies[pid], 
                     env=env
                 )
             else:
                 p = mp.Process(
-                    target=self.children_obj[pid].run_children, 
-                    args=(self.child_pipes[pid],)
+                    target=self.children[pid].run_children
                 )
             p.start()
             self.processes.append(p)

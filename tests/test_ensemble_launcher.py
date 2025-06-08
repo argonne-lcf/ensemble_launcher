@@ -372,7 +372,7 @@ def test_ensemble_update():
         os.system("rm -rf ./run_dir")
     
 if __name__ == "__main__":
-    test_ensemble_update()
-    # test_cpu()
+    # test_ensemble_update()
+    test_cpu()
     # test_gpu()
     # test_cpu_and_gpu()

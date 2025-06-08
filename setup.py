@@ -10,8 +10,10 @@ setup(
         "numpy",
         "matplotlib",
         "scienceplots",
-        "dragonhpc",
         "pytest"
     ],
+    extras_require={
+        "dragonhpc": ["dragonhpc"],
+    },
     python_requires=">=3.6",
 )
