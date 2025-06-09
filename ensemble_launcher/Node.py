@@ -42,10 +42,9 @@ class Node(abc.ABC):
         
         if self.comm_config["comm_layer"] in ["multiprocessing","dragon"]:
             ##always create pipes for multiprocessing or dragon
-            my_conn, other_conn = mp.Pipe(duplex=True)
+            # other_conn, my_conn, = mp.Pipe(duplex=True)
             ##add this to comm_config
-            self.comm_config["my_conn"] = my_conn
-            self.comm_config["other_conn"] = other_conn
+            self._other_conn,self._my_conn = mp.Pipe(duplex=True)
         elif self.comm_config["comm_layer"] == "zmq":
             assert ZMQ_AVAILABLE, "zmq not available"
             assert "role" in self.comm_config and self.comm_config["role"] in ["parent","child"]
@@ -76,40 +75,40 @@ class Node(abc.ABC):
 
     def send_to_parent(self, parent_id: int, data) -> int:
         assert parent_id == 0
-        if parent_id in self.parents:
-            if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                self.comm_config["other_conn"].send(data)
-            elif self.comm_config["comm_layer"] == "zmq":
-                self.zmq_socket.send_multipart([f"{parent_id}".encode(), data])
+        if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
             if self.logger:
-                self.logger.debug(f"Sent message to parent {parent_id}")
-            return 0
-        else:
-            return 1
-
+                my_fd = self._my_conn.fileno() if self._my_conn else 'None'
+                other_fd = self._other_conn.fileno() if self._other_conn else 'None'
+                self.logger.debug(f"send_to_parent: node {self.node_id} using pipes - my_conn={id(self._my_conn)} (fd={my_fd}), other_conn={id(self._other_conn)} (fd={other_fd})")
+            self._my_conn.send(data)
+        elif self.comm_config["comm_layer"] == "zmq":
+            self.zmq_socket.send_multipart([f"{parent_id}".encode(), data])
+        if self.logger:
+            self.logger.debug(f"Sent message to parent {parent_id}: {data}")
+        return 0
+    
     def recv_from_parent(self, parent_id: int, timeout: int = 60):
         assert parent_id == 0
-        if parent_id in self.parents:
-            if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                if self.comm_config["other_conn"].poll(timeout):
-                    msg = self.comm_config["other_conn"].recv()
-                    if self.logger:
-                        self.logger.debug(f"Received message from parent {parent_id}")
-                    return msg
-            elif self.comm_config["comm_layer"] == "zmq":
-                try:
-                    msg = self.zmq_socket.recv_multipart(zmq.NOBLOCK)
-                    if self.logger:
-                        self.logger.debug(f"Received message from parent {parent_id}")
-                    return msg
-                except zmq.ZMQError:
-                    pass
+        if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
+            if self._my_conn.poll(timeout):
+                msg = self._my_conn.recv()
+                if self.logger:
+                    self.logger.debug(f"Received message from parent {parent_id}.")
+                return msg
+        elif self.comm_config["comm_layer"] == "zmq":
+            try:
+                msg = self.zmq_socket.recv_multipart(zmq.NOBLOCK)
+                if self.logger:
+                    self.logger.debug(f"Received message from parent {parent_id}.")
+                return msg
+            except zmq.ZMQError:
+                pass
         return None
 
     def send_to_child(self, child_id: int, message) -> int:
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                self.children[child_id].comm_config["my_conn"].send(message)
+                self.children[child_id]._other_conn.send(message)
             elif self.comm_config["comm_layer"] == "zmq":
                 self.zmq_socket.send_multipart([f"{child_id}".encode(), message])
             if self.logger:
@@ -121,16 +120,25 @@ class Node(abc.ABC):
     def recv_from_child(self, child_id: int, timeout: int = 60):
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                if self.children[child_id].comm_config["my_conn"].poll(timeout):
-                    msg = self.children[child_id].comm_config["my_conn"].recv()
+                try:
                     if self.logger:
-                        self.logger.debug(f"Received message from child {child_id}")
-                    return msg
+                        my_fd = self.children[child_id]._my_conn.fileno() if self.children[child_id]._my_conn else 'None'
+                        other_fd = self.children[child_id]._other_conn.fileno() if self.children[child_id]._other_conn else 'None'
+                        self.logger.debug(f"recv_from_child pipe {child_id}: other_conn={id(self.children[child_id]._other_conn)} (fd={other_fd}), my_conn={id(self.children[child_id]._my_conn)} (fd={my_fd})")
+                    if self.children[child_id]._other_conn.poll(timeout):
+                        msg = self.children[child_id]._other_conn.recv()
+                        if self.logger:
+                            self.logger.debug(f"Received message from child {child_id}. {msg}")
+                        return msg
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Error receiving from child {child_id}: {e}")
+                    return None
             elif self.comm_config["comm_layer"] == "zmq":
                 try:
                     msg = self.zmq_socket.recv_multipart(zmq.NOBLOCK)
                     if self.logger:
-                        self.logger.debug(f"Received message from child {child_id}")
+                        self.logger.debug(f"Received message from child {child_id}. {msg}")
                     return msg
                 except zmq.ZMQError:
                     pass
@@ -141,21 +149,18 @@ class Node(abc.ABC):
         Blocking receive from a specific parent. Waits indefinitely until a message is available.
         """
         assert parent_id == 0
-        if parent_id in self.parents:
-            if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                msg = self.comm_config["other_conn"].recv()  # Blocking call
-                if self.logger:
-                    self.logger.debug(f"Received message from parent {parent_id} (blocking)")
-                return msg
-            elif self.comm_config["comm_layer"] == "zmq":
-                msg = self.zmq_socket.recv_multipart()  # Blocking call
-                if self.logger:
-                    self.logger.debug(f"Received message from parent {parent_id} (blocking)")
-                return msg
-        else:
+        if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
+            # Fix: Use my_conn consistently for receiving from parent
+            msg = self.comm_config["my_conn"].recv()  # Blocking call
             if self.logger:
-                self.logger.debug(f"Cannot receive: Parent {parent_id} does not exist")
-            return None
+                self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+            return msg
+        elif self.comm_config["comm_layer"] == "zmq":
+            msg = self.zmq_socket.recv_multipart()  # Blocking call
+            if self.logger:
+                self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+            return msg
+        return None
 
     def blocking_recv_from_child(self, child_id: int):
         """

@@ -214,7 +214,7 @@ class worker(Node):
                                     for core_set in task_info["assigned_cores"][node]:
                                         rankfile.write(f"rank {rank}={node} slot={core_set}\n")
                                         rank += 1
-                            self.logger.warning(f"Over subscribing cores")
+                            if self.logger: self.logger.warning(f"Over subscribing cores")
                             # launcher_cmd += f"--rankfile {rankfile_path} "
                 
                 ##append all other launcher options that are not checked above
@@ -366,22 +366,21 @@ class worker(Node):
                             "assigned_nodes":[]})
         return None
 
-    def run_tasks(self) -> None:
-        self.configure_logger(self.logging_level)
-        self.logger.info(f"Running on {socket.gethostname()}")
+    def run_tasks(self,logger=False) -> None:
+        if logger: 
+            self.configure_logger(self.logging_level)
+            if self.logger: self.logger.info(f"Running on {socket.gethostname()}")
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir,exist_ok=True)
         while True:
             count = 0
             launched_tasks = self.launch_ready_tasks()
-            self.logger.debug(f"launched {launched_tasks} tasks")
             self.poll_running_tasks()
             if time.time() - self.last_update_time > 1:
                 ##report status
                 self.report_status()
                 self.last_update_time = time.time()
             kill_signal = False
-            self.logger.debug(f"Update interval {self.update_interval}")
             ##function listens to master for updates in tasks
             if self.update_interval is not None:
                 msg = self.recv_from_parent(0,timeout=1)
@@ -394,7 +393,7 @@ class worker(Node):
                         self.commit_task_update(msg[1],msg[2])
                         self.send_to_parent(0,"UPDATE SUCCESSFUL")
                 else:
-                    self.logger.debug(f"Received unknown msg from parent: {msg}")
+                    if self.logger: self.logger.debug(f"Received unknown msg from parent: {msg}")
 
             if kill_signal or len(self.get_pending_tasks()) == 0:
                 self.report_status()
@@ -402,7 +401,7 @@ class worker(Node):
                 self.send_to_parent(0,"DONE")
                 # self.send_to_parent(0,self.my_tasks)
                 ##close all the pipes
-                self.close()
+                # self.close()
                 break
         return None
 
@@ -421,7 +420,7 @@ class worker(Node):
     
     def commit_task_update(self,deleted_tasks:dict,new_tasks:dict):
         self.delete_tasks({task_id:self.my_tasks[task_id] for task_id in deleted_tasks})
-        self.logger.info(f"Got {len(new_tasks)} new task!!")
+        if self.logger: self.logger.info(f"Got {len(new_tasks)} new task!!")
         self.add_tasks(new_tasks)
         
     def report_status(self):
@@ -438,26 +437,26 @@ class worker(Node):
                 "nfree_cores": nfree_cores,
                 "nfree_gpus": nfree_gpus}
         status_str = ",".join([f"{k}:{v}" for k,v in info.items()])
-        self.logger.info(status_str)
+        if self.logger: self.logger.info(status_str)
         self.send_to_parent(0, info)
         return
     
     # cleanup_resources
     def cleanup_resources(self):
-        self.logger.info("Cleaning up resources...")
+        if self.logger: self.logger.info("Cleaning up resources...")
         ##kill the dangling processes
         for task_id, task_info in self.my_tasks.items():
             if "process" in task_info and task_info["process"]:
                 if task_info["process"].poll() is None:
-                    self.logger.info(f"Process of {task_id} is still running. So, killing it...")
+                    if self.logger: self.logger.info(f"Process of {task_id} is still running. So, killing it...")
                     task_info["process"].kill()
                     task_info["process"].wait(timeout=10)
 
         if os.path.exists(self.tmp_dir):
             try:
-                self.logger.info(f"Deleting tmpdir")
+                if self.logger: self.logger.info(f"Deleting tmpdir")
                 shutil.rmtree(self.tmp_dir)
-                self.logger.info(f"Done deleting tmpdir")
+                if self.logger: self.logger.info(f"Done deleting tmpdir")
             except Exception as e:
-                self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
+                if self.logger: self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
         

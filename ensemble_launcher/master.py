@@ -69,14 +69,10 @@ class master(Node):
         self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_cores"] = [0 for i in range(self.n_children)]
         self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
-        
-        # Create appropriate children based on master type
-        self._initialize_children()
 
     def _initialize_children(self):
         """Initialize the appropriate children based on master type."""
         for pid in range(self.n_children):
-            
             if self.is_global_master:
                 # Create local masters as children
                 local_master = master(
@@ -184,14 +180,16 @@ class master(Node):
         progress_info = {}
         for k,v in self.progress_info.items():
             progress_info[k] = sum(v)
+        if self.logger:
+            self.logger.debug(f"Progress info: {progress_info}")
         self.send_to_parent(0,progress_info)
         nnodes = len(self.my_nodes)
         progress_info["total_cores"] = self.sys_info["ncores_per_node"]*nnodes
         progress_info["total_gpus"] = self.sys_info["ngpus_per_node"]*nnodes
         status_str = ",".join([f"{k}:{v}" for k,v in progress_info.items()])
-        self.logger.info(f"{status_str}")
+        if self.logger: self.logger.info(f"{status_str}")
 
-    def run_children(self, logger=False):
+    def run_children(self, logger=True):
         """Wrapper function to run the appropriate type of children."""
         if self.is_global_master:
             return self._run_local_masters(logger=logger)
@@ -200,11 +198,13 @@ class master(Node):
 
     def _run_workers(self,logger=False):
         """Run worker children (for local master)."""
-        if logger: self.configure_logger(self.logging_level)
-        self.logger.info("Started running tasks")
+        self._initialize_children()
+        if logger: 
+            self.configure_logger(self.logging_level)
+            self.logger.info("Started running tasks")
         
         for wid in range(self.n_children):
-            self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
+            if self.logger: self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
         
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
@@ -218,7 +218,7 @@ class master(Node):
                 )
             else:
                 p = mp.Process(
-                    target=self.children[pid].run_tasks
+                    target=self.children[pid].run_tasks,args=(True,)
                 )
             p.start()
             self.processes.append(p)
@@ -227,15 +227,17 @@ class master(Node):
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
                 
-        self.logger.info("Done forking processes")
+        if self.logger: self.logger.info("Done forking processes")
         
         # Monitor worker processes
         return self._monitor_children()
 
     def _run_local_masters(self,logger=False):
         """Run local master children (for global master)."""
-        if logger: self.configure_logger(self.logging_level)
-        self.logger.info("Started running tasks")
+        self._initialize_children()
+        if logger: 
+            self.configure_logger(self.logging_level)
+            self.logger.info("Started running tasks")
 
         # Start all local master processes
         for pid in range(self.n_children):
@@ -258,7 +260,7 @@ class master(Node):
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
                 
-        self.logger.info("Done forking masters")
+        if self.logger: self.logger.info("Done forking masters")
         
         # Monitor local master processes
         return self._monitor_children()
@@ -274,7 +276,7 @@ class master(Node):
                 if isinstance(msg,tuple) and msg[0] == "KILL":
                     self.send_to_children(("KILL",))
                 elif isinstance(msg,tuple) and msg[0] == "SYNC":
-                    self.logger.debug("Received a sync message from parent")
+                    if self.logger: self.logger.debug("Received a sync message from parent")
                     self.send_to_parent(0,"SYNCED")
                     msg = self.blocking_recv_from_parent(0)
                     if isinstance(msg,tuple) and msg[0] == "UPDATE":
@@ -284,7 +286,7 @@ class master(Node):
                         else:
                             self.send_to_parent(0,"UPDATE UNSUCCESSFUL")
                 else:
-                    self.logger.debug(f"Received unknown msg from parent: {msg}")
+                    if self.logger: self.logger.debug(f"Received unknown msg from parent: {msg}")
 
             for pid in range(self.n_children):
                 if pid in done_children:
@@ -294,14 +296,6 @@ class master(Node):
                 if msg == "DONE":
                     ndone += 1
                     done_children.append(pid)
-                    # tasks = self.recv_from_child(pid, timeout=0.5)
-                    # if tasks is not None:
-                    #     for task_id, task_info in tasks.items():
-                    #         if task_id not in self.children_tasks[pid].keys():
-                    #             self.logger.warning(f"{task_id} not in child {pid}")
-                    #         else:
-                    #             self.children_tasks[pid][task_id].update(task_info)
-                    #             self.my_tasks[task_id].update(task_info)
                 else:
                     if msg is not None:
                         for k, v in msg.items():
@@ -316,23 +310,23 @@ class master(Node):
         self.report_status()
         self.send_to_parent(0, "DONE")
         # self.send_to_parent(0, self.my_tasks)
-        self.logger.info("Done running all tasks")
-        self.cleanup_resources()
+        if self.logger: self.logger.info("Done running all tasks")
+        # self.cleanup_resources()
         return
 
     def cleanup_resources(self):
         """Clean up all child processes and pipes"""
-        self.logger.info("Cleaning up resources...")
+        if self.logger: self.logger.info("Cleaning up resources...")
     
         # Terminate any running child processes
         for i, p in enumerate(self.processes):
             if p.is_alive:
                 try:
-                    self.logger.info(f"Terminating process {i}")
+                    if self.logger: self.logger.info(f"Terminating process {i}")
                     p.kill()
                     p.join(timeout=0.5)
                 except Exception as e:
-                    self.logger.error(f"Error terminating process {i}: {e}")
+                    if self.logger: self.logger.error(f"Error terminating process {i}: {e}")
         self.close()
     
         # Clear data structures
@@ -342,7 +336,7 @@ class master(Node):
         self.processes = []
 
         gc.collect()  # Force garbage collection to free up memory
-        self.logger.info("Resource cleanup completed")
+        if self.logger: self.logger.info("Resource cleanup completed")
     # For backward compatibility
     def run_workers(self, parent_pipe=None):
         return self._run_workers(parent_pipe)
@@ -375,7 +369,7 @@ class master(Node):
                     self.my_tasks[task_id] = new_tasks[task_id]
                     break
             if pid == self.n_children:
-                self.logger.warning(f"Can't schedule task {task_id} {new_tasks[task_id]['num_nodes']} <= {len(self.children_nodes[0])}")
+                if self.logger: self.logger.warning(f"Can't schedule task {task_id} {new_tasks[task_id]['num_nodes']} <= {len(self.children_nodes[0])}")
         return new_tasks_children
     
     def commit_task_update(self,deleted_tasks:dict,new_tasks:dict):
@@ -383,23 +377,23 @@ class master(Node):
         new_children_tasks = self.add_tasks(new_tasks)
         nsuccess = 0
         for pid in range(self.n_children):
-            self.logger.debug("Sending update to child "+str(pid))
+            if self.logger: self.logger.debug("Sending update to child "+str(pid))
             ###this block the child process
             self.send_to_child(pid,("SYNC",))
             msg = None
             while msg != "SYNCED":
                 msg=self.recv_from_child(pid,timeout=0.5)
-                self.logger.debug(f"Syncing with child {pid}:{msg}")
-            self.logger.debug(f"Synced with child {pid}:{msg}")
+                if self.logger: self.logger.debug(f"Syncing with child {pid}:{msg}")
+            if self.logger: self.logger.debug(f"Synced with child {pid}:{msg}")
             self.send_to_child(pid,("UPDATE",
                                     deleted_children_tasks[pid],
                                     new_children_tasks[pid]))
             msg = self.recv_from_child(pid,timeout=300)
             if msg == "UPDATE SUCCESSFUL":
-                self.logger.info(f"Updating child {pid} successful")
+                if self.logger: self.logger.info(f"Updating child {pid} successful")
                 nsuccess += 1
             else:
-                self.logger.warning(f"Update unsuccessful: {msg}")
+                if self.logger: self.logger.warning(f"Update unsuccessful: {msg}")
         return nsuccess == self.n_children
 
     ##these are to make sure that the cleanup_resources is called

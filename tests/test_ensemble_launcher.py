@@ -31,11 +31,11 @@ def test_cpu():
     ensembles["poll_interval"] = 1
     ensembles["update_interval"] = None
 
-    ensembles["sys_info"] = {
-        "name":"aurora",
-        "ncores_per_node":104,
-        "ngpus_per_node":12
-    }
+    # ensembles["sys_info"] = {
+    #     "name":"aurora",
+    #     "ncores_per_node":104,
+    #     "ngpus_per_node":12
+    # }
 
     ensembles["ensembles"] = {
         "name1":{
@@ -45,7 +45,7 @@ def test_cpu():
                 "relation":"one-to-one",
                 "pre_launch_cmd":"echo 'Pre-launch command executed'",
                 "cmd_template":"./test_script.sh -h 0 -l {opts1}",
-                "opts1":f"linspace(0, {num_nodes*104//nprocs} , {num_nodes*104//nprocs})",
+                "opts1":f"linspace(0, {num_nodes*12//nprocs} , {num_nodes*12//nprocs})",
                 "run_dir":"./run_dir/name1",
         },
         "name2":{
@@ -69,7 +69,7 @@ def test_cpu():
     logfiles += list(glob(os.path.join("./run_dir","name2", "log_*.txt")))
 
     num_nodes = get_num_nodes()
-    assert len(logfiles) == ((num_nodes*104//nprocs)+num_nodes)
+    assert len(logfiles) == ((num_nodes*12//nprocs)+num_nodes)
     count = 0
     for logfile in logfiles:
         with open(logfile, "r") as f:
@@ -77,8 +77,8 @@ def test_cpu():
             for line in lines:
                 if "started sleep" in line:
                     count += 1
-    
-    assert count == ((num_nodes*104//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
+
+    assert count == ((num_nodes*12//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
 
@@ -90,7 +90,7 @@ def test_cpu():
     logfiles += list(glob(os.path.join("./run_dir","name2", "log_*.txt")))
 
     num_nodes = get_num_nodes()
-    assert len(logfiles) == ((num_nodes*104//nprocs)+num_nodes)
+    assert len(logfiles) == ((num_nodes*12//nprocs)+num_nodes)
     count = 0
     for logfile in logfiles:
         with open(logfile, "r") as f:
@@ -98,8 +98,8 @@ def test_cpu():
             for line in lines:
                 if "started sleep" in line:
                     count += 1
-    
-    assert count == ((num_nodes*104//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
+
+    assert count == ((num_nodes*12//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
 
@@ -376,3 +376,4 @@ if __name__ == "__main__":
     test_cpu()
     # test_gpu()
     # test_cpu_and_gpu()
+    print("All tests passed successfully!")

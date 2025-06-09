@@ -28,6 +28,7 @@ class ensemble_launcher:
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
         self.logging_level = logging_level
+        self.configure_logger()
         assert parallel_backend in ["multiprocessing","dragon"]
         if self.parallel_backend == "dragon":
             if not DRAGON_AVAILABLE:
@@ -42,7 +43,7 @@ class ensemble_launcher:
         self.sys_info = {}
         self.read_input_file()
         os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
-        self.configure_logger()
+        
         
         ##update the system info. NOTE: precedence order config > inputs > functions
         if "ncores_per_node" not in self.sys_info.keys():
@@ -114,6 +115,8 @@ class ensemble_launcher:
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():
                 self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info,system=self.sys_info["name"])
+                if self.logger:
+                    self.logger.info(f"Ensemble {ensemble_name} created with {self.ensembles[ensemble_name].ntasks} tasks.")
         return None
     
     def configure_logger(self):
