@@ -14,6 +14,7 @@ import numpy as np
 from ensemble_launcher.ensemble import *
 from ensemble_launcher.worker import *
 from ensemble_launcher.master import *
+from ensemble_launcher.Node import *
 import logging
 
 class ensemble_launcher:
@@ -28,13 +29,14 @@ class ensemble_launcher:
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
         self.logging_level = logging_level
-        self.configure_logger()
+
         assert parallel_backend in ["multiprocessing","dragon"]
         if self.parallel_backend == "dragon":
             if not DRAGON_AVAILABLE:
                 raise ImportError("Dragon is not available. Please install dragon to use this backend.")
             mp.set_start_method("dragon")
         ##
+
         self.ensembles = {}
         self.start_time = time.time()
         self.last_update_time = time.time()
@@ -43,7 +45,6 @@ class ensemble_launcher:
         self.sys_info = {}
         self.read_input_file()
         os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
-        
         
         ##update the system info. NOTE: precedence order config > inputs > functions
         if "ncores_per_node" not in self.sys_info.keys():
@@ -59,29 +60,31 @@ class ensemble_launcher:
         for en,e in self.ensembles.items():
             self.all_tasks.update(e.get_task_infos())
         
+
+        ###this is to just communicate with the global master
+        self.el_node = self._init_global_master(True,name="el_node",logger=True)
         if force_level is not None:
+            self.el_node.logger.info(f"Force level is set to {force_level}.")
             assert force_level in ["single","double"]
             if force_level == "double":
                 self.global_master = self._init_global_master(True)
             else:
                 self.global_master = self._init_global_master(False)
         else:
-            if len(self.total_nodes) > 128:    
+            if len(self.total_nodes) > 128:
+                self.el_node.logger.info(f"Running in multi level mode with {len(self.total_nodes)} nodes.")
                 self.global_master = self._init_global_master(True)
             else:
+                self.el_node.logger.info(f"Running in single level mode with {len(self.total_nodes)} nodes.")
                 self.global_master = self._init_global_master(False)
         
+        self.el_node.add_child(self.global_master.node_id,self.global_master)
         return None
     
 
-    def _init_global_master(self,is_global_master:bool):
-        if is_global_master:
-            self.logger.info("Running in multi level mode")
-        else:
-            self.logger.info("Running in single level mode")
-
+    def _init_global_master(self,is_global_master:bool,name:str="global_master",logger:bool=False):
         return master(
-                "global_master",
+                name,
                 self.all_tasks,
                 self.total_nodes,
                 self.sys_info,
@@ -90,7 +93,8 @@ class ensemble_launcher:
                 max_children_nnodes=self.max_nodes_per_master,
                 is_global_master=is_global_master,
                 logging_level=self.logging_level,
-                update_interval=self.update_interval
+                update_interval=self.update_interval,
+                logger=logger
             )
 
     """
@@ -115,17 +119,7 @@ class ensemble_launcher:
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():
                 self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info,system=self.sys_info["name"])
-                if self.logger:
-                    self.logger.info(f"Ensemble {ensemble_name} created with {self.ensembles[ensemble_name].ntasks} tasks.")
         return None
-    
-    def configure_logger(self):
-        self.logger = logging.getLogger(f"el")
-        handler = logging.FileHandler(f'./outputs/el_log.txt', mode='w')
-        formatter = logging.Formatter('%(asctime)s %(message)s')
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
-        self.logger.setLevel(self.logging_level)
 
     def get_nodes(self) -> list:
         node_list = []
@@ -167,8 +161,6 @@ class ensemble_launcher:
     def run_tasks(self):
         self.last_update_time = time.time()
     
-        # Create and start the process
-        parent_conn,child_conn = mp.Pipe()
         process = mp.Process(target=self.global_master.run_children,args=(True,))
         process.start()
         if self.update_interval is not None:
@@ -188,11 +180,11 @@ class ensemble_launcher:
                             self.all_tasks[task_id] = task_info
                 # Check if tasks have changed
                 if len(deleted_tasks) > 0 or len(new_tasks) > 0:
-                    self.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
+                    self.el_node.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
                     ###update the global master tasks
-                    self.commit_update(parent_conn,deleted_tasks,new_tasks)
+                    self.commit_update(self.el_node.children[self.global_master.node_id]._other_conn,deleted_tasks,new_tasks)
                 else:
-                    self.logger.debug("No changes in tasks detected.")
+                    self.el_node.logger.debug("No changes in tasks detected.")
         process.join()
     
         return
@@ -200,20 +192,20 @@ class ensemble_launcher:
     def commit_update(self,parent_conn,deleted_tasks:dict,new_tasks:dict):
         nsuccess = 0
         pid = 0
-        self.logger.debug("Sending update to global master")
+        self.el_node.logger.debug("Sending update to global master")
         ###this block the child process
         parent_conn.send(("SYNC",))
         msg = None
         while msg != "SYNCED":
             if parent_conn.poll(timeout=0.5):
                 msg=parent_conn.recv()
-        self.logger.debug(f"Synced with global master")
+        self.el_node.logger.debug(f"Synced with global master")
         parent_conn.send(("UPDATE",
                             deleted_tasks,
                             new_tasks))
         if parent_conn.poll(timeout=300):
             msg = parent_conn.recv()
-        self.logger.info(f"Received {msg} from global master")
+        self.el_node.logger.info(f"Received {msg} from global master")
 
             
 

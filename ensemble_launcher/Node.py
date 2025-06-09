@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Union, List, Dict
 import multiprocessing as mp
 import logging
 import abc
@@ -16,10 +17,10 @@ This class is written to abstract away the communications between workers and ch
 class Node(abc.ABC):
     def __init__(self, 
                  node_id:str, 
-                 my_tasks:dict,
-                 my_nodes:list,
-                 sys_info:dict,
-                 comm_config:dict, 
+                 my_tasks:dict={},
+                 my_nodes:list=[],
+                 sys_info:dict={},
+                 comm_config:dict={"comm_layer":"multiprocessing"},
                  logger=True,
                  logging_level=logging.INFO,
                  update_interval:int=None):
@@ -41,8 +42,6 @@ class Node(abc.ABC):
             self.logger = None
         
         if self.comm_config["comm_layer"] in ["multiprocessing","dragon"]:
-            ##always create pipes for multiprocessing or dragon
-            # other_conn, my_conn, = mp.Pipe(duplex=True)
             ##add this to comm_config
             self._other_conn,self._my_conn = mp.Pipe(duplex=True)
         elif self.comm_config["comm_layer"] == "zmq":
@@ -73,8 +72,7 @@ class Node(abc.ABC):
         self.logger.addHandler(handler)
         self.logger.setLevel(logging_level)
 
-    def send_to_parent(self, parent_id: int, data) -> int:
-        assert parent_id == 0
+    def send_to_parent(self, parent_id: Union[int, str], data) -> int:
         if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
             if self.logger:
                 my_fd = self._my_conn.fileno() if self._my_conn else 'None'
@@ -86,9 +84,8 @@ class Node(abc.ABC):
         if self.logger:
             self.logger.debug(f"Sent message to parent {parent_id}: {data}")
         return 0
-    
-    def recv_from_parent(self, parent_id: int, timeout: int = 60):
-        assert parent_id == 0
+
+    def recv_from_parent(self, parent_id: Union[int, str], timeout: int = 60):
         if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
             if self._my_conn.poll(timeout):
                 msg = self._my_conn.recv()
@@ -105,7 +102,7 @@ class Node(abc.ABC):
                 pass
         return None
 
-    def send_to_child(self, child_id: int, message) -> int:
+    def send_to_child(self, child_id: Union[int, str], message) -> int:
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
                 self.children[child_id]._other_conn.send(message)
@@ -116,8 +113,8 @@ class Node(abc.ABC):
             return 0
         else:
             return 1
-        
-    def recv_from_child(self, child_id: int, timeout: int = 60):
+
+    def recv_from_child(self, child_id: Union[int, str], timeout: int = 60):
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
                 try:
@@ -143,45 +140,40 @@ class Node(abc.ABC):
                 except zmq.ZMQError:
                     pass
         return None
-    
-    def blocking_recv_from_parent(self, parent_id: int):
+
+    def blocking_recv_from_parent(self, parent_id: Union[int, str]):
         """
         Blocking receive from a specific parent. Waits indefinitely until a message is available.
         """
-        assert parent_id == 0
         if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-            # Fix: Use my_conn consistently for receiving from parent
-            msg = self.comm_config["my_conn"].recv()  # Blocking call
-            if self.logger:
-                self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+            if self.logger: self.logger.debug(f"Receiving message from parent {parent_id} (blocking)")
+            msg = self._my_conn.recv()  # Blocking call
+            if self.logger: self.logger.debug(f"Received message from parent {parent_id} (blocking)")
             return msg
         elif self.comm_config["comm_layer"] == "zmq":
             msg = self.zmq_socket.recv_multipart()  # Blocking call
-            if self.logger:
-                self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+            if self.logger: self.logger.debug(f"Received message from parent {parent_id} (blocking)")
             return msg
         return None
 
-    def blocking_recv_from_child(self, child_id: int):
+    def blocking_recv_from_child(self, child_id: Union[int, str]):
         """
         Blocking receive from a specific child. Waits indefinitely until a message is available.
         """
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                msg = self.children[child_id].comm_config["my_conn"].recv()  # Blocking call
-                if self.logger:
-                    self.logger.debug(f"Received message from child {child_id} (blocking)")
+                if self.logger: self.logger.debug(f"Receiving message from child {child_id} (blocking)")
+                msg = self.children[child_id]._other_conn.recv()
+                if self.logger: self.logger.debug(f"Received message from child {child_id} (blocking)")
                 return msg
             elif self.comm_config["comm_layer"] == "zmq":
                 msg = self.zmq_socket.recv_multipart()  # Blocking call
-                if self.logger:
-                    self.logger.debug(f"Received message from child {child_id} (blocking)")
+                if self.logger: self.logger.debug(f"Received message from child {child_id} (blocking)")
                 return msg
         else:
-            if self.logger:
-                self.logger.debug(f"Cannot receive: Child {child_id} does not exist")
+            if self.logger: self.logger.debug(f"Cannot receive: Child {child_id} does not exist")
             return None
-        
+
     def send_to_parents(self, data) -> int:
         for parent_id, pipe in self.parents.items():
             self.send_to_parent(parent_id,data)
@@ -209,8 +201,8 @@ class Node(abc.ABC):
             if msg is not None:
                 messages.append(msg)
         return messages
-    
-    def add_parent(self, parent_id: int, parent: Node):
+
+    def add_parent(self, parent_id: Union[int, str], parent: Node):
         if parent_id not in self.parents:
             self.parents[parent_id] = parent
             if self.logger:
@@ -218,21 +210,21 @@ class Node(abc.ABC):
         else:
             if self.logger: self.logger.warning(f"Parent {parent_id} already exists")
 
-    def remove_parent(self, parent_id: int):
+    def remove_parent(self, parent_id: Union[int, str]):
         if parent_id in self.parents:
             del self.parents[parent_id]
             if self.logger: self.logger.debug(f"Removed parent {parent_id}")
         else:
             if self.logger: self.logger.debug(f"Parent {parent_id} does not exist")
 
-    def add_child(self, child_id: int, child: Node):
+    def add_child(self, child_id: Union[int, str], child: Node):
         if child_id not in self.children:
             self.children[child_id] = child
             if self.logger: self.logger.debug(f"Added child {child_id}")
         else:
             if self.logger: self.logger.debug(f"Child {child_id} already exists")
 
-    def remove_child(self, child_id: int):
+    def remove_child(self, child_id: Union[int, str]):
         if child_id in self.children:
             del self.children[child_id]
             if self.logger: self.logger.debug(f"Removed child {child_id}")

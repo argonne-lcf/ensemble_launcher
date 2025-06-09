@@ -22,6 +22,7 @@ class master(Node):
                  max_children_nnodes:int=None,
                  is_global_master:bool=False,
                  comm_config:dict={"comm_layer":"multiprocessing"},
+                 logger:bool=False,
                  logging_level=logging.INFO,
                  update_interval:int=None):
         super().__init__(master_id,
@@ -29,7 +30,7 @@ class master(Node):
                          my_nodes,
                          sys_info,
                          comm_config,
-                         logger=False,
+                         logger=logger,
                          logging_level=logging_level,
                          update_interval=update_interval)
         self.my_master = my_master
@@ -53,13 +54,15 @@ class master(Node):
         self.max_children_nnodes = max_children_nnodes
         children_assignments = self.assign_children(n_children=n_children,max_children_nnodes=max_children_nnodes)
         self.n_children = len(children_assignments)
-        self.children_nodes = []
-        self.child_pipes = []
-        self.children_tasks = []
+        self.children_nodes = {}
+        self.children_names = []
+        self.children_tasks = {}
+        for pid in range(self.n_children):
+            self.children_names.append(f"{self.node_id}_child_{pid}")
         total = 0
         for cid,assignment in children_assignments.items():
-            self.children_tasks.append({task_id:self.my_tasks[task_id] for task_id in assignment["task_ids"]})
-            self.children_nodes.append(self.my_nodes[total : total + assignment["nnodes"]])
+            self.children_tasks[self.children_names[cid]] = {task_id:self.my_tasks[task_id] for task_id in assignment["task_ids"]}
+            self.children_nodes[self.children_names[cid]] = self.my_nodes[total : total + assignment["nnodes"]]
             total += assignment["nnodes"]
         ##
         self.progress_info = {}
@@ -72,13 +75,13 @@ class master(Node):
 
     def _initialize_children(self):
         """Initialize the appropriate children based on master type."""
-        for pid in range(self.n_children):
+        for child_name in self.children_names:
             if self.is_global_master:
                 # Create local masters as children
                 local_master = master(
-                    f"{self.node_id}_local_master_{pid}",
-                    self.children_tasks[pid],
-                    self.children_nodes[pid],
+                    child_name,
+                    self.children_tasks[child_name],
+                    self.children_nodes[child_name],
                     self.sys_info,
                     comm_config=self.comm_config,
                     parallel_backend=self.parallel_backend,
@@ -86,24 +89,24 @@ class master(Node):
                     logging_level=self.logging_level,
                     update_interval=self.update_interval
                 )
-                self.add_child(pid,local_master)
+                self.add_child(child_name,local_master)
             else:
                 # Create workers as children
                 w = worker(
-                    f"{self.node_id}_worker_{pid}",
-                    self.children_tasks[pid],
-                    self.children_nodes[pid],
+                    child_name,
+                    self.children_tasks[child_name],
+                    self.children_nodes[child_name],
                     self.sys_info,
                     comm_config=self.comm_config,
                     update_interval=self.update_interval,
                     logging_level=self.logging_level
                 )
-                self.add_child(pid,w)
-
+                self.add_child(child_name,w)
+        
             if self.parallel_backend == "dragon":
                 policy = dragon.infrastructure.policy.Policy(
                     placement=dragon.infrastructure.policy.Policy.Placement.HOST_NAME,
-                    host_name=self.children_nodes[pid][0]
+                    host_name=self.children_nodes[child_name][0]
                 )
                 self.policies.append(policy)
 
@@ -203,27 +206,27 @@ class master(Node):
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
         
-        for wid in range(self.n_children):
+        for wid in self.children_names:
             if self.logger: self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
         
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all worker processes
-        for pid in range(self.n_children):
+        for pid,child_name in enumerate(self.children_names):
             if self.parallel_backend == "dragon":
                 p = dragon.native.process.Process(
-                    target=self.children[pid].run_tasks, 
-                    policy=self.policies[pid],
+                    target=self.children[child_name].run_tasks,
+                    policy=self.policies[child_name],
                     env=env
                 )
             else:
                 p = mp.Process(
-                    target=self.children[pid].run_tasks,args=(True,)
+                    target=self.children[child_name].run_tasks,args=(True,)
                 )
             p.start()
             self.processes.append(p)
             
-            for task_id, task_info in self.children_tasks[pid].items():
+            for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
                 
@@ -240,28 +243,28 @@ class master(Node):
             self.logger.info("Started running tasks")
 
         # Start all local master processes
-        for pid in range(self.n_children):
+        for pid,child_name in enumerate(self.children_names):
             if self.parallel_backend == "dragon":
                 env = os.environ.copy()
                 env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
                 p = dragon.native.process.Process(
-                    target=self.children[pid].run_children, 
-                    policy=self.policies[pid], 
+                    target=self.children[child_name].run_children, 
+                    policy=self.policies[child_name], 
                     env=env
                 )
             else:
                 p = mp.Process(
-                    target=self.children[pid].run_children
+                    target=self.children[child_name].run_children
                 )
             p.start()
             self.processes.append(p)
-            
-            for task_id, task_info in self.children_tasks[pid].items():
+
+            for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
-                
+
         if self.logger: self.logger.info("Done forking masters")
-        
+
         # Monitor local master processes
         return self._monitor_children()
     
@@ -272,6 +275,7 @@ class master(Node):
         while True:
             ##First, recieve update from my master
             if self.update_interval is not None:
+                if self.logger: self.logger.debug("Waiting for update from parent")
                 msg = self.recv_from_parent(0,timeout=1)
                 if isinstance(msg,tuple) and msg[0] == "KILL":
                     self.send_to_children(("KILL",))
@@ -292,7 +296,7 @@ class master(Node):
                 if pid in done_children:
                     continue
                 ##there is default timeout of 60s
-                msg = self.recv_from_child(pid, timeout=0.5)
+                msg = self.recv_from_child(self.children_names[pid], timeout=0.5)
                 if msg == "DONE":
                     ndone += 1
                     done_children.append(pid)
@@ -345,26 +349,27 @@ class master(Node):
         return self._run_local_masters(parent_pipe)
     
     def delete_tasks(self, deleted_tasks:dict)->dict:
-        children_deleted_tasks = {pid:{} for pid in range(self.n_children)}
-        for pid in range(self.n_children):
-            for task_id,task_info in self.children_tasks[pid].items():
+        children_deleted_tasks = {child_name:{} for child_name in self.children_names}
+        for pid,child_name in enumerate(self.children_names):
+            for task_id,task_info in self.children_tasks[child_name].items():
                 if task_id in deleted_tasks:
-                    children_deleted_tasks[pid][task_id] = task_info
-            for task_id in children_deleted_tasks[pid]:
+                    children_deleted_tasks[child_name][task_id] = task_info
+            for task_id in children_deleted_tasks[child_name].keys():
                 del self.my_tasks[task_id]
-                del self.children_tasks[pid][task_id]
+                del self.children_tasks[child_name][task_id]
         return children_deleted_tasks
 
 
     def add_tasks(self, new_tasks:dict):
         sorted_new_task_ids = sorted(new_tasks.keys(),key=lambda x:new_tasks[x]["num_nodes"],reverse=True)
         count = 0
-        new_tasks_children = {pid:{} for pid in range(self.n_children)}
+        new_tasks_children = {child_name:{} for child_name in self.children_names}
         for idx,task_id in enumerate(sorted_new_task_ids):
             for pid in range(count%self.n_children,self.n_children):
-                if len(self.children_nodes[pid]) >= new_tasks[task_id]["num_nodes"]:
-                    new_tasks_children[pid][task_id] = new_tasks[task_id]
-                    self.children_tasks[pid][task_id] = new_tasks[task_id]
+                child_name = self.children_names[pid]
+                if len(self.children_nodes[child_name]) >= new_tasks[task_id]["num_nodes"]:
+                    new_tasks_children[child_name][task_id] = new_tasks[task_id]
+                    self.children_tasks[child_name][task_id] = new_tasks[task_id]
                     count += 1
                     self.my_tasks[task_id] = new_tasks[task_id]
                     break
@@ -376,21 +381,21 @@ class master(Node):
         deleted_children_tasks = self.delete_tasks(deleted_tasks)
         new_children_tasks = self.add_tasks(new_tasks)
         nsuccess = 0
-        for pid in range(self.n_children):
-            if self.logger: self.logger.debug("Sending update to child "+str(pid))
+        for child_name in self.children_names:
+            if self.logger: self.logger.debug("Sending update to child "+child_name)
             ###this block the child process
-            self.send_to_child(pid,("SYNC",))
+            self.send_to_child(child_name,("SYNC",))
             msg = None
             while msg != "SYNCED":
-                msg=self.recv_from_child(pid,timeout=0.5)
-                if self.logger: self.logger.debug(f"Syncing with child {pid}:{msg}")
-            if self.logger: self.logger.debug(f"Synced with child {pid}:{msg}")
-            self.send_to_child(pid,("UPDATE",
-                                    deleted_children_tasks[pid],
-                                    new_children_tasks[pid]))
-            msg = self.recv_from_child(pid,timeout=300)
+                msg=self.recv_from_child(child_name,timeout=0.5)
+                if self.logger: self.logger.debug(f"Syncing with child {child_name}:{msg}")
+            if self.logger: self.logger.debug(f"Synced with child {child_name}:{msg}")
+            self.send_to_child(child_name,("UPDATE",
+                                    deleted_children_tasks[child_name],
+                                    new_children_tasks[child_name]))
+            msg = self.recv_from_child(child_name,timeout=300)
             if msg == "UPDATE SUCCESSFUL":
-                if self.logger: self.logger.info(f"Updating child {pid} successful")
+                if self.logger: self.logger.info(f"Updating child {child_name} successful")
                 nsuccess += 1
             else:
                 if self.logger: self.logger.warning(f"Update unsuccessful: {msg}")

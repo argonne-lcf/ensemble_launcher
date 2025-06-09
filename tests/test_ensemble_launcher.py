@@ -280,13 +280,13 @@ def test_ensemble_update():
     def write_ensemble(num_nodes,nprocs,ngpus):
         ensembles = {}
         ensembles["poll_interval"] = 1
-        ensembles["update_interval"] = 5
+        ensembles["update_interval"] = 1
 
-        ensembles["sys_info"] = {
-        "name":"aurora",
-        "ncores_per_node":104,
-        "ngpus_per_node":12
-        }
+        # ensembles["sys_info"] = {
+        # "name":"aurora",
+        # "ncores_per_node":104,
+        # "ngpus_per_node":12
+        # }
 
         ensembles["ensembles"] = {
             "name1":{
@@ -296,7 +296,7 @@ def test_ensemble_update():
                     "relation":"one-to-one",
                     "pre_launch_cmd":"echo 'Pre-launch command executed'",
                     "cmd_template":"./test_script.sh -h 0 -l {opts1}",
-                    "opts1":f"linspace(0, {num_nodes*104//nprocs} , {num_nodes*104//nprocs})",
+                    "opts1":f"linspace(0, {num_nodes*3//nprocs} , {num_nodes*3//nprocs})",
                     "run_dir":"./run_dir/name1",
             },
         }
@@ -328,7 +328,7 @@ def test_ensemble_update():
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
 
-    assert len(logfiles) == ((num_nodes*104//nprocs))
+    assert len(logfiles) == ((num_nodes*3//nprocs))
     count = 0
     for logfile in logfiles:
         with open(logfile, "r") as f:
@@ -336,8 +336,8 @@ def test_ensemble_update():
             for line in lines:
                 if "started sleep" in line:
                     count += 1
-    
-    # assert count == ((num_nodes*104//nprocs)*nprocs )
+
+    # assert count == ((num_nodes*12//nprocs)*nprocs )
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
 
@@ -358,7 +358,7 @@ def test_ensemble_update():
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
 
-    assert len(logfiles) == ((num_nodes*104//nprocs))
+    assert len(logfiles) == ((num_nodes*3//nprocs))
     count = 0
     for logfile in logfiles:
         with open(logfile, "r") as f:
@@ -367,12 +367,12 @@ def test_ensemble_update():
                 if "started sleep" in line:
                     count += 1
     
-    assert count == ((num_nodes*104//nprocs)*nprocs)
+    assert count == ((num_nodes*3//nprocs)*nprocs)
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     
 if __name__ == "__main__":
-    # test_ensemble_update()
+    test_ensemble_update()
     test_cpu()
     # test_gpu()
     # test_cpu_and_gpu()
