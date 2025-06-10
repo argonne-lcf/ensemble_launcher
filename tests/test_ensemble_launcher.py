@@ -379,7 +379,7 @@ def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}):
 if __name__ == "__main__":
     print("Running tests...This may take a while")
     comm_layers = [
-        {"name": "multiprocessing", "config": {"comm_layer": "multiprocessing"}},
+        # {"name": "multiprocessing", "config": {"comm_layer": "multiprocessing"}},
         {"name": "zmq", "config": {"comm_layer": "zmq"}}
     ]
     

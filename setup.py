@@ -14,6 +14,7 @@ setup(
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
+        "zmq": ["pyzmq"],
     },
     python_requires=">=3.6",
 )
