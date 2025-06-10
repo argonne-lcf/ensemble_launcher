@@ -6,6 +6,7 @@ import abc
 import time
 import socket
 import random
+import pickle
 try:
     import zmq
     ZMQ_AVAILABLE = True
@@ -48,33 +49,48 @@ class Node(abc.ABC):
         elif self.comm_config["comm_layer"] == "zmq":
             assert ZMQ_AVAILABLE, "zmq not available"
             assert "role" in self.comm_config and self.comm_config["role"] in ["parent","child"]
-            self.zmq_context = zmq.Context()
-            if self.comm_config["role"] == "parent":
-                self.zmq_socket = self.zmq_context.socket(zmq.ROUTER)
-                parent_address = self.comm_config.get("parent-address",f"{socket.gethostname() if 'local' not in socket.gethostname() else 'localhost'}:5555")
-                self.zmq_socket.setsockopt(zmq.IDENTITY,f"{node_id}".encode())
-                try:
-                    self.zmq_socket.bind(f"tcp://{parent_address}")
-                except zmq.error.ZMQError as e:
-                    if "Address already in use" in str(e):
-                        # Try to bind to a different port
-                        port = int(parent_address.split(':')[-1]) + random.randint(1, 1000)
-                        if self.logger: self.logger.info(f"Trying to bind to port {port} instead.")
-                        parent_address = f"{parent_address.rsplit(':', 1)[0]}:{port}"
-                        self.zmq_socket.bind(f"tcp://{parent_address}")
-                    else:
-                        raise e
-                self.comm_config["parent-address"] = parent_address
-            else:
-                assert "parent-address" in self.comm_config, "Child needs parent-address"
-                self.zmq_socket = self.zmq_context.socket(zmq.DEALER)
-                self.zmq_socket.setsockopt(zmq.IDENTITY,f"{node_id}".encode())
-                if self.logger: self.logger.info(f"connecting to:{self.comm_config['parent-address']}")
-                self.zmq_socket.connect(f"tcp://{self.comm_config['parent-address']}")
-                self.zmq_socket.send_multipart([f"{node_id}".encode(),b"READY"])
+            self.zmq_context = None
+            self.router_socket = None
+            self.dealer_socket = None
+            self.parent_address = None
+            self.my_address = None
+            self.router_cache = None
+            self.router_poller = None
+            self.dealer_poller = None
         else:
+            self._my_conn = None
+            self._other_conn = None
             self.zmq_context = None
             self.zmq_socket = None
+
+    def setup_zmq_sockets(self):
+        self.zmq_context = zmq.Context()
+        if self.comm_config["role"] == "parent":
+            self.router_socket = self.zmq_context.socket(zmq.ROUTER)
+            self.my_address = self.comm_config.get("parent-address",f"{socket.gethostname() if 'local' not in socket.gethostname() else 'localhost'}:5555")
+            self.router_socket.setsockopt(zmq.IDENTITY,f"{self.node_id}".encode())
+            self.router_cache = {}
+            try:
+                self.router_socket.bind(f"tcp://{self.my_address}")
+            except zmq.error.ZMQError as e:
+                if "Address already in use" in str(e):
+                    # Try to bind to a different port
+                    port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
+                    if self.logger: self.logger.info(f"Trying to bind to port {port} instead.")
+                    self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
+                    self.router_socket.bind(f"tcp://{self.my_address}")
+                else:
+                    raise e
+            self.router_poller = zmq.Poller()
+            self.router_poller.register(self.router_socket, zmq.POLLIN)
+        if self.parent_address is not None:
+            self.dealer_socket = self.zmq_context.socket(zmq.DEALER)
+            self.dealer_socket.setsockopt(zmq.IDENTITY,f"{self.node_id}".encode())
+            if self.logger: self.logger.info(f"connecting to:{self.parent_address}")
+            self.dealer_socket.connect(f"tcp://{self.parent_address}")
+            self.dealer_poller = zmq.Poller()
+            self.dealer_poller.register(self.dealer_socket, zmq.POLLIN)
+            # self.dealer_socket.send_multipart([f"{self.node_id}".encode(),b"READY"])
 
     def configure_logger(self,logging_level=logging.INFO):
         self.logger = logging.getLogger(f"Node-{self.node_id}")
@@ -92,7 +108,12 @@ class Node(abc.ABC):
                 self.logger.debug(f"send_to_parent: node {self.node_id} using pipes - my_conn={id(self._my_conn)} (fd={my_fd}), other_conn={id(self._other_conn)} (fd={other_fd})")
             self._my_conn.send(data)
         elif self.comm_config["comm_layer"] == "zmq":
-            self.zmq_socket.send_multipart([f"{parent_id}".encode(), data])
+            if self.dealer_socket is not None:
+                self.dealer_socket.send(pickle.dumps(data))
+            else:
+                if self.logger:
+                    self.logger.warning(f"Cannot send to parent {parent_id}: dealer_socket is not initialized.")
+                return 1
         if self.logger:
             self.logger.debug(f"Sent message to parent {parent_id}: {data}")
         return 0
@@ -102,16 +123,22 @@ class Node(abc.ABC):
             if self._my_conn.poll(timeout):
                 msg = self._my_conn.recv()
                 if self.logger:
-                    self.logger.debug(f"Received message from parent {parent_id}.")
+                    self.logger.debug(f"Received message {msg} from parent {parent_id}.")
                 return msg
         elif self.comm_config["comm_layer"] == "zmq":
-            try:
-                msg = self.zmq_socket.recv_multipart(zmq.NOBLOCK)
+            if self.dealer_socket is not None:
+                socks = dict(self.dealer_poller.poll(timeout * 1000))  # convert timeout to milliseconds
+                if self.dealer_socket in socks and socks[self.dealer_socket] == zmq.POLLIN:
+                    msg = pickle.loads(self.dealer_socket.recv())
+                    if self.logger:
+                        self.logger.debug(f"Received message {msg} from parent {parent_id}.")
+                    return msg
+            else:
                 if self.logger:
-                    self.logger.debug(f"Received message from parent {parent_id}.")
-                return msg
-            except zmq.ZMQError:
-                pass
+                    self.logger.warning(f"Cannot receive from parent {parent_id}: dealer_socket is not initialized.")
+                raise RuntimeError("dealer_socket is not initialized")
+        if self.logger:
+            self.logger.debug(f"No message received from parent {parent_id} within timeout {timeout} seconds.")
         return None
 
     def send_to_child(self, child_id: Union[int, str], message) -> int:
@@ -119,7 +146,7 @@ class Node(abc.ABC):
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
                 self.children[child_id]._other_conn.send(message)
             elif self.comm_config["comm_layer"] == "zmq":
-                self.zmq_socket.send_multipart([f"{child_id}".encode(), message])
+                self.router_socket.send_multipart([f"{child_id}".encode(), pickle.dumps(message)])
             if self.logger:
                 self.logger.debug(f"Sent message to child {child_id}")
             return 0
@@ -129,62 +156,86 @@ class Node(abc.ABC):
     def recv_from_child(self, child_id: Union[int, str], timeout: int = 60):
         if child_id in self.children:
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                try:
+                if self.logger:
+                    my_fd = self.children[child_id]._my_conn.fileno() if self.children[child_id]._my_conn else 'None'
+                    other_fd = self.children[child_id]._other_conn.fileno() if self.children[child_id]._other_conn else 'None'
+                    self.logger.debug(f"recv_from_child pipe {child_id}: other_conn={id(self.children[child_id]._other_conn)} (fd={other_fd}), my_conn={id(self.children[child_id]._my_conn)} (fd={my_fd})")
+                if self.children[child_id]._other_conn.poll(timeout):
+                    msg = self.children[child_id]._other_conn.recv()
                     if self.logger:
-                        my_fd = self.children[child_id]._my_conn.fileno() if self.children[child_id]._my_conn else 'None'
-                        other_fd = self.children[child_id]._other_conn.fileno() if self.children[child_id]._other_conn else 'None'
-                        self.logger.debug(f"recv_from_child pipe {child_id}: other_conn={id(self.children[child_id]._other_conn)} (fd={other_fd}), my_conn={id(self.children[child_id]._my_conn)} (fd={my_fd})")
-                    if self.children[child_id]._other_conn.poll(timeout):
-                        msg = self.children[child_id]._other_conn.recv()
-                        if self.logger:
-                            self.logger.debug(f"Received message from child {child_id}. {msg}")
-                        return msg
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(f"Error receiving from child {child_id}: {e}")
-                    return None
-            elif self.comm_config["comm_layer"] == "zmq":
-                try:
-                    msg = self.zmq_socket.recv_multipart(zmq.NOBLOCK)
-                    if self.logger:
-                        self.logger.debug(f"Received message from child {child_id}. {msg}")
+                        self.logger.debug(f"Received message {msg} from child {child_id}.")
                     return msg
-                except zmq.ZMQError:
-                    pass
+            elif self.comm_config["comm_layer"] == "zmq":
+                if child_id in self.router_cache:
+                    msg = self.router_cache[child_id]
+                    del self.router_cache[child_id]
+                    if self.logger:
+                        self.logger.debug(f"Received cached message from child {child_id}. {msg}")
+                    return msg
+                tstart = time.time()
+                while time.time() - tstart < timeout:
+                    socks = dict(self.router_poller.poll(100)) #wait for 100ms
+                    if self.router_socket in socks and socks[self.router_socket] == zmq.POLLIN:
+                        msg = self.router_socket.recv_multipart()
+                        msg[0] = msg[0].decode()  # Convert bytes to string for child_id
+                        msg[1] = pickle.loads(msg[1])  # Unpickle the message
+                        # wait for a message from the child
+                        if msg[0] == str(child_id):
+                            if self.logger:
+                                self.logger.debug(f"Received message {msg[1]} from child {child_id}.")
+                            return msg[1]
+                        else:
+                            if self.logger:
+                                self.logger.debug(f"Received message from child {msg[0]}, but expected {child_id}. Caching the message.")
+                            self.router_cache[msg[0]] = msg[1]
+        else:
+            if self.logger:
+                self.logger.debug(f"Cannot receive from child {child_id}: child does not exist.")
+            raise ValueError(f"Child {child_id} does not exist.")
+        if self.logger:
+            self.logger.debug(f"No message received from child {child_id} within timeout {timeout} seconds.")
         return None
 
     def blocking_recv_from_parent(self, parent_id: Union[int, str]):
         """
         Blocking receive from a specific parent. Waits indefinitely until a message is available.
         """
+        if self.logger: self.logger.debug(f"Waiting for message from parent {parent_id}......")
         if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-            if self.logger: self.logger.debug(f"Receiving message from parent {parent_id} (blocking)")
             msg = self._my_conn.recv()  # Blocking call
-            if self.logger: self.logger.debug(f"Received message from parent {parent_id} (blocking)")
-            return msg
         elif self.comm_config["comm_layer"] == "zmq":
-            msg = self.zmq_socket.recv_multipart()  # Blocking call
-            if self.logger: self.logger.debug(f"Received message from parent {parent_id} (blocking)")
-            return msg
-        return None
+            msg = pickle.loads(self.dealer_socket.recv())  # Blocking call
+        if self.logger: self.logger.debug(f"Received message from parent {parent_id} (blocking)")
+        return msg
 
     def blocking_recv_from_child(self, child_id: Union[int, str]):
         """
         Blocking receive from a specific child. Waits indefinitely until a message is available.
         """
         if child_id in self.children:
+            if self.logger: self.logger.debug(f"Waiting for message from child {child_id}......")
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
-                if self.logger: self.logger.debug(f"Receiving message from child {child_id} (blocking)")
                 msg = self.children[child_id]._other_conn.recv()
-                if self.logger: self.logger.debug(f"Received message from child {child_id} (blocking)")
-                return msg
             elif self.comm_config["comm_layer"] == "zmq":
-                msg = self.zmq_socket.recv_multipart()  # Blocking call
-                if self.logger: self.logger.debug(f"Received message from child {child_id} (blocking)")
-                return msg
+                if child_id in self.router_cache:
+                    if self.logger: self.logger.debug(f"Child {child_id} has cached messages.")
+                    msg = self.router_cache[child_id]
+                    del self.router_cache[child_id]
+                while True:
+                    msgs = self.zmq_socket.recv_multipart()  # Blocking call
+                    child_id_in = msgs[0].decode()  # Convert bytes to string for child_id
+                    msg = pickle.loads(msgs[1])  # Unpickle the message
+                    if child_id_in == str(child_id):
+                        break
+                    else:
+                        self.router_cache[child_id_in] = msg
+                    time.sleep(0.1)  # Avoid busy waiting
         else:
-            if self.logger: self.logger.debug(f"Cannot receive: Child {child_id} does not exist")
-            return None
+            if self.logger:
+                self.logger.debug(f"Cannot receive from child {child_id}: child does not exist.")
+            raise ValueError(f"Child {child_id} does not exist.")
+        if self.logger: self.logger.debug(f"Received message {msg} from child {child_id}")
+        return msg
 
     def send_to_parents(self, data) -> int:
         for parent_id, pipe in self.parents.items():

@@ -163,7 +163,9 @@ class ensemble_launcher:
 
     def run_tasks(self):
         self.last_update_time = time.time()
-    
+        if self.comm_config["comm_layer"] == "zmq":
+            self.el_node.setup_zmq_sockets()
+            self.el_node.children[self.global_master.node_id].parent_address = self.el_node.my_address
         process = mp.Process(target=self.global_master.run_children,args=(True,))
         process.start()
         if self.update_interval is not None:
@@ -185,29 +187,28 @@ class ensemble_launcher:
                 if len(deleted_tasks) > 0 or len(new_tasks) > 0:
                     self.el_node.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
                     ###update the global master tasks
-                    self.commit_update(self.el_node.children[self.global_master.node_id]._other_conn,deleted_tasks,new_tasks)
+                    self.commit_update(deleted_tasks,new_tasks)
                 else:
                     self.el_node.logger.debug("No changes in tasks detected.")
         process.join()
     
         return
 
-    def commit_update(self,parent_conn,deleted_tasks:dict,new_tasks:dict):
+    def commit_update(self,deleted_tasks:dict,new_tasks:dict):
         nsuccess = 0
         pid = 0
+        child_name = self.global_master.node_id
         self.el_node.logger.debug("Sending update to global master")
         ###this block the child process
-        parent_conn.send(("SYNC",))
+        self.el_node.send_to_child(child_name,("SYNC",))
         msg = None
         while msg != "SYNCED":
-            if parent_conn.poll(timeout=0.5):
-                msg=parent_conn.recv()
+            msg = self.el_node.recv_from_child(child_name,timeout=0.5)
         self.el_node.logger.debug(f"Synced with global master")
-        parent_conn.send(("UPDATE",
+        self.el_node.send_to_child(child_name,("UPDATE",
                             deleted_tasks,
                             new_tasks))
-        if parent_conn.poll(timeout=300):
-            msg = parent_conn.recv()
+        msg=self.el_node.recv_from_child(child_name,timeout=300)  # Wait for confirmation
         self.el_node.logger.info(f"Received {msg} from global master")
 
             

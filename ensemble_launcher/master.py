@@ -25,13 +25,11 @@ class master(Node):
                  logger:bool=False,
                  logging_level=logging.INFO,
                  update_interval:int=None):
-        if comm_config["comm_layer"] == "zmq":
-            comm_config["role"] = "parent"
         super().__init__(master_id,
                          my_tasks,
                          my_nodes,
                          sys_info,
-                         comm_config,
+                         {"comm_layer":comm_config["comm_layer"],"role":"parent"},
                          logger=logger,
                          logging_level=logging_level,
                          update_interval=update_interval)
@@ -85,7 +83,7 @@ class master(Node):
                     self.children_tasks[child_name],
                     self.children_nodes[child_name],
                     self.sys_info,
-                    comm_config=self.comm_config,
+                    comm_config={"comm_layer":self.comm_config["comm_layer"],"role":"parent"},
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
                     logging_level=self.logging_level,
@@ -204,6 +202,9 @@ class master(Node):
     def _run_workers(self,logger=False):
         """Run worker children (for local master)."""
         self._initialize_children()
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
+        
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
@@ -215,6 +216,8 @@ class master(Node):
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all worker processes
         for pid,child_name in enumerate(self.children_names):
+            if self.comm_config["comm_layer"] == "zmq":
+                self.children[child_name].parent_address = self.my_address
             if self.parallel_backend == "dragon":
                 p = dragon.native.process.Process(
                     target=self.children[child_name].run_tasks,
@@ -240,12 +243,16 @@ class master(Node):
     def _run_local_masters(self,logger=False):
         """Run local master children (for global master)."""
         self._initialize_children()
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
 
         # Start all local master processes
         for pid,child_name in enumerate(self.children_names):
+            if self.comm_config["comm_layer"] == "zmq":
+                self.children[child_name].parent_address = self.my_address
             if self.parallel_backend == "dragon":
                 env = os.environ.copy()
                 env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"

@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import sys
 
 def get_num_nodes():
     """
@@ -61,7 +62,7 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
 
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
-
+    
     el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
     total_poll_time = el.run_tasks()
 
@@ -105,7 +106,7 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
 
 
 #**************************************************************************************************
-def test_gpu():
+def test_gpu(comm_config={"comm_layer":"multiprocessing"}):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 6
@@ -121,6 +122,7 @@ def test_gpu():
         "ncores_per_node":104,
         "ngpus_per_node":12
     }
+    ensembles["comm_config"] = comm_config
 
     ensembles["ensembles"] = {
         "name1":{
@@ -191,7 +193,7 @@ def test_gpu():
         os.system("rm -rf ./run_dir")
 
 #**************************************************************************************************
-def test_cpu_and_gpu():
+def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"}):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 6
@@ -207,6 +209,8 @@ def test_cpu_and_gpu():
         "ncores_per_node":104,
         "ngpus_per_node":12
     }
+
+    ensembles["comm_config"] = comm_config
 
     ensembles["ensembles"] = {
         "name1":{
@@ -276,7 +280,7 @@ def test_cpu_and_gpu():
         os.system("rm -rf ./run_dir")
 
 #**************************************************************************************************
-def test_ensemble_update():
+def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}):
     def write_ensemble(num_nodes,nprocs,ngpus):
         ensembles = {}
         ensembles["poll_interval"] = 1
@@ -287,6 +291,7 @@ def test_ensemble_update():
         # "ncores_per_node":104,
         # "ngpus_per_node":12
         # }
+        ensembles["comm_config"] = comm_config
 
         ensembles["ensembles"] = {
             "name1":{
@@ -372,9 +377,21 @@ def test_ensemble_update():
         os.system("rm -rf ./run_dir")
     
 if __name__ == "__main__":
-    # test_ensemble_update()
-    # test_cpu()
-    test_cpu({"comm_layer":"zmq"})
-    # test_gpu()
-    # test_cpu_and_gpu()
+    print("Running tests...This may take a while")
+    comm_layers = [
+        {"name": "multiprocessing", "config": {"comm_layer": "multiprocessing"}},
+        {"name": "zmq", "config": {"comm_layer": "zmq"}}
+    ]
+    
+    test_functions = [
+        test_cpu,
+        # test_gpu,
+        # test_cpu_and_gpu,
+        test_ensemble_update
+    ]
+    
+    for comm_layer in comm_layers:
+        for test_func in test_functions:
+            print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer")
+            test_func(comm_config=comm_layer["config"])
     print("All tests passed successfully!")

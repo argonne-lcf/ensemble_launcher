@@ -20,13 +20,11 @@ class worker(Node):
                 comm_config:dict={"comm_layer":"multiprocessing"},
                 update_interval:int=None,
                 logging_level=logging.INFO):
-        if comm_config["comm_layer"] == "zmq":
-            comm_config["role"] = "child"
         super().__init__(worker_id,
                          my_tasks,
                          my_nodes,
                          sys_info,
-                         comm_config,
+                         {"comm_layer":comm_config["comm_layer"],"role":"child"},
                          logger=False,
                          logging_level=logging_level,
                          update_interval=update_interval)
@@ -370,6 +368,8 @@ class worker(Node):
         return None
 
     def run_tasks(self,logger=False) -> None:
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
         if logger: 
             self.configure_logger(self.logging_level)
             if self.logger: self.logger.info(f"Running on {socket.gethostname()}")
