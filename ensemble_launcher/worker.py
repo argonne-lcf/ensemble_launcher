@@ -291,14 +291,15 @@ class worker(Node):
         ##check if run dir exists
         env = os.environ.copy()
         env.update(task_info["env"])
-        os.makedirs(task_info["run_dir"],exist_ok=True)
+        if task_info["io"]:
+            os.makedirs(task_info["run_dir"],exist_ok=True)
         if self.logger: self.logger.info(f"launching task {task_info['id']} with {task_info['cmd']}")
         env["TMPDIR"] = self.tmp_dir
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
-                             stdout=open(task_info["log_file"],"w"),
-                             stderr=open(task_info["err_file"],"w"),
+                             stdout=open(task_info["log_file"],"w") if task_info["io"] else subprocess.DEVNULL,
+                             stderr=open(task_info["err_file"],"w") if task_info["io"] else subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL,
                              cwd=task_info["launch_dir"],
                              env=env,
