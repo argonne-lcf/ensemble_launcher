@@ -25,6 +25,8 @@ class master(Node):
                  logger:bool=False,
                  logging_level=logging.INFO,
                  update_interval:int=None):
+        if comm_config["comm_layer"] == "zmq":
+            comm_config["role"] = "parent"
         super().__init__(master_id,
                          my_tasks,
                          my_nodes,

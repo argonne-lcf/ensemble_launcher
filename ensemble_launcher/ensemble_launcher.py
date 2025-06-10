@@ -29,6 +29,7 @@ class ensemble_launcher:
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
         self.logging_level = logging_level
+        self.comm_config = None
 
         assert parallel_backend in ["multiprocessing","dragon"]
         if self.parallel_backend == "dragon":
@@ -91,6 +92,7 @@ class ensemble_launcher:
                 parallel_backend=self.parallel_backend,
                 n_children=max(1,len(self.total_nodes)//128) if is_global_master else None,
                 max_children_nnodes=self.max_nodes_per_master,
+                comm_config=self.comm_config,
                 is_global_master=is_global_master,
                 logging_level=self.logging_level,
                 update_interval=self.update_interval,
@@ -115,6 +117,7 @@ class ensemble_launcher:
                 self.sys_info.update(data["sys_info"])
             else:
                 self.sys_info["name"] = "local"
+            self.comm_config = data.get("comm_config",{"comm_layer":"multiprocessing"})
             self.sys_info.update()
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():

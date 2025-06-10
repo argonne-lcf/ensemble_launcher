@@ -5,6 +5,7 @@ import logging
 import abc
 import time
 import socket
+import random
 try:
     import zmq
     ZMQ_AVAILABLE = True
@@ -50,8 +51,19 @@ class Node(abc.ABC):
             self.zmq_context = zmq.Context()
             if self.comm_config["role"] == "parent":
                 self.zmq_socket = self.zmq_context.socket(zmq.ROUTER)
-                parent_address = self.comm_config.get("parent-address",f"{socket.gethostname()}:5555")
-                self.zmq_socket.bind(f"tcp://{parent_address}")
+                parent_address = self.comm_config.get("parent-address",f"{socket.gethostname() if 'local' not in socket.gethostname() else 'localhost'}:5555")
+                self.zmq_socket.setsockopt(zmq.IDENTITY,f"{node_id}".encode())
+                try:
+                    self.zmq_socket.bind(f"tcp://{parent_address}")
+                except zmq.error.ZMQError as e:
+                    if "Address already in use" in str(e):
+                        # Try to bind to a different port
+                        port = int(parent_address.split(':')[-1]) + random.randint(1, 1000)
+                        if self.logger: self.logger.info(f"Trying to bind to port {port} instead.")
+                        parent_address = f"{parent_address.rsplit(':', 1)[0]}:{port}"
+                        self.zmq_socket.bind(f"tcp://{parent_address}")
+                    else:
+                        raise e
                 self.comm_config["parent-address"] = parent_address
             else:
                 assert "parent-address" in self.comm_config, "Child needs parent-address"

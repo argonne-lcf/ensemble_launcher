@@ -20,7 +20,7 @@ def get_num_nodes():
         return 1
 
 #**************************************************************************************************
-def test_cpu():
+def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 1
@@ -36,7 +36,7 @@ def test_cpu():
     #     "ncores_per_node":104,
     #     "ngpus_per_node":12
     # }
-
+    ensembles["comm_config"] = comm_config
     ensembles["ensembles"] = {
         "name1":{
                 "num_nodes":1,
@@ -372,8 +372,9 @@ def test_ensemble_update():
         os.system("rm -rf ./run_dir")
     
 if __name__ == "__main__":
-    test_ensemble_update()
-    test_cpu()
+    # test_ensemble_update()
+    # test_cpu()
+    test_cpu({"comm_layer":"zmq"})
     # test_gpu()
     # test_cpu_and_gpu()
     print("All tests passed successfully!")

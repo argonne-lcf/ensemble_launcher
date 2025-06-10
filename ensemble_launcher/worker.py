@@ -20,6 +20,8 @@ class worker(Node):
                 comm_config:dict={"comm_layer":"multiprocessing"},
                 update_interval:int=None,
                 logging_level=logging.INFO):
+        if comm_config["comm_layer"] == "zmq":
+            comm_config["role"] = "child"
         super().__init__(worker_id,
                          my_tasks,
                          my_nodes,
