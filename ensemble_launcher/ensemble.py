@@ -159,7 +159,7 @@ class ensemble:
             task["env"] = {}
         
         if "io" not in task.keys():
-            task["io"] = False
+            task["io"] = True
 
         task["system"] = self.system
         

@@ -226,7 +226,7 @@ class master(Node):
                 )
             else:
                 p = mp.Process(
-                    target=self.children[child_name].run_tasks,args=(True,)
+                    target=self.children[child_name].run_tasks,args=(False,)
                 )
             p.start()
             self.processes.append(p)
