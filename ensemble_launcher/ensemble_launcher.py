@@ -9,12 +9,14 @@ try:
     DRAGON_AVAILABLE = True
 except ImportError:
     DRAGON_AVAILABLE = False
-from ensemble_launcher.helper_functions import *
 import numpy as np
-from ensemble_launcher.ensemble import *
-from ensemble_launcher.worker import *
-from ensemble_launcher.master import *
-from ensemble_launcher.Node import *
+
+from .helper_functions import *
+from .ensemble import *
+from .worker import *
+from .master import *
+from .Node import *
+
 import logging
 
 class ensemble_launcher:
@@ -31,12 +33,6 @@ class ensemble_launcher:
         self.logging_level = logging_level
         self.comm_config = None
 
-        assert parallel_backend in ["multiprocessing","dragon"]
-        if self.parallel_backend == "dragon":
-            if not DRAGON_AVAILABLE:
-                raise ImportError("Dragon is not available. Please install dragon to use this backend.")
-            mp.set_start_method("dragon")
-        ##
 
         self.ensembles = {}
         self.start_time = time.time()
@@ -46,6 +42,18 @@ class ensemble_launcher:
         self.sys_info = {}
         self.read_input_file()
         os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
+
+        assert parallel_backend in ["multiprocessing","dragon","mpi"]
+
+        if self.parallel_backend == "dragon":
+            if not DRAGON_AVAILABLE:
+                raise ImportError("Dragon is not available. Please install dragon to use this backend.")
+            mp.set_start_method("dragon")
+        elif self.parallel_backend == "mpi":
+            assert self.comm_config["comm_layer"] == "zmq", "MPI backend requires zmq communication layer."
+        else:
+            pass
+        ##
         
         ##update the system info. NOTE: precedence order config > inputs > functions
         if "ncores_per_node" not in self.sys_info.keys():

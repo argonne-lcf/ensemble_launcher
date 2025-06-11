@@ -21,7 +21,7 @@ def get_num_nodes():
         return 1
 
 #**************************************************************************************************
-def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
+def test_cpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="multiprocessing"):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 1
@@ -62,8 +62,8 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
 
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
-    
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
+
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -84,7 +84,7 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
         os.system("rm -rf ./run_dir")
 
     ##forcing multilevel launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG, force_level="double")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG, force_level="double", parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -106,7 +106,7 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"}):
 
 
 #**************************************************************************************************
-def test_gpu(comm_config={"comm_layer":"multiprocessing"}):
+def test_gpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="multiprocessing"):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 6
@@ -151,7 +151,7 @@ def test_gpu(comm_config={"comm_layer":"multiprocessing"}):
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
 
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -172,7 +172,7 @@ def test_gpu(comm_config={"comm_layer":"multiprocessing"}):
         os.system("rm -rf ./run_dir")
     
     ###forcing multi level launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double", parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -193,7 +193,7 @@ def test_gpu(comm_config={"comm_layer":"multiprocessing"}):
         os.system("rm -rf ./run_dir")
 
 #**************************************************************************************************
-def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"}):
+def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="multiprocessing"):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
     nprocs = 6
@@ -238,7 +238,7 @@ def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"}):
     with open("config.json", "w") as f:
         json.dump(ensembles, f, indent=4)
 
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG)
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -259,7 +259,7 @@ def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"}):
         os.system("rm -rf ./run_dir")
     
     ##forcing multilevel launcher
-    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double")
+    el = ensemble_launcher("config.json",logging_level=logging.DEBUG,force_level="double", parallel_backend=parallel_backend)
     total_poll_time = el.run_tasks()
 
     logfiles = list(glob(os.path.join("./run_dir","name1", "log_*.txt")))
@@ -280,7 +280,7 @@ def test_cpu_and_gpu(comm_config={"comm_layer":"multiprocessing"}):
         os.system("rm -rf ./run_dir")
 
 #**************************************************************************************************
-def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}):
+def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}, parallel_backend="multiprocessing"):
     def write_ensemble(num_nodes,nprocs,ngpus):
         ensembles = {}
         ensembles["poll_interval"] = 1
@@ -320,7 +320,7 @@ def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}):
     
     # Create a function to run the ensemble launcher in a thread
     def run_ensemble():
-        el = ensemble_launcher("config.json", logging_level=logging.DEBUG)
+        el = ensemble_launcher("config.json", logging_level=logging.DEBUG, parallel_backend=parallel_backend)
         return el.run_tasks()
 
     # Start a thread to run the ensemble launcher
@@ -349,7 +349,7 @@ def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}):
     ##forcing multilevel launcher
     # Create a function to run the ensemble launcher in a thread
     def run_ensemble_multi_level():
-        el = ensemble_launcher("config.json", logging_level=logging.DEBUG, force_level="double")
+        el = ensemble_launcher("config.json", logging_level=logging.DEBUG, force_level="double", parallel_backend=parallel_backend)
         return el.run_tasks()
 
     write_ensemble(num_nodes,nprocs,ngpus)
@@ -384,14 +384,18 @@ if __name__ == "__main__":
     ]
     
     test_functions = [
-        test_cpu,
+        # test_cpu,
         # test_gpu,
         # test_cpu_and_gpu,
         test_ensemble_update
     ]
     
-    for comm_layer in comm_layers:
-        for test_func in test_functions:
-            print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer")
-            test_func(comm_config=comm_layer["config"])
+    # for comm_layer in comm_layers:
+    #     for test_func in test_functions:
+    #         print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer")
+    #         test_func(comm_config=comm_layer["config"])
+    comm_layer = comm_layers[-1]
+    for test_func in test_functions:
+        print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer and MPI backend")
+        test_func(comm_config=comm_layer["config"], parallel_backend="mpi")
     print("All tests passed successfully!")

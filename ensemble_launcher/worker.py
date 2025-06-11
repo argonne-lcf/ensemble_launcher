@@ -1,15 +1,16 @@
-import os, stat
+import os, stat, sys
 import subprocess
 import time
 import copy
 import multiprocessing as mp
-from ensemble_launcher.helper_functions import *
-import numpy as np
-from ensemble_launcher.Node import Node
-import sys
 import socket
 import logging
 import shutil
+import pickle
+import numpy as np
+from .helper_functions import *
+from .Node import Node
+
 
 class worker(Node):
     def __init__(self,
@@ -293,6 +294,7 @@ class worker(Node):
         env.update(task_info["env"])
         if task_info["io"]:
             os.makedirs(task_info["run_dir"],exist_ok=True)
+            if self.logger: self.logger.info(f"Creating run dir {task_info['run_dir']}")
         if self.logger: self.logger.info(f"launching task {task_info['id']} with {task_info['cmd']}")
         env["TMPDIR"] = self.tmp_dir
         p = subprocess.Popen(task_info["cmd"],
@@ -463,4 +465,15 @@ class worker(Node):
                 if self.logger: self.logger.info(f"Done deleting tmpdir")
             except Exception as e:
                 if self.logger: self.logger.error(f"Failed to delete tmp_dir {self.tmp_dir}: {e}")
+
+if __name__ == "__main__":
+    worker_obj_file = sys.argv[1]
+    logger = int(sys.argv[2]) == 1
+
+    with open(worker_obj_file, "rb") as f:
+        worker_obj = pickle.load(f)
+    if logger:
+        worker_obj.configure_logger(worker_obj.logging_level)
+        worker_obj.logger.info(f"Worker {worker_obj.node_id} started")
+    worker_obj.run_tasks(False)
         

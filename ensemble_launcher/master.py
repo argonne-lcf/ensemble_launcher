@@ -1,5 +1,5 @@
-from ensemble_launcher.worker import *
-from ensemble_launcher.Node import *
+from .worker import *
+from .Node import *
 try:
     import dragon
     DRAGON_AVAILABLE = True
@@ -9,6 +9,8 @@ except ImportError:
 import multiprocessing as mp
 import os
 import gc
+import sys
+import pickle
 
 class master(Node):
     def __init__(self,
@@ -36,7 +38,7 @@ class master(Node):
         self.my_master = my_master
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
-        assert parallel_backend in ["multiprocessing","dragon"]
+        assert parallel_backend in ["multiprocessing","dragon","mpi"], f"Unsupported parallel backend: {parallel_backend}. Supported backends are 'multiprocessing', 'dragon', and 'mpi'."
         if self.parallel_backend == "dragon":
             if not DRAGON_AVAILABLE:
                 raise ImportError("Dragon is not available. Please install dragon to use the dragon backend.")
@@ -218,19 +220,51 @@ class master(Node):
         for pid,child_name in enumerate(self.children_names):
             if self.comm_config["comm_layer"] == "zmq":
                 self.children[child_name].parent_address = self.my_address
+            
             if self.parallel_backend == "dragon":
                 p = dragon.native.process.Process(
                     target=self.children[child_name].run_tasks,
                     policy=self.policies[child_name],
                     env=env
                 )
-            else:
+            elif self.parallel_backend == "multiprocessing":
                 p = mp.Process(
                     target=self.children[child_name].run_tasks,args=(False,)
                 )
-            p.start()
-            self.processes.append(p)
-            
+                p.start()
+                self.processes.append(p)
+            elif self.parallel_backend == "mpi":
+                os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
+                ###dump the child object to a file
+                for child_name,child_obj in self.children.items():
+                    with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+                        pickle.dump(child_obj,f)
+                    ##launch the child process using mpiexec
+                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+                        f" python -m ensemble_launcher.worker"+\
+                            f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
+                    if self.logger: self.logger.debug(f"Running command: {cmd}")
+                    p = subprocess.Popen(
+                        cmd, shell=True, env=env
+                    )
+                    self.processes.append(p)
+                                            # f" python -m {os.path.join(os.path.dirname(__file__), 'worker.py')}"+\
+                ##wait for all children to connect
+                nready = 0
+                tstart = time.time()
+                timeout = 600
+                while nready < self.n_children:
+                    for child_name in self.children_names:
+                        msg = self.recv_from_child(child_name, timeout=0.5)
+                        if msg == "READY":
+                            nready += 1
+                            if self.logger: self.logger.debug(f"Child {child_name} is ready")
+                    time.sleep(0.5)
+                    if time.time() - tstart > timeout:
+                        if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
+                        raise TimeoutError("Timeout waiting for children to be ready")
+
+
             for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
@@ -249,24 +283,56 @@ class master(Node):
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
 
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all local master processes
         for pid,child_name in enumerate(self.children_names):
             if self.comm_config["comm_layer"] == "zmq":
                 self.children[child_name].parent_address = self.my_address
             if self.parallel_backend == "dragon":
-                env = os.environ.copy()
-                env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
                 p = dragon.native.process.Process(
                     target=self.children[child_name].run_children, 
                     policy=self.policies[child_name], 
                     env=env
                 )
-            else:
+                p.start()
+                self.processes.append(p)
+            elif self.parallel_backend == "multiprocessing":
                 p = mp.Process(
                     target=self.children[child_name].run_children
                 )
-            p.start()
-            self.processes.append(p)
+                p.start()
+                self.processes.append(p)
+            elif self.parallel_backend == "mpi":
+                os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
+                ###dump the child object to a file
+                for child_name,child_obj in self.children.items():
+                    with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+                        pickle.dump(child_obj,f)
+                    ##launch the child process using mpiexec
+                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+                        f" python -m ensemble_launcher.master"+\
+                            f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
+                    if self.logger: self.logger.debug(f"Running command: {cmd}")
+                    p = subprocess.Popen(
+                        cmd, shell=True, env=env
+                    )
+                    self.processes.append(p)
+
+                ##wait for all children to connect
+                nready = 0
+                tstart = time.time()
+                timeout = 600
+                while nready < self.n_children:
+                    for child_name in self.children_names:
+                        msg = self.recv_from_child(child_name, timeout=0.5)
+                        if msg == "READY":
+                            nready += 1
+                            if self.logger: self.logger.debug(f"Child {child_name} is ready")
+                    time.sleep(0.5)
+                    if time.time() - tstart > timeout:
+                        if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
+                        raise TimeoutError("Timeout waiting for children to be ready")
 
             for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
@@ -336,8 +402,12 @@ class master(Node):
             if p.is_alive:
                 try:
                     if self.logger: self.logger.info(f"Terminating process {i}")
-                    p.kill()
-                    p.join(timeout=0.5)
+                    if self.parallel_backend in ["dragon","multiprocessing"]:
+                        p.kill()
+                        p.join(timeout=0.5)
+                    elif self.parallel_backend == "mpi":
+                        p.terminate()
+                        p.wait(timeout=0.5)
                 except Exception as e:
                     if self.logger: self.logger.error(f"Error terminating process {i}: {e}")
         self.close()
@@ -418,7 +488,15 @@ class master(Node):
         self.cleanup_resources()
         return False
     
-
+if __name__ == "__main__":
+    master_obj_file = sys.argv[1]
+    logger = int(sys.argv[2]) == 1
+    with open(master_obj_file, "rb") as f:
+        master_obj = pickle.load(f)
+    if logger:
+        master_obj.configure_logger(master_obj.logging_level)
+        master_obj.logger.info("Loaded master object from file")
+    master_obj.run_children(logger=False)
 
 
 #************depreated functions***************

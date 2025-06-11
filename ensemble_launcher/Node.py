@@ -90,7 +90,7 @@ class Node(abc.ABC):
             self.dealer_socket.connect(f"tcp://{self.parent_address}")
             self.dealer_poller = zmq.Poller()
             self.dealer_poller.register(self.dealer_socket, zmq.POLLIN)
-            # self.dealer_socket.send_multipart([f"{self.node_id}".encode(),b"READY"])
+            self.dealer_socket.send(pickle.dumps("READY"))
 
     def configure_logger(self,logging_level=logging.INFO):
         self.logger = logging.getLogger(f"Node-{self.node_id}")
@@ -178,6 +178,7 @@ class Node(abc.ABC):
                     if self.router_socket in socks and socks[self.router_socket] == zmq.POLLIN:
                         msg = self.router_socket.recv_multipart()
                         msg[0] = msg[0].decode()  # Convert bytes to string for child_id
+                        if self.logger: self.logger.debug(f"Received message from child {msg[0]} (expected {child_id})")
                         msg[1] = pickle.loads(msg[1])  # Unpickle the message
                         # wait for a message from the child
                         if msg[0] == str(child_id):
