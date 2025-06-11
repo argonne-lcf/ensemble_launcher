@@ -217,54 +217,61 @@ class master(Node):
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all worker processes
-        for pid,child_name in enumerate(self.children_names):
-            if self.comm_config["comm_layer"] == "zmq":
-                self.children[child_name].parent_address = self.my_address
             
-            if self.parallel_backend == "dragon":
+        if self.parallel_backend == "dragon":
+            for pid,child_name in enumerate(self.children_names):
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
                 p = dragon.native.process.Process(
                     target=self.children[child_name].run_tasks,
-                    policy=self.policies[child_name],
-                    env=env
-                )
-            elif self.parallel_backend == "multiprocessing":
+                        policy=self.policies[child_name],
+                        env=env
+                    )
+                p.start()
+                self.processes.append(p)
+        elif self.parallel_backend == "multiprocessing":
+            for pid,child_name in enumerate(self.children_names):
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
                 p = mp.Process(
                     target=self.children[child_name].run_tasks,args=(False,)
                 )
                 p.start()
                 self.processes.append(p)
-            elif self.parallel_backend == "mpi":
-                os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
-                ###dump the child object to a file
-                for child_name,child_obj in self.children.items():
-                    with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
-                        pickle.dump(child_obj,f)
-                    ##launch the child process using mpiexec
-                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+        elif self.parallel_backend == "mpi":
+            os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
+            ###dump the child object to a file
+            for child_name,child_obj in self.children.items():
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
+                with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+                    pickle.dump(child_obj,f)
+                ##launch the child process using mpiexec
+                cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
                         f" python -m ensemble_launcher.worker"+\
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
-                    if self.logger: self.logger.debug(f"Running command: {cmd}")
-                    p = subprocess.Popen(
+                if self.logger: self.logger.debug(f"Running command: {cmd}")
+                p = subprocess.Popen(
                         cmd, shell=True, env=env
-                    )
-                    self.processes.append(p)
-                                            # f" python -m {os.path.join(os.path.dirname(__file__), 'worker.py')}"+\
-                ##wait for all children to connect
-                nready = 0
-                tstart = time.time()
-                timeout = 600
-                while nready < self.n_children:
-                    for child_name in self.children_names:
-                        msg = self.recv_from_child(child_name, timeout=0.5)
-                        if msg == "READY":
-                            nready += 1
-                            if self.logger: self.logger.debug(f"Child {child_name} is ready")
-                    time.sleep(0.5)
-                    if time.time() - tstart > timeout:
-                        if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
-                        raise TimeoutError("Timeout waiting for children to be ready")
+                )
+                self.processes.append(p)
 
+            ##wait for all children to connect
+            nready = 0
+            tstart = time.time()
+            timeout = 600
+            while nready < self.n_children:
+                for child_name in self.children_names:
+                    msg = self.recv_from_child(child_name, timeout=0.5)
+                    if msg == "READY":
+                        nready += 1
+                        if self.logger: self.logger.debug(f"Child {child_name} is ready")
+                time.sleep(0.5)
+                if time.time() - tstart > timeout:
+                    if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
+                    raise TimeoutError("Timeout waiting for children to be ready")
 
+        for child_name in self.children_names:
             for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})
@@ -286,10 +293,11 @@ class master(Node):
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
         # Start all local master processes
-        for pid,child_name in enumerate(self.children_names):
-            if self.comm_config["comm_layer"] == "zmq":
-                self.children[child_name].parent_address = self.my_address
-            if self.parallel_backend == "dragon":
+        if self.parallel_backend == "dragon":
+            for pid,child_name in enumerate(self.children_names):
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
+            
                 p = dragon.native.process.Process(
                     target=self.children[child_name].run_children, 
                     policy=self.policies[child_name], 
@@ -297,43 +305,49 @@ class master(Node):
                 )
                 p.start()
                 self.processes.append(p)
-            elif self.parallel_backend == "multiprocessing":
+        elif self.parallel_backend == "multiprocessing":
+            for pid,child_name in enumerate(self.children_names):
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
                 p = mp.Process(
                     target=self.children[child_name].run_children
-                )
+                    )
                 p.start()
                 self.processes.append(p)
-            elif self.parallel_backend == "mpi":
-                os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
-                ###dump the child object to a file
-                for child_name,child_obj in self.children.items():
-                    with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
-                        pickle.dump(child_obj,f)
-                    ##launch the child process using mpiexec
-                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+        elif self.parallel_backend == "mpi":
+            os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
+            ###dump the child object to a file
+            for child_name,child_obj in self.children.items():
+                if self.comm_config["comm_layer"] == "zmq":
+                    self.children[child_name].parent_address = self.my_address
+                with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+                    pickle.dump(child_obj,f)
+                ##launch the child process using mpiexec
+                cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
                         f" python -m ensemble_launcher.master"+\
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
-                    if self.logger: self.logger.debug(f"Running command: {cmd}")
-                    p = subprocess.Popen(
+                if self.logger: self.logger.debug(f"Running command: {cmd}")
+                p = subprocess.Popen(
                         cmd, shell=True, env=env
                     )
-                    self.processes.append(p)
+                self.processes.append(p)
 
-                ##wait for all children to connect
-                nready = 0
-                tstart = time.time()
-                timeout = 600
-                while nready < self.n_children:
-                    for child_name in self.children_names:
-                        msg = self.recv_from_child(child_name, timeout=0.5)
-                        if msg == "READY":
-                            nready += 1
-                            if self.logger: self.logger.debug(f"Child {child_name} is ready")
-                    time.sleep(0.5)
-                    if time.time() - tstart > timeout:
-                        if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
-                        raise TimeoutError("Timeout waiting for children to be ready")
+            ##wait for all children to connect
+            nready = 0
+            tstart = time.time()
+            timeout = 600
+            while nready < self.n_children:
+                for child_name in self.children_names:
+                    msg = self.recv_from_child(child_name, timeout=0.5)
+                    if msg == "READY":
+                        nready += 1
+                        if self.logger: self.logger.debug(f"Child {child_name} is ready")
+                time.sleep(0.5)
+                if time.time() - tstart > timeout:
+                    if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
+                    raise TimeoutError("Timeout waiting for children to be ready")
 
+        for child_name in self.children_names:
             for task_id, task_info in self.children_tasks[child_name].items():
                 self.my_tasks[task_id].update({"status":"running"})
                 task_info.update({"status":"running"})

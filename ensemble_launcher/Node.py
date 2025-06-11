@@ -74,11 +74,22 @@ class Node(abc.ABC):
                 self.router_socket.bind(f"tcp://{self.my_address}")
             except zmq.error.ZMQError as e:
                 if "Address already in use" in str(e):
-                    # Try to bind to a different port
-                    port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
-                    if self.logger: self.logger.info(f"Trying to bind to port {port} instead.")
-                    self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
-                    self.router_socket.bind(f"tcp://{self.my_address}")
+                    # Try binding up to 3 times with different ports
+                    max_attempts = 3
+                    for attempt in range(max_attempts):
+                        try:
+                            port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
+                            if self.logger: self.logger.info(f"Attempt {attempt+1}/{max_attempts}: Trying to bind to port {port} instead.")
+                            self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
+                            self.router_socket.bind(f"tcp://{self.my_address}")
+                            if self.logger: self.logger.info(f"Successfully bound to {self.my_address}")
+                            break  # Break out of the retry loop if binding succeeds
+                        except zmq.error.ZMQError as retry_error:
+                            if "Address already in use" in str(retry_error) and attempt < max_attempts - 1:
+                                if self.logger: self.logger.warning(f"Port {port} also in use, retrying...")
+                                continue
+                            else:
+                                raise retry_error
                 else:
                     raise e
             self.router_poller = zmq.Poller()
