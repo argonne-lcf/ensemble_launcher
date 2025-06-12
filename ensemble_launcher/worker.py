@@ -368,14 +368,25 @@ class worker(Node):
                              "status":status,
                              "process":None,
                             "assigned_nodes":[]})
+            else:
+                if "timeout" in task and \
+                   time.time() - task["start_time"] > task["timeout"]:
+                    if self.logger: self.logger.warning(f"Task {task_id} timed out after {task['timeout']} seconds")
+                    popen_proc.kill()
+                    popen_proc.wait(timeout=10)
+                    self.free_task_nodes(task)
+                    task.update({"end_time":time.time(),
+                                 "status":"failed",
+                                 "process":None,
+                                "assigned_nodes":[]})
         return None
 
     def run_tasks(self,logger=False) -> None:
-        if self.comm_config["comm_layer"] == "zmq":
-            self.setup_zmq_sockets()
         if logger: 
             self.configure_logger(self.logging_level)
             if self.logger: self.logger.info(f"Running on {socket.gethostname()}")
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir,exist_ok=True)
         while True:

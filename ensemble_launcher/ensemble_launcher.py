@@ -173,9 +173,15 @@ class ensemble_launcher:
         self.last_update_time = time.time()
         if self.comm_config["comm_layer"] == "zmq":
             self.el_node.setup_zmq_sockets()
+            if self.el_node.logger: self.el_node.logger.info(f"ZMQ sockets setup complete with {self.el_node.comm_config}.")
             self.el_node.children[self.global_master.node_id].parent_address = self.el_node.my_address
         process = mp.Process(target=self.global_master.run_children,args=(True,))
         process.start()
+        if self.el_node.comm_config["comm_layer"] == "zmq":
+            msg = self.el_node.recv_from_child(self.global_master.node_id,timeout=5)  # Wait for the global master to be ready
+            if msg == "READY":
+                if self.el_node.logger: self.el_node.logger.info(f"Global master is ready.")
+                self.el_node.send_to_child(self.global_master.node_id,"CONTINUE")
         if self.update_interval is not None:
             while process.is_alive():
                 time.sleep(self.update_interval)

@@ -11,6 +11,7 @@ import os
 import gc
 import sys
 import pickle
+import socket
 
 class master(Node):
     def __init__(self,
@@ -45,7 +46,7 @@ class master(Node):
             mp.set_start_method("dragon")
 
         # For tracking child processes and pipes
-        self.processes = []
+        self.processes = {}
         self.policies = []
         
 
@@ -54,11 +55,15 @@ class master(Node):
         ##Note that this option will remove tasks that have num nodes > max_children_nnodes
         ##So, set this large enough to not remove any tasks
         self.max_children_nnodes = max_children_nnodes
-        children_assignments = self.assign_children(n_children=n_children,max_children_nnodes=max_children_nnodes)
+        children_assignments = self.assign_children(self.my_tasks,
+                                                    self.my_nodes,
+                                                    n_children=n_children,
+                                                    max_children_nnodes=max_children_nnodes)
         self.n_children = len(children_assignments)
         self.children_nodes = {}
         self.children_names = []
         self.children_tasks = {}
+
         for pid in range(self.n_children):
             self.children_names.append(f"{self.node_id}_child_{pid}")
         total = 0
@@ -68,12 +73,15 @@ class master(Node):
             total += assignment["nnodes"]
         ##
         self.progress_info = {}
-        self.progress_info["nrunning_tasks"] = [0 for i in range(self.n_children)]
-        self.progress_info["nready_tasks"] = [0 for i in range(self.n_children)]
-        self.progress_info["nfailed_tasks"] = [0 for i in range(self.n_children)]
-        self.progress_info["nfinished_tasks"] = [0 for i in range(self.n_children)]
-        self.progress_info["nfree_cores"] = [0 for i in range(self.n_children)]
-        self.progress_info["nfree_gpus"] = [0 for i in range(self.n_children)]
+        self.init_progress_info()
+
+    def init_progress_info(self):
+        self.progress_info["nrunning_tasks"] = {child_name: 0 for child_name in self.children_names}
+        self.progress_info["nready_tasks"] = {child_name: 0 for child_name in self.children_names}
+        self.progress_info["nfailed_tasks"] = {child_name: 0 for child_name in self.children_names}
+        self.progress_info["nfinished_tasks"] = {child_name: 0 for child_name in self.children_names}
+        self.progress_info["nfree_cores"] = {child_name: 0 for child_name in self.children_names}
+        self.progress_info["nfree_gpus"] = {child_name: 0 for child_name in self.children_names}
 
     def _initialize_children(self):
         """Initialize the appropriate children based on master type."""
@@ -113,7 +121,31 @@ class master(Node):
                 self.policies.append(policy)
 
 
+    def reassign_children(self,
+                        my_tasks:dict,
+                        children_names:list,
+                        children_nodes:dict):
+        sorted_tasks = sorted(my_tasks.items(), key=lambda x: x[1]['num_nodes'], reverse=True)
+        last_assigned = 0
+        children_tasks = {name:{} for name in children_names}
+        unassigned_tasks = []
+        for task_id, task_info in sorted_tasks:
+            assigned = False
+            for i in range(last_assigned, last_assigned + len(children_names)):
+                child_name = children_names[i % len(children_names)]
+                if task_info["num_nodes"] <= len(children_nodes[child_name]) and not assigned:
+                    children_tasks[child_name][task_id] = task_info
+                    last_assigned = i + 1
+                    assigned = True
+                    break
+            if not assigned:
+                unassigned_tasks.append(task_id)
+        return children_tasks, unassigned_tasks
+
+
     def assign_children(self,
+                        my_tasks:dict,
+                        my_nodes:list,
                         n_children:int=None,
                         max_children_nnodes:int=None):
         """
@@ -121,16 +153,16 @@ class master(Node):
         """
         
         # Step 1: Sort tasks by decreasing number of nodes required
-        sorted_tasks = sorted(self.my_tasks.items(), key=lambda x: x[1]['num_nodes'], reverse=True)
+        sorted_tasks = sorted(my_tasks.items(), key=lambda x: x[1]['num_nodes'], reverse=True)
         
         ###remove tasks that have num nodes < total nodes of this master
         ##when max_children_nnodes is not None, remove tasks that have num nodes > max_children_nnodes
         removed_tasks = []
         if max_children_nnodes is not None:
-            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > max_children_nnodes and sorted_tasks[0][1]["num_nodes"] > len(self.my_nodes):
+            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > max_children_nnodes and sorted_tasks[0][1]["num_nodes"] > len(my_nodes):
                 removed_tasks.append((sorted_tasks.pop(0))[0])
         else:
-            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > len(self.my_nodes):
+            while sorted_tasks and sorted_tasks[0][1]["num_nodes"] > len(my_nodes):
                 removed_tasks.append((sorted_tasks.pop(0))[0])
         
         if len(removed_tasks) > 0:
@@ -148,11 +180,11 @@ class master(Node):
         # Step 2: Determine the number of workers
         if n_children is not None:
             nworkers = 0
-            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(self.my_nodes) and nworkers < n_children:
+            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(my_nodes) and nworkers < n_children:
                 nworkers += 1
         else:
             nworkers = 0
-            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(self.my_nodes):
+            while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(my_nodes):
                 nworkers += 1
         
         # Step 3: Initialize worker assignments for the first set of tasks
@@ -166,8 +198,8 @@ class master(Node):
         }
 
         assigned_nnodes = sum([a["nnodes"] for _, a in children_assignments.items()])
-        if assigned_nnodes < len(self.my_nodes):
-            for i in range(len(self.my_nodes) - assigned_nnodes):
+        if assigned_nnodes < len(my_nodes):
+            for i in range(len(my_nodes) - assigned_nnodes):
                 children_assignments[i % nworkers]["nnodes"] += 1
 
         # Step 4: Assign remaining tasks to workers in a round-robin fashion
@@ -184,7 +216,7 @@ class master(Node):
     def report_status(self):
         progress_info = {}
         for k,v in self.progress_info.items():
-            progress_info[k] = sum(v)
+            progress_info[k] = sum(list(v.values()))
         if self.logger:
             self.logger.debug(f"Progress info: {progress_info}")
         self.send_to_parent(0,progress_info)
@@ -203,13 +235,12 @@ class master(Node):
 
     def _run_workers(self,logger=False):
         """Run worker children (for local master)."""
-        self._initialize_children()
-        if self.comm_config["comm_layer"] == "zmq":
-            self.setup_zmq_sockets()
-        
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
+        self._initialize_children()
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
         
         for wid in self.children_names:
             if self.logger: self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
@@ -228,7 +259,7 @@ class master(Node):
                         env=env
                     )
                 p.start()
-                self.processes.append(p)
+                self.processes[child_name] = p
         elif self.parallel_backend == "multiprocessing":
             for pid,child_name in enumerate(self.children_names):
                 if self.comm_config["comm_layer"] == "zmq":
@@ -237,7 +268,7 @@ class master(Node):
                     target=self.children[child_name].run_tasks,args=(False,)
                 )
                 p.start()
-                self.processes.append(p)
+                self.processes[child_name] = p
         elif self.parallel_backend == "mpi":
             os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
             ###dump the child object to a file
@@ -246,30 +277,22 @@ class master(Node):
                     self.children[child_name].parent_address = self.my_address
                 with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
                     pickle.dump(child_obj,f)
-                ##launch the child process using mpiexec
-                cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+                if self.children_nodes[child_name][0] == socket.gethostname():
+                    cmd = f"python -m ensemble_launcher.worker"+\
+                            f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
+                else:
+                    ##launch the child process using mpiexec
+                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]} --cpu-bind list:53"+\
                         f" python -m ensemble_launcher.worker"+\
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
-                if self.logger: self.logger.debug(f"Running command: {cmd}")
+                if self.logger: self.logger.info(f"Running command: {cmd}")
                 p = subprocess.Popen(
                         cmd, shell=True, env=env
                 )
-                self.processes.append(p)
+                self.processes[child_name] = p
 
-            ##wait for all children to connect
-            nready = 0
-            tstart = time.time()
-            timeout = 600
-            while nready < self.n_children:
-                for child_name in self.children_names:
-                    msg = self.recv_from_child(child_name, timeout=0.5)
-                    if msg == "READY":
-                        nready += 1
-                        if self.logger: self.logger.debug(f"Child {child_name} is ready")
-                time.sleep(0.5)
-                if time.time() - tstart > timeout:
-                    if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
-                    raise TimeoutError("Timeout waiting for children to be ready")
+            ##confirm that all children are ready
+            self._confirm_connection()
 
         for child_name in self.children_names:
             for task_id, task_info in self.children_tasks[child_name].items():
@@ -283,12 +306,13 @@ class master(Node):
 
     def _run_local_masters(self,logger=False):
         """Run local master children (for global master)."""
-        self._initialize_children()
-        if self.comm_config["comm_layer"] == "zmq":
-            self.setup_zmq_sockets()
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
+        self._initialize_children()
+        if self.comm_config["comm_layer"] == "zmq":
+            self.setup_zmq_sockets()
+        
 
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
@@ -304,7 +328,7 @@ class master(Node):
                     env=env
                 )
                 p.start()
-                self.processes.append(p)
+                self.processes[child_name] = p
         elif self.parallel_backend == "multiprocessing":
             for pid,child_name in enumerate(self.children_names):
                 if self.comm_config["comm_layer"] == "zmq":
@@ -313,7 +337,7 @@ class master(Node):
                     target=self.children[child_name].run_children
                     )
                 p.start()
-                self.processes.append(p)
+                self.processes[child_name] = p
         elif self.parallel_backend == "mpi":
             os.makedirs(os.path.join(os.getcwd(),".obj"),exist_ok=True)
             ###dump the child object to a file
@@ -322,30 +346,24 @@ class master(Node):
                     self.children[child_name].parent_address = self.my_address
                 with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
                     pickle.dump(child_obj,f)
-                ##launch the child process using mpiexec
-                cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]}"+\
+                
+                if self.children_nodes[child_name][0] == socket.gethostname():
+                    cmd = f"python -m ensemble_launcher.master"+\
+                            f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
+                else:
+                    ##launch the child process using mpiexec
+                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]} --cpu-bind list:2"+\
                         f" python -m ensemble_launcher.master"+\
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
                 if self.logger: self.logger.debug(f"Running command: {cmd}")
                 p = subprocess.Popen(
                         cmd, shell=True, env=env
                     )
-                self.processes.append(p)
+                self.processes[child_name] = p
+        
+            ##confirm that all children are ready
+            self._confirm_connection()
 
-            ##wait for all children to connect
-            nready = 0
-            tstart = time.time()
-            timeout = 600
-            while nready < self.n_children:
-                for child_name in self.children_names:
-                    msg = self.recv_from_child(child_name, timeout=0.5)
-                    if msg == "READY":
-                        nready += 1
-                        if self.logger: self.logger.debug(f"Child {child_name} is ready")
-                time.sleep(0.5)
-                if time.time() - tstart > timeout:
-                    if self.logger: self.logger.warning(f"Timeout waiting for children to be ready")
-                    raise TimeoutError("Timeout waiting for children to be ready")
 
         for child_name in self.children_names:
             for task_id, task_info in self.children_tasks[child_name].items():
@@ -356,7 +374,53 @@ class master(Node):
 
         # Monitor local master processes
         return self._monitor_children()
-    
+
+    def _confirm_connection(self):
+        ##wait for all children to connect
+        nready = 0
+        tstart = time.time()
+        timeout = 30
+        ready_children = []
+        while nready < self.n_children:
+            if self.logger: self.logger.debug(f"Waiting for {self.n_children-nready} children to be ready")
+            for child_name in self.children_names:
+                if child_name in ready_children:
+                    continue
+                msg = self.recv_from_child(child_name, timeout=0.5)
+                if msg == "READY":
+                    nready += 1
+                    ready_children.append(child_name)
+                    if self.logger: self.logger.debug(f"Child {child_name} is ready")
+            time.sleep(0.5)
+            if time.time() - tstart > timeout:
+                if self.logger: self.logger.warning(f"Timeout waiting for children to be ready. Killing stalled children and redistributing tasks.")
+                break
+        if nready < self.n_children:
+            tasks = {}
+            toremove_children = list(set(self.children_names) - set(ready_children))
+            self.logger.warning(f"Removing {len(toremove_children)} children that are not ready: {', '.join(toremove_children)}")
+            self.children_names = ready_children
+            self.init_progress_info()
+            self.n_children = len(self.children_names)
+            for child_name in toremove_children:
+                tasks.update(self.children_tasks[child_name])
+                del self.children_tasks[child_name]
+                del self.children_nodes[child_name]
+                self.processes[child_name].terminate()
+                self.processes[child_name].wait(timeout=5)
+                del self.children[child_name]
+            new_child_tasks,unassigned_tasks = \
+                    self.reassign_children(tasks,self.children_names,self.children_nodes)
+            if self.logger: self.logger.info(f"Can't schedule {len(unassigned_tasks)} tasks")
+            for child_name in self.children_names:
+                self.children_tasks[child_name].update(new_child_tasks.get(child_name,{}))
+                self.send_to_child(child_name,new_child_tasks.get(child_name,{}))
+                
+        else:
+            for child_name in self.children_names:
+                self.send_to_child(child_name, "CONTINUE")
+        if self.logger: self.logger.info("All children are ready")
+
     def _monitor_children(self):
         """Common monitoring code for both types of children."""
         ndone = 0
@@ -381,19 +445,20 @@ class master(Node):
                 else:
                     if self.logger: self.logger.debug(f"Received unknown msg from parent: {msg}")
 
-            for pid in range(self.n_children):
-                if pid in done_children:
+            for child_name in self.children_names:
+                if self.logger: self.logger.debug(f"ndone children: {ndone}")
+                if child_name in done_children:
                     continue
                 ##there is default timeout of 60s
-                msg = self.recv_from_child(self.children_names[pid], timeout=0.5)
+                msg = self.recv_from_child(child_name, timeout=0.5)
                 if msg == "DONE":
                     ndone += 1
-                    done_children.append(pid)
+                    done_children.append(child_name)
                 else:
                     if msg is not None:
                         for k, v in msg.items():
-                            self.progress_info[k][pid] = v
-            
+                            self.progress_info[k][child_name] = v
+
             if time.time() - self.last_update_time > 1:
                 ##report status
                 self.report_status()
@@ -412,10 +477,10 @@ class master(Node):
         if self.logger: self.logger.info("Cleaning up resources...")
     
         # Terminate any running child processes
-        for i, p in enumerate(self.processes):
+        for child_name, p in self.processes.items():
             if p.is_alive:
                 try:
-                    if self.logger: self.logger.info(f"Terminating process {i}")
+                    if self.logger: self.logger.info(f"Terminating process {child_name}")
                     if self.parallel_backend in ["dragon","multiprocessing"]:
                         p.kill()
                         p.join(timeout=0.5)
@@ -423,14 +488,14 @@ class master(Node):
                         p.terminate()
                         p.wait(timeout=0.5)
                 except Exception as e:
-                    if self.logger: self.logger.error(f"Error terminating process {i}: {e}")
+                    if self.logger: self.logger.error(f"Error terminating process {child_name}: {e}")
         self.close()
     
         # Clear data structures
         self.children_obj = []
         self.children = {}
         self.parents = {}
-        self.processes = []
+        self.processes = {}
 
         gc.collect()  # Force garbage collection to free up memory
         if self.logger: self.logger.info("Resource cleanup completed")

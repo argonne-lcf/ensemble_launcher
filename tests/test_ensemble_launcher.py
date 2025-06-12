@@ -24,6 +24,8 @@ def get_num_nodes():
 def test_cpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="multiprocessing"):
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
+    if os.path.exists("./outputs"):
+        os.system("rm -rf ./outputs")
     nprocs = 1
     ngpus = 0
 
@@ -82,6 +84,8 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="mult
     assert count == ((num_nodes*12//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
+    if os.path.exists("./outputs"):
+        os.system("rm -rf ./outputs")
 
     ##forcing multilevel launcher
     el = ensemble_launcher("config.json",logging_level=logging.DEBUG, force_level="double", parallel_backend=parallel_backend)
@@ -103,6 +107,8 @@ def test_cpu(comm_config={"comm_layer":"multiprocessing"},parallel_backend="mult
     assert count == ((num_nodes*12//nprocs)*nprocs + sum([i*nprocs for i in list(range(1,num_nodes+1))]))
     if os.path.exists("./run_dir"):
         os.system("rm -rf ./run_dir")
+    if os.path.exists("./outputs"):
+        os.system("rm -rf ./outputs")
 
 
 #**************************************************************************************************
@@ -384,7 +390,7 @@ if __name__ == "__main__":
     ]
     
     test_functions = [
-        # test_cpu,
+        test_cpu,
         # test_gpu,
         # test_cpu_and_gpu,
         test_ensemble_update

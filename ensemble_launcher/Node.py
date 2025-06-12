@@ -7,6 +7,7 @@ import time
 import socket
 import random
 import pickle
+import sys
 try:
     import zmq
     ZMQ_AVAILABLE = True
@@ -25,14 +26,17 @@ class Node(abc.ABC):
                  comm_config:dict={"comm_layer":"multiprocessing"},
                  logger=True,
                  logging_level=logging.INFO,
-                 update_interval:int=None):
+                 update_interval:int=None,
+                 enable_heartbeat:bool=False,
+                 heartbeat_interval:int=10):
         self.node_id = node_id
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
         self.sys_info = sys_info
         self.logging_level = logging_level
         self.update_interval = update_interval
-        self.last_update_time =time.time()
+        self.last_update_time = time.time()
+        self.last_heartbeat_time = None
 
         self.comm_config = comm_config
         assert comm_config["comm_layer"] in ["multiprocessing","dragon","zmq"]
@@ -72,6 +76,7 @@ class Node(abc.ABC):
             self.router_cache = {}
             try:
                 self.router_socket.bind(f"tcp://{self.my_address}")
+                if self.logger: self.logger.info(f"Successfully bound to {self.my_address}")
             except zmq.error.ZMQError as e:
                 if "Address already in use" in str(e):
                     # Try binding up to 3 times with different ports
@@ -102,6 +107,20 @@ class Node(abc.ABC):
             self.dealer_poller = zmq.Poller()
             self.dealer_poller.register(self.dealer_socket, zmq.POLLIN)
             self.dealer_socket.send(pickle.dumps("READY"))
+            msg = pickle.loads(self.dealer_socket.recv())
+            if msg == "CONTINUE":
+                if self.logger: self.logger.info(f"Received continue from parent")
+            elif msg == "STOP":
+                if self.logger: self.logger.info(f"Received stop from parent, Quitting...")
+                sys.exit(0)
+            else:
+                if isinstance(msg, dict):
+                    self.my_tasks.update(msg)
+                else:
+                    if self.logger: 
+                        self.logger.warning(f"Unexpected message from parent: {msg}. Expected dict or 'CONTINUE'/'STOP'.")
+                        
+                    
 
     def configure_logger(self,logging_level=logging.INFO):
         self.logger = logging.getLogger(f"Node-{self.node_id}")
@@ -177,9 +196,8 @@ class Node(abc.ABC):
                         self.logger.debug(f"Received message {msg} from child {child_id}.")
                     return msg
             elif self.comm_config["comm_layer"] == "zmq":
-                if child_id in self.router_cache:
-                    msg = self.router_cache[child_id]
-                    del self.router_cache[child_id]
+                if child_id in self.router_cache and len(self.router_cache[child_id]) > 0:
+                    msg = self.router_cache[child_id].pop(0)  # Get the first cached message
                     if self.logger:
                         self.logger.debug(f"Received cached message from child {child_id}. {msg}")
                     return msg
@@ -199,7 +217,9 @@ class Node(abc.ABC):
                         else:
                             if self.logger:
                                 self.logger.debug(f"Received message from child {msg[0]}, but expected {child_id}. Caching the message.")
-                            self.router_cache[msg[0]] = msg[1]
+                            if msg[0] not in self.router_cache:
+                                self.router_cache[msg[0]] = []
+                            self.router_cache[msg[0]].append(msg[1])
         else:
             if self.logger:
                 self.logger.debug(f"Cannot receive from child {child_id}: child does not exist.")
@@ -229,10 +249,9 @@ class Node(abc.ABC):
             if self.comm_config["comm_layer"] in ["multiprocessing", "dragon"]:
                 msg = self.children[child_id]._other_conn.recv()
             elif self.comm_config["comm_layer"] == "zmq":
-                if child_id in self.router_cache:
+                if child_id in self.router_cache and len(self.router_cache[child_id]) > 0:
                     if self.logger: self.logger.debug(f"Child {child_id} has cached messages.")
-                    msg = self.router_cache[child_id]
-                    del self.router_cache[child_id]
+                    msg = self.router_cache[child_id].pop(0)  # Get the first cached message
                 while True:
                     msgs = self.zmq_socket.recv_multipart()  # Blocking call
                     child_id_in = msgs[0].decode()  # Convert bytes to string for child_id
@@ -240,7 +259,9 @@ class Node(abc.ABC):
                     if child_id_in == str(child_id):
                         break
                     else:
-                        self.router_cache[child_id_in] = msg
+                        if child_id_in not in self.router_cache:
+                            self.router_cache[child_id_in] = []
+                        self.router_cache[child_id_in].append(msg)
                     time.sleep(0.1)  # Avoid busy waiting
         else:
             if self.logger:
