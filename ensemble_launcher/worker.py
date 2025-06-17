@@ -11,6 +11,49 @@ import numpy as np
 from .helper_functions import *
 from .Node import Node
 
+def _execute_task(task_info:dict) -> dict:
+    """Function to execute in process pool - takes a dictionary with all task parameters"""
+    env = os.environ.copy()
+    env.update(task_info["env"])
+    if task_info["io"]:
+        os.makedirs(task_info["run_dir"],exist_ok=True)
+    cmd = task_info["cmd"]
+    log_file = task_info["log_file"]
+    err_file = task_info["err_file"]
+    launch_dir = task_info["launch_dir"]
+    io = task_info["io"]
+    timeout = task_info.get("timeout", None)
+    start_time = time.time()
+    task_info["start_time"] = start_time
+    stdout = open(log_file, "w") if io else subprocess.DEVNULL
+    stderr = open(err_file, "w") if io else subprocess.DEVNULL
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            cwd=launch_dir,
+            env=env,
+            timeout=timeout,
+            close_fds=True
+        )
+        status = "finished" if result.returncode == 0 else "failed"
+        task_info["end_time"] = time.time()
+        task_info["status"] = status
+        task_info["execution_time"] = time.time() - start_time
+        task_info["returncode"] = result.returncode
+        task_info["error"] = None if status == "finished" else f"Command failed with return code {result.returncode}"
+    except Exception as e:
+        task_info["status"] = "failed"
+        task_info["end_time"] = time.time()
+        task_info["execution_time"] = time.time() - start_time
+        task_info["error"] = str(e)
+    if io:
+        if hasattr(stdout, 'close'): stdout.close()
+        if hasattr(stderr, 'close'): stderr.close()
+    return task_info
 
 class worker(Node):
     def __init__(self,
@@ -41,6 +84,14 @@ class worker(Node):
         else:
             self.free_gpus_per_node = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.my_nodes}
 
+        ### High Throughput
+        if len(self.my_nodes) == 1 and all([task_info["num_processes_per_node"] == 1 for task_info in my_tasks.values()]):
+            self.high_throughput = True
+        else:
+            self.high_throughput = False
+        self.futures = {}
+        self.process_pool = None
+        ###
         self.tmp_dir = f"/tmp/worker-{worker_id}"
         
 
@@ -297,6 +348,7 @@ class worker(Node):
             if self.logger: self.logger.info(f"Creating run dir {task_info['run_dir']}")
         if self.logger: self.logger.info(f"launching task {task_info['id']} with {task_info['cmd']}")
         env["TMPDIR"] = self.tmp_dir
+
         p = subprocess.Popen(task_info["cmd"],
                              executable="/bin/bash",
                              shell=True,
@@ -307,6 +359,22 @@ class worker(Node):
                              env=env,
                              close_fds = True)
         return p
+    
+    def launch_all_tasks(self):
+        futures = {}
+        if self.process_pool is None:
+            self.process_pool = mp.Pool(processes=mp.cpu_count())
+        ready_tasks = self.get_ready_tasks()
+        for task_id in ready_tasks:
+            task_info = self.my_tasks[task_id]
+            cmd,env = self.build_task_cmd(task_info)
+            task_info["cmd"] = cmd
+            task_info["env"].update(env)
+            task_info["env"]["TMPDIR"] = self.tmp_dir
+            task_info["status"] = "running"
+            futures[task_id] = self.process_pool.apply_async(_execute_task, (task_info,))
+
+        return futures
 
     """
     function checks if the requested resources are available on the node
@@ -389,10 +457,27 @@ class worker(Node):
             self.setup_zmq_sockets()
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir,exist_ok=True)
+        ##in high throughput mode, we launch all the tasks at once
+        if self.high_throughput:
+            if self.logger: self.logger.info("High throughput mode enabled. Launching all tasks at once.")
         while True:
             count = 0
-            launched_tasks = self.launch_ready_tasks()
-            self.poll_running_tasks()
+            if self.high_throughput:
+                new_futures = self.launch_all_tasks()
+                self.futures.update(new_futures)
+                if len(new_futures) > 0 and self.logger:
+                    self.logger.info(f"Launching {len(new_futures)} tasks")
+                for task_id, future in self.futures.items():
+                    try:
+                        update_task_info = future.get(timeout=0.01)
+                        self.my_tasks[task_id].update(update_task_info)
+                        if self.logger:
+                            self.logger.info(f"Task {task_id} {update_task_info['status']} in {update_task_info['execution_time']:.2f} seconds on {socket.gethostname()}")
+                    except mp.TimeoutError:
+                        pass
+            else:
+                launched_tasks = self.launch_ready_tasks()
+                self.poll_running_tasks()
             if time.time() - self.last_update_time > 1:
                 ##report status
                 self.report_status()
@@ -468,6 +553,12 @@ class worker(Node):
                     if self.logger: self.logger.info(f"Process of {task_id} is still running. So, killing it...")
                     task_info["process"].kill()
                     task_info["process"].wait(timeout=10)
+                    
+        if self.process_pool is not None:
+            if self.logger: self.logger.info("Closing process pool...")
+            self.process_pool.close()
+            self.process_pool.join()
+            self.process_pool = None
 
         if os.path.exists(self.tmp_dir):
             try:
