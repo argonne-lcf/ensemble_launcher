@@ -11,7 +11,7 @@ import numpy as np
 from .helper_functions import *
 from .Node import Node
 
-def _execute_task(task_info:dict) -> dict:
+def _execute_task(task_info:dict, result_queue:mp.Queue) -> dict:
     """Function to execute in process pool - takes a dictionary with all task parameters"""
     env = os.environ.copy()
     env.update(task_info["env"])
@@ -39,6 +39,7 @@ def _execute_task(task_info:dict) -> dict:
             timeout=timeout,
             close_fds=True
         )
+
         status = "finished" if result.returncode == 0 else "failed"
         task_info["end_time"] = time.time()
         task_info["status"] = status
@@ -53,6 +54,7 @@ def _execute_task(task_info:dict) -> dict:
     if io:
         if hasattr(stdout, 'close'): stdout.close()
         if hasattr(stderr, 'close'): stderr.close()
+    result_queue.put(task_info)
     return task_info
 
 class worker(Node):
@@ -91,6 +93,8 @@ class worker(Node):
             self.high_throughput = False
         self.futures = {}
         self.process_pool = None
+        self.result_queue = None
+        self.manager = None
         ###
         self.tmp_dir = f"/tmp/worker-{worker_id}"
         
@@ -361,20 +365,22 @@ class worker(Node):
         return p
     
     def launch_all_tasks(self):
-        futures = {}
-        if self.process_pool is None:
-            self.process_pool = mp.Pool(processes=mp.cpu_count())
         ready_tasks = self.get_ready_tasks()
-        for task_id in ready_tasks:
+        task_infos = []
+        for idx,task_id in enumerate(ready_tasks):
             task_info = self.my_tasks[task_id]
             cmd,env = self.build_task_cmd(task_info)
             task_info["cmd"] = cmd
             task_info["env"].update(env)
             task_info["env"]["TMPDIR"] = self.tmp_dir
             task_info["status"] = "running"
-            futures[task_id] = self.process_pool.apply_async(_execute_task, (task_info,))
+            task_infos.append(task_info)
 
-        return futures
+        if len(task_infos) > 0:
+            self.process_pool.starmap_async(_execute_task, 
+            [(task_info, self.result_queue) for task_info in task_infos],)
+
+        return len(ready_tasks)
 
     """
     function checks if the requested resources are available on the node
@@ -449,63 +455,106 @@ class worker(Node):
                                 "assigned_nodes":[]})
         return None
 
-    def run_tasks(self,logger=False) -> None:
+    def check_for_messages(self) -> bool:
+        """
+        Check for messages from parent and handle them appropriately.
+        Returns True if a kill signal was received.
+        """
+        kill_signal = False
+        if self.update_interval is not None:
+            msg = self.recv_from_parent(0, timeout=1)
+            if isinstance(msg, tuple):
+                if msg[0] == "KILL":
+                    kill_signal = True
+                elif msg[0] == "SYNC":
+                    self.send_to_parent(0, "SYNCED")
+                    msg = self.blocking_recv_from_parent(0)
+                    if isinstance(msg, tuple) and msg[0] == "UPDATE":
+                        self.commit_task_update(msg[1], msg[2])
+                        self.send_to_parent(0, "UPDATE SUCCESSFUL")
+            elif msg and self.logger:
+                self.logger.debug(f"Received unknown msg from parent: {msg}")
+        return kill_signal
+
+    def setup_environment(self, logger=False):
+        """Setup the environment for task execution."""
         if logger: 
             self.configure_logger(self.logging_level)
             if self.logger: self.logger.info(f"Running on {socket.gethostname()}")
         if self.comm_config["comm_layer"] == "zmq":
             self.setup_zmq_sockets()
         self.last_update_time = time.time()
-        os.makedirs(self.tmp_dir,exist_ok=True)
-        ##in high throughput mode, we launch all the tasks at once
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        ##this is needed so that pool can see all the cores. In addition to the one used by mpirun
         if self.high_throughput:
-            if self.logger: self.logger.info("High throughput mode enabled. Launching all tasks at once.")
-        while True:
-            count = 0
-            if self.high_throughput:
-                new_futures = self.launch_all_tasks()
-                self.futures.update(new_futures)
-                if len(new_futures) > 0 and self.logger:
-                    self.logger.info(f"Launching {len(new_futures)} tasks")
-                for task_id, future in self.futures.items():
-                    try:
-                        update_task_info = future.get(timeout=0.01)
-                        self.my_tasks[task_id].update(update_task_info)
-                        if self.logger:
-                            self.logger.info(f"Task {task_id} {update_task_info['status']} in {update_task_info['execution_time']:.2f} seconds on {socket.gethostname()}")
-                    except mp.TimeoutError:
-                        pass
-            else:
-                launched_tasks = self.launch_ready_tasks()
-                self.poll_running_tasks()
-            if time.time() - self.last_update_time > 1:
-                ##report status
-                self.report_status()
-                self.last_update_time = time.time()
-            kill_signal = False
-            ##function listens to master for updates in tasks
-            if self.update_interval is not None:
-                msg = self.recv_from_parent(0,timeout=1)
-                if isinstance(msg,tuple) and msg[0] == "KILL":
-                    kill_signal = True
-                elif isinstance(msg,tuple) and msg[0] == "SYNC":
-                    self.send_to_parent(0,"SYNCED")
-                    msg = self.blocking_recv_from_parent(0)
-                    if isinstance(msg,tuple) and msg[0] == "UPDATE":
-                        self.commit_task_update(msg[1],msg[2])
-                        self.send_to_parent(0,"UPDATE SUCCESSFUL")
-                else:
-                    if self.logger: self.logger.debug(f"Received unknown msg from parent: {msg}")
+            os.sched_setaffinity(0, range(mp.cpu_count()))
+            
+    def exit_sequence(self):
+        """Handle cleanup and send completion signal."""
+        self.report_status()
+        self.cleanup_resources()
+        self.send_to_parent(0, "DONE")
 
-            if kill_signal or len(self.get_pending_tasks()) == 0:
-                self.report_status()
-                self.cleanup_resources()
-                self.send_to_parent(0,"DONE")
-                # self.send_to_parent(0,self.my_tasks)
-                ##close all the pipes
-                # self.close()
-                break
-        return None
+    def process_high_throughput_tasks(self):
+        """Process tasks in high throughput mode."""
+        tstart = time.time()
+        ntasks = self.launch_all_tasks()
+        tend = time.time()
+        if ntasks > 0 and self.logger:
+            self.logger.debug(f"Launched {ntasks} tasks in {tend - tstart:.2f} seconds.")
+        
+        # Poll running tasks
+        while not self.result_queue.empty():
+            update_task_info = self.result_queue.get()
+            task_id = update_task_info["id"]
+            self.my_tasks[task_id].update(update_task_info)
+    
+    def process_standard_tasks(self):
+        """Process tasks in standard mode."""
+        self.launch_ready_tasks()
+        self.poll_running_tasks()
+
+    def run_tasks(self, logger=False) -> None:
+        # Setup
+        self.setup_environment(logger)
+        
+        # Use manager for high throughput mode
+        if self.high_throughput:
+            with mp.Manager() as manager:
+                self.manager = manager
+                self.result_queue = manager.Queue()
+                self.process_pool = manager.Pool(processes=mp.cpu_count())
+                if self.logger: self.logger.info("High throughput mode enabled. Launching all tasks at once.")
+
+                # Main execution loop
+                while True:
+                    # Process tasks
+                    self.process_high_throughput_tasks()
+                    # Report status periodically
+                    if time.time() - self.last_update_time > 1:
+                        self.report_status()
+                        self.last_update_time = time.time()
+                    # Check for parent messages
+                    kill_signal = self.check_for_messages()
+                    # Exit conditions
+                    if kill_signal or not self.get_pending_tasks():
+                        self.exit_sequence()
+                        break
+        else: 
+            # Main execution loop
+            while True:
+                # Process tasks
+                self.process_standard_tasks()
+                # Report status periodically
+                if time.time() - self.last_update_time > 1:
+                    self.report_status()
+                    self.last_update_time = time.time()
+                # Check for parent messages
+                kill_signal = self.check_for_messages()
+                # Exit conditions
+                if kill_signal or not self.get_pending_tasks():
+                    self.exit_sequence()
+                    break
 
     def delete_tasks(self,task_infos:dict) -> None:
         task_ids = list(task_infos.keys())
