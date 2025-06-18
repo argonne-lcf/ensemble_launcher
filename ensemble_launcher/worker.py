@@ -88,9 +88,9 @@ class worker(Node):
 
         ### High Throughput
         if len(self.my_nodes) == 1 and all([task_info["num_processes_per_node"] == 1 for task_info in my_tasks.values()]):
-            self.high_throughput = True
+            self.serial = True
         else:
-            self.high_throughput = False
+            self.serial = False
         self.futures = {}
         self.process_pool = None
         self.result_queue = None
@@ -216,93 +216,77 @@ class worker(Node):
     """
     Function modifies the task template based on the system and input values
     """
-    def build_launcher_cmd(self, task_info:dict, cpu_bind = True) -> tuple:
+    def build_mpi_launcher_cmd(self, task_info:dict, cpu_bind = True) -> tuple:
         env = {}
-        if task_info["launcher"] == "mpi":
-            if task_info["system"] == "local":
-                launcher_cmd = f"mpirun -np {task_info['num_nodes'] * task_info['num_processes_per_node']} "
-                if "num_gpus_per_process" in task_info.keys():
-                    raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
-            else:
-                launcher_options = task_info.get("launcher_options", {})
-
-                launcher_cmd = "mpirun "
-
-                if "np" in launcher_options:
-                    if launcher_options["np"] != task_info["num_nodes"] * task_info["num_processes_per_node"]:
-                        raise ValueError("Mismatch in 'np' value between launcher_options and calculated options")
-                launcher_cmd += f"-np {task_info['num_nodes']*task_info['num_processes_per_node']} "
-                
-                if "ppn" in launcher_options:
-                    if launcher_options["ppn"] != task_info["num_processes_per_node"]:
-                        raise ValueError("Mismatch in 'ppn' value between launcher_options and calculated options")
-                launcher_cmd += f"-ppn {task_info['num_processes_per_node']} "
-
-                launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
-                
-                if cpu_bind:
-                    ###check for launcher options
-                    if "cpu-bind" in launcher_options:
-                        if launcher_options["cpu-bind"] == "depth":
-                            if "depth" not in launcher_options:
-                                raise ValueError("'cpu-bind' value is 'depth' but 'depth' is not in launcher_options")
-                            launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
-                        else:
-                            launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
+        if task_info["system"] == "local":
+            launcher_cmd = f"mpirun -np {task_info['num_nodes'] * task_info['num_processes_per_node']} "
+            if "num_gpus_per_process" in task_info.keys():
+                raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
+        else:
+            launcher_options = task_info.get("launcher_options", {})
+            launcher_cmd = "mpirun "
+            if "np" in launcher_options:
+                if launcher_options["np"] != task_info["num_nodes"] * task_info["num_processes_per_node"]:
+                    raise ValueError("Mismatch in 'np' value between launcher_options and calculated options")
+            launcher_cmd += f"-np {task_info['num_nodes']*task_info['num_processes_per_node']} "
+            
+            if "ppn" in launcher_options:
+                if launcher_options["ppn"] != task_info["num_processes_per_node"]:
+                    raise ValueError("Mismatch in 'ppn' value between launcher_options and calculated options")
+            launcher_cmd += f"-ppn {task_info['num_processes_per_node']} "
+            launcher_cmd += f"--hosts {','.join(task_info['assigned_nodes'])} "
+            
+            if cpu_bind:
+                ###check for launcher options
+                if "cpu-bind" in launcher_options:
+                    if launcher_options["cpu-bind"] == "depth":
+                        if "depth" not in launcher_options:
+                            raise ValueError("'cpu-bind' value is 'depth' but 'depth' is not in launcher_options")
+                        launcher_cmd += f"--depth={launcher_options['depth']} --cpu-bind={launcher_options['cpu-bind']} "
                     else:
-                        common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
-                        use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
-                        if use_common_cpus:
-                            if self.sys_info["name"] == "aurora":
-                                cores = []
-                                for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
-                                    cores.append(f"{2*i},{2*i+1}")
-                                cores = ":".join(cores)
-                            else:
-                                cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
-                            launcher_cmd += f"--cpu-bind list:{cores} "
+                        launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
+                else:
+                    common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
+                    use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
+                    if use_common_cpus:
+                        if self.sys_info["name"] == "aurora":
+                            cores = []
+                            for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
+                                cores.append(f"{2*i},{2*i+1}")
+                            cores = ":".join(cores)
                         else:
-                            ###user rankfile option
-                            rankfile_path = task_info["mpi_rankfile"]
-                            with open(rankfile_path, "w") as rankfile:
-                                rank = 0
-                                for node in task_info["assigned_nodes"]:
-                                    for core_set in task_info["assigned_cores"][node]:
-                                        rankfile.write(f"rank {rank}={node} slot={core_set}\n")
-                                        rank += 1
-                            if self.logger: self.logger.warning(f"Over subscribing cores")
-                            # launcher_cmd += f"--rankfile {rankfile_path} "
-                
-                ##append all other launcher options that are not checked above
-                for key, value in launcher_options.items():
-                    if key != "np" and key != "ppn" and key != "hosts" and key != "cpu-bind" and key != "depth":
-                        launcher_cmd += f"--{key} {value} "
-                
-                if "num_gpus_per_process" in task_info.keys():
-                    if task_info["system"] == "aurora":
-                        common_gpus = set.intersection(*[set(gpus) for gpus in task_info["assigned_gpus"].values()])
-                        use_common_gpus = sorted(list(common_gpus)) == sorted(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])
-                        if use_common_gpus:
-                            if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
-                                ##here you don't need any compilcated bash script 
-                                # you can just getaway with a simple environment variable
-                                # launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]][0]} "
-                                env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
-                                env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
-                            else:
-                                bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
-                                os.makedirs(task_info["run_dir"], exist_ok=True)
-                                fname = task_info["gpu_affinity_file"]
-                                if not os.path.exists(fname):
-                                    with open(fname, "w") as f:
-                                        f.write(bash_script)
-                                    st = os.stat(fname)
-                                    os.chmod(fname,st.st_mode | stat.S_IEXEC)
-                                launcher_cmd += f"{fname} "
-                                ##set environment variables
-                                env.update({"AVAILABLE_GPUS": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
+                            cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
+                        launcher_cmd += f"--cpu-bind list:{cores} "
+                    else:
+                        ###user rankfile option
+                        rankfile_path = task_info["mpi_rankfile"]
+                        with open(rankfile_path, "w") as rankfile:
+                            rank = 0
+                            for node in task_info["assigned_nodes"]:
+                                for core_set in task_info["assigned_cores"][node]:
+                                    rankfile.write(f"rank {rank}={node} slot={core_set}\n")
+                                    rank += 1
+                        if self.logger: self.logger.warning(f"Over subscribing cores")
+                        # launcher_cmd += f"--rankfile {rankfile_path} "
+            
+            ##append all other launcher options that are not checked above
+            for key, value in launcher_options.items():
+                if key != "np" and key != "ppn" and key != "hosts" and key != "cpu-bind" and key != "depth":
+                    launcher_cmd += f"--{key} {value} "
+            
+            if "num_gpus_per_process" in task_info.keys():
+                if task_info["system"] == "aurora":
+                    common_gpus = set.intersection(*[set(gpus) for gpus in task_info["assigned_gpus"].values()])
+                    use_common_gpus = sorted(list(common_gpus)) == sorted(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])
+                    if use_common_gpus:
+                        if task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1:
+                            ##here you don't need any compilcated bash script 
+                            # you can just getaway with a simple environment variable
+                            # launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]][0]} "
+                            env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
+                            env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
                         else:
-                            bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
+                            bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
                             os.makedirs(task_info["run_dir"], exist_ok=True)
                             fname = task_info["gpu_affinity_file"]
                             if not os.path.exists(fname):
@@ -311,26 +295,47 @@ class worker(Node):
                                 st = os.stat(fname)
                                 os.chmod(fname,st.st_mode | stat.S_IEXEC)
                             launcher_cmd += f"{fname} "
-                            ##Here you need to set the environment variables for each node
-                            for node in task_info["assigned_nodes"]:
-                                env.update({f"AVAILABLE_GPUS_{node}": ",".join(task_info["assigned_gpus"][node])})
+                            ##set environment variables
+                            env.update({"AVAILABLE_GPUS": ",".join(task_info["assigned_gpus"][task_info["assigned_nodes"][0]])})
                     else:
-                        raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
-                    
-        else:
-            if task_info["launcher"] != "bash":
-                raise ValueError(f"Unknown launcher {task_info['launcher']}")
-            else:
-                launcher_cmd = ""
-                env = {}
+                        bash_script = gen_affinity_bash_script_aurora_2(task_info["num_gpus_per_process"])
+                        os.makedirs(task_info["run_dir"], exist_ok=True)
+                        fname = task_info["gpu_affinity_file"]
+                        if not os.path.exists(fname):
+                            with open(fname, "w") as f:
+                                f.write(bash_script)
+                            st = os.stat(fname)
+                            os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                        launcher_cmd += f"{fname} "
+                        ##Here you need to set the environment variables for each node
+                        for node in task_info["assigned_nodes"]:
+                            env.update({f"AVAILABLE_GPUS_{node}": ",".join(task_info["assigned_gpus"][node])})
+                else:
+                    raise NotImplementedError("Unknown machine for scheduling tasks on GPUs, sorry!")
 
         return launcher_cmd, env
+    
+    def build_bash_cmd(self, task_info:dict):
+        launcher_cmd = ""
+        env = {}
+        if task_info.get("ngpus_per_process", 0) > 0:
+            assert task_info["system"] == "aurora", "High throughput tasks with GPUs are only supported on Aurora currently."
+            env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
+            env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
+        return launcher_cmd, env
+
+
     """
     Build the launch cmd based on cmd_template from the user
     """
     def build_task_cmd(self,task_info:dict) -> tuple:
 
-        launcher_cmd, env = self.build_launcher_cmd(task_info, cpu_bind = "cpu-bind" not in task_info["cmd_template"])
+        if self.serial or task_info.get("launcher", "") == "bash":
+            if task_info.get("launcher","") == "mpi" and self.logger:
+                self.logger.warning("Using 'bash' launcher for high throughput tasks, ignoring 'mpi' launcher option.")
+            launcher_cmd, env = self.build_bash_cmd(task_info)
+        else:
+            launcher_cmd, env = self.build_mpi_launcher_cmd(task_info, cpu_bind = "cpu-bind" not in task_info["cmd_template"])
         open_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "{"]
         close_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "}"]
         placeholders = [task_info["cmd_template"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]
@@ -363,8 +368,8 @@ class worker(Node):
                              env=env,
                              close_fds = True)
         return p
-    
-    def launch_all_tasks(self):
+
+    def launch_serial_tasks(self):
         ready_tasks = self.get_ready_tasks()
         task_infos = []
         for idx,task_id in enumerate(ready_tasks):
@@ -373,6 +378,18 @@ class worker(Node):
             task_info["cmd"] = cmd
             task_info["env"].update(env)
             task_info["env"]["TMPDIR"] = self.tmp_dir
+            ##assign nodes, cores and gpus
+            assigned_node = self.my_free_nodes[idx % len(self.my_free_nodes)]
+            task_info["assigned_nodes"] = [assigned_node]
+            task_info["assigned_cores"] = {assigned_node:[]}
+            ##assign gpus
+            if task_info.get("ngpus_per_process", 0) > 0:
+                assigned_gpus = []
+                while len(self.free_gpus_per_node[assigned_node]) > 0 and len(assigned_gpus) < task_info["ngpus_per_process"]:
+                    assigned_gpus.append(self.free_gpus_per_node[assigned_node].pop(0))
+                if len(assigned_gpus) < task_info["ngpus_per_process"]:
+                    continue
+                task_info["assigned_gpus"] = {assigned_node:assigned_gpus}
             task_info["status"] = "running"
             task_infos.append(task_info)
 
@@ -454,7 +471,7 @@ class worker(Node):
                                  "process":None,
                                 "assigned_nodes":[]})
         return None
-
+    
     def check_for_messages(self) -> bool:
         """
         Check for messages from parent and handle them appropriately.
@@ -475,7 +492,7 @@ class worker(Node):
             elif msg and self.logger:
                 self.logger.debug(f"Received unknown msg from parent: {msg}")
         return kill_signal
-
+    
     def setup_environment(self, logger=False):
         """Setup the environment for task execution."""
         if logger: 
@@ -486,29 +503,29 @@ class worker(Node):
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir, exist_ok=True)
         ##this is needed so that pool can see all the cores. In addition to the one used by mpirun
-        if self.high_throughput:
+        if self.serial:
             os.sched_setaffinity(0, range(mp.cpu_count()))
-            
+
     def exit_sequence(self):
         """Handle cleanup and send completion signal."""
         self.report_status()
         self.cleanup_resources()
         self.send_to_parent(0, "DONE")
 
-    def process_high_throughput_tasks(self):
+    def process_serial_tasks(self):
         """Process tasks in high throughput mode."""
         tstart = time.time()
-        ntasks = self.launch_all_tasks()
+        ntasks = self.launch_serial_tasks()
         tend = time.time()
         if ntasks > 0 and self.logger:
             self.logger.debug(f"Launched {ntasks} tasks in {tend - tstart:.2f} seconds.")
-        
         # Poll running tasks
         while not self.result_queue.empty():
             update_task_info = self.result_queue.get()
             task_id = update_task_info["id"]
             self.my_tasks[task_id].update(update_task_info)
-    
+            self.free_task_nodes(self.my_tasks[task_id])
+
     def process_standard_tasks(self):
         """Process tasks in standard mode."""
         self.launch_ready_tasks()
@@ -519,17 +536,17 @@ class worker(Node):
         self.setup_environment(logger)
         
         # Use manager for high throughput mode
-        if self.high_throughput:
+        if self.serial:
             with mp.Manager() as manager:
                 self.manager = manager
                 self.result_queue = manager.Queue()
                 self.process_pool = manager.Pool(processes=mp.cpu_count())
-                if self.logger: self.logger.info("High throughput mode enabled. Launching all tasks at once.")
+                if self.logger: self.logger.info("Serial mode enabled. Launching all tasks at once.")
 
                 # Main execution loop
                 while True:
                     # Process tasks
-                    self.process_high_throughput_tasks()
+                    self.process_serial_tasks()
                     # Report status periodically
                     if time.time() - self.last_update_time > 1:
                         self.report_status()
