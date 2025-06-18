@@ -211,6 +211,8 @@ class worker(Node):
                 self.free_gpus_per_node[node].extend(task_info["assigned_gpus"][node])
                 self.free_gpus_per_node[node] = \
                         sorted(self.free_gpus_per_node[node])
+                if self.logger:
+                    self.logger.info(f"Freed {task_info['assigned_gpus'][node]} GPUs from node {node} for task {task_info['id']}")
         return
 
     """
@@ -318,7 +320,7 @@ class worker(Node):
     def build_bash_cmd(self, task_info:dict):
         launcher_cmd = ""
         env = {}
-        if task_info.get("ngpus_per_process", 0) > 0:
+        if task_info.get("num_gpus_per_process", 0) > 0:
             assert task_info["system"] == "aurora", "High throughput tasks with GPUs are only supported on Aurora currently."
             env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
             env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
@@ -369,27 +371,34 @@ class worker(Node):
                              close_fds = True)
         return p
 
-    def launch_serial_tasks(self):
+    def launch_serial_tasks(self,oversubscribe_gpus:bool=True) -> int:
         ready_tasks = self.get_ready_tasks()
         task_infos = []
         for idx,task_id in enumerate(ready_tasks):
             task_info = self.my_tasks[task_id]
-            cmd,env = self.build_task_cmd(task_info)
-            task_info["cmd"] = cmd
-            task_info["env"].update(env)
-            task_info["env"]["TMPDIR"] = self.tmp_dir
             ##assign nodes, cores and gpus
             assigned_node = self.my_free_nodes[idx % len(self.my_free_nodes)]
             task_info["assigned_nodes"] = [assigned_node]
             task_info["assigned_cores"] = {assigned_node:[]}
             ##assign gpus
-            if task_info.get("ngpus_per_process", 0) > 0:
+            if task_info.get("num_gpus_per_process", 0) > 0:
                 assigned_gpus = []
-                while len(self.free_gpus_per_node[assigned_node]) > 0 and len(assigned_gpus) < task_info["ngpus_per_process"]:
-                    assigned_gpus.append(self.free_gpus_per_node[assigned_node].pop(0))
-                if len(assigned_gpus) < task_info["ngpus_per_process"]:
-                    continue
+                if not oversubscribe_gpus:
+                    while len(self.free_gpus_per_node[assigned_node]) > 0 and len(assigned_gpus) < task_info["num_gpus_per_process"]:
+                        assigned_gpus.append(self.free_gpus_per_node[assigned_node].pop(0))
+                    if len(assigned_gpus) < task_info["num_gpus_per_process"]:
+                        continue
+                else:
+                    while len(assigned_gpus) < task_info["num_gpus_per_process"]:
+                        assigned_gpus.append(self.free_gpus_per_node[assigned_node].pop(0))
+                        self.free_gpus_per_node[assigned_node].append(assigned_gpus[-1])
                 task_info["assigned_gpus"] = {assigned_node:assigned_gpus}
+                if self.logger: self.logger.info(f"Assigned {assigned_gpus} GPUs to task {task_id} on node {assigned_node}")
+            cmd,env = self.build_task_cmd(task_info)
+            task_info["cmd"] = cmd
+            task_info["env"].update(env)
+            task_info["env"]["TMPDIR"] = self.tmp_dir
+
             task_info["status"] = "running"
             task_infos.append(task_info)
 
@@ -512,10 +521,10 @@ class worker(Node):
         self.cleanup_resources()
         self.send_to_parent(0, "DONE")
 
-    def process_serial_tasks(self):
+    def process_serial_tasks(self,oversubscribe_gpus:bool=False):
         """Process tasks in high throughput mode."""
         tstart = time.time()
-        ntasks = self.launch_serial_tasks()
+        ntasks = self.launch_serial_tasks(oversubscribe_gpus=oversubscribe_gpus)
         tend = time.time()
         if ntasks > 0 and self.logger:
             self.logger.debug(f"Launched {ntasks} tasks in {tend - tstart:.2f} seconds.")
@@ -524,7 +533,8 @@ class worker(Node):
             update_task_info = self.result_queue.get()
             task_id = update_task_info["id"]
             self.my_tasks[task_id].update(update_task_info)
-            self.free_task_nodes(self.my_tasks[task_id])
+            if not oversubscribe_gpus:
+                self.free_task_nodes(self.my_tasks[task_id])
 
     def process_standard_tasks(self):
         """Process tasks in standard mode."""
