@@ -27,7 +27,8 @@ class master(Node):
                  comm_config:dict={"comm_layer":"multiprocessing"},
                  logger:bool=False,
                  logging_level=logging.INFO,
-                 update_interval:int=None):
+                 update_interval:int=None,
+                 heartbeat_interval:int=1):
         super().__init__(master_id,
                          my_tasks,
                          my_nodes,
@@ -35,7 +36,8 @@ class master(Node):
                          {"comm_layer":comm_config["comm_layer"],"role":"parent"},
                          logger=logger,
                          logging_level=logging_level,
-                         update_interval=update_interval)
+                         update_interval=update_interval,
+                         heartbeat_interval=heartbeat_interval)
         self.my_master = my_master
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
@@ -97,7 +99,8 @@ class master(Node):
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
                     logging_level=self.logging_level,
-                    update_interval=self.update_interval
+                    update_interval=self.update_interval,
+                    heartbeat_interval=self.heartbeat_interval,
                 )
                 self.add_child(child_name,local_master)
             else:
@@ -109,7 +112,8 @@ class master(Node):
                     self.sys_info,
                     comm_config=self.comm_config,
                     update_interval=self.update_interval,
-                    logging_level=self.logging_level
+                    logging_level=self.logging_level,
+                    heartbeat_interval=self.heartbeat_interval
                 )
                 self.add_child(child_name,w)
         
@@ -459,12 +463,14 @@ class master(Node):
                         for k, v in msg.items():
                             self.progress_info[k][child_name] = v
 
-            if time.time() - self.last_update_time > 1:
+            if time.time() - self.last_update_time > self.heartbeat_interval:
                 ##report status
                 self.report_status()
                 self.last_update_time = time.time()
+            time.sleep(0.1)
             if ndone == self.n_children:
                 break
+
         self.report_status()
         self.send_to_parent(0, "DONE")
         # self.send_to_parent(0, self.my_tasks)

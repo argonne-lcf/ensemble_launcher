@@ -65,7 +65,8 @@ class worker(Node):
                 sys_info:dict,
                 comm_config:dict={"comm_layer":"multiprocessing"},
                 update_interval:int=None,
-                logging_level=logging.INFO):
+                logging_level=logging.INFO,
+                heartbeat_interval:int=1):
         super().__init__(worker_id,
                          my_tasks,
                          my_nodes,
@@ -73,8 +74,9 @@ class worker(Node):
                          {"comm_layer":comm_config["comm_layer"],"role":"child"},
                          logger=False,
                          logging_level=logging_level,
-                         update_interval=update_interval)
-    
+                         update_interval=update_interval,
+                         heartbeat_interval=heartbeat_interval)
+
         assert "name" in sys_info and "ncores_per_node" in sys_info and "ngpus_per_node" in sys_info
         ##resource info
         self.free_cores_per_node = {node:list(range(self.sys_info["ncores_per_node"])) 
@@ -248,13 +250,20 @@ class worker(Node):
                     else:
                         launcher_cmd += f"--cpu-bind {launcher_options['cpu-bind']} "
                 else:
+                    if self.sys_info["name"] == "aurora":
+                        ctoi = {i: i+1 for i in range(51)}
+                        ctoi.update({i: i+2 for i in range(51,102)})
+                        ctoi.update({i: i+3 for i in range(102,153)})
+                        ctoi.update({i: i+4 for i in range(153,204)})
+                    else:
+                        ctoi = {i: i for i in range(self.sys_info["ncores_per_node"])}
                     common_cpus = set.intersection(*[set(cores) for cores in task_info["assigned_cores"].values()])
                     use_common_cpus = list(common_cpus) == task_info["assigned_cores"][task_info["assigned_nodes"][0]]
                     if use_common_cpus:
                         if self.sys_info["name"] == "aurora":
                             cores = []
                             for i in task_info["assigned_cores"][task_info["assigned_nodes"][0]]:
-                                cores.append(f"{2*i},{2*i+1}")
+                                cores.append(f"{ctoi[i]}")
                             cores = ":".join(cores)
                         else:
                             cores = ":".join(map(str, task_info["assigned_cores"][task_info["assigned_nodes"][0]]))
@@ -266,7 +275,7 @@ class worker(Node):
                             rank = 0
                             for node in task_info["assigned_nodes"]:
                                 for core_set in task_info["assigned_cores"][node]:
-                                    rankfile.write(f"rank {rank}={node} slot={core_set}\n")
+                                    rankfile.write(f"rank {rank}={node} slot={ctoi[core_set]}\n")
                                     rank += 1
                         if self.logger: self.logger.warning(f"Over subscribing cores")
                         # launcher_cmd += f"--rankfile {rankfile_path} "
@@ -373,8 +382,20 @@ class worker(Node):
 
     def launch_serial_tasks(self,oversubscribe_gpus:bool=True) -> int:
         ready_tasks = self.get_ready_tasks()
+        running_tasks = self.get_running_tasks()
+        
+        # Limit concurrent tasks to process pool capacity
+        max_concurrent = mp.cpu_count()
+        slots_available = max_concurrent - len(running_tasks)
+        
+        if slots_available <= 0:
+            return 0
+        
+        # Only launch up to available slots
+        tasks_to_launch = ready_tasks[:slots_available]
         task_infos = []
-        for idx,task_id in enumerate(ready_tasks):
+        
+        for idx,task_id in enumerate(tasks_to_launch):
             task_info = self.my_tasks[task_id]
             ##assign nodes, cores and gpus
             assigned_node = self.my_free_nodes[idx % len(self.my_free_nodes)]
@@ -406,7 +427,7 @@ class worker(Node):
             self.process_pool.starmap_async(_execute_task, 
             [(task_info, self.result_queue) for task_info in task_infos],)
 
-        return len(ready_tasks)
+        return len(task_infos)
 
     """
     function checks if the requested resources are available on the node
@@ -521,7 +542,7 @@ class worker(Node):
         self.cleanup_resources()
         self.send_to_parent(0, "DONE")
 
-    def process_serial_tasks(self,oversubscribe_gpus:bool=False):
+    def process_serial_tasks(self,oversubscribe_gpus:bool=True):
         """Process tasks in high throughput mode."""
         tstart = time.time()
         ntasks = self.launch_serial_tasks(oversubscribe_gpus=oversubscribe_gpus)
@@ -558,7 +579,7 @@ class worker(Node):
                     # Process tasks
                     self.process_serial_tasks()
                     # Report status periodically
-                    if time.time() - self.last_update_time > 1:
+                    if time.time() - self.last_update_time > self.heartbeat_interval:
                         self.report_status()
                         self.last_update_time = time.time()
                     # Check for parent messages
@@ -567,13 +588,14 @@ class worker(Node):
                     if kill_signal or not self.get_pending_tasks():
                         self.exit_sequence()
                         break
+                    time.sleep(0.1)
         else: 
             # Main execution loop
             while True:
                 # Process tasks
                 self.process_standard_tasks()
                 # Report status periodically
-                if time.time() - self.last_update_time > 1:
+                if time.time() - self.last_update_time > self.heartbeat_interval:
                     self.report_status()
                     self.last_update_time = time.time()
                 # Check for parent messages
@@ -582,6 +604,7 @@ class worker(Node):
                 if kill_signal or not self.get_pending_tasks():
                     self.exit_sequence()
                     break
+                time.sleep(0.1)
 
     def delete_tasks(self,task_infos:dict) -> None:
         task_ids = list(task_infos.keys())

@@ -26,12 +26,14 @@ class ensemble_launcher:
                  ngpus_per_node:int=None,
                  parallel_backend="multiprocessing",
                  logging_level=logging.INFO,
-                 force_level:str=None) -> None:
+                 force_level:str=None,
+                 heartbeat_interval:int=1) -> None:
         self.update_interval = None ##how often to update the ensembles in secs
         self.poll_interval = 60 ##how often to poll the running tasks in secs
         self.parallel_backend = parallel_backend
         self.logging_level = logging_level
         self.comm_config = None
+        self.heartbeat_interval = heartbeat_interval
 
 
         self.ensembles = {}
@@ -104,7 +106,8 @@ class ensemble_launcher:
                 is_global_master=is_global_master,
                 logging_level=self.logging_level,
                 update_interval=self.update_interval,
-                logger=logger
+                logger=logger,
+                heartbeat_interval=self.heartbeat_interval
             )
 
     """

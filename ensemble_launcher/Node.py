@@ -27,8 +27,7 @@ class Node(abc.ABC):
                  logger=True,
                  logging_level=logging.INFO,
                  update_interval:int=None,
-                 enable_heartbeat:bool=False,
-                 heartbeat_interval:int=10):
+                 heartbeat_interval:int=1):
         self.node_id = node_id
         self.my_tasks = my_tasks
         self.my_nodes = my_nodes
@@ -37,6 +36,7 @@ class Node(abc.ABC):
         self.update_interval = update_interval
         self.last_update_time = time.time()
         self.last_heartbeat_time = None
+        self.heartbeat_interval = heartbeat_interval
 
         self.comm_config = comm_config
         assert comm_config["comm_layer"] in ["multiprocessing","dragon","zmq"]
