@@ -82,6 +82,8 @@ class worker(Node):
         
         # Store launcher configuration
         self.launcher_config = launcher_config
+        if self.launcher_config["mode"] == "mpi" and "cpu_bind" not in self.launcher_config:
+            self.launcher_config["cpu_bind"] = True
         ##resource info
         self.free_cores_per_node = {node:list(range(self.sys_info["ncores_per_node"])) 
                                                      for node in self.my_nodes}
@@ -362,7 +364,9 @@ class worker(Node):
         if self.mode == "high throughput":
             launcher_cmd, env = self.build_bash_cmd(task_info)
         else:  # mode == "mpi" or any other value defaults to mpi
-            launcher_cmd, env = self.build_mpi_launcher_cmd(task_info, cpu_bind = "cpu-bind" not in task_info["cmd_template"])
+            do_cpu_bind = "cpu-bind" not in task_info["cmd_template"] and \
+                            self.launcher_config.get("cpu_bind", True)
+            launcher_cmd, env = self.build_mpi_launcher_cmd(task_info, cpu_bind=do_cpu_bind)
         open_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "{"]
         close_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "}"]
         placeholders = [task_info["cmd_template"][open_braces[i] + 1:close_braces[i]] for i in range(len(open_braces))]

@@ -294,7 +294,7 @@ class master(Node):
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
                 else:
                     ##launch the child process using mpiexec
-                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]} --cpu-bind list:53"+\
+                    cmd = f"mpiexec -n 1 --hosts {self.children_nodes[child_name][0]} "+\
                         f" python -m ensemble_launcher.worker"+\
                             f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')} 1"
                 if self.logger: self.logger.info(f"Running command: {cmd}")
