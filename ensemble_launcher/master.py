@@ -25,6 +25,7 @@ class master(Node):
                  max_children_nnodes:int=None,
                  is_global_master:bool=False,
                  comm_config:dict={"comm_layer":"multiprocessing"},
+                 launcher_config:dict={"mode": "mpi"},
                  logger:bool=False,
                  logging_level=logging.INFO,
                  update_interval:int=None,
@@ -41,6 +42,9 @@ class master(Node):
         self.my_master = my_master
         self.parallel_backend = parallel_backend
         self.is_global_master = is_global_master
+        self.launcher_config = launcher_config or {
+            "mode": "mpi"
+        }
         assert parallel_backend in ["multiprocessing","dragon","mpi"], f"Unsupported parallel backend: {parallel_backend}. Supported backends are 'multiprocessing', 'dragon', and 'mpi'."
         if self.parallel_backend == "dragon":
             if not DRAGON_AVAILABLE:
@@ -96,6 +100,7 @@ class master(Node):
                     self.children_nodes[child_name],
                     self.sys_info,
                     comm_config={"comm_layer":self.comm_config["comm_layer"],"role":"parent"},
+                    launcher_config=self.launcher_config,
                     parallel_backend=self.parallel_backend,
                     is_global_master=False,
                     logging_level=self.logging_level,
@@ -111,6 +116,7 @@ class master(Node):
                     self.children_nodes[child_name],
                     self.sys_info,
                     comm_config=self.comm_config,
+                    launcher_config=self.launcher_config,
                     update_interval=self.update_interval,
                     logging_level=self.logging_level,
                     heartbeat_interval=self.heartbeat_interval
@@ -232,6 +238,7 @@ class master(Node):
 
     def run_children(self, logger=True):
         """Wrapper function to run the appropriate type of children."""
+        os.environ.update(self.parent_env)  # Ensure the environment is set up correctly
         if self.is_global_master:
             return self._run_local_masters(logger=logger)
         else:
@@ -242,6 +249,9 @@ class master(Node):
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
+        ##update my environment
+        os.environ.update({"PYTHONPATH": f"{os.path.join(os.path.dirname(__file__),'..')}:{os.environ.get('PYTHONPATH', '')}"})
+        env = os.environ.copy()
         self._initialize_children()
         if self.comm_config["comm_layer"] == "zmq":
             self.setup_zmq_sockets()
@@ -249,10 +259,8 @@ class master(Node):
         for wid in self.children_names:
             if self.logger: self.logger.debug(f"Worker {wid} has {len(self.children_tasks[wid])} tasks and {self.children_nodes[wid]} nodes")
         
-        env = os.environ.copy()
-        env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
+
         # Start all worker processes
-            
         if self.parallel_backend == "dragon":
             for pid,child_name in enumerate(self.children_names):
                 if self.comm_config["comm_layer"] == "zmq":
@@ -313,13 +321,15 @@ class master(Node):
         if logger: 
             self.configure_logger(self.logging_level)
             self.logger.info("Started running tasks")
+        ##update my environment
+        os.environ.update({"PYTHONPATH": f"{os.path.join(os.path.dirname(__file__),'..')}:{os.environ.get('PYTHONPATH', '')}"})
+        env = os.environ.copy()
         self._initialize_children()
         if self.comm_config["comm_layer"] == "zmq":
             self.setup_zmq_sockets()
         
 
-        env = os.environ.copy()
-        env["PYTHONPATH"] = f"{os.path.join(os.path.dirname(__file__),'..')}:{env.get('PYTHONPATH', '')}"
+
         # Start all local master processes
         if self.parallel_backend == "dragon":
             for pid,child_name in enumerate(self.children_names):

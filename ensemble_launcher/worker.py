@@ -64,6 +64,7 @@ class worker(Node):
                 my_nodes:list,
                 sys_info:dict,
                 comm_config:dict={"comm_layer":"multiprocessing"},
+                launcher_config:dict={"mode":"mpi"},
                 update_interval:int=None,
                 logging_level=logging.INFO,
                 heartbeat_interval:int=1):
@@ -78,21 +79,39 @@ class worker(Node):
                          heartbeat_interval=heartbeat_interval)
 
         assert "name" in sys_info and "ncores_per_node" in sys_info and "ngpus_per_node" in sys_info
+        
+        # Store launcher configuration
+        self.launcher_config = launcher_config
         ##resource info
         self.free_cores_per_node = {node:list(range(self.sys_info["ncores_per_node"])) 
                                                      for node in self.my_nodes}
+        #
         if self.sys_info["name"] == "aurora":
-            self.free_gpus_per_node = {node:["{}.{}".format(*list(np.unravel_index(i,(6,2)))) 
+            if os.getenv("ZE_FLAT_DEVICE_HIERARCHY", "COMPOSITE") == "FLAT":
+                self.free_gpus_per_node = {node:[f"{i}" for i in range(self.sys_info["ngpus_per_node"])] 
+                                                              for node in self.my_nodes}
+            else:
+                self.free_gpus_per_node = {node:["{}.{}".format(*list(np.unravel_index(i,(6,2)))) 
                                                               for i in range(self.sys_info["ngpus_per_node"])] 
                                                               for node in self.my_nodes}
+
+            
         else:
             self.free_gpus_per_node = {node:list(range(self.sys_info["ngpus_per_node"])) for node in self.my_nodes}
 
-        ### High Throughput
-        if len(self.my_nodes) == 1 and all([task_info["num_processes_per_node"] == 1 for task_info in my_tasks.values()]):
-            self.serial = True
-        else:
-            self.serial = False
+        ### Mode determination from launcher_config
+        self.mode = self.launcher_config.get("mode", "mpi")
+        # Validate mode
+        if self.mode not in ["mpi", "high throughput"]:
+            if self.logger:
+                self.logger.warning(f"Invalid mode '{self.mode}', defaulting to 'mpi'")
+            self.mode = "mpi"
+
+        # Ensure all tasks are compatible with the mode
+        if self.mode == "high throughput":
+            assert all([task_info["num_nodes"] == 1 and task_info["num_processes_per_node"] == 1
+                         for task_info in self.my_tasks.values()]), "All tasks must be single-node, single-process"
+
         self.futures = {}
         self.process_pool = None
         self.result_queue = None
@@ -294,7 +313,6 @@ class worker(Node):
                             ##here you don't need any compilcated bash script 
                             # you can just getaway with a simple environment variable
                             # launcher_cmd += f"ZE_AFFINITY_MASK={task_info['assigned_gpus'][task_info['assigned_nodes'][0]][0]} "
-                            env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
                             env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
                         else:
                             bash_script = gen_affinity_bash_script_aurora_1(task_info["num_gpus_per_process"])
@@ -331,7 +349,6 @@ class worker(Node):
         env = {}
         if task_info.get("num_gpus_per_process", 0) > 0:
             assert task_info["system"] == "aurora", "High throughput tasks with GPUs are only supported on Aurora currently."
-            env.update({"ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"})
             env.update({"ZE_AFFINITY_MASK": ",".join(task_info['assigned_gpus'][task_info['assigned_nodes'][0]])})
         return launcher_cmd, env
 
@@ -341,11 +358,10 @@ class worker(Node):
     """
     def build_task_cmd(self,task_info:dict) -> tuple:
 
-        if self.serial or task_info.get("launcher", "") == "bash":
-            if task_info.get("launcher","") == "mpi" and self.logger:
-                self.logger.warning("Using 'bash' launcher for high throughput tasks, ignoring 'mpi' launcher option.")
+        # Use the mode from launcher_config
+        if self.mode == "high throughput":
             launcher_cmd, env = self.build_bash_cmd(task_info)
-        else:
+        else:  # mode == "mpi" or any other value defaults to mpi
             launcher_cmd, env = self.build_mpi_launcher_cmd(task_info, cpu_bind = "cpu-bind" not in task_info["cmd_template"])
         open_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "{"]
         close_braces = [i for i, char in enumerate(task_info["cmd_template"]) if char == "}"]
@@ -380,11 +396,11 @@ class worker(Node):
                              close_fds = True)
         return p
 
-    def launch_serial_tasks(self,oversubscribe_gpus:bool=True) -> int:
+    def launch_high_throughput_tasks(self,oversubscribe_gpus:bool=True) -> int:
         ready_tasks = self.get_ready_tasks()
         running_tasks = self.get_running_tasks()
         
-        # Limit concurrent tasks to process pool capacity
+        # Limit concurrent tasks to CPU count
         max_concurrent = mp.cpu_count()
         slots_available = max_concurrent - len(running_tasks)
         
@@ -525,15 +541,23 @@ class worker(Node):
     
     def setup_environment(self, logger=False):
         """Setup the environment for task execution."""
+        os.environ.update(self.parent_env)
         if logger: 
             self.configure_logger(self.logging_level)
             if self.logger: self.logger.info(f"Running on {socket.gethostname()}")
+
+        if self.sys_info["name"] == "aurora":
+            if  "ZE_FLAT_DEVICE_HIERARCHY" not in os.environ:
+                os.environ["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE"
+            else:
+                if os.environ["ZE_FLAT_DEVICE_HIERARCHY"] != "COMPOSITE" and self.logger:
+                    self.logger.warning("ZE_FLAT_DEVICE_HIERARCHY is not set to COMPOSITE, this may cause issues")
         if self.comm_config["comm_layer"] == "zmq":
             self.setup_zmq_sockets()
         self.last_update_time = time.time()
         os.makedirs(self.tmp_dir, exist_ok=True)
         ##this is needed so that pool can see all the cores. In addition to the one used by mpirun
-        if self.serial:
+        if self.mode == "high throughput":
             os.sched_setaffinity(0, range(mp.cpu_count()))
 
     def exit_sequence(self):
@@ -542,10 +566,10 @@ class worker(Node):
         self.cleanup_resources()
         self.send_to_parent(0, "DONE")
 
-    def process_serial_tasks(self,oversubscribe_gpus:bool=True):
+    def process_high_throughput_tasks(self,oversubscribe_gpus:bool=False):
         """Process tasks in high throughput mode."""
         tstart = time.time()
-        ntasks = self.launch_serial_tasks(oversubscribe_gpus=oversubscribe_gpus)
+        ntasks = self.launch_high_throughput_tasks(oversubscribe_gpus=oversubscribe_gpus)
         tend = time.time()
         if ntasks > 0 and self.logger:
             self.logger.debug(f"Launched {ntasks} tasks in {tend - tstart:.2f} seconds.")
@@ -566,18 +590,18 @@ class worker(Node):
         # Setup
         self.setup_environment(logger)
         
-        # Use manager for high throughput mode
-        if self.serial:
+        # Use manager for high throughput mode only
+        if self.mode == "high throughput":
             with mp.Manager() as manager:
                 self.manager = manager
                 self.result_queue = manager.Queue()
                 self.process_pool = manager.Pool(processes=mp.cpu_count())
-                if self.logger: self.logger.info("Serial mode enabled. Launching all tasks at once.")
+                if self.logger: self.logger.info("High throughput mode enabled. Launching all tasks at once.")
 
                 # Main execution loop
                 while True:
                     # Process tasks
-                    self.process_serial_tasks()
+                    self.process_high_throughput_tasks(oversubscribe_gpus=self.launcher_config.get("oversubscribe_gpus", False))
                     # Report status periodically
                     if time.time() - self.last_update_time > self.heartbeat_interval:
                         self.report_status()
@@ -590,7 +614,7 @@ class worker(Node):
                         break
                     time.sleep(0.1)
         else: 
-            # Main execution loop
+            # Main execution loop - standard mode
             while True:
                 # Process tasks
                 self.process_standard_tasks()
@@ -677,4 +701,3 @@ if __name__ == "__main__":
         worker_obj.configure_logger(worker_obj.logging_level)
         worker_obj.logger.info(f"Worker {worker_obj.node_id} started")
     worker_obj.run_tasks(False)
-        

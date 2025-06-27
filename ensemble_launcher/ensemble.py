@@ -40,7 +40,6 @@ class ensemble:
         ensemble = self.__ensemble_info
         ##assert some necessary vals
         assert "num_nodes" in ensemble.keys()
-        assert "launcher" in ensemble.keys()
         assert "relation" in ensemble.keys()
         assert "cmd_template" in ensemble.keys()
 

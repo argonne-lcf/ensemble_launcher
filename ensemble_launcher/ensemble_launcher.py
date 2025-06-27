@@ -103,6 +103,7 @@ class ensemble_launcher:
                 n_children=max(1,len(self.total_nodes)//128) if is_global_master else None,
                 max_children_nnodes=self.max_nodes_per_master,
                 comm_config=self.comm_config,
+                launcher_config=self.launcher_config,
                 is_global_master=is_global_master,
                 logging_level=self.logging_level,
                 update_interval=self.update_interval,
@@ -129,6 +130,9 @@ class ensemble_launcher:
             else:
                 self.sys_info["name"] = "local"
             self.comm_config = data.get("comm_config",{"comm_layer":"multiprocessing"})
+            self.launcher_config = data.get("launcher_config",{
+                "mode": "mpi"
+            })
             self.sys_info.update()
             ensembles_info = data["ensembles"]
             for ensemble_name,ensemble_info in ensembles_info.items():
@@ -178,7 +182,8 @@ class ensemble_launcher:
             self.el_node.setup_zmq_sockets()
             if self.el_node.logger: self.el_node.logger.info(f"ZMQ sockets setup complete with {self.el_node.comm_config}.")
             self.el_node.children[self.global_master.node_id].parent_address = self.el_node.my_address
-        process = mp.Process(target=self.global_master.run_children,args=(True,))
+        # Note: multiprocessing.Process already inherits parent environment variables by default
+        process = mp.Process(target=self.global_master.run_children, args=(True,))
         process.start()
         if self.el_node.comm_config["comm_layer"] == "zmq":
             msg = self.el_node.recv_from_child(self.global_master.node_id,timeout=5)  # Wait for the global master to be ready

@@ -385,23 +385,23 @@ def test_ensemble_update(comm_config={"comm_layer":"multiprocessing"}, parallel_
 if __name__ == "__main__":
     print("Running tests...This may take a while")
     comm_layers = [
-        {"name": "multiprocessing", "config": {"comm_layer": "multiprocessing"}},
-        {"name": "zmq", "config": {"comm_layer": "zmq"}}
+        {"name": "multiprocessing", "config": {"comm_layer": "multiprocessing"}, "backend": "multiprocessing"},
+        {"name": "zmq", "config": {"comm_layer": "zmq"}, "backend": "mpi"}
     ]
     
     test_functions = [
         test_cpu,
         # test_gpu,
         # test_cpu_and_gpu,
-        test_ensemble_update
+        # test_ensemble_update
     ]
     
-    # for comm_layer in comm_layers:
-    #     for test_func in test_functions:
-    #         print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer")
-    #         test_func(comm_config=comm_layer["config"])
-    comm_layer = comm_layers[-1]
-    for test_func in test_functions:
-        print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer and MPI backend")
-        test_func(comm_config=comm_layer["config"], parallel_backend="mpi")
+    for comm_layer in comm_layers:
+        for test_func in test_functions:
+            print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer")
+            test_func(parallel_backend=comm_layer["backend"], comm_config=comm_layer["config"])
+    # comm_layer = comm_layers[-1]
+    # for test_func in test_functions:
+    #     print(f"Running test: {test_func.__name__} with {comm_layer['name']} comm layer and MPI backend")
+    #     test_func(comm_config=comm_layer["config"], parallel_backend="mpi")
     print("All tests passed successfully!")

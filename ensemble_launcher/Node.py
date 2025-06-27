@@ -8,6 +8,8 @@ import socket
 import random
 import pickle
 import sys
+import os
+
 try:
     import zmq
     ZMQ_AVAILABLE = True
@@ -37,6 +39,8 @@ class Node(abc.ABC):
         self.last_update_time = time.time()
         self.last_heartbeat_time = None
         self.heartbeat_interval = heartbeat_interval
+
+        self.parent_env = os.environ.copy()  # Copy the current environment variables
 
         self.comm_config = comm_config
         assert comm_config["comm_layer"] in ["multiprocessing","dragon","zmq"]
