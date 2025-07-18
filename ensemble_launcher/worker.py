@@ -190,15 +190,49 @@ class worker(Node):
                 visit_node = visit_node and len(self.free_gpus_per_node[node]) >= task["num_processes_per_node"]*task["num_gpus_per_process"]
 
             if visit_node:
-                assigned_cores[node] = []
-                ##smply pop the cores from the list at the start
-                for i in range(task["num_processes_per_node"]):
-                    assigned_cores[node].append(self.free_cores_per_node[node].pop(0))
+                if "cpu_affinity" in task and task["cpu_affinity"] is not None:
+                    cpu_affinity = task["cpu_affinity"]
+                    if all([cpu in self.free_cores_per_node[node] for cpu in cpu_affinity]):
+                        if self.logger:
+                            self.logger.debug(f"Assigning node {node} for task {task['id']} with CPU affinity {cpu_affinity}")
+                        assigned_cores[node] = []
+                        for cpu in cpu_affinity:
+                            assigned_cores[node].append(cpu)
+                            self.free_cores_per_node[node].remove(cpu)
+                    else:
+                        ## if the cpu_affinity is not available, then skip this node
+                        if self.logger:
+                            self.logger.debug(f"Skipping node {node} for task {task['id']} due to unavailable CPU affinity {cpu_affinity}")
+                        j += 1
+                        continue
+
+                else:
+                    assigned_cores[node] = []
+                    ##smply pop the cores from the list at the start
+                    for i in range(task["num_processes_per_node"]):
+                        assigned_cores[node].append(self.free_cores_per_node[node].pop(0))
                 
                 if task.get("num_gpus_per_process",0) > 0:
-                    assigned_gpus[node] = []
-                    for i in range(task["num_gpus_per_process"]*task["num_processes_per_node"]):
-                        assigned_gpus[node].append(self.free_gpus_per_node[node].pop(0))
+                    if "gpu_affinity" in task and task["gpu_affinity"] is not None:
+                        gpu_affinity = task["gpu_affinity"]
+                        if all([gpu in self.free_gpus_per_node[node] for gpu in gpu_affinity]):
+                            if self.logger:
+                                self.logger.debug(f"Assigning node {node} for task {task['id']} with GPU affinity {gpu_affinity}")
+                            assigned_gpus[node] = []
+                            for gpu in gpu_affinity:
+                                assigned_gpus[node].append(gpu)
+                                self.free_gpus_per_node[node].remove(gpu)
+                        else:
+                            if self.logger:
+                                self.logger.debug(f"Skipping node {node} for task {task['id']} due to unavailable GPU affinity {gpu_affinity}")
+                            ## if the gpu_affinity is not available, then skip this node
+                            self.free_cores_per_node[node].extend(assigned_cores[node])
+                            j += 1
+                            continue
+                    else:
+                        assigned_gpus[node] = []
+                        for i in range(task["num_gpus_per_process"]*task["num_processes_per_node"]):
+                            assigned_gpus[node].append(self.free_gpus_per_node[node].pop(0))
                 assigned_nodes.append(node)
 
             j += 1
