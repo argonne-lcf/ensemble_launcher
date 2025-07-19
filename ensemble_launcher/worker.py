@@ -596,7 +596,8 @@ class worker(Node):
         os.makedirs(self.tmp_dir, exist_ok=True)
         ##this is needed so that pool can see all the cores. In addition to the one used by mpirun
         if self.mode == "high throughput":
-            os.sched_setaffinity(0, range(mp.cpu_count()))
+            if sys.platform.lower() == 'linux':
+                os.sched_setaffinity(0, range(mp.cpu_count()))
 
     def exit_sequence(self):
         """Handle cleanup and send completion signal."""

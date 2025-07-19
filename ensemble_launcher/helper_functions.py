@@ -79,7 +79,7 @@ def create_task_info(
     io: bool = True,
     launcher_options: Optional[Dict[str, Any]] = None,
     timeout: Optional[float] = None,
-    pre_launch_cmd: Optional[str] = None
+    pre_launch_cmd: Optional[str] = None,
     gpu_affinity_file: Optional[str] = None,
     mpi_rankfile: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -116,9 +116,9 @@ def create_task_info(
     
     if mpi_rankfile is None:
         mpi_rankfile = os.path.join(run_dir, "rankfile.txt")
-    
-    if set_affinity_file is None:
-        set_affinity_file = os.path.join(run_dir, "set_affinity.sh")
+
+    if gpu_affinity_file is None:
+        gpu_affinity_file = os.path.join(run_dir, "gpu_affinity.sh")
 
     task_info = {
         "id": task_id,
@@ -132,8 +132,8 @@ def create_task_info(
         "status": status,
         "system": system,
         "io": io,
-        "log_file": os.path.join(run_dir, f"worker_{hostname}.log"),
-        "err_file": os.path.join(run_dir, f"worker_{hostname}.err"),
+        "log_file": os.path.join(run_dir, f"worker_{socket.gethostname()}.log"),
+        "err_file": os.path.join(run_dir, f"worker_{socket.gethostname()}.err"),
         "gpu_affinity_file": gpu_affinity_file,
         "mpi_rankfile": mpi_rankfile
     }
