@@ -81,7 +81,9 @@ def create_task_info(
     timeout: Optional[float] = None,
     pre_launch_cmd: Optional[str] = None,
     gpu_affinity_file: Optional[str] = None,
-    mpi_rankfile: Optional[str] = None
+    mpi_rankfile: Optional[str] = None,
+    log_file: Optional[str] = None,
+    err_file: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Helper function to construct a task_info dictionary with common parameters.
@@ -120,6 +122,10 @@ def create_task_info(
     if gpu_affinity_file is None:
         gpu_affinity_file = os.path.join(run_dir, "gpu_affinity.sh")
 
+    if io:
+        log_file = log_file if log_file else os.path.join(run_dir, f"worker_{socket.gethostname()}.log")
+        err_file = err_file if err_file else os.path.join(run_dir, f"worker_{socket.gethostname()}.err")
+
     task_info = {
         "id": task_id,
         "num_nodes": num_nodes,
@@ -132,8 +138,8 @@ def create_task_info(
         "status": status,
         "system": system,
         "io": io,
-        "log_file": os.path.join(run_dir, f"worker_{socket.gethostname()}.log"),
-        "err_file": os.path.join(run_dir, f"worker_{socket.gethostname()}.err"),
+        "log_file": log_file,
+        "err_file": err_file,
         "gpu_affinity_file": gpu_affinity_file,
         "mpi_rankfile": mpi_rankfile
     }
