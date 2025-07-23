@@ -8,7 +8,7 @@ To install `ensemble_launcher`, clone the repository and install the required de
 ```bash
 git clone https://github.com/your-repo/ensemble_launcher.git
 cd ensemble_launcher
-pip install -r requirements.txt
+python3 -m pip install -e ./
 ```
 
 ## Usage
