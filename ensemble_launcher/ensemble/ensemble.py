@@ -1,7 +1,25 @@
 import json
 import os
 import numpy as np
+from pydantic import BaseModel
+import enum
 
+
+class TaskStatus(enum.Enum):
+    NOT_READY = "not_ready"
+    READY = "ready"
+    RUNNING = "running"
+    FAILED = "failed"
+    SUCCESS = "success"
+
+class Task(BaseModel):
+    task_id: str
+    nnodes: int
+    ppn: int
+    ngpus_per_process: int
+    status: TaskStatus = TaskStatus.NOT_READY
+    estimated_runtime: float = 0.0
+    
 
 ##NOTE: all the tasks need to be modified through ensemble object
 class ensemble:
