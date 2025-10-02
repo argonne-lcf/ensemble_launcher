@@ -1,5 +1,5 @@
 from typing import Any, Dict, Callable, Tuple, Union
-from ensemble_launcher.scheduler import JobResource, NodeResourceList, NodeResourceCount
+from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList, NodeResourceCount
 from ensemble_launcher.comm.queue import QueueProtocol, queue_registry
 import uuid
 import logging
@@ -33,8 +33,8 @@ class DragonExecutor(Executor):
     
     def start(self,job_resource: JobResource, 
                 fn: Union[Callable,str], 
-                args: Tuple = (),
-                kwargs: Dict = {}, 
+                task_args: Tuple = (),
+                task_kwargs: Dict = {}, 
                 env: Dict[str, Any] = {}):
         
         task_id = str(uuid.uuid4())
@@ -54,9 +54,9 @@ class DragonExecutor(Executor):
                 if callable(fn):
                     q = queue_registry.create_queue("dragon")
                     self._queues[task_id] = q
-                    p = Process(target=return_wrapper, args=(q, fn, args, kwargs), env=merged_env, policy=policy)
+                    p = Process(target=return_wrapper, args=(q, fn, task_args, task_kwargs), env=merged_env, policy=policy)
                 else:
-                    p = Process(target=fn, args=args, kwargs=kwargs, env=merged_env, policy=policy)
+                    p = Process(target=fn, args=task_args, kwargs=task_kwargs, env=merged_env, policy=policy)
                 p.start()
             else:
                 p = ProcessGroup(restart=False)
@@ -77,8 +77,8 @@ class DragonExecutor(Executor):
                             nproc = req.cpu_count,
                             template=ProcessTemplate(
                                         target=fn if isinstance(fn,str) else return_wrapper, 
-                                        args=args if isinstance(fn,str) else (q, fn, args, kwargs), 
-                                        kwargs=kwargs if isinstance(fn,str) else {}, 
+                                        args=task_args if isinstance(fn,str) else (q, fn, task_args, task_kwargs), 
+                                        kwargs=task_kwargs if isinstance(fn,str) else {}, 
                                         env = merged_env,
                                         policy=local_policy)
                         )
@@ -99,8 +99,8 @@ class DragonExecutor(Executor):
                                 nproc = 1,
                                 template=ProcessTemplate(
                                                         target=fn if isinstance(fn,str) else return_wrapper, 
-                                                        args=args if isinstance(fn,str) else (q, fn, args, kwargs), 
-                                                        kwargs=kwargs if isinstance(fn,str) else {}, 
+                                                        args=task_args if isinstance(fn,str) else (q, fn, task_args, task_kwargs), 
+                                                        kwargs=task_kwargs if isinstance(fn,str) else {}, 
                                                         env = merged_env, 
                                                         policy=local_policy
                                         )

@@ -26,7 +26,7 @@ class PolicyRegistry:
     
     def create_policy(self,policy_name:str, *args, **kwargs):
         if policy_name in self.available_policies:
-            self.available_policies[policy_name](*args,**kwargs)
+            return self.available_policies[policy_name](*args,**kwargs)
         else:
             logger.error(f"{policy_name} not available. Available policy names {self.available_policies.keys()}")
             raise

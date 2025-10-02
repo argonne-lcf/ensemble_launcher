@@ -1,5 +1,5 @@
 from typing import Any, Dict, Callable, List, Union, Tuple
-from ensemble_launcher.scheduler import JobResource
+from ensemble_launcher.scheduler.resource import JobResource
 import subprocess
 import logging
 from .utils import gen_affinity_bash_script_1, gen_affinity_bash_script_2, generate_python_exec_command, executor_registry
@@ -79,11 +79,11 @@ class MPIExecutor(Executor):
 
     def start(self,job_resource: JobResource, 
                 task: Union[str, Callable], 
-                args: Tuple = (), 
-                kwargs: Dict[str,Any] = {}, 
+                task_args: Tuple = (), 
+                task_kwargs: Dict[str,Any] = {}, 
+                env: Dict[str, Any] = {},
                 mpi_args: Tuple = (),
-                mpi_kwargs:Dict[str, Any] = {}, 
-                env: Dict[str, Any] = {}):
+                mpi_kwargs:Dict[str, Any] = {}):
         # task is a str command
         task_id = str(uuid.uuid4())
 
@@ -95,7 +95,7 @@ class MPIExecutor(Executor):
             additional_mpi_opts.extend([str(k),str(v)])
 
         if callable(task):
-            task_cmd = ["python", "-c", shlex.quote(generate_python_exec_command(task,args,kwargs))]
+            task_cmd = ["python", "-c", shlex.quote(generate_python_exec_command(task,task_args,task_kwargs))]
         elif isinstance(task,str):
             task_cmd = [s.strip() for s in task.split()]
         else:

@@ -1,8 +1,9 @@
 import json
 import os
 import numpy as np
-from pydantic import BaseModel
 import enum
+from typing import Optional, Union, Callable, Tuple, Dict, List
+from pydantic import BaseModel, Field
 
 
 class TaskStatus(enum.Enum):
@@ -16,9 +17,16 @@ class Task(BaseModel):
     task_id: str
     nnodes: int
     ppn: int
-    ngpus_per_process: int
+    executable: Union[str, Callable]
+    ngpus_per_process: int = 0
+    args: Tuple = Field(default_factory=tuple)
+    kwargs: Dict = Field(default_factory=dict)
+    env: Dict = Field(default_factory=dict)
     status: TaskStatus = TaskStatus.NOT_READY
     estimated_runtime: float = 0.0
+    exception: Optional[str] = None  # Store exception message as string
+    cpu_affinity: List[int] = Field(default_factory=list)
+    gpu_affinity: List[Union[int, str]] = Field(default_factory=list)
     
 
 ##NOTE: all the tasks need to be modified through ensemble object

@@ -6,10 +6,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from .base import Executor
-
 def run_callable_with_affinity(fn: Callable, 
                                args: Tuple = (), 
                                kwargs: Dict = {}, 
@@ -160,10 +156,10 @@ def gen_affinity_bash_script_2(ngpus_per_process: int, gpu_selector: str) -> str
 
 class ExecutorRegistry:
     def __init__(self):
-        self._available_executors: Dict[str, Type[Executor]] = {}
+        self._available_executors: Dict = {}
 
     def register(self,name:str):
-        def decorator(cls: Type[Executor]):
+        def decorator(cls: Type[Any]):
             self._available_executors[name] = cls
             return cls
         return decorator

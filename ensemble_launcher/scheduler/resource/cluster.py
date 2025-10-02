@@ -100,6 +100,25 @@ class ClusterResource(ABC):
         """Returns current free resources i.e self._nodes dict"""
         return (self.free_cpus,self.free_gpus)
     
+    def __eq__(self, other) -> bool:
+        """Check equality between two ClusterResource instances."""
+        if not isinstance(other, ClusterResource):
+            return False
+        
+        # Check if system_info is equal
+        if self._system_info != other._system_info:
+            return False
+        
+        # Check if nodes dictionaries have same keys
+        if set(self._nodes.keys()) != set(other._nodes.keys()):
+            return False
+        
+        # Check if each node's NodeResource is equal
+        for node_name in self._nodes:
+            if self._nodes[node_name] != other._nodes[node_name]:
+                return False
+        
+        return True
     def __repr__(self) -> str:
         """Return string representation of the cluster."""
         node_info = []

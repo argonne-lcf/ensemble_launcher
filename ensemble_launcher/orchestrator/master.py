@@ -1,5 +1,5 @@
 from .worker import *
-from .Node import *
+from .node import *
 from ensemble_launcher.executors import executor_registry, MPIExecutor
 from ensemble_launcher.scheduler import WorkerScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource

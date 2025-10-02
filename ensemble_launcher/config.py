@@ -13,6 +13,7 @@ class SystemConfig(BaseModel):
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
     executor_name: str
+    report_interval: float = 10.0
 
 
 # class OchestratorConfig(BaseModel):

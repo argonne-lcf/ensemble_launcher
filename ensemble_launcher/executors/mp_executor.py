@@ -1,5 +1,5 @@
 from typing import Any, Dict, Callable, Tuple, Union
-from ensemble_launcher.scheduler import JobResource, NodeResourceList, NodeResourceCount
+from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList, NodeResourceCount
 from concurrent.futures import ProcessPoolExecutor
 from .utils import run_callable_with_affinity, run_cmd, executor_registry
 import multiprocessing as mp
@@ -20,8 +20,8 @@ class MultiprocessingExecutor(Executor):
 
     def start(self,job_resource: JobResource, 
                fn: Union[Callable,str], 
-              args: Tuple = (),
-              kwargs: Dict = {}, 
+              task_args: Tuple = (),
+              task_kwargs: Dict = {}, 
               env: Dict[str, Any] = {}):
         
         task_id = str(uuid.uuid4())
@@ -43,9 +43,9 @@ class MultiprocessingExecutor(Executor):
             env.update({self._gpu_selector: gpu_ids})
 
         if callable(fn):
-            future = self._executor.submit(run_callable_with_affinity,*(fn, args, kwargs, cpu_id, env))
+            future = self._executor.submit(run_callable_with_affinity,*(fn, task_args, task_kwargs, cpu_id, env))
         elif isinstance(fn, str):
-            future = self._executor.submit(run_cmd,*(fn, args, kwargs, cpu_id, env))
+            future = self._executor.submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env))
         else:
             logger.warning(f"Can only excute either a str or a callable")
             return None

@@ -1,19 +1,23 @@
-from typing import Union, Any
+from typing import Union, Any, TYPE_CHECKING
 import multiprocessing as mp
 import logging
 import time
 from .base import Comm
-from ensemble_launcher.orchestrator.Node import NodeInfo
 from queue import Empty, Full
+
+if TYPE_CHECKING:
+    from ensemble_launcher.orchestrator.node import NodeInfo
 
 
 logger = logging.getLogger(__name__)
 
 class MPComm(Comm):
     def __init__(self, 
-                 node_info: NodeInfo,
+                 node_info: "NodeInfo",
                  parent_comm: "MPComm",              
                  heartbeat_interval:int=1):
+        # Import NodeInfo here to avoid circular import
+        from ensemble_launcher.orchestrator.node import NodeInfo
         self.node_info = node_info
         self.last_update_time = time.time()
         self.last_heartbeat_time = None
@@ -22,14 +26,17 @@ class MPComm(Comm):
 
         ###This only to send the results back to the parent
         self.result_queue = mp.Queue()
-        self._parent_result_queue = self._parent_comm.result_queue()
+
         
         self._my_conn_to_child = {}
         self._child_conn_to_me = {}
         for child_id in self.node_info.children_ids:
             self._my_conn_to_child[child_id], self._child_conn_to_me[child_id]= mp.Pipe()
-        
-        self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
+        self._parent_result_queue = None
+        self._my_conn_to_parent = None
+        if self._parent_comm:
+            self._parent_result_queue = self._parent_comm.result_queue() if self._parent_comm is not None else None        
+            self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
 
     def send_to_parent(self, parent_id: Union[int, str], data) -> int:
         logger.debug(f"send_to_parent: node {self.node_id}")

@@ -1,3 +1,3 @@
-from .Node import Node
+from .node import Node
 from .worker import Worker
 from .master import Master

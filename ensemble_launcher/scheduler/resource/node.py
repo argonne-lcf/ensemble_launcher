@@ -46,6 +46,17 @@ class NodeResource(ABC):
             return self
         return self.__add__(other)
     
+    def __eq__(self, other) -> bool:
+        """Check equality based on resource counts."""
+        if not isinstance(other, NodeResource):
+            return False
+        return (self.cpu_count == other.cpu_count and 
+                self.gpu_count == other.gpu_count)
+    
+    def __hash__(self) -> int:
+        """Hash based on resource counts for use in sets/dicts."""
+        return hash((self.cpu_count, self.gpu_count))
+    
     @abstractmethod
     def _add_impl(self, other: 'NodeResource') -> 'NodeResource':
         """Implementation-specific addition"""
@@ -160,6 +171,18 @@ class NodeResourceList(NodeResource):
                     other.ngpus <= self.gpu_count)
         return False
     
+    def __eq__(self, other) -> bool:
+        """Check equality based on CPU and GPU lists."""
+        if not isinstance(other, NodeResourceList):
+            # Fall back to parent class equality for cross-type comparison
+            return super().__eq__(other)
+        return (set(self.cpus) == set(other.cpus) and 
+                set(self.gpus) == set(other.gpus))
+    
+    def __hash__(self) -> int:
+        """Hash based on sorted CPU and GPU tuples for use in sets/dicts."""
+        return hash((tuple(sorted(self.cpus)), tuple(sorted(self.gpus))))
+    
     @classmethod
     def from_config(self, info: SystemConfig):
         """creates a node resource list from a dict"""
@@ -205,3 +228,14 @@ class JobResource:
         total_gpus = sum(r.gpu_count for r in self.resources)
         nodes_info = f", nodes={self.nodes}" if self.nodes else ""
         return f"JobResource({len(self.resources)} nodes, total_cpus={total_cpus}, total_gpus={total_gpus}{nodes_info})"
+    
+    def __eq__(self, other) -> bool:
+        """Check equality based on resources and nodes."""
+        if not isinstance(other, JobResource):
+            return False
+        return (self.resources == other.resources and 
+                self.nodes == other.nodes)
+    
+    def __hash__(self) -> int:
+        """Hash based on resources and nodes for use in sets/dicts."""
+        return hash((tuple(self.resources), tuple(self.nodes)))
