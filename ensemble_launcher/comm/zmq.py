@@ -5,13 +5,9 @@ import socket
 import random
 import pickle
 import sys
-import os
-from typing import TYPE_CHECKING
-from .base import Comm
+from .base import Comm, NodeInfo
 from .messages import Result
 
-if TYPE_CHECKING:
-    from ensemble_launcher.orchestrator.node import NodeInfo
 
 try:
     import zmq
@@ -23,12 +19,10 @@ logger = logging.getLogger(__name__)
 
 class ZMQComm(Comm):
     def __init__(self, 
-                 node_info: "NodeInfo",
+                 node_info: NodeInfo,
                  parent_comm: "ZMQComm" = None,              
                  heartbeat_interval:int=1,
                  comm_config:dict={"comm_layer":"zmq"}):
-        # Import NodeInfo here to avoid circular import
-        from ensemble_launcher.orchestrator.node import NodeInfo
         if not ZMQ_AVAILABLE:
             logger.error(f"zmq is not available")
             raise ModuleNotFoundError

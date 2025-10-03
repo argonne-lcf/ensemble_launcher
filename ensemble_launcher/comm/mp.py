@@ -1,23 +1,19 @@
-from typing import Union, Any, TYPE_CHECKING
+from typing import Union, Any
 import multiprocessing as mp
 import logging
 import time
-from .base import Comm
+from .base import Comm, NodeInfo
 from queue import Empty, Full
-
-if TYPE_CHECKING:
-    from ensemble_launcher.orchestrator.node import NodeInfo
 
 
 logger = logging.getLogger(__name__)
 
 class MPComm(Comm):
     def __init__(self, 
-                 node_info: "NodeInfo",
+                 node_info: NodeInfo,
                  parent_comm: "MPComm",              
                  heartbeat_interval:int=1):
-        # Import NodeInfo here to avoid circular import
-        from ensemble_launcher.orchestrator.node import NodeInfo
+        super().__init__()
         self.node_info = node_info
         self.last_update_time = time.time()
         self.last_heartbeat_time = None

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, List
 
 @dataclass
 class Status:
@@ -25,3 +25,7 @@ class Status:
 class Result:
     def __init__(self, data: Any):
         self.data = data
+
+# class TaskUpdate:
+#     def __init__(self, new:List[] ):
+#         pass

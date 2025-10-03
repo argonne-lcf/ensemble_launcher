@@ -1,7 +1,18 @@
 from abc import ABC, abstractmethod
+from typing import Dict, Any, List
+from .messages import Status
+from dataclasses import dataclass, field
 
+
+@dataclass
+class NodeInfo:
+    node_id:str
+    parent_ids: List[str] =  field(default_factory=[])
+    children_ids: List[str] =  field(default_factory=[])
 
 class Comm(ABC):
+    def __init__(self):
+        self._cache: Dict[str, Any] = {}
 
     @abstractmethod
     def send_to_parent(self, *args, **kwargs) -> int:
@@ -60,3 +71,5 @@ class Comm(ABC):
             if msg is not None:
                 messages.append(msg)
         return messages
+    
+    # def send_status_updated(self,Status):

@@ -40,6 +40,7 @@ class Worker(Node):
             self._comm = ZMQComm(self.info,self.parent.comm)
         else:
             raise ValueError(f"Unsupported executor for comm {config.executor_name}")
+        ##map from executor ids to task ids
         self._executor_task_ids: Dict[str, List[str]] = {}
         self._status_info = {
             "ReadyTasks": 0,

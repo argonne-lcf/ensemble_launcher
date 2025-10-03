@@ -1,14 +1,9 @@
 from typing import Union, List, Dict
 import logging
 from dataclasses import dataclass, field
+from ensemble_launcher.comm import NodeInfo
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class NodeInfo:
-    node_id:str
-    parent_ids: List[str] =  field(default_factory=[])
-    children_ids: List[str] =  field(default_factory=[])
     
 class Node:
     """
