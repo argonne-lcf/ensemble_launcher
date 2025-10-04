@@ -1,129 +1,100 @@
-from typing import Union, Any
+from typing import Any, Optional
 import multiprocessing as mp
 import logging
-import time
 from .base import Comm, NodeInfo
-from queue import Empty, Full
-
 
 logger = logging.getLogger(__name__)
 
 class MPComm(Comm):
     def __init__(self, 
                  node_info: NodeInfo,
-                 parent_comm: "MPComm",              
-                 heartbeat_interval:int=1):
-        super().__init__()
-        self.node_info = node_info
-        self.last_update_time = time.time()
-        self.last_heartbeat_time = None
-        self.heartbeat_interval = heartbeat_interval
-        self._parent_comm = parent_comm
-
-        ###This only to send the results back to the parent
-        self.result_queue = mp.Queue()
-
+                 parent_comm: Optional["MPComm"] = None,  # Fixed: Should be Optional, not required
+                 heartbeat_interval: int = 1):
+        super().__init__(node_info,
+                         parent_comm=parent_comm,
+                         heartbeat_interval=heartbeat_interval)
         
         self._my_conn_to_child = {}
         self._child_conn_to_me = {}
         for child_id in self.node_info.children_ids:
-            self._my_conn_to_child[child_id], self._child_conn_to_me[child_id]= mp.Pipe()
-        self._parent_result_queue = None
+            self._my_conn_to_child[child_id], self._child_conn_to_me[child_id] = mp.Pipe()
+        
         self._my_conn_to_parent = None
         if self._parent_comm:
-            self._parent_result_queue = self._parent_comm.result_queue() if self._parent_comm is not None else None        
             self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
 
-    def send_to_parent(self, parent_id: Union[int, str], data) -> int:
-        logger.debug(f"send_to_parent: node {self.node_id}")
-        self._my_conn_to_parent.send(data)
-        logger.debug(f"Sent message to parent {parent_id}: {data}")
-        return 0
+    def _send_to_parent(self, data: Any) -> bool:
+        # Fixed: Added None check for parent connection
+        if self._my_conn_to_parent is None:
+            logger.warning(f"{self.node_info.node_id}: No parent connection available")
+            return False
+            
+        try:
+            self._my_conn_to_parent.send(data)
+            logger.debug(f"{self.node_info.node_id}: Sent message to parent: {data}")
+            return True  # Fixed: This was missing the return True
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Sending message to parent failed with {e}")
+            return False
 
-    def recv_from_parent(self, parent_id: Union[int, str], timeout: int = 60):
-        if self._my_conn.poll(timeout):
-            msg = self._my_conn_to_parent.recv()
-            logger.debug(f"Received message {msg} from parent {parent_id}.")
-            return msg
-        logger.debug(f"No message received from parent {parent_id} within timeout {timeout} seconds.")
-        return None
+    def _recv_from_parent(self, timeout: Optional[float] = None) -> Any:
+        # Fixed: Added None check for parent connection
+        if self._my_conn_to_parent is None:
+            logger.debug(f"{self.node_info.node_id}: No parent connection available")
+            return None
+            
+        try:
+            if self._my_conn_to_parent.poll(timeout):
+                msg = self._my_conn_to_parent.recv()
+                logger.debug(f"{self.node_info.node_id}: Received message {msg} from parent.")
+                return msg
+            logger.debug(f"{self.node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
+            return None
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
+            return None
 
-    def send_to_child(self, child_id: Union[int, str], message) -> int:
-        if child_id in self.node_info.children_ids:
-            self._my_conn_to_child[child_id].send(message)
-            logger.debug(f"Sent message to child {child_id}")
-            return 0
-        else:
-            return 1
+    def _send_to_child(self, child_id: str, data: Any) -> bool:
+        # Fixed: Added validation for child_id existence
+        if child_id not in self._my_conn_to_child:
+            logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            return False
+            
+        try:
+            self._my_conn_to_child[child_id].send(data)
+            logger.debug(f"{self.node_info.node_id}: Sent message to child {child_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Sending message to child {child_id} failed with {e}")
+            return False
 
-    def recv_from_child(self, child_id: Union[int, str], timeout: int = 60):
-        if child_id in self.node_info.children_ids:
-            logger.debug(f"recv_from_child pipe {child_id}")
+    def _recv_from_child(self, child_id: str, timeout: Optional[float] = None) -> Any:
+        # Fixed: Added validation for child_id existence
+        if child_id not in self._my_conn_to_child:
+            logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            return None
+            
+        try:
+            logger.debug(f"{self.node_info.node_id}: recv_from_child pipe {child_id}")
             if self._my_conn_to_child[child_id].poll(timeout):
                 msg = self._my_conn_to_child[child_id].recv()
-                logger.debug(f"Received message {msg} from child {child_id}.")
+                logger.debug(f"{self.node_info.node_id}: Received message {msg} from child {child_id}.")
                 return msg
-        else:
-            logger.debug(f"Cannot receive from child {child_id}: child does not exist.")
-            raise ValueError(f"Child {child_id} does not exist.")
-        logger.debug(f"No message received from child {child_id} within timeout {timeout} seconds.")
-        return None
+            logger.debug(f"{self.node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
+            return None
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
+            return None
 
-    def blocking_recv_from_parent(self, parent_id: Union[int, str]):
-        """
-        Blocking receive from a specific parent. Waits indefinitely until a message is available.
-        """
-        logger.debug(f"Waiting for message from parent {parent_id}......")
-        msg = self._my_conn_to_parent.recv()  # Blocking call
-        logger.debug(f"Received message from parent {parent_id} (blocking)")
-        return msg
-
-    def blocking_recv_from_child(self, child_id: Union[int, str]):
-        """
-        Blocking receive from a specific child. Waits indefinitely until a message is available.
-        """
-        if child_id in self.node_info.children_ids:
-            logger.debug(f"Waiting for message from child {child_id}......")
-            msg = self._my_conn_to_child[child_id].recv()
-        else:
-            logger.debug(f"Cannot receive from child {child_id}: child does not exist.")
-            raise ValueError(f"Child {child_id} does not exist.")
-        logger.debug(f"Received message {msg} from child {child_id}")
-        return msg
-    
-    def return_result(self, result: Any):
+    def close(self):
+        """Clean up connections."""
         try:
-            # Non‐blocking put; if the queue is full, Full is raised immediately
-            self._parent_result_queue.put(result, block=False)
-            logger.debug(f"Returned result to parent (non‐blocking): {result}")
-        except Full:
-            logger.warning(f"Parent result queue is full; dropping result: {result}")
-    
-    def get_results(self, timeout: float = None) -> list[Any]:
-        """
-        Retrieve all results from this node's result queue until it's empty.
-        If timeout is provided, waits for the first result up to timeout seconds, then
-        drains the queue immediately.
-        Returns a list of results (empty if no result is available).
-        """
-        results = []
-
-        # Try to get the first item (blocking or non-blocking depending on timeout)
-        try:
-            if timeout is not None:
-                first = self.result_queue.get(timeout=timeout)
-            else:
-                first = self.result_queue.get_nowait()
-            results.append(first)
-        except Empty:
-            logger.debug(f"No result available within {timeout} seconds.")
-            return results
-
-        # Drain remaining items without blocking
-        while True:
-            try:
-                results.append(self.result_queue.get_nowait())
-            except Empty:
-                break
-
-        return results
+            # Close child connections
+            for child_id in list(self._my_conn_to_child.keys()):
+                self._my_conn_to_child[child_id].close()
+                self._child_conn_to_me[child_id].close()
+            
+            # Note: Parent connection is owned by parent, so we don't close it
+            
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Error during cleanup: {e}")

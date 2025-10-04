@@ -51,6 +51,6 @@ class Node:
     def info(self):
         return NodeInfo(
             node_id=self.node_id,
-            parent_ids=[self.parent],
+            parent_id=self.parent.node_id if self.parent is not None else None,
             children_ids=list(self.children.keys())
         )

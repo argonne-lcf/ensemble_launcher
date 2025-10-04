@@ -7,7 +7,6 @@ try:
     from dragon.native.queue import Queue as DragonQueue
     DRAGON_AVAILABLE = True
 except Exception as e:
-    logger.warning(f"Dragon is not available")
     DRAGON_AVAILABLE = False
 
 
