@@ -24,7 +24,6 @@ class MPComm(Comm):
             self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
 
     def _send_to_parent(self, data: Any) -> bool:
-        # Fixed: Added None check for parent connection
         if self._my_conn_to_parent is None:
             logger.warning(f"{self.node_info.node_id}: No parent connection available")
             return False
@@ -32,7 +31,7 @@ class MPComm(Comm):
         try:
             self._my_conn_to_parent.send(data)
             logger.debug(f"{self.node_info.node_id}: Sent message to parent: {data}")
-            return True  # Fixed: This was missing the return True
+            return True 
         except Exception as e:
             logger.warning(f"{self.node_info.node_id}: Sending message to parent failed with {e}")
             return False

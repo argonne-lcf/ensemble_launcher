@@ -122,13 +122,12 @@ class Comm(ABC):
                         self._cache[parent_id].append(msg)
             return None
         else:
-            while True:
-                msg = self._recv_from_parent(timeout=0.1)
-                if msg is not None:
-                    if isinstance(msg, cls):
-                        return msg
-                    else:
-                        self._cache[parent_id].append(msg)
+            msg = self._recv_from_parent()
+            if msg is not None:
+                if isinstance(msg, cls):
+                    return msg
+                else:
+                    self._cache[parent_id].append(msg)
 
 
 
