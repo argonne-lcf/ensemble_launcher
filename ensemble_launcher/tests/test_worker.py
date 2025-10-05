@@ -27,7 +27,7 @@ def test_worker():
     )
     w.run_tasks()
     results = w.results()
-    w.stop()
+    # w.stop()
 
     assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 

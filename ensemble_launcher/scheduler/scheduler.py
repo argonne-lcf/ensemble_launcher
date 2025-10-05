@@ -114,9 +114,47 @@ class TaskScheduler(Scheduler):
             
         return ready_tasks
     
-    def add_task(self,task: Task):
-        self.tasks[task.task_id] = task
-        self.sorted_tasks = sorted(self.tasks.values(), key=self.scheduler_policy.get_score, reverse=True)
+    def add_task(self,task: Task) -> bool:
+        try:
+            if task.nnodes > len(self.cluster.nodes):
+                raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
+            self.tasks[task.task_id] = task
+            self.sorted_tasks = sorted(self.tasks.values(), key=self.scheduler_policy.get_score, reverse=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add task {task.task_id}: {e}")
+            return False
+    
+    def delete_task(self, task: Task) -> bool:
+        if task.task_id not in self.tasks:
+            logger.warning(f"Unknown task: {task.task_id}")
+            return False
+        
+        try:
+            # Remove from tasks dict
+            del self.tasks[task.task_id]
+
+            # If running, free the resources
+            if task.task_id in self._running_tasks:
+                self.cluster.deallocate(self.task_assignment[task.task_id])
+
+            if task.task_id in self.task_assignment:
+                del self.task_assignment[task.task_id]
+
+            # Remove from running and status sets
+            self._running_tasks.discard(task.task_id)
+            self._done_tasks = [t for t in self._done_tasks if t != task.task_id]
+            self._failed_tasks.discard(task.task_id)
+            self._successful_tasks.discard(task.task_id)
+
+            # Remove from sorted tasks
+            if task in self.sorted_tasks:
+                self.sorted_tasks.remove(task)
+
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to delete task {task.task_id}: {e}")
+            return False
     
     def free(self, task_id: str, status: TaskStatus):
         if task_id in self.tasks:

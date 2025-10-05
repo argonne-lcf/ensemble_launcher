@@ -29,16 +29,20 @@ class ClusterResource(ABC):
         logger.debug(f"Node configuration: {list(self._nodes.keys())}")
 
     @property
-    def system_info(self):
+    def system_info(self) -> NodeResource:
         return self._system_info
     
     @property
-    def free_cpus(self):
+    def free_cpus(self) -> int:
         return sum([node.cpu_count for node in self._nodes.values()])
     
     @property
-    def free_gpus(self):
+    def free_gpus(self) -> int:
         return sum([node.gpu_count for node in self._nodes.values()])
+    
+    @property
+    def nodes(self) -> List[str]:
+        return list(self._nodes.keys())
     
     @abstractmethod
     def allocate(self, job_resource: JobResource):
@@ -119,6 +123,7 @@ class ClusterResource(ABC):
                 return False
         
         return True
+    
     def __repr__(self) -> str:
         """Return string representation of the cluster."""
         node_info = []

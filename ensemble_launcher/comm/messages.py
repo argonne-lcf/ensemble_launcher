@@ -2,6 +2,14 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from datetime import datetime
 from ensemble_launcher.ensemble import Task
+import enum
+
+
+
+class ActionType(enum.Enum):
+    START = "start"
+    WAIT = "wait"
+    STOP = "stop"
 
 ##Base message class
 @dataclass
@@ -37,6 +45,7 @@ class Status(Message):
 @dataclass
 class Result(Message):
     data: Any = None
+    task_id: str = None
     success: bool = True
     error_message: Optional[str] = None
 
@@ -48,3 +57,7 @@ class TaskUpdate(Message):
 @dataclass
 class HeartBeat(Message):
     alive: bool = True
+
+@dataclass
+class Action(Message):
+    type: Optional[ActionType] = None

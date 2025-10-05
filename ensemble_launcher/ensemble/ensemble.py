@@ -2,7 +2,7 @@ import json
 import os
 import numpy as np
 import enum
-from typing import Optional, Union, Callable, Tuple, Dict, List
+from typing import Optional, Union, Callable, Tuple, Dict, List, Any
 from pydantic import BaseModel, Field
 
 
@@ -25,6 +25,7 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.NOT_READY
     estimated_runtime: float = 0.0
     exception: Optional[str] = None  # Store exception message as string
+    result: Optional[Any] = None
     cpu_affinity: List[int] = Field(default_factory=list)
     gpu_affinity: List[Union[int, str]] = Field(default_factory=list)
     
