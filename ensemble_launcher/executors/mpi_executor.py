@@ -1,5 +1,5 @@
 from typing import Any, Dict, Callable, List, Union, Tuple
-from ensemble_launcher.scheduler.resource import JobResource
+from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
 import subprocess
 import logging
 from .utils import gen_affinity_bash_script_1, gen_affinity_bash_script_2, generate_python_exec_command, executor_registry
@@ -7,6 +7,7 @@ import os
 import stat
 import uuid
 import shlex
+import socket
 
 from .base import Executor
 
@@ -32,27 +33,46 @@ class MPIExecutor(Executor):
 
         env = {}
         launcher_cmd = []
-        common_cpus = set.intersection(*[set(node_resource.cpus) for node_resource in job_resource.resources])
-        
-        use_common_cpus = common_cpus == set(job_resource.resources[0].cpus)
-        if use_common_cpus:
-            cores = ":".join(map(str, job_resource.resources[0].cpus))
-        else:
-            ##TODO: implement host file option
-            logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
-            cores = ":".join(map(str, job_resource.resources[0].cpus))
-        launcher_cmd.append("--cpu-bind")
-        launcher_cmd.append(f"list:{cores}")
-        
-        ##defaults to Aurora (Level zero)
-        logger.info(f"Using {self.gpu_selector} for pinning GPUs")
-        common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
-        use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
-        if use_common_gpus:
-            if nnodes == 1 and ppn == 1:
-                env.update({"ZE_AFFINITY_MASK": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+
+        launcher_cmd.append("-np")
+        launcher_cmd.append(f"{ppn*nnodes}")
+        if not(len(job_resource.nodes) == 1 and job_resource.nodes[0] == socket.gethostname()):
+            launcher_cmd.append("--hosts")
+            launcher_cmd.append(f"{",".join(job_resource.nodes)}")
+
+        if isinstance(job_resource.resources[0],NodeResourceList):
+            common_cpus = set.intersection(*[set(node_resource.cpus) for node_resource in job_resource.resources])
+
+            use_common_cpus = common_cpus == set(job_resource.resources[0].cpus)
+            if use_common_cpus:
+                cores = ":".join(map(str, job_resource.resources[0].cpus))
             else:
-                bash_script = gen_affinity_bash_script_1(ngpus_per_process,self.gpu_selector)
+                ##TODO: implement host file option
+                logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
+                cores = ":".join(map(str, job_resource.resources[0].cpus))
+            launcher_cmd.append("--cpu-bind")
+            launcher_cmd.append(f"list:{cores}")
+        
+            ##defaults to Aurora (Level zero)
+            logger.info(f"Using {self.gpu_selector} for pinning GPUs")
+            common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
+            use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
+            if use_common_gpus:
+                if nnodes == 1 and ppn == 1:
+                    env.update({"ZE_AFFINITY_MASK": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+                else:
+                    bash_script = gen_affinity_bash_script_1(ngpus_per_process,self.gpu_selector)
+                    fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
+                    if not os.path.exists(fname):
+                        with open(fname, "w") as f:
+                            f.write(bash_script)
+                        st = os.stat(fname)
+                        os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                    launcher_cmd.append(f"{fname}")
+                    ##set environment variables
+                    env.update({"AVAILABLE_GPUS": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+            else:
+                bash_script = gen_affinity_bash_script_2(ngpus_per_process,self.gpu_selector)
                 fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
                 if not os.path.exists(fname):
                     with open(fname, "w") as f:
@@ -60,20 +80,9 @@ class MPIExecutor(Executor):
                     st = os.stat(fname)
                     os.chmod(fname,st.st_mode | stat.S_IEXEC)
                 launcher_cmd.append(f"{fname}")
-                ##set environment variables
-                env.update({"AVAILABLE_GPUS": ",".join([str(i) for i in job_resource.resources[0].gpus])})
-        else:
-            bash_script = gen_affinity_bash_script_2(ngpus_per_process,self.gpu_selector)
-            fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
-            if not os.path.exists(fname):
-                with open(fname, "w") as f:
-                    f.write(bash_script)
-                st = os.stat(fname)
-                os.chmod(fname,st.st_mode | stat.S_IEXEC)
-            launcher_cmd.append(f"{fname}")
-            ##Here you need to set the environment variables for each node
-            for nid,node in enumerate(job_resource.nodes):
-                env.update({f"AVAILABLE_GPUS_{node}": ",".join([str(i) for i in job_resource.resources[nid].gpus])})
+                ##Here you need to set the environment variables for each node
+                for nid,node in enumerate(job_resource.nodes):
+                    env.update({f"AVAILABLE_GPUS_{node}": ",".join([str(i) for i in job_resource.resources[nid].gpus])})
 
         return launcher_cmd, env
 
@@ -87,7 +96,7 @@ class MPIExecutor(Executor):
         # task is a str command
         task_id = str(uuid.uuid4())
 
-        resource_pinning_cmd = self._build_resource_cmd(task_id,job_resource)
+        resource_pinning_cmd, resource_pinning_env = self._build_resource_cmd(task_id,job_resource)
 
         additional_mpi_opts = []
         additional_mpi_opts.extend(list(mpi_args))
@@ -95,7 +104,7 @@ class MPIExecutor(Executor):
             additional_mpi_opts.extend([str(k),str(v)])
 
         if callable(task):
-            task_cmd = ["python", "-c", shlex.quote(generate_python_exec_command(task,task_args,task_kwargs))]
+            task_cmd = ["python", "-c", generate_python_exec_command(task,task_args,task_kwargs)]
         elif isinstance(task,str):
             task_cmd = [s.strip() for s in task.split()]
         else:
@@ -104,7 +113,13 @@ class MPIExecutor(Executor):
 
         cmd = [self.mpiexec] + resource_pinning_cmd + additional_mpi_opts + task_cmd
 
-        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        merged_env = os.environ.copy()
+        merged_env.update(resource_pinning_env)
+        merged_env.update(env)
+
+        logger.debug(f"executing: {" ".join(cmd)}")
+        p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
         self._processes[task_id] = p
         return task_id
     
@@ -150,7 +165,8 @@ class MPIExecutor(Executor):
             output=self._results.get(task_id, None)
         )
 
-    def done(self, process):
+    def done(self, task_id: str):
+        process = self._processes[task_id]
         return process.poll() is not None
     
     def shutdown(self, force:bool = False):

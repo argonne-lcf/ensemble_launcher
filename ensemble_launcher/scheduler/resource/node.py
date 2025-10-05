@@ -106,6 +106,14 @@ class NodeResourceCount(NodeResource):
             return (other.cpu_count <= self.ncpus and 
                     other.gpu_count <= self.ngpus)
         return False
+    
+    @classmethod
+    def from_config(self, info: SystemConfig):
+        """creates a node resource list from a dict"""
+        return NodeResourceCount(
+            ncpus = info.ncpus,
+            ngpus = info.ngpus
+        )
 
 
 @dataclass(frozen=True, eq=True)

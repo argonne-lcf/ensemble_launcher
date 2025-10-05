@@ -87,7 +87,7 @@ def generate_python_exec_command(fn: Callable, args: Tuple, kwargs: Dict) -> str
     script = [
         "import cloudpickle",
         "import base64",
-        f"s = '{s}'",
+        f"s = {repr(s)}",
         "fb = base64.decodebytes(s.encode('utf-8'))",
         "fn,args,kwargs = cloudpickle.loads(fb)",
         "fn(*args,**kwargs)"
