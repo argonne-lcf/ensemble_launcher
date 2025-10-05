@@ -43,6 +43,7 @@ class ZMQComm(Comm):
         self.dealer_poller = None
 
         self.setup_zmq_sockets()
+        self.send_heartbeat()
 
     def setup_zmq_sockets(self):
         self.zmq_context = zmq.Context()
@@ -161,3 +162,16 @@ class ZMQComm(Comm):
         except Exception as e:
             logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
             return None
+    
+
+    def close(self):
+        """Clean up ZMQ resources."""
+        try:
+            if self.router_socket:
+                self.router_socket.close()
+            if self.dealer_socket:
+                self.dealer_socket.close()
+            if self.zmq_context:
+                self.zmq_context.term()
+        except Exception as e:
+            logger.warning(f"{self.node_info.node_id}: Error during ZMQ cleanup: {e}")

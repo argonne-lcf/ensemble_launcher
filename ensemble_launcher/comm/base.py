@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Type
-from .messages import Status, Result, Message, TaskUpdate
+from .messages import Message, HeartBeat
 from dataclasses import dataclass, field
 import time
 
@@ -128,7 +128,14 @@ class Comm(ABC):
                     return msg
                 else:
                     self._cache[parent_id].append(msg)
+    
 
+    def wait_for_children(self, timeout: float = None) -> bool:
+        return self.recv_messages_from_children(HeartBeat, timeout=timeout)
+
+    def send_heartbeat(self) -> bool:
+        return self.send_message_to_parent(msg=HeartBeat())
+        
 
 
 

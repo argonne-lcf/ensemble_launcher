@@ -44,3 +44,7 @@ class Result(Message):
 class TaskUpdate(Message):
     added_tasks: List[Task] = field(default_factory=list)  # Should be callable
     deleted_tasks: List[Task] = field(default_factory=list)  # Should be callable
+
+@dataclass
+class HeartBeat(Message):
+    alive: bool = True

@@ -24,7 +24,9 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
                       kwargs={"parent_address": comm.my_address, "comm_type": comm_type})
     p.start()
 
-    time.sleep(5.0)
+    if node_info.children_ids and comm_type == "zmq":
+        comm.wait_for_children(timeout=10.0)
+
 
     if node_info.parent_id:
         msg = comm.recv_message_from_parent(Message, timeout=10.0)
@@ -80,5 +82,5 @@ def test_zmq_comm():
     
 
 if __name__ == "__main__":
-    test_mp_comm()
+    # test_mp_comm()
     test_zmq_comm()
