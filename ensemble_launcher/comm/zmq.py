@@ -34,7 +34,7 @@ class ZMQComm(Comm):
 
         # ZMQ specific attributes
         self.parent_address = self._parent_comm.my_address if self._parent_comm is not None else parent_address
-        self.my_address = f"{socket.gethostname() if 'local' not in socket.gethostname() else 'localhost'}:5555"
+        self.my_address = f"{socket.gethostname() if 'local' not in socket.gethostname() else 'localhost'}:{5555+random.randint(1, 1000)}"
 
         self.zmq_context = None
         self.router_socket = None

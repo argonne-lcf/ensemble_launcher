@@ -42,7 +42,7 @@ def test_worker():
     for r in res.data:
         results[r.task_id] = r.data
 
-    assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+    assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
 def test_worker_in_mp():
     ##create tasks

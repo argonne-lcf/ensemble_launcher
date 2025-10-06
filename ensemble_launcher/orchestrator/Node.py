@@ -25,6 +25,7 @@ class Node:
     
     def set_parent(self, parent: NodeInfo):
         self.parent = parent
+        self._level = parent.level + 1
 
     def add_child(self, child_id: str, child: NodeInfo):
         if child_id not in self.children:
@@ -43,5 +44,6 @@ class Node:
         return NodeInfo(
             node_id=self.node_id,
             parent_id=self.parent.node_id if self.parent is not None else None,
-            children_ids=list(self.children.keys()) if self.children else []
+            children_ids=list(self.children.keys()) if self.children else [],
+            level = self.level
         )

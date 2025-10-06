@@ -173,7 +173,7 @@ class Master(Node):
 
         ##create children
         children = self._create_children()
-        logger.info(f"{self.node_id} Created {len(children)} children")
+        logger.info(f"{self.node_id} Created {len(children)} children: {children.keys()}")
 
         #add children
         for child_id, child in children.items():
@@ -327,7 +327,10 @@ class Master(Node):
         }
         
         start = time.time()
+        retry = 0
         while len(done) < len(self.children):
+            retry += 1
+            logger.debug(f"{self.node_id}: Trying to get result retry {retry}")
             if timeout is not None and time.time() > start + timeout:
                 logger.warning(f"{self.node_id}: Timed out while collecting results")
                 break
@@ -338,7 +341,7 @@ class Master(Node):
                 result = self._comm.recv_message_from_child(Result, child_id, timeout=1.0)
                 if result is not None:
                     results[child_id].append(result)
-                    logger.debug(f"{self.node_id}: Received result from {child_id}")
+                    logger.info(f"{self.node_id}: Received result from {child_id}")
                     done.add(child_id)
         
         ##Create a new result from all the results
@@ -358,8 +361,10 @@ class Master(Node):
             success = self._comm.send_message_to_parent(new_result)
             if not success:
                 logger.warning(f"{self.node_id}: Failed to send results to parent")
+            else:
+                logger.info(f"{self.node_id}: Succesfully sent results to parent")
         self.stop()
-        logger.info(f"{self.node_id}: Done getting results")
+        logger.info(f"{self.node_id}: Done getting results.")
         return new_result
 
     def stop(self):

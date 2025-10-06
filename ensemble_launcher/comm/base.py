@@ -10,6 +10,7 @@ class NodeInfo:
     node_id:str
     parent_id: str =  None
     children_ids: List[str] =  field(default_factory=list)
+    level: int = 0
 
 class Comm(ABC):
     def __init__(self, 
