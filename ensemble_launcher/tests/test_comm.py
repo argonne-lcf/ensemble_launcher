@@ -13,6 +13,8 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
         comm = MPComm(node_info=nodes[0].info(), parent_comm=parent_comm)
     elif comm_type == "zmq":
         comm = ZMQComm(node_info=nodes[0].info(), parent_address=parent_address)
+        comm.setup_zmq_sockets()
+        comm.send_heartbeat()
     else:
         return 
     
