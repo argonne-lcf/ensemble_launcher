@@ -91,7 +91,8 @@ class MPComm(Comm):
             # Close child connections
             for child_id in list(self._my_conn_to_child.keys()):
                 self._my_conn_to_child[child_id].close()
-                self._child_conn_to_me[child_id].close()
+            if self._my_conn_to_parent:
+                self._my_conn_to_parent.close()
             
             # Note: Parent connection is owned by parent, so we don't close it
             

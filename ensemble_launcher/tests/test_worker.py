@@ -5,12 +5,19 @@ from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.scheduler.resource import NodeResourceList, JobResource
 import multiprocessing as mp
 import os
+import logging
+import copy
+
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 def echo(task_id: str):
     return f"Hello from task {task_id}"
 
 def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
+
+
+
 
 def test_worker():
     ##create tasks
@@ -30,9 +37,10 @@ def test_worker():
         "test",LauncherConfig(executor_name="multiprocessing"),sys_info,nodes,tasks
     )
 
-    w.run()
-    results = w.results()
-    # w.stop()
+    res = w.run()
+    results = {}
+    for r in res.data:
+        results[r.task_id] = r.data
 
     assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
@@ -50,20 +58,13 @@ def test_worker_in_mp():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
-
     w = Worker(
-        "test-worker",LauncherConfig(executor_name="multiprocessing"),sys_info,nodes,tasks
+        "test-worker",LauncherConfig(executor_name="multiprocessing", comm_name="zmq"),sys_info,nodes,tasks
     )
-    
-
-    req = JobResource(
-                resources=[NodeResourceList(cpus=[1])], nodes=[socket.gethostname]
-            )
     
     p = mp.Process(target=w.run)
     p.start()
-
-    # assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+    p.join()
 
 if __name__ == "__main__":
     test_worker()

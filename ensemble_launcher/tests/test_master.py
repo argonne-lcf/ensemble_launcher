@@ -29,11 +29,34 @@ def test_master():
     m = Master(
         "test",LauncherConfig(executor_name="multiprocessing"),sys_info,nodes,tasks
     )
-    m.run()
-    results = {r.task_id:r.data for r in m.results()["test.w0"]}
-    m.stop()
+
+    result = m.run()
+    results = {r.task_id:r.data for r in result.data}
+    
+    assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+
+def test_master_zmq_comm():
+    ##create tasks
+    tasks = {}
+    for i in range(12):
+        tasks[f"task-{i}"] = \
+            Task(task_id=f"task-{i}",
+                 nnodes=1,
+                 ppn=1,
+                 executable=echo,
+                 args=(f"task-{i}",))
+
+    nodes = [socket.gethostname()]
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+
+    m = Master(
+        "test",LauncherConfig(executor_name="multiprocessing",comm_name="zmq"),sys_info,nodes,tasks
+    )
+    result = m.run()
+    results = {r.task_id:r.data for r in result.data}
     
     assert all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
 if __name__ == "__main__":
-    test_master()
+    # test_master()
+    test_master_zmq_comm()

@@ -6,8 +6,8 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResour
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
-from ensemble_launcher.comm.messages import Status, Result 
-
+from ensemble_launcher.comm.messages import Status, Result, HeartBeat
+import copy
 import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Any
@@ -42,7 +42,6 @@ class Master(Node):
         ##maps
         self._children_exec_ids: Dict[str, str] = {}
         self._child_assignment: Dict[str, Dict] = {}
-        self._results: Dict[str, Any] = {}
 
 
     @property
@@ -184,7 +183,7 @@ class Master(Node):
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
         for child_id, child in children.items():
-            child.parent_comm = self.comm
+            child.parent_comm = copy.deepcopy(self.comm) if self._config.comm_name == "zmq" else self.comm
         
         for child_name,child_obj in children.items():
             child_nodes = child_obj.nodes
@@ -198,34 +197,68 @@ class Master(Node):
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
         
-        ##send heart beat
-        self._comm.send_heartbeat()
+        ##heart beat sync with parent
+        if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
 
-        success = []
-        failure = []
-        for child_id,exec_id in self._children_exec_ids.items():
-            if child_id in success or child_id in failure:
-                continue
-            if self._executor.running(exec_id):
-                logger.info(f"Waiting for child {child_id}.")
-                self._comm.wait_for_child(child_id=child_id)
-                success.append(child_id)
-            else:
-                if not self._executor.done(exec_id):
-                    raise RuntimeError(f"Invalid state for {child_id}")
-                else:
-                    e = self._executor.exception(exec_id)
-                    logger.error(f"{child_id} failed with exception {e}")
-                    failure.append(child_id)
-
-        if len(success) == len(self.children):
-            logger.info(f"{self.node_id}: All children connected")
+        if not self._comm.sync_heartbeat_with_children(timeout=10.0):
+            return self._get_child_exceptions() # Should return and report
         else:
-            logger.info(f"{self.node_id}: Children {failure} failed to start")
-            self.stop()
-            return
+            return self._results(timeout=30.0) #should return and report
 
-        self._monitor_children()
+    def _get_child_exceptions(self) -> Result:
+        """
+        Collect and handle exceptions from child processes.
+        This method stops all running child processes and collects any exceptions
+        that occurred during their execution. It creates Result objects for each
+        exception found and optionally sends them to the parent node.
+        Returns:
+            Result: A Result object containing exception results from failed child processes.
+                    The data field contains a list of Result objects, one for each child
+                    that failed with an exception. Each child Result has the exception
+                    stored as a string in its exception attribute.
+        Notes:
+            - All running children are stopped before collecting exceptions
+            - Only processes that are done and have exceptions are included
+            - Exception results are automatically sent to parent node if one exists
+            - Logs information about stopped children and found exceptions
+        """
+        
+        # First, stop all children
+        for child_id, exec_id in self._children_exec_ids.items():
+            if self._executor.running(exec_id):
+                logger.info(f"Stopping child {child_id}")
+                self._executor.stop(exec_id)
+    
+        # Collect exceptions without waiting
+        exceptions = {}
+        for child_id, exec_id in self._children_exec_ids.items():
+            if self._executor.done(exec_id):
+                exception = self._executor.exception(exec_id)
+                if exception is not None:
+                    exceptions[child_id] = exception
+                    logger.error(f"Child {child_id} failed with exception: {exception}")
+
+        logger.info(f"{self.node_id}: Stopped children. Found {len(exceptions)} exceptions")
+
+        # Create result objects for each exception
+        exception_results = []
+        for child_id, exception in exceptions.items():
+            exception_result = Result(sender=child_id, data=[])
+            exception_result.exception = str(exception)
+            exception_results.append(exception_result)
+        
+        # Create a result with the exception results
+        result = Result(sender=self.node_id, data=exception_results)
+
+        # Send to parent if exists
+        if self.parent:
+            success = self._comm.send_message_to_parent(result)
+            if not success:
+                logger.warning(f"{self.node_id}: Failed to send exception results to parent")
+
+        self.stop()
+        return result
     
     def _monitor_children(self):
         next_report_time = time.time() + self._config.report_interval
@@ -257,10 +290,34 @@ class Master(Node):
                 logger.info(f"{self.node_id}: All children are done")
                 break
     
-    def results(self):
-        """Collect results from all children workers."""
+    def _results(self, timeout: Optional[float] = None) -> Result:
+        """
+        Collect and aggregate results from all child processes.
+        This method waits for all child processes to complete their assigned tasks,
+        then collects their individual results and aggregates them into a single
+        Result object. The aggregated result is sent to the parent process if one exists.
+        Args:
+            timeout (Optional[float], optional): Maximum time in seconds to wait for
+                results collection. If None, waits indefinitely. Defaults to None.
+        Returns:
+            Result: A new Result object containing aggregated data from all child
+                processes. The data field contains a list of all individual results
+                received from children.
+        Raises:
+            ValueError: If a child process returns a result with an unknown data type
+                (not a list or Result object).
+        Note:
+            - Monitors child processes until completion before collecting results
+            - Handles child process failures gracefully by logging warnings
+            - Times out gracefully if specified timeout is exceeded
+            - Sends aggregated results to parent process if one exists
+        """
+
+        self._monitor_children() ##block untill all children are done
+
+        ##collect the results
         results = {}
-        for child_id in self.children.keys():
+        for child_id in self.children:
             results[child_id] = []
 
         done = set()
@@ -269,24 +326,43 @@ class Master(Node):
             for wid, child_id in enumerate(self.children.keys())
         }
         
+        start = time.time()
         while len(done) < len(self.children):
+            if timeout is not None and time.time() > start + timeout:
+                logger.warning(f"{self.node_id}: Timed out while collecting results")
+                break
+
             for child_id in self.children.keys():
                 if child_id in done:
                     continue
-                    
-                # Check if we have all expected results for this child
-                if len(results[child_id]) >= expected_results[child_id]:
-                    done.add(child_id)
-                    continue
-                    
-                result = self._comm.recv_message_from_child(Result, child_id, timeout=0.1)
+                result = self._comm.recv_message_from_child(Result, child_id, timeout=1.0)
                 if result is not None:
                     results[child_id].append(result)
-                    logger.debug(f"Received result from {child_id}: {len(results[child_id])}/{expected_results[child_id]}")
+                    logger.debug(f"{self.node_id}: Received result from {child_id}")
+                    done.add(child_id)
         
-        logger.info(f"{self.node_id}: Collected all results from children")
-        return results
+        ##Create a new result from all the results
+        data: List[Result] = []
+        for child_id, results in results.items():
+            for r in results:
+                if isinstance(r.data,list):
+                    data.extend(r.data)
+                elif isinstance(r.data, Result):
+                    data.append(r.data)
+                else:
+                    raise ValueError(f"{self.node_id}: Received unknown type result from child {child_id}")
+        new_result = Result(sender = self.node_id, data = data)
+
+        #report it to parent
+        if self.parent:
+            success = self._comm.send_message_to_parent(new_result)
+            if not success:
+                logger.warning(f"{self.node_id}: Failed to send results to parent")
+        self.stop()
+        logger.info(f"{self.node_id}: Done getting results")
+        return new_result
 
     def stop(self):
-        self._executor.shutdown()
         self._comm.close()
+        self._executor.shutdown()
+        

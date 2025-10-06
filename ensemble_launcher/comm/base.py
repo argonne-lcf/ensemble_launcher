@@ -136,15 +136,45 @@ class Comm(ABC):
                     self._cache[parent_id].append(msg)
     
 
-    def wait_for_children(self, timeout: float = None) -> bool:
-        return self.recv_messages_from_children(HeartBeat, timeout=timeout)
-    
-    def wait_for_child(self, child_id: str, timeout: float = None) -> bool:
-        return self.recv_message_from_child(HeartBeat, child_id=child_id)
-
-    def send_heartbeat(self) -> bool:
-        return self.send_message_to_parent(msg=HeartBeat())
+    def sync_heartbeat_with_parent(self, timeout: Optional[float] = None) -> bool:
+        #heart beat sync with parent
+        if self.node_info.parent_id is None:
+            return True
         
+        if timeout is not None:
+            end_time = time.time() + timeout
+
+        while True:
+            if timeout is not None and time.time() > end_time:
+                return False
+            self.send_message_to_parent(HeartBeat())
+            msg = self.recv_message_from_parent(HeartBeat,timeout=1.0)
+            if msg is not None:
+                return True
+            time.sleep(1.0)
+        
+    
+    def sync_heartbeat_with_child(self, child_id: str, timeout: Optional[float] = None) -> bool:
+        if len(self.node_info.children_ids) == 0:
+            return True
+    
+        if timeout is not None:
+            end_time = time.time() + timeout
+
+        while True:
+            if timeout is not None and time.time() > end_time:
+                return False
+            self.send_message_to_child(child_id, HeartBeat())
+            msg = self.recv_message_from_child(HeartBeat,child_id, timeout=1.0)
+            if msg is not None:
+                return True
+            time.sleep(1.0)
+    
+    def sync_heartbeat_with_children(self, timeout: Optional[float] = None) -> bool:
+        status = []
+        for child_id in self.node_info.children_ids:
+            status.append(self.sync_heartbeat_with_child(child_id, timeout=timeout))
+        return all(status)
 
 
 

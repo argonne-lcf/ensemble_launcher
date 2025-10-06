@@ -123,17 +123,17 @@ class Worker(Node):
             self._scheduler.free(task_id, task.status)
             logger.debug(f"Resources freed for task {task_id} with status {task.status}")
 
-    def run(self):
+    def run(self) -> Result:
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.executor_name)
         ##Lazy comm creation
-        logger.info("********************************************")
-        logger.info("in-run")
         self._create_comm()
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
-        self._comm.send_heartbeat()
         
+        if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+
         next_report_time = time.time() + self._config.report_interval
         while True:
             ready_tasks = self._scheduler.get_ready_tasks()
@@ -174,37 +174,34 @@ class Worker(Node):
                 break
             time.sleep(1.0)
         
-        self.report_results()
+        logger.info(f"{self.node_id}: Done executing all the tasks")
+
+        all_results = self._results()
         self._stop()
+        return all_results
 
-    def results(self) -> Dict[str, Any]:
-        ret = {}
+    def _results(self) -> Result:
+        results = []
         for task_id,task in self._tasks.items():
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
-                ret[task_id] = self._tasks[task_id].result
-        return ret
-    
-    def exceptions(self) -> Dict[str, str]:
-        ret = {}
-        for task_id,task in self._tasks.items():
-            if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
-                ret[task_id] = self._tasks[task_id].exception
-        return ret
+                task_result = Result(task_id=task_id,
+                                    data=self._tasks[task_id].result,
+                                    error_message=self._tasks[task_id].exception)
+                results.append(task_result)
 
-    def report_results(self) -> Dict[str, Any]:
-        results = self.results()
-        exceptions = self.exceptions()
+        new_result = Result(
+            sender=self.node_id,
+            data=results
+        )
+        
+        status = self._comm.send_message_to_parent(new_result)
         if self.parent:
-            for task_id in results:
-                self._comm.send_message_to_parent(Result(sender=self.node_id,
-                                                         task_id=task_id,
-                                                         data=results[task_id],
-                                                         error_message=exceptions[task_id]))
-                time.sleep(0.1)
-        else:
-            logger.info(f"{self.node_id} results: {results}")
-            logger.info(f"{self.node_id} exceptions: {exceptions}")
+            if status:
+                logger.info(f"{self.node_id}: Successfully sent the results to parent")
+            else:
+                logger.warning(f"{self.node_id}: Failed to send results to parent")
+        return new_result
         
     def _stop(self):
-        self._executor.shutdown()
         self._comm.close()
+        self._executor.shutdown()

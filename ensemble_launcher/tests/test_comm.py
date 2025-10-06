@@ -14,7 +14,6 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
     elif comm_type == "zmq":
         comm = ZMQComm(node_info=nodes[0].info(), parent_address=parent_address)
         comm.setup_zmq_sockets()
-        comm.send_heartbeat()
     else:
         return 
     
@@ -26,8 +25,11 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
                       kwargs={"parent_address": comm.my_address, "comm_type": comm_type})
     p.start()
 
-    if node_info.children_ids and comm_type == "zmq":
-        comm.wait_for_children(timeout=10.0)
+    if node_info.parent_id is not None:
+        comm.sync_heartbeat_with_parent(timeout=10.0)
+    
+    if node_info.children_ids:
+        comm.sync_heartbeat_with_children(timeout=10.0)
 
 
     if node_info.parent_id:
