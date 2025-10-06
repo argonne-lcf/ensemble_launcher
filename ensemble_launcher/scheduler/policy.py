@@ -22,6 +22,7 @@ class PolicyRegistry:
     def register(self, policy_name: str):
         def decorator(cls: Type[Policy]):
             self.available_policies[policy_name] = cls
+            return cls
         return decorator
     
     def create_policy(self,policy_name:str, *args, **kwargs):

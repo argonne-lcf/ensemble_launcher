@@ -1,4 +1,4 @@
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Optional
 import logging
 from dataclasses import dataclass, field
 from ensemble_launcher.comm import NodeInfo
@@ -11,37 +11,28 @@ class Node:
     """
     def __init__(self, 
                  node_id:str,
-                 parent: "Node" = None,
-                 children:Dict = {}):
+                 parent: Optional[NodeInfo] = None,
+                 children:Optional[Dict[str, NodeInfo]] = None):
         self.node_id = node_id
-        self.parent: "Node" = parent
-        self.children: Dict[str,"Node"] = children
-        self._comm = None
+        self.parent: NodeInfo = parent
+        self.children: Dict[str,NodeInfo] = children if children is not None else {}
+        
+        self._level = 0 if self.parent is None else self.parent.level + 1
 
     @property
-    def comm(self):
-        return self._comm
+    def level(self):
+        return self._level
     
-    def add_parent(self, parent_id: str, parent: "Node"):
-        if parent_id not in self.parents:
-            self.parents[parent_id] = parent
-        else:
-            logger.debug(f"Parent {parent_id} already exists")
+    def set_parent(self, parent: NodeInfo):
+        self.parent = parent
 
-    def remove_parent(self, parent_id: str):
-        if parent_id in self.parents:
-            del self.parents[parent_id]
-        else:
-            logger.error(f"Parent {parent_id} does not exist")
-            raise
-
-    def add_child(self, child_id: str, child: "Node"):
+    def add_child(self, child_id: str, child: NodeInfo):
         if child_id not in self.children:
             self.children[child_id] = child
         else:
             logger.debug(f"Child {child_id} already exists")
 
-    def remove_child(self, child_id: Union[int, str]):
+    def remove_child(self, child_id: str):
         if child_id in self.children:
             del self.children[child_id]
         else:
@@ -52,5 +43,5 @@ class Node:
         return NodeInfo(
             node_id=self.node_id,
             parent_id=self.parent.node_id if self.parent is not None else None,
-            children_ids=list(self.children.keys())
+            children_ids=list(self.children.keys()) if self.children else []
         )

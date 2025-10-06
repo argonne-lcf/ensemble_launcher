@@ -42,8 +42,8 @@ class ZMQComm(Comm):
         self.router_poller = None
         self.dealer_poller = None
 
-        self.setup_zmq_sockets()
-        self.send_heartbeat()
+        # self.setup_zmq_sockets()
+        # self.send_heartbeat()
 
     def setup_zmq_sockets(self):
         self.zmq_context = zmq.Context()

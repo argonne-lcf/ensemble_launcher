@@ -78,6 +78,9 @@ class MultiprocessingExecutor(Executor):
         """This is a blocking call"""
         return self._futures[task_id].exception()
     
+    def running(self, task_id: str) -> bool:
+        return self._futures[task_id].running()
+    
     def done(self, task_id: str) -> bool:
         return self._futures[task_id].done()
     

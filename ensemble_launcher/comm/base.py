@@ -28,6 +28,12 @@ class Comm(ABC):
         
         self._cache[self.node_info.parent_id] = []
 
+    def update_node_info(self,node_info: NodeInfo):
+        self.node_info = node_info
+        for child_id in self.node_info.children_ids:
+            if child_id not in self._cache:
+                self._cache[child_id] = []
+                
     @abstractmethod
     def _send_to_parent(self, data: Any, **kwargs) -> bool:
         pass
@@ -132,6 +138,9 @@ class Comm(ABC):
 
     def wait_for_children(self, timeout: float = None) -> bool:
         return self.recv_messages_from_children(HeartBeat, timeout=timeout)
+    
+    def wait_for_child(self, child_id: str, timeout: float = None) -> bool:
+        return self.recv_message_from_child(HeartBeat, child_id=child_id)
 
     def send_heartbeat(self) -> bool:
         return self.send_message_to_parent(msg=HeartBeat())

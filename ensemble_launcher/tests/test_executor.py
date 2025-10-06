@@ -90,5 +90,5 @@ def test_mpi_executor():
         assert exec.done(exec_ids[task_id])
 
 if __name__ == "__main__":
-    # test_mp_executor()
+    test_mp_executor()
     test_mpi_executor()

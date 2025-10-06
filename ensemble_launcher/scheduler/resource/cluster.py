@@ -146,7 +146,7 @@ class LocalClusterResource(ClusterResource):
 
     def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:
         """Allocate specific resource IDs."""
-        logger.info(f"Starting allocation for job with {len(job_resource.resources)} resource requirements")
+        logger.debug(f"Starting allocation for job with {len(job_resource.resources)} resource requirements")
 
         allocation_result = self._can_allocate(job_resource)
         if not allocation_result:
@@ -159,7 +159,7 @@ class LocalClusterResource(ClusterResource):
         
         if not job_resource.nodes:
             allocated_nodes = allocation_result
-            logger.info(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
+            logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
             
             # Capture original state and perform allocation
             for node_id, node_name in enumerate(allocated_nodes):
@@ -175,10 +175,10 @@ class LocalClusterResource(ClusterResource):
                 logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
             
             # Return JobResource with actual allocated resources
-            logger.info(f"Allocation successful.")
+            logger.debug(f"Allocation successful.")
             return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
         else:
-            logger.info(f"Allocating resources on specified nodes: {job_resource.nodes}")
+            logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
             
             # Handle specified nodes case
             for node_id, node_name in enumerate(job_resource.nodes):
@@ -191,7 +191,7 @@ class LocalClusterResource(ClusterResource):
                 allocated_resources.append(allocated_resource)
                 logger.debug(f"Allocated {allocated_resource} on node {node_name}")
             
-            logger.info("Allocation successful")
+            logger.debug("Allocation successful")
             return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
     
     def deallocate(self, job_resource: JobResource) -> bool:
@@ -200,14 +200,14 @@ class LocalClusterResource(ClusterResource):
             logger.error("Deallocation failed: JobResource must have nodes specified")
             raise ValueError("JobResource must have nodes specified for deallocation")
         
-        logger.info(f"Starting deallocation for {len(job_resource.nodes)} nodes: {job_resource.nodes}")
+        logger.debug(f"Starting deallocation for {len(job_resource.nodes)} nodes: {job_resource.nodes}")
         
         for node_id, node_name in enumerate(job_resource.nodes):
             resource_req = job_resource.resources[node_id]
             self._nodes[node_name] += resource_req
             logger.debug(f"Deallocated {resource_req} from node {node_name}")
         
-        logger.info("Deallocation successful")
+        logger.debug("Deallocation successful")
         return True
 
     

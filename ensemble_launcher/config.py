@@ -13,7 +13,9 @@ class SystemConfig(BaseModel):
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
     executor_name: str
+    comm_name: str = "multiprocessing"
     report_interval: float = 10.0
+    nlevels: int = 1
 
 
 # class OchestratorConfig(BaseModel):
