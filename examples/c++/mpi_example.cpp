@@ -82,6 +82,7 @@ int main(int argc, char *argv[])
     const char* gpu_affinity = std::getenv("ZE_AFFINITY_MASK") ? std::getenv("ZE_AFFINITY_MASK") : std::getenv("CUDA_VISIBLE_DEVICES");
     printf("Hello from rank %d/%d on node %s, CPU cores %s and GPU %s\n", 
             rank, size, hostname, list_cores, gpu_affinity);
+    fflush();
   }
 
   // Sleep for the given time
