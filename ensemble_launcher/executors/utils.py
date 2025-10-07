@@ -58,7 +58,7 @@ def run_cmd(cmd: str,
     kwargs_list = []
     for k,v in kwargs.items():
         kwargs_list.extend([str(k),str(v)])
-    result = subprocess.run([cmd] + list(args) + kwargs_list , capture_output=True, text=True,env=merged_env)
+    result = subprocess.run(cmd + list(args) + kwargs_list , capture_output=True, text=True,env=merged_env)
 
     # Reset affinity
     if cpu_id is not None and original_affinity is not None:

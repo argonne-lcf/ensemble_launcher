@@ -2,7 +2,7 @@ from .worker import Worker
 from .node import Node
 from ensemble_launcher.executors import executor_registry, MPIExecutor, Executor
 from ensemble_launcher.scheduler import WorkerScheduler
-from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList
+from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
@@ -21,7 +21,7 @@ class Master(Node):
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
-                system_info: SystemConfig,
+                system_info: NodeResource,
                 Nodes:List[str],
                 tasks: Dict[str, Task],
                 parent: Optional[NodeInfo] = None,

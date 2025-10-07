@@ -3,7 +3,7 @@ from .node import *
 import time
 from typing import Any, TYPE_CHECKING, Tuple, Optional
 from ensemble_launcher.scheduler import TaskScheduler
-from ensemble_launcher.scheduler.resource import LocalClusterResource
+from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
@@ -28,7 +28,7 @@ class Worker(Node):
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
-                system_info: SystemConfig,
+                system_info: NodeResource,
                 Nodes:List[str],
                 tasks: Dict[str, Task],
                 parent: Optional[NodeInfo] = None,
