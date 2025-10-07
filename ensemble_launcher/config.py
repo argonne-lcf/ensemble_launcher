@@ -12,8 +12,9 @@ class SystemConfig(BaseModel):
 
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
-    executor_name: str
-    comm_name: str = "multiprocessing"
+    child_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing"
+    task_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing"
+    comm_name: Literal["multiprocessing","zmq","dragon"] = "multiprocessing"
     report_interval: float = 10.0
     nlevels: int = 1
 

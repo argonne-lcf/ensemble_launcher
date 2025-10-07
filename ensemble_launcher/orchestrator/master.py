@@ -169,7 +169,7 @@ class Master(Node):
     
     def run(self):
         #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.executor_name)
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name)
 
         ##create children
         children = self._create_children()
