@@ -38,7 +38,7 @@ class MPIExecutor(Executor):
         launcher_cmd.append(f"{ppn*nnodes}")
         if not(len(job_resource.nodes) == 1 and job_resource.nodes[0] == socket.gethostname()):
             launcher_cmd.append("--hosts")
-            launcher_cmd.append(f"{",".join(job_resource.nodes)}")
+            launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
         if isinstance(job_resource.resources[0],NodeResourceList):
             common_cpus = set.intersection(*[set(node_resource.cpus) for node_resource in job_resource.resources])
@@ -117,7 +117,7 @@ class MPIExecutor(Executor):
         merged_env.update(resource_pinning_env)
         merged_env.update(env)
 
-        logger.debug(f"executing: {" ".join(cmd)}")
+        logger.debug(f"executing: {' '.join(cmd)}")
         p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         self._processes[task_id] = p

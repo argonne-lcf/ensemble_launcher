@@ -49,7 +49,7 @@ def test_scheduler():
     #
     for i in range(12):
         scheduler.free(task_id=f"task-{i}",status=TaskStatus.SUCCESS)
-        assert scheduler.remaining_tasks == set([f"task-{id}" for id in range(i+1,12)]) , f"{scheduler.remaining_tasks} != {set([f"task-{id}" for id in range(i,12)])}"
+        assert scheduler.remaining_tasks == set([f"task-{id}" for id in range(i+1,12)]) , f"{scheduler.remaining_tasks} != {set([f'task-{id}' for id in range(i,12)])}"
         assert scheduler.successful_tasks == set([f"task-{id}" for id in range(i+1)])
 
 

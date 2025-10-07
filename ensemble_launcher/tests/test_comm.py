@@ -4,6 +4,10 @@ from ensemble_launcher.comm.messages import Message, Result
 import multiprocessing as mp
 import time
 
+import logging
+
+# logging.basicConfig(level=logging.INFO)
+
 def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent_address: str = None):
     if len(nodes) == 0:
         return
@@ -58,7 +62,7 @@ def test_mp_comm():
     nodes = [Node(f"0.")]
 
     for i in range(3):
-        nodes.append(Node(f"{".".join([str(j) for j in  range(i+2)])}",parent=nodes[i],children={}))
+        nodes.append(Node(f"{'.'.join([str(j) for j in  range(i+2)])}",parent=nodes[i],children={}))
     
     for i in range(3):
         nodes[i].children[nodes[i+1].node_id] = nodes[i+1]
@@ -73,7 +77,7 @@ def test_zmq_comm():
     nodes = [Node(f"0.")]
 
     for i in range(3):
-        nodes.append(Node(f"{".".join([str(j) for j in  range(i+2)])}",parent=nodes[i],children={}))
+        nodes.append(Node(f"{'.'.join([str(j) for j in  range(i+2)])}",parent=nodes[i],children={}))
     
     for i in range(3):
         nodes[i].children[nodes[i+1].node_id] = nodes[i+1]
