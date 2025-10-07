@@ -72,7 +72,7 @@ def test_master_multilevel():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(executor_name="multiprocessing",nlevels=2),sys_info,nodes,tasks
+        "test",LauncherConfig(executor_name="multiprocessing",comm_name="zmq",nlevels=2,report_interval=0.1),sys_info,nodes,tasks
     )
     ret_result = m.run()
     results = {r.task_id:r.data for r in ret_result.data}

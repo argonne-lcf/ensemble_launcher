@@ -119,9 +119,9 @@ class Worker(Node):
                 else:
                     task.result = self._executor.result(exec_id)
                     logger.debug(f"Task {task_id} completed successfully")
-            ##free the resources
-            self._scheduler.free(task_id, task.status)
-            logger.debug(f"Resources freed for task {task_id} with status {task.status}")
+                ##free the resources
+                self._scheduler.free(task_id, task.status)
+                logger.debug(f"Resources freed for task {task_id} with status {task.status}")
 
     def run(self) -> Result:
         ##lazy executor creation
@@ -177,6 +177,13 @@ class Worker(Node):
         logger.info(f"{self.node_id}: Done executing all the tasks")
 
         all_results = self._results()
+        while True and self.parent is not None:
+            msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
+            if msg is not None:
+                if msg.type == ActionType.STOP:
+                    logger.info(f"{self.node_id}: Received stop from parent")
+                    break
+            time.sleep(1.0)
         self._stop()
         return all_results
 
