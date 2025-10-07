@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass, field
 from ensemble_launcher.comm import NodeInfo
 
+
 logger = logging.getLogger(__name__)
     
 class Node:
