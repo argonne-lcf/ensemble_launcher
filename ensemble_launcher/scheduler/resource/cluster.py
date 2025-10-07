@@ -150,7 +150,7 @@ class LocalClusterResource(ClusterResource):
 
         allocation_result = self._can_allocate(job_resource)
         if not allocation_result:
-            logger.error("Allocation failed: insufficient resources")
+            logger.debug("Allocation failed: insufficient resources")
             return False, job_resource
         
         # Track original state before allocation

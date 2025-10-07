@@ -146,7 +146,7 @@ class Worker(Node):
                                                     env=task.env)
                 self._executor_task_ids[task_id] = exec_task_id
                 task.status = TaskStatus.RUNNING
-
+            logger.info(f"{self.node_id}: Submitted {len(ready_tasks)} for execution")
             ##poll tasks and free resources
             self._poll_tasks()
             if time.time() > next_report_time:

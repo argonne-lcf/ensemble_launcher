@@ -23,6 +23,7 @@ class MPIExecutor(Executor):
         self.mpiexec = mpiexec
         self._processes: Dict[str,subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
+        os.makedirs(self.tmp_dir,exist_ok=True)
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
         """Function to build the mpi cmd from the job resources"""

@@ -1,5 +1,5 @@
-import json
-from typing import Dict, List, Optional
+import json, sys
+from typing import Dict, List, Optional, Union
 
 from .ensemble import TaskFactory, Task
 from .config import SystemConfig, LauncherConfig
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class EnsembleLauncher:
     def __init__(self,
-                 ensemble_file:str,
+                 ensemble_file: Union[str, Dict[str, Dict]],
                  system_config: SystemConfig = SystemConfig(name="local"),
                  launcher_config: Optional[LauncherConfig] = None,
                  Nodes: Optional[List[str]] = None,
@@ -30,6 +30,7 @@ class EnsembleLauncher:
             self.nodes = Nodes
         else:
             self.nodes = get_nodes()
+            logger.info(f"Found {len(self.nodes)} nodes for execution.")
         
         if len(self.nodes) == 0:
             raise ValueError(f"No compute nodes to execute tasks")
@@ -78,9 +79,12 @@ class EnsembleLauncher:
 
     
     def _generate_tasks(self) -> Dict[str, Task]:
-        with open(self.ensemble_file, "r") as file:
-            data = json.load(file)
-            ensemble_infos = data["ensembles"]
+        if isinstance(self.ensemble_file, str):
+            with open(self.ensemble_file, "r") as file:
+                data = json.load(file)
+                ensemble_infos = data["ensembles"]
+        else:
+            ensemble_infos = self.ensemble_file
         
         tasks = {}
         for name, info in ensemble_infos.items():

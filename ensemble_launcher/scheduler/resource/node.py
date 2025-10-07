@@ -111,8 +111,8 @@ class NodeResourceCount(NodeResource):
     def from_config(self, info: SystemConfig):
         """creates a node resource list from a dict"""
         return NodeResourceCount(
-            ncpus = info.ncpus,
-            ngpus = info.ngpus
+            ncpus = info.ncpus if len(info.cpus) == 0 else len(info.cpus),
+            ngpus = info.ngpus if len(info.gpus) == 0 else len(info.gpus)
         )
 
 
@@ -195,8 +195,8 @@ class NodeResourceList(NodeResource):
     def from_config(self, info: SystemConfig):
         """creates a node resource list from a dict"""
         return NodeResourceList(
-            cpus=list(range(info.ncpus)),
-            gpus = list(range(info.ngpus))
+            cpus = tuple(range(info.ncpus)) if len(info.cpus) == 0 else tuple(info.cpus),
+            gpus = tuple(range(info.ngpus)) if len(info.gpus) == 0 else tuple(info.gpus)
         )
 
 
