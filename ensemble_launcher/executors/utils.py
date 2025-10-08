@@ -115,7 +115,6 @@ def gen_affinity_bash_script_1(ngpus_per_process: int, gpu_selector: str) -> str
                       "# Calculate the GPUs assigned to this rank",
                       f"start_idx=$((_MPI_RANKID * {ngpus_per_process}))",
                       f"rank_gpus=$(IFS=','; echo \"${{my_free_gpus[@]:${{start_idx}}:{ngpus_per_process}}}\")",
-                      r"echo $rank_gpus $_MPI_RANKID",
                       f"export {gpu_selector}" + r"=${rank_gpus}",
                       '"$@"'
                  ]

@@ -41,6 +41,7 @@ class MPIExecutor(Executor):
             launcher_cmd.append("--hosts")
             launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
+        ##resource pinning
         if isinstance(job_resource.resources[0],NodeResourceList):
             common_cpus = set.intersection(*[set(node_resource.cpus) for node_resource in job_resource.resources])
 
@@ -54,15 +55,27 @@ class MPIExecutor(Executor):
             launcher_cmd.append("--cpu-bind")
             launcher_cmd.append(f"list:{cores}")
         
-            ##defaults to Aurora (Level zero)
-            logger.info(f"Using {self.gpu_selector} for pinning GPUs")
-            common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
-            use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
-            if use_common_gpus:
-                if nnodes == 1 and ppn == 1:
-                    env.update({"ZE_AFFINITY_MASK": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+            if ngpus_per_process > 0:
+                ##defaults to Aurora (Level zero)
+                logger.info(f"Using {self.gpu_selector} for pinning GPUs")
+                common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
+                use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
+                if use_common_gpus:
+                    if nnodes == 1 and ppn == 1:
+                        env.update({"ZE_AFFINITY_MASK": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+                    else:
+                        bash_script = gen_affinity_bash_script_1(ngpus_per_process,self.gpu_selector)
+                        fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
+                        if not os.path.exists(fname):
+                            with open(fname, "w") as f:
+                                f.write(bash_script)
+                            st = os.stat(fname)
+                            os.chmod(fname,st.st_mode | stat.S_IEXEC)
+                        launcher_cmd.append(f"{fname}")
+                        ##set environment variables
+                        env.update({"AVAILABLE_GPUS": ",".join([str(i) for i in job_resource.resources[0].gpus])})
                 else:
-                    bash_script = gen_affinity_bash_script_1(ngpus_per_process,self.gpu_selector)
+                    bash_script = gen_affinity_bash_script_2(ngpus_per_process,self.gpu_selector)
                     fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
                     if not os.path.exists(fname):
                         with open(fname, "w") as f:
@@ -70,20 +83,9 @@ class MPIExecutor(Executor):
                         st = os.stat(fname)
                         os.chmod(fname,st.st_mode | stat.S_IEXEC)
                     launcher_cmd.append(f"{fname}")
-                    ##set environment variables
-                    env.update({"AVAILABLE_GPUS": ",".join([str(i) for i in job_resource.resources[0].gpus])})
-            else:
-                bash_script = gen_affinity_bash_script_2(ngpus_per_process,self.gpu_selector)
-                fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
-                if not os.path.exists(fname):
-                    with open(fname, "w") as f:
-                        f.write(bash_script)
-                    st = os.stat(fname)
-                    os.chmod(fname,st.st_mode | stat.S_IEXEC)
-                launcher_cmd.append(f"{fname}")
-                ##Here you need to set the environment variables for each node
-                for nid,node in enumerate(job_resource.nodes):
-                    env.update({f"AVAILABLE_GPUS_{node}": ",".join([str(i) for i in job_resource.resources[nid].gpus])})
+                    ##Here you need to set the environment variables for each node
+                    for nid,node in enumerate(job_resource.nodes):
+                        env.update({f"AVAILABLE_GPUS_{node}": ",".join([str(i) for i in job_resource.resources[nid].gpus])})
 
         return launcher_cmd, env
 
