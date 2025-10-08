@@ -6,7 +6,7 @@ import time
 
 import logging
 
-# logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
 def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent_address: str = None):
     if len(nodes) == 0:
@@ -30,10 +30,10 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
     p.start()
 
     if node_info.parent_id is not None:
-        comm.sync_heartbeat_with_parent(timeout=10.0)
+        comm.sync_heartbeat_with_parent(timeout=30.0)
     
     if node_info.children_ids:
-        comm.sync_heartbeat_with_children(timeout=10.0)
+        comm.sync_heartbeat_with_children(timeout=30.0)
 
 
     if node_info.parent_id:

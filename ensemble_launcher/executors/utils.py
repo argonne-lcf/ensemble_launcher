@@ -40,7 +40,8 @@ def run_cmd(cmd: str,
             args: Tuple = (), 
             kwargs: Dict = {}, 
             cpu_id:int = None, 
-            env: Dict[str, Any] = {}):
+            env: Dict[str, Any] = {},
+            return_stdout: bool = False):
     import os
     import subprocess
 
@@ -58,7 +59,7 @@ def run_cmd(cmd: str,
     kwargs_list = []
     for k,v in kwargs.items():
         kwargs_list.extend([str(k),str(v)])
-    result = subprocess.run(cmd + list(args) + kwargs_list , capture_output=True, text=True,env=merged_env)
+    result = subprocess.run(cmd + list(args) + kwargs_list , capture_output=return_stdout, text=True,env=merged_env)
 
     # Reset affinity
     if cpu_id is not None and original_affinity is not None:
@@ -66,7 +67,10 @@ def run_cmd(cmd: str,
             os.sched_setaffinity(0, original_affinity)
         except Exception as e:
             print(f"Resetting affinity failed with exception {e}")
-    return result.stdout
+    if return_stdout:
+        return result.stdout
+    else:
+        return None
 
 def return_wrapper(queue:QueueProtocol, fn: Callable, args: Tuple = (), kwargs: Dict = {}):
     result = fn(*args, **kwargs)

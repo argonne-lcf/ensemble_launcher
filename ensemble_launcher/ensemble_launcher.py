@@ -17,7 +17,8 @@ class EnsembleLauncher:
                  system_config: SystemConfig = SystemConfig(name="local"),
                  launcher_config: Optional[LauncherConfig] = None,
                  Nodes: Optional[List[str]] = None,
-                 pin_resources: bool = True) -> None:
+                 pin_resources: bool = True,
+                 return_stdout: bool = False) -> None:
         self.ensemble_file = ensemble_file
         self.system_config = system_config
         self.launcher_config = launcher_config
@@ -72,7 +73,8 @@ class EnsembleLauncher:
             self.launcher_config = LauncherConfig(child_executor_name=child_executor_name,
                                                   task_executor_name=task_executor_name,
                                                   comm_name=comm_name,
-                                                  nlevels=nlevels)
+                                                  nlevels=nlevels,
+                                                  return_stdout=return_stdout)
 
         self._launcher = self._create_launcher()
 

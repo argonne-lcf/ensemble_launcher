@@ -12,11 +12,12 @@ logger = logging.getLogger(__name__)
 
 @executor_registry.register("multiprocessing")
 class MultiprocessingExecutor(Executor):
-    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK"):
+    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True):
         self._executor = ProcessPoolExecutor()
         self._futures: Dict[str, mp.Process] = {}
         self._gpu_selector = gpu_selector
         self._results: Dict[str, Any] = {}
+        self._return_stdout = return_stdout
 
     def start(self,job_resource: JobResource, 
                fn: Union[Callable,str], 
@@ -45,7 +46,7 @@ class MultiprocessingExecutor(Executor):
         if callable(fn):
             future = self._executor.submit(run_callable_with_affinity,*(fn, task_args, task_kwargs, cpu_id, env))
         elif isinstance(fn, str):
-            future = self._executor.submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env))
+            future = self._executor.submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout))
         else:
             logger.warning(f"Can only excute either a str or a callable")
             return None

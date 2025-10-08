@@ -27,7 +27,7 @@ def test_master():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(executor_name="multiprocessing"),sys_info,nodes,tasks
+        "test",LauncherConfig(executor_name="multiprocessing", return_stdout=True),sys_info,nodes,tasks
     )
 
     result = m.run()

@@ -8,7 +8,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 def test_EL():
     el = EnsembleLauncher(
         ensemble_file="ensembles.json",
-        Nodes=[socket.gethostname()]
+        Nodes=[socket.gethostname()],
+        return_stdout= True
     )
     res = el.run()
     results = {}

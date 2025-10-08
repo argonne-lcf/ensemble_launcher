@@ -23,13 +23,14 @@ logger = logging.getLogger(__name__)
 
 @executor_registry.register("dragon")
 class DragonExecutor(Executor):
-    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK"):
+    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True):
         if not DRAGON_AVAILABLE:
             raise ModuleNotFoundError("Dragon is not available")
         self._gpu_selector = gpu_selector
         self._processes: Dict[str, Union[Process, ProcessGroup]] = {}
         self._results: Dict[str, Any] = {}
         self._queues: Dict[str, QueueProtocol] = {}
+        self._return_stdout = return_stdout
     
     def start(self,job_resource: JobResource, 
                 fn: Union[Callable,str], 

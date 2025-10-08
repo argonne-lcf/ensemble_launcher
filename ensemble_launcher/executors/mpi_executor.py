@@ -17,12 +17,14 @@ logger = logging.getLogger(__name__)
 class MPIExecutor(Executor):
     def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",
                  tmp_dir:str = ".mpiexec_tmp",
-                 mpiexec:str = "mpirun"):
+                 mpiexec:str = "mpirun",
+                 return_stdout: bool = True):
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
         self.mpiexec = mpiexec
         self._processes: Dict[str,subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
+        self._return_stdout = return_stdout
         os.makedirs(self.tmp_dir,exist_ok=True)
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
@@ -121,7 +123,11 @@ class MPIExecutor(Executor):
         merged_env.update(env)
 
         logger.debug(f"executing: {' '.join(cmd)}")
-        p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if self._return_stdout:
+            p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        else:
+            p = subprocess.Popen(cmd, env=merged_env)
+
         
         self._processes[task_id] = p
         return task_id
@@ -144,7 +150,9 @@ class MPIExecutor(Executor):
         except subprocess.TimeoutExpired:
             logger.warning(f"Process {task_id} timed out after {timeout} seconds.")
             return False
-        stdout, stderr = process.communicate()
+        stdout = None
+        if self._return_stdout:
+            stdout, stderr = process.communicate()
         self._results[task_id] = stdout
         return True
     

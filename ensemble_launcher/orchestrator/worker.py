@@ -125,7 +125,7 @@ class Worker(Node):
 
     def run(self) -> Result:
         ##lazy executor creation
-        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name)
+        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout})
         ##Lazy comm creation
         self._create_comm()
         if self._config.comm_name == "zmq":

@@ -19,3 +19,4 @@ class LauncherConfig(BaseModel):
     comm_name: Literal["multiprocessing","zmq","dragon"] = "multiprocessing"
     report_interval: float = 10.0
     nlevels: int = 1
+    return_stdout: bool = False
