@@ -14,15 +14,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Configure file handler for this specific logger
-file_handler = logging.FileHandler('worker.log')
-file_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
+# # Configure file handler for this specific logger
+# file_handler = logging.FileHandler('worker.log')
+# file_handler.setLevel(logging.INFO)
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# file_handler.setFormatter(formatter)
 
-# Add handler to this logger only
-logger.addHandler(file_handler)
-logger.setLevel(logging.INFO)
+# # Add handler to this logger only
+# logger.addHandler(file_handler)
+# logger.setLevel(logging.INFO)
 
 class Worker(Node):
     def __init__(self,
