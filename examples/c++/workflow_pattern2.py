@@ -17,7 +17,7 @@ ensemble_info = {
         "sleep_time": [1]*10,
         "relation":"one-to-one",
         "nnodes":2,
-        "ppn":12,
+        "ppn":24,
     },
     "gpu_ensemble": {
         "cmd_template": "./mpi_example {sleep_time} true",
@@ -46,6 +46,7 @@ os.environ["ZE_FLAT_DEVICE_HIERARCHY"]="FLAT"
 el = EnsembleLauncher(
     ensemble_file=ensemble_info,
     system_config=sys_config,
+    return_stdout=True
 )
 
 results = el.run() ##blocking call
