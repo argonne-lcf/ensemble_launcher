@@ -57,7 +57,7 @@ class EnsembleLauncher:
                 #nnodes > 1
                 comm_name = "zmq"
                 if nnodes <= 64:
-                    nlevels = 0
+                    nlevels = 1
                 elif nnodes > 64 and nnodes <= 256:
                     nlevels = 1
                 elif nnodes  > 256 and nnodes <= 2048:
@@ -68,7 +68,7 @@ class EnsembleLauncher:
             if nlevels == 0:
                 child_executor_name = "multiprocessing"
             else:
-                child_executor_name = "multiprocessing"
+                child_executor_name = "mpi"
         
             self.launcher_config = LauncherConfig(child_executor_name=child_executor_name,
                                                   task_executor_name=task_executor_name,
