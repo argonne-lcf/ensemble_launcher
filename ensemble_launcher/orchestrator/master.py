@@ -335,6 +335,8 @@ class Master(Node):
                 logger.warning(f"{self.node_id}: Failed to send status to parent")
             else:
                 logger.info(f"{self.node_id}: Succesfully sent status to parent")
+                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                self._status.to_file(fname)
         else:
             try:
                 #write to a json file

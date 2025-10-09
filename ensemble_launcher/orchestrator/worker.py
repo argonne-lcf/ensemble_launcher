@@ -1,6 +1,7 @@
 from .worker import *
 from .node import *
 import time
+import os
 from typing import Any, TYPE_CHECKING, Tuple, Optional
 from ensemble_launcher.scheduler import TaskScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource
@@ -184,7 +185,9 @@ class Worker(Node):
             logger.info(f"{self.node_id}: Sent final status to parent")
         else:
             logger.warning(f"{self.node_id}: Failed to send final status to parent")
-            
+            fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+            final_status.to_file(fname)
+
         while True and self.parent is not None:
             msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
             if msg is not None:
