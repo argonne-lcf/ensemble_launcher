@@ -57,9 +57,9 @@ class EnsembleLauncher:
                 #nnodes > 1
                 comm_name = "zmq"
                 if nnodes <= 64:
-                    nlevels = 1
+                    nlevels = 2
                 elif nnodes > 64 and nnodes <= 256:
-                    nlevels = 1
+                    nlevels = 2
                 elif nnodes  > 256 and nnodes <= 2048:
                     nlevels = 2
                 else:
@@ -75,6 +75,8 @@ class EnsembleLauncher:
                                                   comm_name=comm_name,
                                                   nlevels=nlevels,
                                                   return_stdout=return_stdout)
+        
+        logger.info(f"LauncherConfig: {self.launcher_config}")
 
         self._launcher = self._create_launcher()
 

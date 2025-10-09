@@ -20,3 +20,14 @@ class LauncherConfig(BaseModel):
     report_interval: float = 10.0
     nlevels: int = 1
     return_stdout: bool = False
+
+    def __str__(self) -> str:
+        """Return a nicely formatted string representation of the config"""
+        lines = [f"{self.__class__.__name__}:"]
+        for field_name, field_value in self.__dict__.items():
+            lines.append(f"  {field_name}: {field_value}")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        """Return a detailed string representation"""
+        return self.__str__()

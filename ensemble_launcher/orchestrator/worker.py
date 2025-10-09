@@ -160,20 +160,20 @@ class Worker(Node):
 
             if self.parent:
                 #check for actions
-                action = self._comm.recv_message_from_parent(Action, timeout=1.0)
+                action = self._comm.recv_message_from_parent(Action, timeout=0.1)
                 if action:
                     if action == ActionType.STOP:
                         break
                 
                 #check for task updates
-                taskupdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=1.0)
+                taskupdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=0.1)
                 if taskupdate:
                     add_status, del_status = self._update_tasks(taskupdate)
                 
             
             if len(self._scheduler.remaining_tasks) == 0:
                 break
-            time.sleep(1.0)
+            time.sleep(0.05)
         
         logger.info(f"{self.node_id}: Done executing all the tasks")
 

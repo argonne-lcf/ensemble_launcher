@@ -273,13 +273,13 @@ class Master(Node):
                 if child_id in done:
                     continue
                 ##receive status updates
-                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
+                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
                 if status is not None:
                     # logger.info(f"{self.node_id}: Received status update from {child_id}: {status}")
                     children_status[child_id] = status
 
                 ##look for results
-                result = self._comm.recv_message_from_child(Result,child_id, timeout=1.0)
+                result = self._comm.recv_message_from_child(Result,child_id, timeout=0.1)
                 if result is not None:
                     ##final status of the child
                     final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
