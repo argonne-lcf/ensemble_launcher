@@ -109,7 +109,8 @@ class MPIExecutor(Executor):
             additional_mpi_opts.extend([str(k),str(v)])
 
         if callable(task):
-            task_cmd = ["python", "-c", generate_python_exec_command(task,task_args,task_kwargs)]
+            tmp_fname = os.path.join(self.tmp_dir,f"callable_{task_id}.pkl")
+            task_cmd = ["python", "-c", generate_python_exec_command(task,task_args,task_kwargs,tmp_fname)]
         elif isinstance(task,str):
             task_cmd = [s.strip() for s in task.split()]
         else:
@@ -127,7 +128,6 @@ class MPIExecutor(Executor):
             p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
             p = subprocess.Popen(cmd, env=merged_env)
-
         
         self._processes[task_id] = p
         return task_id
@@ -179,6 +179,9 @@ class MPIExecutor(Executor):
     def done(self, task_id: str):
         process = self._processes[task_id]
         return process.poll() is not None
+
+    def running(self, task_id: str):
+        return not self.done(task_id)
     
     def shutdown(self, force:bool = False):
         for task_id, process in self._processes.items():

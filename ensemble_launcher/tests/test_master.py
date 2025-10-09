@@ -5,12 +5,10 @@ from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.scheduler.resource import NodeResourceList, JobResource
 from ensemble_launcher.orchestrator import Master
 import logging
+from utils import echo
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-def echo(task_id: str):
-    return f"Hello from task {task_id}"
 
 def test_master():
     ##create tasks
@@ -27,7 +25,7 @@ def test_master():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(executor_name="multiprocessing", return_stdout=True),sys_info,nodes,tasks
+        "test",LauncherConfig(return_stdout=True),sys_info,nodes,tasks
     )
 
     result = m.run()
@@ -50,7 +48,7 @@ def test_master_zmq_comm():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(executor_name="multiprocessing",comm_name="zmq"),sys_info,nodes,tasks
+        "test",LauncherConfig(comm_name="zmq"),sys_info,nodes,tasks
     )
     result = m.run()
     results = {r.task_id:r.data for r in result.data}
@@ -72,9 +70,10 @@ def test_master_multilevel():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(executor_name="multiprocessing",comm_name="multiprocessing",nlevels=2,report_interval=0.1),sys_info,nodes,tasks
+        "test",LauncherConfig(child_executor_name="mpi",comm_name="zmq",nlevels=1,report_interval=0.1, return_stdout=True),sys_info,nodes,tasks
     )
     ret_result = m.run()
+    
     results = {r.task_id:r.data for r in ret_result.data}
     
     assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"

@@ -82,19 +82,19 @@ def serialize_callable(fn: Callable, args: Tuple, kwargs: Dict) -> str:
     fb = cloudpickle.dumps((fn,args,kwargs))
     return base64.encodebytes(fb).decode("utf-8")
 
-def generate_python_exec_command(fn: Callable, args: Tuple, kwargs: Dict) -> str:
+def generate_python_exec_command(fn: Callable, args: Tuple, kwargs: Dict, tmp_fname: str) -> str:
     """
     Generates a Python command string that deserializes and executes a given function with arguments.
     The returned string can be run using `python -c "<command>"`.
     """
-    s = serialize_callable(fn, args, kwargs)
+    with open(tmp_fname, 'wb') as f:
+        cloudpickle.dump((fn, args, kwargs), f)
     script = [
         "import cloudpickle",
-        "import base64",
-        f"s = {repr(s)}",
-        "fb = base64.decodebytes(s.encode('utf-8'))",
-        "fn,args,kwargs = cloudpickle.loads(fb)",
-        "fn(*args,**kwargs)"
+        f"f = open('{tmp_fname}', 'rb')",
+        "fn, args, kwargs = cloudpickle.load(f)",
+        "f.close()",
+        "fn(*args, **kwargs)"
     ]
     return ";".join(script)
     
