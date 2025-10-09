@@ -3,6 +3,7 @@ from typing import Any, List, Optional
 from datetime import datetime
 from ensemble_launcher.ensemble import Task
 import enum
+import json
 
 
 
@@ -41,6 +42,20 @@ class Status(Message):
         )
 
     __radd__ = __add__
+
+    def to_file(self,fname:str):
+        with open(fname, 'w') as f:
+            json.dump({
+                'sender': self.sender,
+                'receiver': self.receiver,
+                'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+                'message_id': self.message_id,
+                'nrunning_tasks': self.nrunning_tasks,
+                'nfailed_tasks': self.nfailed_tasks,
+                'nsuccessful_tasks': self.nsuccessful_tasks,
+                'nfree_cores': self.nfree_cores,
+                'nfree_gpus': self.nfree_gpus
+            }, f, indent=2)
 
 @dataclass
 class Result(Message):

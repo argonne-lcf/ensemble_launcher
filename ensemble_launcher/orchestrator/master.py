@@ -43,6 +43,9 @@ class Master(Node):
         self._children_exec_ids: Dict[str, str] = {}
         self._child_assignment: Dict[str, Dict] = {}
 
+        ##most recent Status
+        self._status: Status = None
+
 
     @property
     def nodes(self):
@@ -275,9 +278,14 @@ class Master(Node):
                     # logger.info(f"{self.node_id}: Received status update from {child_id}: {status}")
                     children_status[child_id] = status
 
-                ##look some results
+                ##look for results
                 result = self._comm.recv_message_from_child(Result,child_id, timeout=1.0)
                 if result is not None:
+                    ##final status of the child
+                    final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
+                    if final_status is not None:
+                        children_status[child_id] = final_status
+                    ##
                     logger.info(f"{self.node_id}: Recieved result from {child_id} while monitoring")
                     results[child_id] = result
                     done.add(child_id)
@@ -288,12 +296,12 @@ class Master(Node):
                 
             ##send status to parent
             if time.time() > next_report_time:
-                status = sum(children_status.values(), Status())
+                self._status = sum(children_status.values(), Status())
                 if self.parent:
-                    self._comm.send_message_to_parent(status)
+                    self._comm.send_message_to_parent(self._status)
                 else:
-                    if isinstance(status,Status):
-                        logger.info(f"{self.node_id}: Status: {status}")
+                    if isinstance(self._status,Status):
+                        logger.info(f"{self.node_id}: Status: {self._status}")
                 next_report_time = time.time() + self._config.report_interval
 
             if len(done) == len(self.children):
@@ -314,10 +322,30 @@ class Master(Node):
         #report it to parent
         if self.parent:
             success = self._comm.send_message_to_parent(new_result)
+
             if not success:
                 logger.warning(f"{self.node_id}: Failed to send results to parent")
             else:
                 logger.info(f"{self.node_id}: Succesfully sent results to parent")
+            
+            ##also send the final_status
+            self._status = sum(children_status.values(), Status())
+            success = self._comm.send_message_to_parent(self._status)
+            if not success:
+                logger.warning(f"{self.node_id}: Failed to send status to parent")
+            else:
+                logger.info(f"{self.node_id}: Succesfully sent status to parent")
+        else:
+            try:
+                #write to a json file
+                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                self._status.to_file(fname)
+                logger.info(f"{self.node_id}: Successfully reported final status")
+            except Exception as e:
+                logger.warning(f"{self.node_id}: Reorting final status failed with excepiton {e}")
+
+
+            
         
         #wait for my parent to instruct me
         while True and self.parent is not None:
@@ -328,6 +356,7 @@ class Master(Node):
                     break
             time.sleep(1.0)
         self.stop()
+
         return new_result
 
     def stop(self):

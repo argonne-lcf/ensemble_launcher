@@ -177,6 +177,14 @@ class Worker(Node):
         logger.info(f"{self.node_id}: Done executing all the tasks")
 
         all_results = self._results()
+        ##also send the final status
+        final_status = self.get_status()
+        success = self._comm.send_message_to_parent(final_status)
+        if success:
+            logger.info(f"{self.node_id}: Sent final status to parent")
+        else:
+            logger.warning(f"{self.node_id}: Failed to send final status to parent")
+            
         while True and self.parent is not None:
             msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
             if msg is not None:

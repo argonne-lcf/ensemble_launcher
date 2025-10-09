@@ -70,7 +70,7 @@ def test_master_multilevel():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(child_executor_name="mpi",comm_name="zmq",nlevels=1,report_interval=0.1, return_stdout=True),sys_info,nodes,tasks
+        "test",LauncherConfig(child_executor_name="multiprocessing",comm_name="zmq",nlevels=1,report_interval=0.1, return_stdout=True),sys_info,nodes,tasks
     )
     ret_result = m.run()
     
