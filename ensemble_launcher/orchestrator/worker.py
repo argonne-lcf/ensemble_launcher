@@ -158,17 +158,17 @@ class Worker(Node):
                     logger.info(status)
                 next_report_time = time.time() + self._config.report_interval
 
-            if self.parent:
-                #check for actions
-                action = self._comm.recv_message_from_parent(Action, timeout=0.1)
-                if action:
-                    if action == ActionType.STOP:
-                        break
+            # if self.parent:
+            #     #check for actions
+            #     action = self._comm.recv_message_from_parent(Action, timeout=0.1)
+            #     if action:
+            #         if action == ActionType.STOP:
+            #             break
                 
-                #check for task updates
-                taskupdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=0.1)
-                if taskupdate:
-                    add_status, del_status = self._update_tasks(taskupdate)
+            #     #check for task updates
+            #     taskupdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=0.1)
+            #     if taskupdate:
+            #         add_status, del_status = self._update_tasks(taskupdate)
                 
             
             if len(self._scheduler.remaining_tasks) == 0:

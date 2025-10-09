@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any
 import os
 import cloudpickle
 import time
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,27 @@ class Master(Node):
         # Step 1: Calculate cumulative sum of nodes required for tasks
         cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
         
-        # Step 2: Determine the number of workers
-        nworkers = 0
-        while nworkers < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers] <= len(nodes):
-            nworkers += 1
+        # Step 2: Determine the max number of workers
+        nworkers_max = 0
+        while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
+            nworkers_max += 1
         
-        # Step 3: Initialize worker assignments for the first set of tasks
+        # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
+        # Calculate nworkers using log2 interpolation
+        if self._config.nlevels > 1:
+            # Create log2 space arrays for interpolation
+            x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
+            y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
+            
+            # Interpolate in log2 space
+            log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
+            
+            # Convert back from log2 space
+            nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+        else:
+            nworkers = nworkers_max
+        
+        # Step 4: Initialize worker assignments for the first set of tasks
         nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
         if sum(nnodes) < len(nodes):
             nremaining = len(nodes) - sum(nnodes)
@@ -113,7 +129,7 @@ class Master(Node):
             for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
         }
 
-        # Step 4: Assign remaining tasks to workers in a round-robin fashion
+        # Step 5: Assign remaining tasks to workers in a round-robin fashion
         for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
             # Determine the worker ID in a round-robin manner
             worker_id = i % nworkers
@@ -272,11 +288,6 @@ class Master(Node):
             for child_id, exec_id in self._children_exec_ids.items():
                 if child_id in done:
                     continue
-                ##receive status updates
-                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
-                if status is not None:
-                    # logger.info(f"{self.node_id}: Received status update from {child_id}: {status}")
-                    children_status[child_id] = status
 
                 ##look for results
                 result = self._comm.recv_message_from_child(Result,child_id, timeout=0.1)
@@ -296,6 +307,12 @@ class Master(Node):
                 
             ##send status to parent
             if time.time() > next_report_time:
+                ##receive status updates
+                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
+                if status is not None:
+                    # logger.info(f"{self.node_id}: Received status update from {child_id}: {status}")
+                    children_status[child_id] = status
+
                 self._status = sum(children_status.values(), Status())
                 if self.parent:
                     self._comm.send_message_to_parent(self._status)
