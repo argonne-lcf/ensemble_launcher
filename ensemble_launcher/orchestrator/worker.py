@@ -10,7 +10,6 @@ from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
 from ensemble_launcher.comm import Status, Result, HeartBeat, Message, Action, ActionType, TaskUpdate
 from ensemble_launcher.executors import executor_registry, Executor
-
 import logging
 
 # self.logger = logging.getself.logger(__name__)
@@ -125,7 +124,9 @@ class Worker(Node):
 
     def _poll_tasks(self):
         """Poll the tasks and set its status"""
-        for task_id, exec_id in self._executor_task_ids.items():
+        running_tasks = self._scheduler.running_tasks
+        for task_id in running_tasks:
+            exec_id = self._executor_task_ids[task_id]
             task = self._tasks[task_id]
             if self._executor.done(exec_id):
                 exception = self._executor.exception(exec_id) ##excepiton will be None if the task is succesful
@@ -178,7 +179,7 @@ class Worker(Node):
                                                     env=task.env)
                 self._executor_task_ids[task_id] = exec_task_id
                 task.status = TaskStatus.RUNNING
-            self.logger.info(f"{self.node_id}: Submitted {len(ready_tasks)} for execution")
+            if len(ready_tasks) > 0: self.logger.info(f"{self.node_id}: Submitted {len(ready_tasks)} for execution")
             ##poll tasks and free resources
             self._poll_tasks()
             if time.time() > next_report_time:

@@ -74,7 +74,9 @@ class EnsembleLauncher:
                                                   task_executor_name=task_executor_name,
                                                   comm_name=comm_name,
                                                   nlevels=nlevels,
-                                                  return_stdout=return_stdout)
+                                                  return_stdout=return_stdout,
+                                                  master_logs=True,
+                                                  worker_logs=True)
         
         logger.info(f"LauncherConfig: {self.launcher_config}")
 

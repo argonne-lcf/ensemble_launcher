@@ -3,9 +3,8 @@ from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
 from typing import List, Dict, Any, Union, Set
 from .policy import policy_registry, Policy
-from collections import deque
 from  logging import Logger
-from collections import deque
+import copy
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -71,13 +70,7 @@ class TaskScheduler(Scheduler):
             self.scheduler_policy: Policy = policy_registry.create_policy(policy)
         else:
             self.scheduler_policy: Policy = policy
-        self.sorted_tasks: List[Task] = sorted(self.tasks.values(),key=self.scheduler_policy.get_score,reverse=True)
-    
-    def assign(self, task_id: str,  task_resource: JobResource):
-        allocated,resource = self.cluster.allocate(task_resource)
-        if allocated:
-            self.task_assignment[task_id] = resource
-        return allocated,resource
+        self.sorted_tasks: List[str] = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
     
     def _buld_task_resource_req(self, task: Task) -> JobResource:
         req = JobResource(
@@ -99,21 +92,24 @@ class TaskScheduler(Scheduler):
 
     def get_ready_tasks(self) -> Dict[str, JobResource]:
         ready_tasks = {}
-        allocated_tasks = []
-        for task in self.sorted_tasks:
+        for task_id in self.sorted_tasks:
+            task = copy.deepcopy(self.tasks[task_id])
             req = self._buld_task_resource_req(task)
-            allocated, resource = self.assign(task.task_id,req)
+            allocated,resource = self.cluster.allocate(req)
             if allocated:
-                ready_tasks[task.task_id] = resource
                 if task.task_id in self._running_tasks:
-                    self.logger.warning(f"Task {task.task_id} is already running")
+                    self.logger.error(f"Task {task.task_id} is already running")
+                    raise RuntimeError
+                #add to running tasks
                 self._running_tasks.add(task.task_id)
-                allocated_tasks.append(task)
+                #remove from the queue
+                self.sorted_tasks.remove(task_id)
+                ##save the assignment
+                self.task_assignment[task_id] = resource
+                #save the req
+                ready_tasks[task.task_id] = resource
 
-        ##remove them from the queue
-        for task in allocated_tasks:
-            self.sorted_tasks.remove(task)
-            
+        self.logger.debug(f"Allocated {list(ready_tasks.keys())}")
         return ready_tasks
     
     def add_task(self,task: Task) -> bool:
@@ -121,7 +117,7 @@ class TaskScheduler(Scheduler):
             if task.nnodes > len(self.cluster.nodes):
                 raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
             self.tasks[task.task_id] = task
-            self.sorted_tasks = sorted(self.tasks.values(), key=self.scheduler_policy.get_score, reverse=True)
+            self.sorted_tasks = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
             return True
         except Exception as e:
             self.logger.error(f"Failed to add task {task.task_id}: {e}")
@@ -150,8 +146,8 @@ class TaskScheduler(Scheduler):
             self._successful_tasks.discard(task.task_id)
 
             # Remove from sorted tasks
-            if task in self.sorted_tasks:
-                self.sorted_tasks.remove(task)
+            if task.task_id in self.sorted_tasks:
+                self.sorted_tasks.remove(task.task_id)
 
             return True
         except Exception as e:
@@ -160,14 +156,28 @@ class TaskScheduler(Scheduler):
     
     def free(self, task_id: str, status: TaskStatus):
         if task_id in self.tasks:
-            self._done_tasks.append(task_id)
+            if task_id not in self._running_tasks:
+                self.logger.error(f"{task_id} is not running")
+                raise RuntimeError
+            ##delete from running tasks
             self._running_tasks.discard(task_id)
+            #deallocate
+            self.cluster.deallocate(self.task_assignment[task_id])
+            #delete the assignment
+            del self.task_assignment[task_id]
+            #Add to done tasks
+            self._done_tasks.append(task_id)
+            #add to failed/successful tasks
             if status == TaskStatus.FAILED:
                 self._failed_tasks.add(task_id)
             elif status == TaskStatus.SUCCESS:
                 self._successful_tasks.add(task_id)
                 self._failed_tasks.discard(task_id)
-            return self.cluster.deallocate(self.task_assignment[task_id])
+            
+            self.logger.debug(f"Freed {task_id}")
+            
+
+
         return None
     
     def get_task_assignment(self):
@@ -176,7 +186,7 @@ class TaskScheduler(Scheduler):
     @property
     def running_tasks(self) -> Set[str]:
         """Return IDs of currently running tasks."""
-        return self._running_tasks
+        return copy.deepcopy(self._running_tasks)
 
     @property
     def failed_tasks(self) -> Set[str]:

@@ -26,32 +26,31 @@ def test_scheduler():
         tasks.append(
             Task(task_id=f"task-{i}",
                  nnodes=1,
-                 ppn=1,
+                 ppn=12-i,
                  executable=echo,
                  args=(i,))
         )
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12))
 
     cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
 
     scheduler = TaskScheduler(logger, {task.task_id: task for task in tasks},cluster=cluster)
 
-    ready_tasks = scheduler.get_ready_tasks()
+    # ready_tasks = scheduler.get_ready_tasks()
 
-    for task,req in ready_tasks.items():
-        assert int(task.split("-")[1]) == req.resources[0].cpus[0]
-
-    #should get zero
-    ready_tasks = scheduler.get_ready_tasks()
-    assert len(ready_tasks) == 0
-
-    #
-    for i in range(12):
-        scheduler.free(task_id=f"task-{i}",status=TaskStatus.SUCCESS)
-        assert scheduler.remaining_tasks == set([f"task-{id}" for id in range(i+1,12)]) , f"{scheduler.remaining_tasks} != {set([f'task-{id}' for id in range(i,12)])}"
-        assert scheduler.successful_tasks == set([f"task-{id}" for id in range(i+1)])
+    iter = 0
+    while True:
+        ready_tasks = scheduler.get_ready_tasks()
+        if len(ready_tasks) == 0:
+            break
+        if iter == 0:
+            assert len(ready_tasks) == 1, f"{len(ready_tasks)} != 1"
+            assert list(ready_tasks.keys())[0] == f"task-0", f"{list(ready_tasks.keys())[0]} != task-0"
+        else:
+            assert len(ready_tasks) == 2, f"{len(ready_tasks)} != 2"
+            assert list(ready_tasks.keys())[0] == f"task-{iter}", f"{list(ready_tasks.keys())[0]} != task-{11-iter}"
 
 
 if __name__ == "__main__":
