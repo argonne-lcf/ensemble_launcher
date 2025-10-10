@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional, Type
 from .messages import Message, HeartBeat
 from dataclasses import dataclass, field
 import time
+from logging import Logger
 
 
 @dataclass
@@ -14,10 +15,12 @@ class NodeInfo:
 
 class Comm(ABC):
     def __init__(self, 
+                 logger: Logger,
                  node_info: NodeInfo, 
                  parent_comm: "Comm"= None, 
                  heartbeat_interval: int = 1):
         
+        self.logger = logger
         self.node_info = node_info
         self.last_update_time = time.time()
         self.last_heartbeat_time = None
@@ -145,31 +148,22 @@ class Comm(ABC):
         if timeout is not None:
             end_time = time.time() + timeout
 
-        while True:
-            if timeout is not None and time.time() > end_time:
-                return False
-            self.send_message_to_parent(HeartBeat())
-            msg = self.recv_message_from_parent(HeartBeat,timeout=1.0)
-            if msg is not None:
-                return True
-            time.sleep(1.0)
+        self.send_message_to_parent(HeartBeat())
+        msg = self.recv_message_from_parent(HeartBeat,timeout=timeout)
+        if msg is not None:
+            return True
+        return False
         
     
     def sync_heartbeat_with_child(self, child_id: str, timeout: Optional[float] = None) -> bool:
         if len(self.node_info.children_ids) == 0:
             return True
     
-        if timeout is not None:
-            end_time = time.time() + timeout
-
-        while True:
-            if timeout is not None and time.time() > end_time:
-                return False
-            self.send_message_to_child(child_id, HeartBeat())
-            msg = self.recv_message_from_child(HeartBeat,child_id, timeout=1.0)
-            if msg is not None:
-                return True
-            time.sleep(1.0)
+        msg = self.recv_message_from_child(HeartBeat,child_id, timeout=timeout)
+        self.send_message_to_child(child_id, HeartBeat())
+        if msg is not None:
+            return True
+        return False
     
     def sync_heartbeat_with_children(self, timeout: Optional[float] = None) -> bool:
         status = []

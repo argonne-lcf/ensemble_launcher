@@ -9,6 +9,7 @@ from .base import Comm, NodeInfo
 from .messages import Result
 from typing import Any, Optional
 import cloudpickle
+from logging import Logger
 
 
 try:
@@ -17,20 +18,21 @@ try:
 except:
     ZMQ_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 class ZMQComm(Comm):
     def __init__(self, 
+                 logger: Logger,
                  node_info: NodeInfo,
                  parent_comm: "ZMQComm" = None,              
                  heartbeat_interval:int=1,
                  parent_address: str = None ###parent comm is not always pickleble
                  ):
-        if not ZMQ_AVAILABLE:
-            logger.error(f"zmq is not available")
-            raise ModuleNotFoundError
         
-        super().__init__(node_info,parent_comm,heartbeat_interval)
+        super().__init__(logger, node_info,parent_comm,heartbeat_interval)
+        if not ZMQ_AVAILABLE:
+            self.logger.error(f"zmq is not available")
+            raise ModuleNotFoundError
 
         # ZMQ specific attributes
         self.parent_address = self._parent_comm.my_address if self._parent_comm is not None else parent_address
@@ -52,7 +54,7 @@ class ZMQComm(Comm):
             self.router_socket.setsockopt(zmq.IDENTITY,f"{self.node_info.node_id}".encode())
             try:
                 self.router_socket.bind(f"tcp://{self.my_address}")
-                logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
+                self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
             except zmq.error.ZMQError as e:
                 if "Address already in use" in str(e):
                     # Try binding up to 3 times with different ports
@@ -60,14 +62,14 @@ class ZMQComm(Comm):
                     for attempt in range(max_attempts):
                         try:
                             port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
-                            logger.info(f"{self.node_info.node_id}: Attempt {attempt+1}/{max_attempts}: Trying to bind to port {port} instead.")
+                            self.logger.info(f"{self.node_info.node_id}: Attempt {attempt+1}/{max_attempts}: Trying to bind to port {port} instead.")
                             self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
                             self.router_socket.bind(f"tcp://{self.my_address}")
-                            logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
+                            self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
                             break  # Break out of the retry loop if binding succeeds
                         except zmq.error.ZMQError as retry_error:
                             if "Address already in use" in str(retry_error) and attempt < max_attempts - 1:
-                                logger.warning(f"{self.node_info.node_id}: Port {port} also in use, retrying...")
+                                self.logger.warning(f"{self.node_info.node_id}: Port {port} also in use, retrying...")
                                 continue
                             else:
                                 raise retry_error
@@ -79,65 +81,65 @@ class ZMQComm(Comm):
         if self.parent_address is not None:
             self.dealer_socket = self.zmq_context.socket(zmq.DEALER)
             self.dealer_socket.setsockopt(zmq.IDENTITY,f"{self.node_info.node_id}".encode())
-            # logger.info(f"{self.node_info.node_id}: connecting to:{self.parent_address}")
+            # self.logger.info(f"{self.node_info.node_id}: connecting to:{self.parent_address}")
             self.dealer_socket.connect(f"tcp://{self.parent_address}")
             self.dealer_poller = zmq.Poller()
             self.dealer_poller.register(self.dealer_socket, zmq.POLLIN)
-            logger.info(f"{self.node_info.node_id}: connected to:{self.parent_address}")
+            self.logger.info(f"{self.node_info.node_id}: connected to:{self.parent_address}")
             time.sleep(1.0)
 
     def _send_to_parent(self, data: Any) -> bool:
         if self.node_info.parent_id is None:
-            logger.warning(f"{self.node_info.node_id}: No parent connection available")
+            self.logger.warning(f"{self.node_info.node_id}: No parent connection available")
             return False
         
         try:
             self.dealer_socket.send(cloudpickle.dumps(data))
-            logger.debug(f"{self.node_info.node_id}: Sent message to parent: {data}")
+            self.logger.debug(f"{self.node_info.node_id}: Sent message to parent: {data}")
             return True
         except Exception as e:
-            logger.warning(f"{self.node_info.node_id}: Sending message to parent failed with {e}")
+            self.logger.warning(f"{self.node_info.node_id}: Sending message to parent failed with {e}")
             return False
 
     def _recv_from_parent(self, timeout: Optional[float] = None) -> Any:
         if self.node_info.parent_id is None:
-            logger.warning(f"{self.node_info.node_id}: No parent connection available")
+            self.logger.warning(f"{self.node_info.node_id}: No parent connection available")
             return None
         
         try:
             socks = dict(self.dealer_poller.poll((timeout * 1000) if timeout is not None else None))  # convert timeout to milliseconds
             if self.dealer_socket in socks and socks[self.dealer_socket] == zmq.POLLIN:
                 msg = cloudpickle.loads(self.dealer_socket.recv())
-                logger.debug(f"{self.node_info.node_id}: Received message {msg} from parent.")
+                self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from parent.")
                 return msg
-            logger.debug(f"{self.node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
+            self.logger.debug(f"{self.node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
             return None
         except Exception as e:
-            logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
+            self.logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
             return None
 
     def _send_to_child(self, child_id: str, data: Any) -> bool:
         if child_id not in self.node_info.children_ids:
-            logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            self.logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
             return False
         
         try:
             self.router_socket.send_multipart([f"{child_id}".encode(), cloudpickle.dumps(data)])
-            logger.debug(f"{self.node_info.node_id}: Sent message to child {child_id}")
+            self.logger.debug(f"{self.node_info.node_id}: Sent message to child {child_id}")
             return True
         except Exception as e:
-            logger.warning(f"{self.node_info.node_id}: Sending message to child {child_id} failed with {e}")
+            self.logger.warning(f"{self.node_info.node_id}: Sending message to child {child_id} failed with {e}")
             return False
 
     def _recv_from_child(self, child_id: str, timeout: Optional[float] = None) -> Any:
         if child_id not in self.node_info.children_ids:
-            logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            self.logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
             return None
         
         try:
             if child_id in self._cache and len(self._cache[child_id]) > 0:
                 msg = self._cache[child_id].pop(0)  # Get the first cached message
-                logger.debug(f"{self.node_info.node_id}: Received (cached) message from child {child_id}.")
+                self.logger.debug(f"{self.node_info.node_id}: Received (cached) message from child {child_id}.")
                 return msg
             
             start_time = time.time()
@@ -153,14 +155,14 @@ class ZMQComm(Comm):
                     msg[1] = cloudpickle.loads(msg[1])  # Unpickle the message
                     # wait for a message from the child
                     if msg[0] == str(child_id):
-                        logger.debug(f"{self.node_info.node_id}: Received message {msg} from child {child_id}.")
+                        self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from child {child_id}.")
                         return msg[1]
                     else:
                         self._cache[msg[0]].append(msg[1])
-            logger.debug(f"{self.node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
+            self.logger.debug(f"{self.node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
             return None
         except Exception as e:
-            logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
+            self.logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
             return None
     
 
@@ -174,4 +176,4 @@ class ZMQComm(Comm):
             if self.zmq_context:
                 self.zmq_context.term()
         except Exception as e:
-            logger.warning(f"{self.node_info.node_id}: Error during ZMQ cleanup: {e}")
+            self.logger.warning(f"{self.node_info.node_id}: Error during ZMQ cleanup: {e}")

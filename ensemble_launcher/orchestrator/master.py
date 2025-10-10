@@ -2,7 +2,7 @@ from .worker import Worker
 from .node import Node
 from ensemble_launcher.executors import executor_registry, MPIExecutor, Executor
 from ensemble_launcher.scheduler import WorkerScheduler
-from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource
+from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource, NodeResourceCount
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
@@ -16,7 +16,7 @@ import cloudpickle
 import time
 import numpy as np
 
-logger = logging.getLogger(__name__)
+# self.logger = logging.getself.logger(__name__)
 
 class Master(Node):
     def __init__(self,
@@ -47,6 +47,8 @@ class Master(Node):
         ##most recent Status
         self._status: Status = None
 
+        self.logger = None
+
 
     @property
     def nodes(self):
@@ -63,13 +65,25 @@ class Master(Node):
     @property
     def comm(self):
         return self._comm
+    
+    def _setup_logger(self):
+        # Configure file handler for this specific self.self.logger
+        file_handler = logging.FileHandler(f'master-{self.node_id}.log')
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+
+        # Create instance self.self.logger and add handler
+        self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
+        self.logger.addHandler(file_handler)
+        self.logger.setLevel(logging.INFO)
 
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
-            self._comm = MPComm(self.info(),self.parent_comm if self.parent_comm else None)
+            self._comm = MPComm(self.logger, self.info(),self.parent_comm if self.parent_comm else None)
         elif self._config.comm_name == "zmq":
             ##sending parent address here because all zmq objects are not picklable
-            self._comm = ZMQComm(self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None)
+            self._comm = ZMQComm(self.logger, self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None)
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
@@ -89,7 +103,7 @@ class Master(Node):
             removed_tasks.append((sorted_tasks.pop(0))[0])
         
         if len(removed_tasks) > 0:
-            logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
+            self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
 
         # Step 1: Calculate cumulative sum of nodes required for tasks
         cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
@@ -187,12 +201,14 @@ class Master(Node):
         return cmd
     
     def run(self):
+        #lazy logger creation
+        self._setup_logger()
         #create executor
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name)
 
         ##create children
         children = self._create_children()
-        logger.info(f"{self.node_id} Created {len(children)} children: {children.keys()}")
+        self.logger.info(f"{self.node_id} Created {len(children)} children: {children.keys()}")
 
         #add children
         for child_id, child in children.items():
@@ -204,14 +220,6 @@ class Master(Node):
         for child_id, child in children.items():
             child.parent_comm = copy.deepcopy(self.comm) if self._config.comm_name == "zmq" else self.comm
         
-        for child_name,child_obj in children.items():
-            child_nodes = child_obj.nodes
-            req = JobResource(
-                resources=[NodeResourceList(cpus=[1])], nodes=child_nodes[:1]
-            )
-            env = os.environ.copy()
-            self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
-        
         ##lazy creation of non-pickable objects
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
@@ -219,8 +227,18 @@ class Master(Node):
         ##heart beat sync with parent
         if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        
+        for child_name,child_obj in children.items():
+            child_nodes = child_obj.nodes
+            req = JobResource(
+                    resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                )
+            env = os.environ.copy()
 
-        if not self._comm.sync_heartbeat_with_children(timeout=10.0):
+            self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
+
+        if not self._comm.sync_heartbeat_with_children(timeout=30.0):
             return self._get_child_exceptions() # Should return and report
         else:
             return self._results() #should return and report
@@ -246,7 +264,7 @@ class Master(Node):
         # First, stop all children
         for child_id, exec_id in self._children_exec_ids.items():
             if self._executor.running(exec_id):
-                logger.info(f"Stopping child {child_id}")
+                self.logger.info(f"Stopping child {child_id}")
                 self._executor.stop(exec_id)
     
         # Collect exceptions without waiting
@@ -256,9 +274,9 @@ class Master(Node):
                 exception = self._executor.exception(exec_id)
                 if exception is not None:
                     exceptions[child_id] = exception
-                    logger.error(f"Child {child_id} failed with exception: {exception}")
+                    self.logger.error(f"Child {child_id} failed with exception: {exception}")
 
-        logger.info(f"{self.node_id}: Stopped children. Found {len(exceptions)} exceptions")
+        self.logger.info(f"{self.node_id}: Stopped children. Found {len(exceptions)} exceptions")
 
         # Create result objects for each exception
         exception_results = []
@@ -274,7 +292,7 @@ class Master(Node):
         if self.parent:
             success = self._comm.send_message_to_parent(result)
             if not success:
-                logger.warning(f"{self.node_id}: Failed to send exception results to parent")
+                self.logger.warning(f"{self.node_id}: Failed to send exception results to parent")
 
         self.stop()
         return result
@@ -290,14 +308,14 @@ class Master(Node):
                     continue
 
                 ##look for results
-                result = self._comm.recv_message_from_child(Result,child_id, timeout=0.1)
+                result = self._comm.recv_message_from_child(Result,child_id, timeout=0.5)
                 if result is not None:
                     ##final status of the child
                     final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
                     if final_status is not None:
                         children_status[child_id] = final_status
                     ##
-                    logger.info(f"{self.node_id}: Recieved result from {child_id} while monitoring")
+                    self.logger.info(f"{self.node_id}: Recieved result from {child_id} while monitoring")
                     results[child_id] = result
                     done.add(child_id)
                     self._comm.send_message_to_child(child_id,Action(sender=self.node_id, type=ActionType.STOP))
@@ -310,7 +328,6 @@ class Master(Node):
                 ##receive status updates
                 status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
                 if status is not None:
-                    # logger.info(f"{self.node_id}: Received status update from {child_id}: {status}")
                     children_status[child_id] = status
 
                 self._status = sum(children_status.values(), Status())
@@ -318,11 +335,11 @@ class Master(Node):
                     self._comm.send_message_to_parent(self._status)
                 else:
                     if isinstance(self._status,Status):
-                        logger.info(f"{self.node_id}: Status: {self._status}")
+                        self.logger.info(f"{self.node_id}: Status: {self._status}")
                 next_report_time = time.time() + self._config.report_interval
 
             if len(done) == len(self.children):
-                logger.info(f"{self.node_id}: All children are done")
+                self.logger.info(f"{self.node_id}: All children are done")
                 break
         ##Create a new result from all the results
         data: List[Result] = []
@@ -341,17 +358,17 @@ class Master(Node):
             success = self._comm.send_message_to_parent(new_result)
 
             if not success:
-                logger.warning(f"{self.node_id}: Failed to send results to parent")
+                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
             else:
-                logger.info(f"{self.node_id}: Succesfully sent results to parent")
+                self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
             
             ##also send the final_status
             self._status = sum(children_status.values(), Status())
             success = self._comm.send_message_to_parent(self._status)
             if not success:
-                logger.warning(f"{self.node_id}: Failed to send status to parent")
+                self.logger.warning(f"{self.node_id}: Failed to send status to parent")
             else:
-                logger.info(f"{self.node_id}: Succesfully sent status to parent")
+                self.logger.info(f"{self.node_id}: Succesfully sent status to parent")
                 fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
                 self._status.to_file(fname)
         else:
@@ -359,19 +376,16 @@ class Master(Node):
                 #write to a json file
                 fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
                 self._status.to_file(fname)
-                logger.info(f"{self.node_id}: Successfully reported final status")
+                self.logger.info(f"{self.node_id}: Successfully reported final status")
             except Exception as e:
-                logger.warning(f"{self.node_id}: Reorting final status failed with excepiton {e}")
-
-
-            
+                self.logger.warning(f"{self.node_id}: Reorting final status failed with excepiton {e}")
         
         #wait for my parent to instruct me
         while True and self.parent is not None:
             msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
             if msg is not None:
                 if msg.type == ActionType.STOP:
-                    logger.info(f"{self.node_id}: Received stop from parent")
+                    self.logger.info(f"{self.node_id}: Received stop from parent")
                     break
             time.sleep(1.0)
         self.stop()

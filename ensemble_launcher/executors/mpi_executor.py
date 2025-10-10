@@ -39,7 +39,8 @@ class MPIExecutor(Executor):
 
         launcher_cmd.append("-np")
         launcher_cmd.append(f"{ppn*nnodes}")
-        if not(len(job_resource.nodes) == 1 and job_resource.nodes[0] == socket.gethostname()):
+        if not(len(job_resource.nodes) == 1 and \
+               (job_resource.nodes[0] == socket.gethostname() or job_resource.nodes[0] == socket.gethostname().split(".")[0] )):
             launcher_cmd.append("--hosts")
             launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
@@ -97,7 +98,8 @@ class MPIExecutor(Executor):
                 task_kwargs: Dict[str,Any] = {}, 
                 env: Dict[str, Any] = {},
                 mpi_args: Tuple = (),
-                mpi_kwargs:Dict[str, Any] = {}):
+                mpi_kwargs:Dict[str, Any] = {},
+                serial_launch: bool = False):
         # task is a str command
         task_id = str(uuid.uuid4())
 
@@ -117,13 +119,17 @@ class MPIExecutor(Executor):
             logger.warning("Can only execute either a callable or a string")
             return None
 
-        cmd = [self.mpiexec] + resource_pinning_cmd + additional_mpi_opts + task_cmd
+        if " ".join(resource_pinning_cmd).strip() == "-np 1" and len(additional_mpi_opts) == 0:
+            cmd = task_cmd
+        else:
+            cmd = [self.mpiexec] + resource_pinning_cmd + additional_mpi_opts + task_cmd
 
         merged_env = os.environ.copy()
         merged_env.update(resource_pinning_env)
         merged_env.update(env)
 
-        logger.debug(f"executing: {' '.join(cmd)}")
+        logger.info(f"executing: {' '.join(cmd)}")
+        print(f"executing: {' '.join(cmd)}")
         if self._return_stdout:
             p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
