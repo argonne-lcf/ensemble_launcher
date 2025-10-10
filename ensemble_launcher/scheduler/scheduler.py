@@ -4,10 +4,10 @@ from ensemble_launcher.ensemble import Task, TaskStatus
 from typing import List, Dict, Any, Union, Set
 from .policy import policy_registry, Policy
 from collections import deque
-import logging
+from  logging import Logger
 from collections import deque
 
-logger = logging.getLogger(__name__)
+# self.logger = logging.getself.logger(__name__)
 
 
 class Scheduler:
@@ -15,7 +15,8 @@ class Scheduler:
     Class responsible for assigning a certain task onto resource.
     The resources of the scheduler could be updated
     """
-    def __init__(self,cluster_resource: LocalClusterResource):
+    def __init__(self, logger: Logger, cluster_resource: LocalClusterResource):
+        self.logger = logger
         self._cluster_resource = cluster_resource
         
     def assign(self):
@@ -35,8 +36,8 @@ class Scheduler:
 
 
 class WorkerScheduler(Scheduler):
-    def __init__(self, cluster: ClusterResource):
-        super().__init__(cluster)
+    def __init__(self, logger: Logger, cluster: ClusterResource):
+        super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}
     
     def assign(self, worker_id: str,  worker_resource: JobResource):
@@ -55,10 +56,11 @@ class WorkerScheduler(Scheduler):
 
 class TaskScheduler(Scheduler):
     def __init__(self, 
+                 logger: Logger,
                  tasks: Dict[str, Task], 
                  cluster: ClusterResource, 
                  policy: Union[str,Policy]= "large_resource_policy"):
-        super().__init__(cluster)
+        super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
         self.task_assignment: Dict[str, JobResource] = {}
         self._running_tasks: Set[str] = set()
@@ -83,11 +85,11 @@ class TaskScheduler(Scheduler):
             )
         if len(task.cpu_affinity) > 0 or len(task.gpu_affinity) > 0:
             if task.cpu_affinity and (task.ngpus_per_process > 0 and not task.gpu_affinity):
-                logger.warning(f"Task {task.task_id}: Ignoring cpu_affinity as gpu_affinity is not set")
+                self.logger.warning(f"Task {task.task_id}: Ignoring cpu_affinity as gpu_affinity is not set")
                 return req
             
             if task.gpu_affinity and not task.cpu_affinity:
-                logger.warning(f"Task {task.task_id}: Ignoring gpu_affinitiy as cpu_affinity is not set")
+                self.logger.warning(f"Task {task.task_id}: Ignoring gpu_affinitiy as cpu_affinity is not set")
                 return req
             
             req = JobResource(
@@ -104,7 +106,7 @@ class TaskScheduler(Scheduler):
             if allocated:
                 ready_tasks[task.task_id] = resource
                 if task.task_id in self._running_tasks:
-                    logger.warning(f"Task {task.task_id} is already running")
+                    self.logger.warning(f"Task {task.task_id} is already running")
                 self._running_tasks.add(task.task_id)
                 allocated_tasks.append(task)
 
@@ -122,12 +124,12 @@ class TaskScheduler(Scheduler):
             self.sorted_tasks = sorted(self.tasks.values(), key=self.scheduler_policy.get_score, reverse=True)
             return True
         except Exception as e:
-            logger.error(f"Failed to add task {task.task_id}: {e}")
+            self.logger.error(f"Failed to add task {task.task_id}: {e}")
             return False
     
     def delete_task(self, task: Task) -> bool:
         if task.task_id not in self.tasks:
-            logger.warning(f"Unknown task: {task.task_id}")
+            self.logger.warning(f"Unknown task: {task.task_id}")
             return False
         
         try:
@@ -153,7 +155,7 @@ class TaskScheduler(Scheduler):
 
             return True
         except Exception as e:
-            logger.warning(f"Failed to delete task {task.task_id}: {e}")
+            self.logger.warning(f"Failed to delete task {task.task_id}: {e}")
             return False
     
     def free(self, task_id: str, status: TaskStatus):

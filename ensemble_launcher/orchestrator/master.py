@@ -32,13 +32,14 @@ class Master(Node):
         self._tasks = tasks
         self._config = config
         self._parent_comm = parent_comm
+        self._nodes = Nodes
+        self._sys_info = system_info
 
         ##lazily created in run
         self._executor = None
         self._comm = None
 
-        ##create a scheduler. maybe this can be removed??
-        self._scheduler = WorkerScheduler(cluster=LocalClusterResource(Nodes,system_info))
+        self._scheduler = None
 
         ##maps
         self._children_exec_ids: Dict[str, str] = {}
@@ -49,10 +50,9 @@ class Master(Node):
 
         self.logger = None
 
-
     @property
     def nodes(self):
-        return self._scheduler.cluster.nodes
+        return self._nodes
     
     @property
     def parent_comm(self):
@@ -67,16 +67,20 @@ class Master(Node):
         return self._comm
     
     def _setup_logger(self):
-        # Configure file handler for this specific self.self.logger
-        file_handler = logging.FileHandler(f'master-{self.node_id}.log')
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
 
-        # Create instance self.self.logger and add handler
-        self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-        self.logger.addHandler(file_handler)
-        self.logger.setLevel(logging.INFO)
+        if self._config.master_logs:
+            os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
+            # Configure file handler for this specific self.self.logger
+            file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/master-{self.node_id}.log'))
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            # Create instance self.self.logger and add handler
+            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
+            self.logger.addHandler(file_handler)
+            self.logger.setLevel(logging.INFO)
+        else:
+            self.logger = logging.getLogger(__name__)
 
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
@@ -200,9 +204,14 @@ class Master(Node):
                         f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
         return cmd
     
-    def run(self):
+
+    def _lazy_init(self) -> Dict[str, Node]:
         #lazy logger creation
         self._setup_logger()
+        
+        ##create a scheduler. maybe this can be removed??
+        self._scheduler = WorkerScheduler(self.logger, cluster=LocalClusterResource(self.logger, self._nodes,self._sys_info))
+
         #create executor
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name)
 
@@ -224,6 +233,11 @@ class Master(Node):
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
         
+        return children
+
+    def run(self):
+        children = self._lazy_init()
+
         ##heart beat sync with parent
         if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")

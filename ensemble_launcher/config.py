@@ -20,6 +20,8 @@ class LauncherConfig(BaseModel):
     report_interval: float = 10.0
     nlevels: int = 1
     return_stdout: bool = False
+    worker_logs: bool = False
+    master_logs: bool = False
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

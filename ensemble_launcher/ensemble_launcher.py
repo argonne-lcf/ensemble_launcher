@@ -57,7 +57,7 @@ class EnsembleLauncher:
                 #nnodes > 1
                 comm_name = "zmq"
                 if nnodes <= 64:
-                    nlevels = 2
+                    nlevels = 1
                 elif nnodes > 64 and nnodes <= 256:
                     nlevels = 2
                 elif nnodes  > 256 and nnodes <= 2048:

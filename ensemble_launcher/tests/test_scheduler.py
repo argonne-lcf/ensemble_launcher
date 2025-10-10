@@ -14,6 +14,7 @@ logging.basicConfig(
     level=logging.ERROR,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger()
 
 def echo(task_id: int):
     return f"Hello from task {task_id}"
@@ -33,9 +34,9 @@ def test_scheduler():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
-    cluster = LocalClusterResource(nodes,system_info=sys_info)
+    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
 
-    scheduler = TaskScheduler({task.task_id: task for task in tasks},cluster=cluster)
+    scheduler = TaskScheduler(logger, {task.task_id: task for task in tasks},cluster=cluster)
 
     ready_tasks = scheduler.get_ready_tasks()
 

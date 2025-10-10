@@ -39,15 +39,16 @@ class Worker(Node):
         super().__init__(id, parent=parent, children=children)
         self._config = config
         self._tasks: Dict[str, Task] = tasks
-        
         self._parent_comm = parent_comm
+        self._nodes = Nodes
+        self._sys_info = system_info
 
         ##lazy init in run function
         self._comm = None
         ##lazy init in run function
         self._executor = None
-        ##init scheduler
-        self._scheduler = TaskScheduler(self._tasks,cluster=LocalClusterResource(Nodes,system_info))
+
+        self._scheduler = None
         
         ##map from executor ids to task ids
         self._executor_task_ids: Dict[str, List[str]] = {}
@@ -56,7 +57,7 @@ class Worker(Node):
     
     @property
     def nodes(self):
-        return self._scheduler.cluster.nodes
+        return self._nodes
     
     @property
     def parent_comm(self):
@@ -71,16 +72,20 @@ class Worker(Node):
         return self._comm
     
     def _setup_logger(self):
-        # Configure file handler for this specific self.logger
-        file_handler = logging.FileHandler(f'worker-{self.node_id}.log')
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
+        if self._config.worker_logs:
+            os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
+            # Configure file handler for this specific self.logger
+            file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/worker-{self.node_id}.log'))
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
 
-        # Create instance self.logger and add handler
-        self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-        self.logger.addHandler(file_handler)
-        self.logger.setLevel(logging.INFO)
+            # Create instance self.logger and add handler
+            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
+            self.logger.addHandler(file_handler)
+            self.logger.setLevel(logging.INFO)
+        else:
+            self.logger = logging.getLogger(__name__)
     
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
@@ -137,17 +142,26 @@ class Worker(Node):
                 self._scheduler.free(task_id, task.status)
                 self.logger.debug(f"Resources freed for task {task_id} with status {task.status}")
 
-    def run(self) -> Result:
+    def _lazy_init(self):
         #lazy logger creation
         self._setup_logger()
 
+        ##init scheduler
+        self._scheduler = TaskScheduler(self.logger, self._tasks,cluster=LocalClusterResource(self.logger, self._nodes, self._sys_info))
+
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout})
+
         ##Lazy comm creation
         self._create_comm()
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
 
+    def run(self) -> Result:
+        ##lazy init
+        self._lazy_init()
+
+        #sync with parent
         if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
             self.logger.error(f"{self.node_id}: Failed to connect to parent")
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")

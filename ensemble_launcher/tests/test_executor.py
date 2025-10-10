@@ -14,6 +14,7 @@ logging.basicConfig(
     level=logging.ERROR,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger()
 
 def echo(task_id: str):
     return f"Hello from task {task_id}"
@@ -36,9 +37,9 @@ def test_mp_executor():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
-    cluster = LocalClusterResource(nodes,system_info=sys_info)
+    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
 
-    scheduler = TaskScheduler(tasks,cluster=cluster)
+    scheduler = TaskScheduler(logger, tasks,cluster=cluster)
 
     ready_tasks = scheduler.get_ready_tasks()
 
@@ -69,9 +70,9 @@ def test_mpi_executor():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
 
-    cluster = LocalClusterResource(nodes,system_info=sys_info)
+    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
 
-    scheduler = TaskScheduler(tasks,cluster=cluster)
+    scheduler = TaskScheduler(logger, tasks,cluster=cluster)
 
     ready_tasks = scheduler.get_ready_tasks()
 

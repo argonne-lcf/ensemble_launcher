@@ -1,10 +1,13 @@
 from ensemble_launcher.scheduler.resource import NodeResourceList, LocalClusterResource, NodeResourceCount, JobResource
+import logging
+
+logger = logging.getLogger()
 
 def test_resource():
     import copy
     
     sys_info = NodeResourceList(cpus=list(range(10)),gpus=[])
-    cluster = LocalClusterResource(nodes=[f"node:{str(i)}" for i in range(2)],system_info=sys_info)
+    cluster = LocalClusterResource(logger, nodes=[f"node:{str(i)}" for i in range(2)],system_info=sys_info)
 
     cluster_copy = copy.deepcopy(cluster)
 

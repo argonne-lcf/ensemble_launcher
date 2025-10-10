@@ -91,5 +91,5 @@ def test_zmq_comm():
     
 
 if __name__ == "__main__":
-    # test_mp_comm()
+    test_mp_comm()
     test_zmq_comm()
