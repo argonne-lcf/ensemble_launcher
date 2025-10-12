@@ -227,7 +227,8 @@ class Master(Node):
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
         for child_id, child in children.items():
-            child.parent_comm = copy.deepcopy(self.comm) if self._config.comm_name == "zmq" else self.comm
+            ###TODO: Implement a comminfo to fix this!!!
+            child.parent_comm = self.comm.pickable_copy()
         
         ##lazy creation of non-pickable objects
         if self._config.comm_name == "zmq":
@@ -238,6 +239,7 @@ class Master(Node):
     def run(self):
         children = self._lazy_init()
 
+        self._comm.async_recv() ###start the recv thread
         ##heart beat sync with parent
         if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")
@@ -324,12 +326,14 @@ class Master(Node):
                 ##look for results
                 result = self._comm.recv_message_from_child(Result,child_id, timeout=0.5)
                 if result is not None:
+                    self.logger.info(f"{self.node_id}: Received result from {child_id}.")
                     ##final status of the child
                     final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
                     if final_status is not None:
                         children_status[child_id] = final_status
+                        self.logger.info(f"{self.node_id}: Received final status from {child_id}")
+                        self.logger.info(f"{self.node_id}: Final status {final_status}")
                     ##
-                    self.logger.info(f"{self.node_id}: Recieved result from {child_id} while monitoring")
                     results[child_id] = result
                     done.add(child_id)
                     self._comm.send_message_to_child(child_id,Action(sender=self.node_id, type=ActionType.STOP))
@@ -387,12 +391,13 @@ class Master(Node):
                 self._status.to_file(fname)
         else:
             try:
+                self._status = sum(children_status.values(), Status())
                 #write to a json file
                 fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
                 self._status.to_file(fname)
                 self.logger.info(f"{self.node_id}: Successfully reported final status")
             except Exception as e:
-                self.logger.warning(f"{self.node_id}: Reorting final status failed with excepiton {e}")
+                self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
         
         #wait for my parent to instruct me
         while True and self.parent is not None:
@@ -407,6 +412,8 @@ class Master(Node):
         return new_result
 
     def stop(self):
-        self._comm.close()
+        self._comm.stop_async_recv()
+        self._comm.clear_cache()
+        self._comm.close()        
         self._executor.shutdown()
         

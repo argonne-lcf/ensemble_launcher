@@ -29,7 +29,7 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
                       args=(nodes[1:] if len(nodes) > 1 else [],), 
                       kwargs={"parent_address": comm.my_address, "comm_type": comm_type})
     p.start()
-
+    comm.async_recv() ##start the recv
     if node_info.parent_id is not None:
         comm.sync_heartbeat_with_parent(timeout=30.0)
     
@@ -57,6 +57,7 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
             updated_data.append(msg)
             new_result = Result(data=updated_data)
             comm.send_message_to_parent(new_result)
+    comm.stop_async_recv()
     return res.data if res is not None else None
 
 def test_mp_comm():

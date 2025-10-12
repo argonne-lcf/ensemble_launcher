@@ -1,15 +1,12 @@
-from typing import Union
-import logging
+from typing import Dict
 import time
 import socket
 import random
-import pickle
-import sys
 from .base import Comm, NodeInfo
-from .messages import Result
 from typing import Any, Optional
 import cloudpickle
 from logging import Logger
+import queue
 
 
 try:
@@ -43,11 +40,23 @@ class ZMQComm(Comm):
         self.dealer_socket = None
         self.router_poller = None
         self.dealer_poller = None
+        
+        self._router_cache = None
 
-        # self.setup_zmq_sockets()
-        # self.send_heartbeat()
+    
+    def _init_router_cache(self):
+        # ZMQ-specific raw data cache using FIFO queues (preserves message order)
+        self._router_cache: Dict[str, queue.Queue] = {}
+        for child_id in self.node_info.children_ids:
+            self._router_cache[child_id] = queue.Queue()
+        
+        if self.node_info.parent_id:
+            self._router_cache[self.node_info.parent_id] = queue.Queue()
 
     def setup_zmq_sockets(self):
+        if not self._router_cache:
+            self._init_router_cache()
+
         self.zmq_context = zmq.Context()
         if len(self.node_info.children_ids) > 0:
             self.router_socket = self.zmq_context.socket(zmq.ROUTER)
@@ -107,15 +116,25 @@ class ZMQComm(Comm):
             return None
         
         try:
+            # Check ZMQ-specific FIFO cache first for raw data
+            parent_id = self.node_info.parent_id
+            if parent_id in self._router_cache:
+                try:
+                    raw_data = self._router_cache[parent_id].get_nowait()
+                    self.logger.debug(f"{self.node_info.node_id}: Received (cached) raw data from parent.")
+                    return raw_data
+                except queue.Empty:
+                    pass
+            
             socks = dict(self.dealer_poller.poll((timeout * 1000) if timeout is not None else None))  # convert timeout to milliseconds
             if self.dealer_socket in socks and socks[self.dealer_socket] == zmq.POLLIN:
-                msg = cloudpickle.loads(self.dealer_socket.recv())
-                self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from parent.")
-                return msg
+                raw_data = cloudpickle.loads(self.dealer_socket.recv())
+                self.logger.debug(f"{self.node_info.node_id}: Received raw data from parent.")
+                return raw_data
             self.logger.debug(f"{self.node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
             return None
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
+            self.logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")
             return None
 
     def _send_to_child(self, child_id: str, data: Any) -> bool:
@@ -137,38 +156,65 @@ class ZMQComm(Comm):
             return None
         
         try:
-            if child_id in self._cache and len(self._cache[child_id]) > 0:
-                msg = self._cache[child_id].pop(0)  # Get the first cached message
-                self.logger.debug(f"{self.node_info.node_id}: Received (cached) message from child {child_id}.")
-                return msg
+            # Check ZMQ-specific FIFO cache first for raw data
+            if child_id in self._router_cache:
+                try:
+                    raw_data = self._router_cache[child_id].get_nowait()
+                    self.logger.debug(f"{self.node_info.node_id}: Received (cached) raw data from child {child_id}.")
+                    return raw_data
+                except queue.Empty:
+                    pass
             
             start_time = time.time()
             while True:
-
                 if timeout is not None and time.time() - start_time >= timeout:
                     break
 
                 socks = dict(self.router_poller.poll(100)) #wait for 100ms
                 if self.router_socket in socks and socks[self.router_socket] == zmq.POLLIN:
                     msg = self.router_socket.recv_multipart()
-                    msg[0] = msg[0].decode()  # Convert bytes to string for child_id
-                    msg[1] = cloudpickle.loads(msg[1])  # Unpickle the message
-                    # wait for a message from the child
-                    if msg[0] == str(child_id):
-                        self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from child {child_id}.")
-                        return msg[1]
+                    sender_id = msg[0].decode()  # Convert bytes to string for child_id
+                    raw_data = cloudpickle.loads(msg[1])  # Unpickle the raw data
+                    
+                    # Check if this is the message we're waiting for
+                    if sender_id == str(child_id):
+                        self.logger.debug(f"{self.node_info.node_id}: Received raw data from child {child_id}.")
+                        return raw_data
                     else:
-                        self._cache[msg[0]].append(msg[1])
+                        # Cache raw data for other children in ZMQ-specific FIFO cache
+                        if sender_id in self._router_cache:
+                            self._router_cache[sender_id].put(raw_data)
+                        else:
+                            self.logger.warning(f"{self.node_info.node_id}: Received data from unknown child {sender_id}")
+            
             self.logger.debug(f"{self.node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
             return None
         except Exception as e:
             self.logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
             return None
-    
+
+    def update_node_info(self, node_info: NodeInfo):
+        """Override to update ZMQ-specific cache as well"""
+        super().update_node_info(node_info)
+        
+        # Update ZMQ-specific FIFO cache
+        for child_id in self.node_info.children_ids:
+            if child_id not in self._router_cache:
+                self._router_cache[child_id] = queue.Queue()
 
     def close(self):
         """Clean up ZMQ resources."""
         try:
+            # Clear ZMQ-specific FIFO cache
+            for cache_queue in self._router_cache.values():
+                try:
+                    while True:
+                        cache_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._router_cache.clear()
+            
+            # Close ZMQ resources
             if self.router_socket:
                 self.router_socket.close()
             if self.dealer_socket:
@@ -177,3 +223,8 @@ class ZMQComm(Comm):
                 self.zmq_context.term()
         except Exception as e:
             self.logger.warning(f"{self.node_info.node_id}: Error during ZMQ cleanup: {e}")
+    
+    def pickable_copy(self):
+        ret = ZMQComm(None, node_info=self.node_info, parent_address=self.parent_address)
+        ret.my_address = self.my_address
+        return ret

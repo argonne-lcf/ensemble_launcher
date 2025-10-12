@@ -155,6 +155,8 @@ class Worker(Node):
 
         ##Lazy comm creation
         self._create_comm()
+        self._comm.init_cache()
+
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
 
@@ -162,6 +164,7 @@ class Worker(Node):
         ##lazy init
         self._lazy_init()
 
+        self._comm.async_recv() ##start to monitor the endpoints
         #sync with parent
         if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
             self.logger.error(f"{self.node_id}: Failed to connect to parent")
@@ -255,5 +258,7 @@ class Worker(Node):
         return new_result
         
     def _stop(self):
+        self._comm.stop_async_recv()
+        self._comm.clear_cache()
         self._comm.close()
         self._executor.shutdown()

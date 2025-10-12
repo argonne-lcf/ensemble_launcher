@@ -11,7 +11,7 @@ import sys
 
 logging.basicConfig(
     stream=sys.stdout,
-    level=logging.ERROR,
+    level=logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger()
@@ -35,7 +35,7 @@ def test_mp_executor():
                                     args=(i,))
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12))
 
     cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
 

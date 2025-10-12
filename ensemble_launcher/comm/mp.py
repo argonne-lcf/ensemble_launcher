@@ -98,3 +98,10 @@ class MPComm(Comm):
             
         except Exception as e:
             self.logger.warning(f"{self.node_info.node_id}: Error during cleanup: {e}")
+    
+    def pickable_copy(self):
+        """These might not be usable. These are just to capture the metadata to send to the children"""
+        ret = MPComm(None,self.node_info,parent_comm=self._parent_comm)
+        ret._my_conn_to_child = self._my_conn_to_child
+        ret._child_conn_to_me = self._child_conn_to_me
+        return ret

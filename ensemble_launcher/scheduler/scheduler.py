@@ -70,7 +70,8 @@ class TaskScheduler(Scheduler):
             self.scheduler_policy: Policy = policy_registry.create_policy(policy)
         else:
             self.scheduler_policy: Policy = policy
-        self.sorted_tasks: List[str] = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
+        self.sorted_tasks: List[str] = sorted(list(self.tasks.keys()), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
+        self.logger.debug(f"Sorted tasks {self.sorted_tasks}")
     
     def _buld_task_resource_req(self, task: Task) -> JobResource:
         req = JobResource(
@@ -93,7 +94,7 @@ class TaskScheduler(Scheduler):
     def get_ready_tasks(self) -> Dict[str, JobResource]:
         ready_tasks = {}
         for task_id in self.sorted_tasks:
-            task = copy.deepcopy(self.tasks[task_id])
+            task = self.tasks[task_id]
             req = self._buld_task_resource_req(task)
             allocated,resource = self.cluster.allocate(req)
             if allocated:
@@ -102,12 +103,14 @@ class TaskScheduler(Scheduler):
                     raise RuntimeError
                 #add to running tasks
                 self._running_tasks.add(task.task_id)
-                #remove from the queue
-                self.sorted_tasks.remove(task_id)
                 ##save the assignment
                 self.task_assignment[task_id] = resource
                 #save the req
                 ready_tasks[task.task_id] = resource
+
+        #remove from the queue
+        for task_id in ready_tasks.keys():
+            self.sorted_tasks.remove(task_id)
 
         self.logger.debug(f"Allocated {list(ready_tasks.keys())}")
         return ready_tasks
