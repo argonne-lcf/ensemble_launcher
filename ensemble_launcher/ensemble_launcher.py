@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class EnsembleLauncher:
     def __init__(self,
-                 ensemble_file: Union[str, Dict[str, Dict]],
+                 ensemble_file: Union[str, Dict[str, Union[Dict, Task]]],
                  system_config: SystemConfig = SystemConfig(name="local"),
                  launcher_config: Optional[LauncherConfig] = None,
                  Nodes: Optional[List[str]] = None,
@@ -23,7 +23,11 @@ class EnsembleLauncher:
         self.system_config = system_config
         self.launcher_config = launcher_config
         self.pin_resources = pin_resources
-        self._tasks = self._generate_tasks()
+        if isinstance(self.ensemble_file, dict) and \
+            all([isinstance(t, Task) for t in self.ensemble_file.values()]):
+            self._tasks = self.ensemble_file
+        else:
+            self._tasks = self._generate_tasks()
 
         logger.info(f"Created {len(self._tasks)} tasks")
 
