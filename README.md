@@ -176,7 +176,7 @@ launcher_config = LauncherConfig(
     comm_name="zmq",                # multiprocessing, zmq, dragon
     nlevels=2,                      # Hierarchy depth (auto-computed if None)
     report_interval=10.0,           # Status update frequency (seconds)
-    return_stdout=True,             # Capture task output
+    return_stdout=True,             # Capture stdout
     worker_logs=True,               # Enable worker logging
     master_logs=True                # Enable master logging
 )
@@ -271,9 +271,9 @@ See the [`examples`](examples/) directory for complete workflow samples:
 - [`examples/c++/workflow_pattern2.py`](examples/c++/workflow_pattern2.py) - Parameter sweeps
 - [`examples/c++/workflow_pattern3.py`](examples/c++/workflow_pattern3.py) - Complex dependencies
 
-### Python Examples
+<!-- ### Python Examples
 - [`examples/python/mpi_example.py`](examples/python/mpi_example.py) - MPI-based execution
-- [`examples/python/serial_example.py`](examples/python/serial_example.py) - Serial task execution
+- [`examples/python/serial_example.py`](examples/python/serial_example.py) - Serial task execution -->
 
 ---
 
@@ -310,8 +310,8 @@ launcher_config = LauncherConfig(
 Enable logging for detailed execution traces:
 
 ```python
-import logging
-logging.basicConfig(level=logging.INFO)
+# import logging
+# logging.basicConfig(level=logging.INFO)
 
 launcher_config = LauncherConfig(
     worker_logs=True,
