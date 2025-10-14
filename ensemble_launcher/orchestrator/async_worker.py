@@ -1,7 +1,7 @@
 from .node import *
 import time
 import os
-from typing import Any, TYPE_CHECKING, Tuple, Optional
+from typing import Any, TYPE_CHECKING, Tuple, Optional, Set
 from ensemble_launcher.scheduler import TaskScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource
 from ensemble_launcher.config import SystemConfig, LauncherConfig
@@ -10,9 +10,10 @@ from ensemble_launcher.comm import ZMQComm, MPComm, Comm
 from ensemble_launcher.comm import Status, Result, HeartBeat, Message, Action, ActionType, TaskUpdate
 from ensemble_launcher.executors import executor_registry, Executor
 import logging
+import threading
 
-class Worker(Node):
-    """Synchronous worker implementation - all operations in main loop"""
+class AsyncWorker(Node):
+    """Worker with async executor poller - polls in background thread"""
     
     def __init__(self,
                 id:str,
@@ -42,6 +43,12 @@ class Worker(Node):
         self._executor_task_ids: Dict[str, str] = {}
 
         self.logger = None
+        
+        # Async poller components
+        self._poller_thread = None
+        self._poller_running = False
+        self._completed_tasks: Set[str] = set()  # Task IDs that are done
+        self._completed_tasks_lock = threading.RLock()
     
     @property
     def nodes(self):
@@ -108,14 +115,67 @@ class Worker(Node):
         
         return (add_status, del_status)
 
-    def _free_task(self, task_id: str):
-        exec_id = self._executor_task_ids[task_id]
-        task = self._tasks[task_id]
-        if self._executor.done(exec_id):
+    def _async_executor_poller(self):
+        """Background thread that continuously polls executor and updates completed tasks list"""
+        def _poll():
+            while self._poller_running:
+                try:
+                    # Get snapshot of running tasks
+                    running_tasks = list(self._scheduler.running_tasks)
+                    
+                    for task_id in running_tasks:
+                        # Check if task has been submitted to executor
+                        if task_id not in self._executor_task_ids:
+                            continue
+                        
+                        exec_id = self._executor_task_ids[task_id]
+                        
+                        # Poll executor
+                        if self._executor.done(exec_id):
+                            # Add to completed list
+                            with self._completed_tasks_lock:
+                                self._completed_tasks.add(task_id)
+                            self.logger.debug(f"Poller detected task {task_id} completed")
+                    
+                    # Small sleep to avoid busy-waiting
+                    time.sleep(0.01)
+                    
+                except Exception as e:
+                    self.logger.error(f"{self.node_id}: Error in poller thread: {e}")
+
+        if self._poller_thread is None:
+            self._poller_thread = threading.Thread(target=_poll, daemon=True)
+        
+        try:
+            self._poller_running = True
+            self._poller_thread.start()
+            self.logger.info(f"{self.node_id}: Started async executor poller")
+        except Exception as e:
+            self.logger.error(f"{self.node_id}: Starting poller thread failed with exception {e}")
+
+    def _stop_async_poller(self):
+        if self._poller_running and self._poller_thread.is_alive():
+            self._poller_running = False
+            self._poller_thread.join(timeout=5.0)
+            if self._poller_thread.is_alive():
+                self.logger.warning(f"{self.node_id}: Poller thread did not stop within timeout")
+
+    def _free_completed_tasks(self):
+        """Main process reads completed tasks list and frees them"""
+        with self._completed_tasks_lock:
+            # Get and clear completed tasks
+            completed = list(self._completed_tasks)
+            self._completed_tasks.clear()
+        
+        for task_id in completed:
+            exec_id = self._executor_task_ids[task_id]
+            task = self._tasks[task_id]
+            
             task.end_time = time.time()
             exception = self._executor.exception(exec_id)
             self.logger.debug(f"Task {task_id} completed with executor ID {exec_id}")
             task.status = TaskStatus.SUCCESS
+            
             if exception is not None:
                 task.status = TaskStatus.FAILED
                 task.exception = str(exception)
@@ -123,17 +183,12 @@ class Worker(Node):
             else:
                 task.result = self._executor.result(exec_id)
                 self.logger.debug(f"Task {task_id} completed successfully")
+            
             ##free the resources
             self._scheduler.free(task_id, task.status)
             self.logger.debug(f"Resources freed for task {task_id} with status {task.status}")
             ##remove from tracking
             del self._executor_task_ids[task_id]
-
-    def _poll_tasks(self):
-        """Poll the tasks and set its status"""
-        running_tasks = list(self._scheduler.running_tasks)
-        for task_id in running_tasks:
-            self._free_task(task_id)
 
     def _lazy_init(self):
         #lazy logger creation
@@ -179,14 +234,17 @@ class Worker(Node):
             self.logger.error(f"{self.node_id}: Failed to connect to parent")
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")
 
+        # Start async executor poller
+        self._async_executor_poller()
+        
         next_report_time = time.time() + self._config.report_interval
         
         while True:
-            # Submit ready tasks synchronously
+            # Submit ready tasks
             self._submit_ready_tasks()
             
-            # Poll and free completed tasks synchronously
-            self._poll_tasks()
+            # Free completed tasks (read from poller's list)
+            self._free_completed_tasks()
             
             # Report status periodically
             if time.time() > next_report_time:
@@ -203,6 +261,9 @@ class Worker(Node):
                 break
             
             time.sleep(0.05)
+        
+        # Stop async poller
+        self._stop_async_poller()
         
         self.logger.info(f"{self.node_id}: Done executing all the tasks")
 
@@ -257,5 +318,3 @@ class Worker(Node):
         self._comm.clear_cache()
         self._comm.close()
         self._executor.shutdown()
-
-

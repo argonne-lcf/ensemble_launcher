@@ -129,7 +129,6 @@ class MPIExecutor(Executor):
         merged_env.update(env)
 
         logger.info(f"executing: {' '.join(cmd)}")
-        print(f"executing: {' '.join(cmd)}")
         if self._return_stdout:
             p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:

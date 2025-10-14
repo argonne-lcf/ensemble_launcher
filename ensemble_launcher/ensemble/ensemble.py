@@ -29,6 +29,8 @@ class Task(BaseModel):
     cpu_affinity: List[int] = Field(default_factory=list)
     gpu_affinity: List[Union[int, str]] = Field(default_factory=list)
     run_dir: Union[str, os.PathLike] = Field(default="")
+    start_time: Any = None
+    end_time: Any = None
     
 
 class TaskFactory:

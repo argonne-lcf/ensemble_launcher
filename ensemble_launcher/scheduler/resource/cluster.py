@@ -8,6 +8,7 @@ import time
 import copy
 from logging import Logger
 from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList
+import threading
 # from SimAIBench.config import server_registry
 
 SUPPORTED_BACKENDS = ["redis","filesystem"]
@@ -28,6 +29,7 @@ class ClusterResource(ABC):
         self._system_info = system_info
         self._nodes: Dict[str, NodeResource] = {node: copy.deepcopy(system_info) for node in nodes}
         self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
+        self._lock = threading.RLock()
 
     @property
     def system_info(self) -> NodeResource:
@@ -35,15 +37,18 @@ class ClusterResource(ABC):
     
     @property
     def free_cpus(self) -> int:
-        return sum([node.cpu_count for node in self._nodes.values()])
-    
+        with self._lock:
+            return sum([node.cpu_count for node in self._nodes.values()])
+
     @property
     def free_gpus(self) -> int:
-        return sum([node.gpu_count for node in self._nodes.values()])
+        with self._lock:
+            return sum([node.gpu_count for node in self._nodes.values()])
     
     @property
     def nodes(self) -> List[str]:
-        return list(self._nodes.keys())
+        with self._lock:
+            return list(self._nodes.keys())
     
     @abstractmethod
     def allocate(self, job_resource: JobResource):
@@ -103,7 +108,10 @@ class ClusterResource(ABC):
     
     def get_status(self):
         """Returns current free resources i.e self._nodes dict"""
-        return (self.free_cpus,self.free_gpus)
+        with self._lock:
+            free_cpus = sum([node.cpu_count for node in self._nodes.values()])
+            free_gpus = sum([node.gpu_count for node in self._nodes.values()])
+            return (free_cpus, free_gpus)
     
     def __eq__(self, other) -> bool:
         """Check equality between two ClusterResource instances."""
@@ -148,52 +156,52 @@ class LocalClusterResource(ClusterResource):
     def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:
         """Allocate specific resource IDs."""
         self.logger.debug(f"Starting allocation for job with {len(job_resource.resources)} resource requirements")
+        with self._lock:
+            allocation_result = self._can_allocate(job_resource)
+            if not allocation_result:
+                self.logger.debug("Allocation failed: insufficient resources")
+                return False, job_resource
 
-        allocation_result = self._can_allocate(job_resource)
-        if not allocation_result:
-            self.logger.debug("Allocation failed: insufficient resources")
-            return False, job_resource
-        
-        # Track original state before allocation
-        original_state = {}
-        allocated_resources = []
-        
-        if not job_resource.nodes:
-            allocated_nodes = allocation_result
-            self.logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
-            
-            # Capture original state and perform allocation
-            for node_id, node_name in enumerate(allocated_nodes):
-                resource_req = job_resource.resources[node_id]
-                original_state[node_name] = self._nodes[node_name]
-                self.logger.debug(f"Requesting {resource_req} from node {node_name}")
-                self._nodes[node_name] = self._nodes[node_name] - resource_req
-                
-                # Calculate what was actually allocated
-                allocated_resource = original_state[node_name] - self._nodes[node_name]
-                allocated_resources.append(allocated_resource)
-                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
-                self.logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
-            
-            # Return JobResource with actual allocated resources
-            self.logger.debug(f"Allocation successful.")
-            return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
-        else:
-            self.logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
-            
-            # Handle specified nodes case
-            for node_id, node_name in enumerate(job_resource.nodes):
-                resource_req = job_resource.resources[node_id]
-                original_state[node_name] = self._nodes[node_name]
-                self._nodes[node_name] = self._nodes[node_name] - resource_req
-                
-                # Calculate what was actually allocated
-                allocated_resource = original_state[node_name] - self._nodes[node_name]
-                allocated_resources.append(allocated_resource)
-                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
-            
-            self.logger.debug("Allocation successful")
-            return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
+            # Track original state before allocation
+            original_state = {}
+            allocated_resources = []
+
+            if not job_resource.nodes:
+                allocated_nodes = allocation_result
+                self.logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
+
+                # Capture original state and perform allocation
+                for node_id, node_name in enumerate(allocated_nodes):
+                    resource_req = job_resource.resources[node_id]
+                    original_state[node_name] = self._nodes[node_name]
+                    self.logger.debug(f"Requesting {resource_req} from node {node_name}")
+                    self._nodes[node_name] = self._nodes[node_name] - resource_req
+
+                    # Calculate what was actually allocated
+                    allocated_resource = original_state[node_name] - self._nodes[node_name]
+                    allocated_resources.append(allocated_resource)
+                    self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
+                    self.logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
+
+                # Return JobResource with actual allocated resources
+                self.logger.debug(f"Allocation successful.")
+                return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
+            else:
+                self.logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
+
+                # Handle specified nodes case
+                for node_id, node_name in enumerate(job_resource.nodes):
+                    resource_req = job_resource.resources[node_id]
+                    original_state[node_name] = self._nodes[node_name]
+                    self._nodes[node_name] = self._nodes[node_name] - resource_req
+
+                    # Calculate what was actually allocated
+                    allocated_resource = original_state[node_name] - self._nodes[node_name]
+                    allocated_resources.append(allocated_resource)
+                    self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
+
+                self.logger.debug("Allocation successful")
+                return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
     
     def deallocate(self, job_resource: JobResource) -> bool:
         """Deallocate the resources"""
@@ -203,13 +211,14 @@ class LocalClusterResource(ClusterResource):
         
         self.logger.debug(f"Starting deallocation for {len(job_resource.nodes)} nodes: {job_resource.nodes}")
         
-        for node_id, node_name in enumerate(job_resource.nodes):
-            resource_req = job_resource.resources[node_id]
-            self._nodes[node_name] += resource_req
-            self.logger.debug(f"Deallocated {resource_req} from node {node_name}")
-        
-        self.logger.debug("Deallocation successful")
-        return True
+        with self._lock:
+            for node_id, node_name in enumerate(job_resource.nodes):
+                resource_req = job_resource.resources[node_id]
+                self._nodes[node_name] += resource_req
+                self.logger.debug(f"Deallocated {resource_req} from node {node_name}")
+
+            self.logger.debug("Deallocation successful")
+            return True
 
     
 # class DistributedClusterResource(ClusterResource):
@@ -416,35 +425,3 @@ class LocalClusterResource(ClusterResource):
 #                 self.logger.info("Server stopped successfully")
 #             except Exception as e:
 #                 self.logger.error(f"Error stopping server: {e}")
-
-if __name__ == "__main__":
-    # Configure logging for the main execution
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    sys_info = NodeResourceList(cpus=list(range(104)),gpus=list(range(12)))
-    cluster = LocalClusterResource(nodes=[f"node:{str(i)}" for i in range(10)],system_info=sys_info)
-
-    print("*"*100)
-    print(cluster)
-
-    def print_allocated(allocated_job):
-        for node_id,node_name in enumerate(allocated_job.nodes):
-            print(node_name)
-            print(allocated_job.resources[node_id])
-
-    resources = []
-    resources.append(NodeResourceCount(ncpus=10,ngpus=6))
-    job = JobResource(resources=resources)
-    allocated,allocated_job = cluster.allocate(job)
-    if allocated:
-        print("*"*100)
-        print(cluster)
-        # print_allocated(allocated_job)
-        cluster.deallocate(allocated_job)
-        print("*"*100)
-        print(cluster)
-    else:
-        print("Not allocated")
