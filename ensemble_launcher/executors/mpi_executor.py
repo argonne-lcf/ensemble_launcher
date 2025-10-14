@@ -158,7 +158,7 @@ class MPIExecutor(Executor):
         stdout = None
         if self._return_stdout:
             stdout, stderr = process.communicate()
-        self._results[task_id] = stdout
+        self._results[task_id] = (stdout,stderr)
         return True
     
     def result(self, task_id: str, timeout:float = None):
@@ -175,11 +175,8 @@ class MPIExecutor(Executor):
         return_code = self._processes[task_id].poll()
         if return_code == 0:
             return None
-        return subprocess.CalledProcessError(
-            returncode=return_code,
-            cmd=self._processes[task_id].args,
-            output=self._results.get(task_id, None)
-        )
+        result = self._results.get(task_id, (None, None))
+        return result[1]
 
     def done(self, task_id: str):
         process = self._processes[task_id]

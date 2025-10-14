@@ -10,6 +10,9 @@ from ensemble_launcher.comm import ZMQComm, MPComm, Comm
 from ensemble_launcher.comm import Status, Result, HeartBeat, Message, Action, ActionType, TaskUpdate
 from ensemble_launcher.executors import executor_registry, Executor
 import logging
+import cloudpickle
+import socket
+
 
 class Worker(Node):
     """Synchronous worker implementation - all operations in main loop"""
@@ -229,6 +232,28 @@ class Worker(Node):
         
         self._stop()
         return all_results
+    
+    @classmethod
+    def load(cls, fname: str):
+        """
+            This method loads the master object from a file. 
+            The file is pickled as Dict[hostname, Master]
+        """
+        with open(fname, "rb") as f:
+            obj_dict: Dict[str, 'Worker'] = cloudpickle.load(f)
+        hostname = socket.gethostname()
+        worker_obj = None
+        try:
+            worker_obj = obj_dict[hostname]
+        except KeyError:
+            for key in obj_dict.keys():
+                if hostname in key:
+                    worker_obj = obj_dict[key]
+                    break
+        if worker_obj is None:
+            return
+        
+        worker_obj.run()
 
     def _results(self) -> Result:
         results = []
@@ -236,7 +261,7 @@ class Worker(Node):
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
                 task_result = Result(task_id=task_id,
                                     data=self._tasks[task_id].result,
-                                    error_message=self._tasks[task_id].exception)
+                                    exception=str(self._tasks[task_id].exception))
                 results.append(task_result)
 
         new_result = Result(

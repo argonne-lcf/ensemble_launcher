@@ -12,10 +12,10 @@ import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Any
 import os
-import cloudpickle
 import time
 import numpy as np
-
+import cloudpickle
+import socket
 # self.logger = logging.getself.logger(__name__)
 
 class Master(Node):
@@ -190,19 +190,19 @@ class Master(Node):
                     )
         return children
 
-    def _build_launch_cmd(self) -> str:
-        ##save the state of the child obj        
-        for child_name,child_obj in self.children.items():
-                with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
-                    cloudpickle.dump(child_obj,f)
+    # def _build_launch_cmd(self) -> str:
+    #     ##save the state of the child obj        
+    #     for child_name,child_obj in self.children.items():
+    #             with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+    #                 cloudpickle.dump(child_obj,f)
 
-        if self.level + 1 == self._config.nlevels:
-            cmd = f"python -m ensemble_launcher.orchestrator.worker"+\
-                        f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-        else:   
-            cmd = f"python -m ensemble_launcher.orchestrator.master"+\
-                        f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-        return cmd
+    #     if self.level + 1 == self._config.nlevels:
+    #         cmd = f"python -m ensemble_launcher.orchestrator.worker"+\
+    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
+    #     else:   
+    #         cmd = f"python -m ensemble_launcher.orchestrator.master"+\
+    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
+    #     return cmd
     
 
     def _lazy_init(self) -> Dict[str, Node]:
@@ -245,19 +245,66 @@ class Master(Node):
             raise TimeoutError(f"{self.node_id}: Can't connect to parent")
         self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
         
-        for child_name,child_obj in children.items():
-            child_nodes = child_obj.nodes
+        if self._config.child_executor_name == "mpi":
+            ##launch all children in a single shot
+            child_obj_dict = {}
+            child_head_nodes = []
+            child_resources = []
+            for child_name,child_obj in children.items():
+                child_head_nodes.append(child_obj.nodes[0])
+                child_resources.append(NodeResourceCount(ncpus=1))
+                child_obj_dict[child_head_nodes[-1]] = child_obj
             req = JobResource(
-                    resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                        resources=child_resources, nodes=child_head_nodes
                 )
             env = os.environ.copy()
+            os.makedirs(os.path.join(os.getcwd(),".tmp"),exist_ok=True)
+            fname = os.path.join(os.getcwd(),".tmp",f"{self.node_id}_children_obj.pkl")
+            with open(fname,"wb") as f:
+                cloudpickle.dump(child_obj_dict,f)
+            if isinstance(list(children.values())[0], Worker):
+                self.logger.info(f"Launching worker using one shot mpiexec")
+                self._children_exec_ids["all"] = self._executor.start(req, Worker.load,task_args=(fname,), env = env)
+            else:
+                self.logger.info(f"Launching master using one shot mpiexec")
+                self._children_exec_ids["all"] = self._executor.start(req, Master.load, task_args=(fname,), env = env)
+        else:
+            for child_name,child_obj in children.items():
+                child_nodes = child_obj.nodes
+                req = JobResource(
+                        resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                    )
+                env = os.environ.copy()
 
-            self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
+                self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
 
         if not self._comm.sync_heartbeat_with_children(timeout=30.0):
             return self._get_child_exceptions() # Should return and report
         else:
             return self._results() #should return and report
+    
+    @classmethod
+    def load(cls, fname: str):
+        """
+            This method loads the master object from a file. 
+            The file is pickled as Dict[hostname, Master]
+        """
+        with open(fname, "rb") as f:
+            obj_dict: Dict[str, 'Master'] = cloudpickle.load(f)
+        hostname = socket.gethostname()
+        master_obj = None
+        try:
+            master_obj = obj_dict[hostname]
+        except KeyError:
+            for key in obj_dict.keys():
+                if hostname in key:
+                    master_obj = obj_dict[key]
+                    break
+        if master_obj is None:
+            print(f"failed loading child from {fname}{list(obj_dict.keys())}")
+            return
+        master_obj.run()
+
 
     def _get_child_exceptions(self) -> Result:
         """
@@ -316,19 +363,27 @@ class Master(Node):
     def _results(self):
         next_report_time = time.time() + self._config.report_interval
         children_status = {}
-        results: Dict[str,Result] = {}
+        results: Dict[str, Result] = {}
+        
         while True:
             done = set()
-            for child_id, exec_id in self._children_exec_ids.items():
+            
+            # Special handling for MPI executor - check once before child loop
+            if self._config.child_executor_name == "mpi":
+                if self._executor.done(self._children_exec_ids["all"]):
+                    for child_id in self.children:
+                        done.add(child_id)
+            
+            for child_id in self.children:
                 if child_id in done:
                     continue
 
                 ##look for results
-                result = self._comm.recv_message_from_child(Result,child_id, timeout=0.5)
+                result = self._comm.recv_message_from_child(Result, child_id, timeout=0.5)
                 if result is not None:
                     self.logger.info(f"{self.node_id}: Received result from {child_id}.")
                     ##final status of the child
-                    final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
+                    final_status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=5.0)
                     if final_status is not None:
                         children_status[child_id] = final_status
                         self.logger.info(f"{self.node_id}: Received final status from {child_id}")
@@ -336,23 +391,31 @@ class Master(Node):
                     ##
                     results[child_id] = result
                     done.add(child_id)
-                    self._comm.send_message_to_child(child_id,Action(sender=self.node_id, type=ActionType.STOP))
-                ##
-                if self._executor.done(exec_id):
-                    done.add(child_id)
+                    self._comm.send_message_to_child(child_id, Action(sender=self.node_id, type=ActionType.STOP))
                 
+                # For non-MPI executors, check individual exec_ids
+                if self._config.child_executor_name != "mpi":
+                    if child_id not in self._children_exec_ids:
+                        self.logger.error(f"{child_id} not in exec_id map!!")
+                        raise RuntimeError
+                    else:
+                        exec_id = self._children_exec_ids[child_id]
+                        if self._executor.done(exec_id):
+                            done.add(child_id)
+            
             ##send status to parent
             if time.time() > next_report_time:
-                ##receive status updates
-                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
-                if status is not None:
-                    children_status[child_id] = status
+                ##receive status updates from ALL children
+                for child_id in self.children:
+                    status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.1)
+                    if status is not None:
+                        children_status[child_id] = status
 
                 self._status = sum(children_status.values(), Status())
                 if self.parent:
                     self._comm.send_message_to_parent(self._status)
                 else:
-                    if isinstance(self._status,Status):
+                    if isinstance(self._status, Status):
                         self.logger.info(f"{self.node_id}: Status: {self._status}")
                 next_report_time = time.time() + self._config.report_interval
 
@@ -416,4 +479,3 @@ class Master(Node):
         self._comm.clear_cache()
         self._comm.close()        
         self._executor.shutdown()
-        
