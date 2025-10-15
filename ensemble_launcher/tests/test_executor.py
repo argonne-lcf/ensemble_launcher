@@ -87,7 +87,7 @@ def test_mpi_executor():
     for task_id in tasks:
         exec.wait(exec_ids[task_id])
         results[task_id] = exec.result(exec_ids[task_id])
-        assert results[task_id].decode('utf-8') == f"Hello from task {task_id}", f"Got: {results[task_id]}"
+        assert results[task_id][0].decode('utf-8') == f"Hello from task {task_id}", f"Got: {results[task_id]}"
         assert exec.done(exec_ids[task_id])
 
 if __name__ == "__main__":
