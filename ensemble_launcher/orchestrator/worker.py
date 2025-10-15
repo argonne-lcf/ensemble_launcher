@@ -205,7 +205,7 @@ class Worker(Node):
             if len(self._scheduler.remaining_tasks) == 0:
                 break
             
-            time.sleep(0.05)
+            time.sleep(0.001)
         
         self.logger.info(f"{self.node_id}: Done executing all the tasks")
 

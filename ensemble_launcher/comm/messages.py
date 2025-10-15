@@ -76,3 +76,7 @@ class HeartBeat(Message):
 @dataclass
 class Action(Message):
     type: Optional[ActionType] = None
+
+@dataclass
+class TaskRequest(Message):
+    ntasks: int = 0

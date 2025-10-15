@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 import multiprocessing as mp
-from typing import Literal, List, Union
+from typing import Literal, List, Union, Optional
 from difflib import get_close_matches
 
 
@@ -22,6 +22,7 @@ class LauncherConfig(BaseModel):
     return_stdout: bool = False
     worker_logs: bool = False
     master_logs: bool = False
+    nchildren: Optional[int] = None
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

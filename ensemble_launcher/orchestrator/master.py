@@ -112,40 +112,58 @@ class Master(Node):
         # Step 1: Calculate cumulative sum of nodes required for tasks
         cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
         
-        # Step 2: Determine the max number of workers
-        nworkers_max = 0
-        while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
-            nworkers_max += 1
-        
-        # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
-        # Calculate nworkers using log2 interpolation
-        if self._config.nlevels > 1:
-            # Create log2 space arrays for interpolation
-            x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
-            y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
-            
-            # Interpolate in log2 space
-            log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
-            
-            # Convert back from log2 space
-            nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+        if self._config.nchildren is None:
+            # Step 2: Determine the max number of workers
+            nworkers_max = 0
+            while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
+                nworkers_max += 1
+
+            # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
+            # Calculate nworkers using log2 interpolation
+            if self._config.nlevels > 1:
+                # Create log2 space arrays for interpolation
+                x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
+                y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
+
+                # Interpolate in log2 space
+                log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
+
+                # Convert back from log2 space
+                nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+            else:
+                nworkers = nworkers_max
         else:
-            nworkers = nworkers_max
+            nworkers = self._config.nchildren
         
-        # Step 4: Initialize worker assignments for the first set of tasks
-        nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
-        if sum(nnodes) < len(nodes):
-            nremaining = len(nodes) - sum(nnodes)
-            for i in range(nremaining):
-                nnodes[i%nworkers] += 1
-        nnodes = list(accumulate(nnodes))
-        children_assignments = {
-            wid: {
-            "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
-            "task_ids": [task_id]        # List of task IDs assigned to the worker
+        if len(nodes) == 1:
+            children_assignments = {
+                wid: {
+                "nodes": nodes,
+                "task_ids": [task_id]        # List of task IDs assigned to the worker
+                }
+                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
             }
-            for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-        }
+        else:
+            if len(nodes) < nworkers:
+                self.logger.error(f"number of nodes < number of children")
+                raise RuntimeError
+            
+            # Step 4: Initialize worker assignments for the first set of tasks
+            nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
+            if sum(nnodes) < len(nodes):
+                nremaining = len(nodes) - sum(nnodes)
+                for i in range(nremaining):
+                    nnodes[i%nworkers] += 1
+            nnodes = list(accumulate(nnodes))
+            children_assignments = {
+                wid: {
+                "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
+                "task_ids": [task_id]        # List of task IDs assigned to the worker
+                }
+                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
+            }
+        
+        
 
         # Step 5: Assign remaining tasks to workers in a round-robin fashion
         for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
@@ -269,12 +287,14 @@ class Master(Node):
                 self.logger.info(f"Launching master using one shot mpiexec")
                 self._children_exec_ids["all"] = self._executor.start(req, Master.load, task_args=(fname,), env = env)
         else:
-            for child_name,child_obj in children.items():
+            for child_idx, (child_name,child_obj) in enumerate(children.items()):
                 child_nodes = child_obj.nodes
                 req = JobResource(
                         resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
                     )
                 env = os.environ.copy()
+                
+                env["EL_CHILDID"] = str(child_idx)
 
                 self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
 
@@ -419,6 +439,7 @@ class Master(Node):
                         self.logger.info(f"{self.node_id}: Status: {self._status}")
                 next_report_time = time.time() + self._config.report_interval
 
+            time.sleep(0.001)
             if len(done) == len(self.children):
                 self.logger.info(f"{self.node_id}: All children are done")
                 break
