@@ -8,6 +8,7 @@ import stat
 import uuid
 import shlex
 import socket
+from datetime import datetime
 
 from .base import Executor
 
@@ -18,14 +19,24 @@ class MPIExecutor(Executor):
     def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",
                  tmp_dir:str = ".mpiexec_tmp",
                  mpiexec:str = "mpirun",
-                 return_stdout: bool = True):
+                 return_stdout: bool = True,
+                 profile: bool = False):
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
         self.mpiexec = mpiexec
         self._processes: Dict[str,subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
+        self._profile = profile
+        self._profile_info: Dict[str, Dict] = {}
         os.makedirs(self.tmp_dir,exist_ok=True)
+
+    def _record_profile_stop(self, task_id: str):
+        """Helper method to record profiling stop time and duration"""
+        if self._profile and task_id in self._profile_info and "stop" not in self._profile_info[task_id]:
+            self._profile_info[task_id]["stop"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._profile_info[task_id]["duration"] = (datetime.now() - self._profile_info[task_id]["start"]).total_seconds()
+            self._profile_info[task_id]["start"] = self._profile_info[task_id]["start"].strftime("%Y-%m-%d %H:%M:%S")
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
         """Function to build the mpi cmd from the job resources"""
@@ -134,6 +145,9 @@ class MPIExecutor(Executor):
         else:
             p = subprocess.Popen(cmd, env=merged_env)
         
+        if self._profile:
+            self._profile_info[task_id] = {"start": datetime.now()}
+        
         self._processes[task_id] = p
         return task_id
     
@@ -143,6 +157,7 @@ class MPIExecutor(Executor):
                 self._processes[task_id].kill()
             else:
                 self._processes[task_id].terminate()
+            self._record_profile_stop(task_id)
             return True
         except Exception as e:
             logger.warning(f"Failed to kill task {task_id} with an exception {e}")
@@ -159,6 +174,7 @@ class MPIExecutor(Executor):
         if self._return_stdout:
             stdout, stderr = process.communicate()
         self._results[task_id] = (stdout,stderr)
+        self._record_profile_stop(task_id)
         return True
     
     def result(self, task_id: str, timeout:float = None):
@@ -172,6 +188,7 @@ class MPIExecutor(Executor):
     
     def exception(self, task_id: str):
         self.wait(task_id)
+        self._record_profile_stop(task_id)
         return_code = self._processes[task_id].poll()
         if return_code == 0:
             return None
@@ -179,6 +196,8 @@ class MPIExecutor(Executor):
         return result[1]
 
     def done(self, task_id: str):
+        if self._profile and task_id in self._profile_info:
+            self._profile_info[task_id]["done"] += 1
         process = self._processes[task_id]
         return process.poll() is not None
 

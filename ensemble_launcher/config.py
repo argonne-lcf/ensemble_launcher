@@ -22,7 +22,8 @@ class LauncherConfig(BaseModel):
     return_stdout: bool = False
     worker_logs: bool = False
     master_logs: bool = False
-    nchildren: Optional[int] = None
+    nchildren: Optional[int] = None ##Setting this will fix the number of children at each level
+    profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

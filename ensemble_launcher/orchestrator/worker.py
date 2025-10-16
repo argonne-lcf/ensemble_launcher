@@ -12,6 +12,9 @@ from ensemble_launcher.executors import executor_registry, Executor
 import logging
 import cloudpickle
 import socket
+import json
+from contextlib import contextmanager
+from collections import defaultdict
 
 
 class Worker(Node):
@@ -45,7 +48,28 @@ class Worker(Node):
         self._executor_task_ids: Dict[str, str] = {}
 
         self.logger = None
+
+
+        self._event_timings: Dict[str, List[float]] = defaultdict(list)  # Store all timing measurements
+        if self._config.profile == "timeline":
+            self._timer = self._profile_timer
+        else:
+            self._timer = self._noop_timer
     
+
+    @contextmanager
+    def _profile_timer(self,event_name: str):
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._event_timings[event_name].append(time.perf_counter() - start_time)
+
+
+    @contextmanager
+    def _noop_timer(self, event_name: str):
+        yield
+
     @property
     def nodes(self):
         return self._nodes
@@ -78,10 +102,10 @@ class Worker(Node):
     
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
-            self._comm = MPComm(self.logger, self.info(),self.parent_comm if self.parent_comm else None)
+            self._comm = MPComm(self.logger, self.info(),self.parent_comm if self.parent_comm else None, profile=self._config.profile)
         elif self._config.comm_name == "zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = ZMQComm(self.logger, self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None)
+            self._comm = ZMQComm(self.logger, self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
@@ -146,7 +170,7 @@ class Worker(Node):
         self._scheduler = TaskScheduler(self.logger, self._tasks,cluster=LocalClusterResource(self.logger, self._nodes, self._sys_info))
 
         ##lazy executor creation
-        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout})
+        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,"profile":self._config.profile})
 
         ##Lazy comm creation
         self._create_comm()
@@ -173,62 +197,68 @@ class Worker(Node):
         return
 
     def run(self) -> Result:
-        ##lazy init
-        self._lazy_init()
-
-        self._comm.async_recv()
-        #sync with parent
-        if self.parent and not self._comm.sync_heartbeat_with_parent(timeout=30.0):
-            self.logger.error(f"{self.node_id}: Failed to connect to parent")
-            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        with self._timer("init"):
+            ##lazy init
+            self._lazy_init()
+        
+        with self._timer("heartbeat_sync"):
+            self._comm.async_recv()
+            #sync with parent
+            if self.parent and not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+                self.logger.error(f"{self.node_id}: Failed to connect to parent")
+                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
 
         next_report_time = time.time() + self._config.report_interval
         
         while True:
-            # Submit ready tasks synchronously
-            self._submit_ready_tasks()
-            
-            # Poll and free completed tasks synchronously
-            self._poll_tasks()
-            
+            with self._timer("submit"):
+                # Submit ready tasks synchronously
+                self._submit_ready_tasks()
+            with self._timer("poll"):
+                # Poll and free completed tasks synchronously
+                self._poll_tasks()
             # Report status periodically
             if time.time() > next_report_time:
-                status = self.get_status()
-                if self.parent:
-                    self._comm.send_message_to_parent(status)
-                    self.logger.info(status)
-                else:
-                    self.logger.info(status)
-                next_report_time = time.time() + self._config.report_interval
-            
+                with self._timer("report_status"):
+                    status = self.get_status()
+                    if self.parent:
+                        self._comm.send_message_to_parent(status)
+                        self.logger.info(status)
+                    else:
+                        self.logger.info(status)
+                    next_report_time = time.time() + self._config.report_interval
             # Check if all tasks are done
             if len(self._scheduler.remaining_tasks) == 0:
                 break
             
-            time.sleep(0.001)
+            with self._timer("sleep"):
+                time.sleep(0.01)
         
         self.logger.info(f"{self.node_id}: Done executing all the tasks")
 
-        all_results = self._results()
+        with self._timer("result_collection"):
+            all_results = self._results()
         
-        ##also send the final status
-        final_status = self.get_status()
-        success = self._comm.send_message_to_parent(final_status)
-        if success:
-            self.logger.info(f"{self.node_id}: Sent final status to parent")
-        else:
-            self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
-            fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-            final_status.to_file(fname)
+        with self._timer("final_status"):
+            ##also send the final status
+            final_status = self.get_status()
+            success = self._comm.send_message_to_parent(final_status)
+            if success:
+                self.logger.info(f"{self.node_id}: Sent final status to parent")
+            else:
+                self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
+                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                final_status.to_file(fname)
 
-        self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
-        while True and self.parent is not None:
-            msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
-            if msg is not None:
-                if msg.type == ActionType.STOP:
-                    self.logger.info(f"{self.node_id}: Received stop from parent")
-                    break
-            time.sleep(1.0)
+        with self._timer("wait_for_stop"):
+            self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
+            while True and self.parent is not None:
+                msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
+                if msg is not None:
+                    if msg.type == ActionType.STOP:
+                        self.logger.info(f"{self.node_id}: Received stop from parent")
+                        break
+                time.sleep(1.0)
         
         self._stop()
         return all_results
@@ -278,6 +308,34 @@ class Worker(Node):
         return new_result
         
     def _stop(self):
+        if self._config.profile:
+            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
+            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
+            with open(fname,"w") as f:
+                json.dump(self._comm._profile_info, f, indent=2)
+            
+            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_executor_profile.json")
+            with open(fname,"w") as f:
+                json.dump(self._executor._profile_info, f, indent=2)
+    
+        if self._config.profile == "timeline":
+            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
+            # Compute statistics for all timed events
+            stats = {}
+            for event_name, timings in self._event_timings.items():
+                if timings:  # Check if list is not empty
+                    stats[event_name] = {
+                        'mean': sum(timings) / len(timings),
+                        'sum': sum(timings),
+                        'std': (sum((x - sum(timings) / len(timings)) ** 2 for x in timings) / len(timings)) ** 0.5 if len(timings) > 1 else 0.0,
+                        'count': len(timings)
+                    }
+
+            # Write statistics to file
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_timeline_stats.json")
+            with open(fname, "w") as f:
+                json.dump(stats, f, indent=2)
+        
         self._comm.stop_async_recv()
         self._comm.clear_cache()
         self._comm.close()
