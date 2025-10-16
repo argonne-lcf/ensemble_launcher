@@ -59,7 +59,7 @@ def test_worker_in_mp():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     w = Worker(
-        "test-worker",LauncherConfig(executor_name="multiprocessing", comm_name="zmq", return_stdout = True),sys_info,nodes,tasks
+        "test-worker",LauncherConfig(executor_name="multiprocessing", comm_name="zmq", return_stdout = True, profile="basic"),sys_info,nodes,tasks
     )
     
     p = mp.Process(target=w.run)

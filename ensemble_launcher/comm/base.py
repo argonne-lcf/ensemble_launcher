@@ -6,6 +6,7 @@ import time
 from logging import Logger
 import threading
 import queue
+from datetime import datetime
 
 
 @dataclass
@@ -211,7 +212,8 @@ class Comm(ABC):
                  logger: Logger,
                  node_info: NodeInfo, 
                  parent_comm: "Comm"= None, 
-                 heartbeat_interval: int = 1):
+                 heartbeat_interval: int = 1,
+                 profile: bool = False):
         
         self.logger = logger
         self.node_info = node_info
@@ -220,13 +222,23 @@ class Comm(ABC):
         self.heartbeat_interval = heartbeat_interval
         self._parent_comm = parent_comm
         self._cache: Dict[str, MessageRoutingQueue] = {}
+        self._profile = profile
+        self._profile_info: Dict[str, Dict[str,List]] = {}
 
     def init_cache(self):
         for child_id in self.node_info.children_ids:
             self._cache[child_id] = MessageRoutingQueue()
         
+        if self._profile:
+            self._profile_lock = threading.RLock()
+            for child_id in self.node_info.children_ids:
+                self._profile_info[child_id] = {"latency":[], "datasize":[], "type":[]}
+        
         if self.node_info.parent_id:
             self._cache[self.node_info.parent_id] = MessageRoutingQueue()
+        
+        if self._profile:
+            self._profile_info[self.node_info.parent_id] = {"latency":[], "datasize":[], "type":[]}
 
     def update_node_info(self,node_info: NodeInfo):
         self.node_info = node_info
@@ -372,6 +384,11 @@ class Comm(ABC):
                     if msg is not None and self.node_info.parent_id is not None:
                         if isinstance(msg, Message):
                             self._cache[self.node_info.parent_id].put(msg)
+                            if self._profile:
+                                with self._profile_lock:
+                                    self._profile_info[self.node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
+                                    self._profile_info[self.node_info.parent_id]["datasize"].append(0.0)
+                                    self._profile_info[self.node_info.parent_id]["type"].append(type(msg).__name__)
                     else:
                         # Add small sleep when no messages to reduce CPU usage
                         time.sleep(0.01)
@@ -388,6 +405,11 @@ class Comm(ABC):
                         msg = self._recv_from_child(child_id, timeout=0.01)  # Shorter timeout
                         if msg is not None:
                             if isinstance(msg, Message):
+                                if self._profile:
+                                    with self._profile_lock:
+                                        self._profile_info[child_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
+                                        self._profile_info[child_id]["datasize"].append(0.0)
+                                        self._profile_info[child_id]["type"].append(type(msg).__name__)
                                 self._cache[child_id].put(msg)
                                 messages_received += 1
                     

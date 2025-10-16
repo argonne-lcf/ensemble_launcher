@@ -8,11 +8,13 @@ class MPComm(Comm):
                  logger: Logger, 
                  node_info: NodeInfo,
                  parent_comm: Optional["MPComm"] = None,  # Fixed: Should be Optional, not required
-                 heartbeat_interval: int = 1):
+                 heartbeat_interval: int = 1,
+                 profile:bool = False):
         super().__init__(logger,
                          node_info,
                          parent_comm=parent_comm,
-                         heartbeat_interval=heartbeat_interval)
+                         heartbeat_interval=heartbeat_interval,
+                         profile=profile)
         
         self._my_conn_to_child = {}
         self._child_conn_to_me = {}

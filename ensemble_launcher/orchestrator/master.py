@@ -12,9 +12,13 @@ import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Any
 import os
-import cloudpickle
 import time
 import numpy as np
+import cloudpickle
+import socket
+import json
+from contextlib import contextmanager
+from collections import defaultdict
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -49,6 +53,25 @@ class Master(Node):
         self._status: Status = None
 
         self.logger = None
+        self._event_timings: Dict[str, List[float]] = defaultdict(list)  # Store all timing measurements
+        if self._config.profile == "timeline":
+            self._timer = self._profile_timer
+        else:
+            self._timer = self._noop_timer
+    
+
+    @contextmanager
+    def _profile_timer(self,event_name: str):
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._event_timings[event_name].append(time.perf_counter() - start_time)
+
+
+    @contextmanager
+    def _noop_timer(self, event_name: str):
+        yield
 
     @property
     def nodes(self):
@@ -84,10 +107,16 @@ class Master(Node):
 
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
-            self._comm = MPComm(self.logger, self.info(),self.parent_comm if self.parent_comm else None)
+            self._comm = MPComm(self.logger, 
+                                self.info(),
+                                self.parent_comm if self.parent_comm else None, 
+                                profile=self._config.profile)
         elif self._config.comm_name == "zmq":
             ##sending parent address here because all zmq objects are not picklable
-            self._comm = ZMQComm(self.logger, self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None)
+            self._comm = ZMQComm(self.logger, 
+                                 self.info(),
+                                 parent_address=self.parent_comm.my_address if self.parent_comm else None,
+                                 profile=self._config.profile)
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
@@ -112,40 +141,58 @@ class Master(Node):
         # Step 1: Calculate cumulative sum of nodes required for tasks
         cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
         
-        # Step 2: Determine the max number of workers
-        nworkers_max = 0
-        while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
-            nworkers_max += 1
-        
-        # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
-        # Calculate nworkers using log2 interpolation
-        if self._config.nlevels > 1:
-            # Create log2 space arrays for interpolation
-            x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
-            y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
-            
-            # Interpolate in log2 space
-            log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
-            
-            # Convert back from log2 space
-            nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+        if self._config.nchildren is None:
+            # Step 2: Determine the max number of workers
+            nworkers_max = 0
+            while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
+                nworkers_max += 1
+
+            # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
+            # Calculate nworkers using log2 interpolation
+            if self._config.nlevels > 1:
+                # Create log2 space arrays for interpolation
+                x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
+                y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
+
+                # Interpolate in log2 space
+                log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
+
+                # Convert back from log2 space
+                nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+            else:
+                nworkers = nworkers_max
         else:
-            nworkers = nworkers_max
+            nworkers = self._config.nchildren
         
-        # Step 4: Initialize worker assignments for the first set of tasks
-        nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
-        if sum(nnodes) < len(nodes):
-            nremaining = len(nodes) - sum(nnodes)
-            for i in range(nremaining):
-                nnodes[i%nworkers] += 1
-        nnodes = list(accumulate(nnodes))
-        children_assignments = {
-            wid: {
-            "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
-            "task_ids": [task_id]        # List of task IDs assigned to the worker
+        if len(nodes) == 1:
+            children_assignments = {
+                wid: {
+                "nodes": nodes,
+                "task_ids": [task_id]        # List of task IDs assigned to the worker
+                }
+                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
             }
-            for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-        }
+        else:
+            if len(nodes) < nworkers:
+                self.logger.error(f"number of nodes < number of children")
+                raise RuntimeError
+            
+            # Step 4: Initialize worker assignments for the first set of tasks
+            nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
+            if sum(nnodes) < len(nodes):
+                nremaining = len(nodes) - sum(nnodes)
+                for i in range(nremaining):
+                    nnodes[i%nworkers] += 1
+            nnodes = list(accumulate(nnodes))
+            children_assignments = {
+                wid: {
+                "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
+                "task_ids": [task_id]        # List of task IDs assigned to the worker
+                }
+                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
+            }
+        
+        
 
         # Step 5: Assign remaining tasks to workers in a round-robin fashion
         for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
@@ -190,19 +237,19 @@ class Master(Node):
                     )
         return children
 
-    def _build_launch_cmd(self) -> str:
-        ##save the state of the child obj        
-        for child_name,child_obj in self.children.items():
-                with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
-                    cloudpickle.dump(child_obj,f)
+    # def _build_launch_cmd(self) -> str:
+    #     ##save the state of the child obj        
+    #     for child_name,child_obj in self.children.items():
+    #             with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
+    #                 cloudpickle.dump(child_obj,f)
 
-        if self.level + 1 == self._config.nlevels:
-            cmd = f"python -m ensemble_launcher.orchestrator.worker"+\
-                        f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-        else:   
-            cmd = f"python -m ensemble_launcher.orchestrator.master"+\
-                        f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-        return cmd
+    #     if self.level + 1 == self._config.nlevels:
+    #         cmd = f"python -m ensemble_launcher.orchestrator.worker"+\
+    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
+    #     else:   
+    #         cmd = f"python -m ensemble_launcher.orchestrator.master"+\
+    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
+    #     return cmd
     
 
     def _lazy_init(self) -> Dict[str, Node]:
@@ -213,7 +260,7 @@ class Master(Node):
         self._scheduler = WorkerScheduler(self.logger, cluster=LocalClusterResource(self.logger, self._nodes,self._sys_info))
 
         #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name)
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile})
 
         ##create children
         children = self._create_children()
@@ -237,27 +284,80 @@ class Master(Node):
         return children
 
     def run(self):
-        children = self._lazy_init()
+        with self._timer("init"):
+            children = self._lazy_init()
 
-        self._comm.async_recv() ###start the recv thread
-        ##heart beat sync with parent
-        if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
-            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        with self._timer("heartbeat_sync"):
+            self._comm.async_recv() ###start the recv thread
+            ##heart beat sync with parent
+            if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
         
-        for child_name,child_obj in children.items():
-            child_nodes = child_obj.nodes
-            req = JobResource(
-                    resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
-                )
-            env = os.environ.copy()
+        with self._timer("launch_children"):
+            if self._config.child_executor_name == "mpi":
+                ##launch all children in a single shot
+                child_obj_dict = {}
+                child_head_nodes = []
+                child_resources = []
+                for child_name,child_obj in children.items():
+                    child_head_nodes.append(child_obj.nodes[0])
+                    child_resources.append(NodeResourceCount(ncpus=1))
+                    child_obj_dict[child_head_nodes[-1]] = child_obj
+                req = JobResource(
+                            resources=child_resources, nodes=child_head_nodes
+                    )
+                env = os.environ.copy()
+                os.makedirs(os.path.join(os.getcwd(),".tmp"),exist_ok=True)
+                fname = os.path.join(os.getcwd(),".tmp",f"{self.node_id}_children_obj.pkl")
+                with open(fname,"wb") as f:
+                    cloudpickle.dump(child_obj_dict,f)
+                if isinstance(list(children.values())[0], Worker):
+                    self.logger.info(f"Launching worker using one shot mpiexec")
+                    self._children_exec_ids["all"] = self._executor.start(req, Worker.load,task_args=(fname,), env = env)
+                else:
+                    self.logger.info(f"Launching master using one shot mpiexec")
+                    self._children_exec_ids["all"] = self._executor.start(req, Master.load, task_args=(fname,), env = env)
+            else:
+                for child_idx, (child_name,child_obj) in enumerate(children.items()):
+                    child_nodes = child_obj.nodes
+                    req = JobResource(
+                            resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                        )
+                    env = os.environ.copy()
+                    
+                    env["EL_CHILDID"] = str(child_idx)
 
-            self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
+                    self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
 
-        if not self._comm.sync_heartbeat_with_children(timeout=30.0):
-            return self._get_child_exceptions() # Should return and report
-        else:
-            return self._results() #should return and report
+        with self._timer("sync_with_children"):
+            if not self._comm.sync_heartbeat_with_children(timeout=30.0):
+                return self._get_child_exceptions() # Should return and report
+            else:
+                return self._results() #should return and report
+    
+    @classmethod
+    def load(cls, fname: str):
+        """
+            This method loads the master object from a file. 
+            The file is pickled as Dict[hostname, Master]
+        """
+        with open(fname, "rb") as f:
+            obj_dict: Dict[str, 'Master'] = cloudpickle.load(f)
+        hostname = socket.gethostname()
+        master_obj = None
+        try:
+            master_obj = obj_dict[hostname]
+        except KeyError:
+            for key in obj_dict.keys():
+                if hostname in key:
+                    master_obj = obj_dict[key]
+                    break
+        if master_obj is None:
+            print(f"failed loading child from {fname}{list(obj_dict.keys())}")
+            return
+        master_obj.run()
+
 
     def _get_child_exceptions(self) -> Result:
         """
@@ -316,104 +416,149 @@ class Master(Node):
     def _results(self):
         next_report_time = time.time() + self._config.report_interval
         children_status = {}
-        results: Dict[str,Result] = {}
+        results: Dict[str, Result] = {}
+        
         while True:
-            done = set()
-            for child_id, exec_id in self._children_exec_ids.items():
-                if child_id in done:
-                    continue
-
-                ##look for results
-                result = self._comm.recv_message_from_child(Result,child_id, timeout=0.5)
-                if result is not None:
-                    self.logger.info(f"{self.node_id}: Received result from {child_id}.")
-                    ##final status of the child
-                    final_status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=5.0)
-                    if final_status is not None:
-                        children_status[child_id] = final_status
-                        self.logger.info(f"{self.node_id}: Received final status from {child_id}")
-                        self.logger.info(f"{self.node_id}: Final status {final_status}")
-                    ##
-                    results[child_id] = result
-                    done.add(child_id)
-                    self._comm.send_message_to_child(child_id,Action(sender=self.node_id, type=ActionType.STOP))
-                ##
-                if self._executor.done(exec_id):
-                    done.add(child_id)
+            with self._timer("check_children"):
+                done = set()
                 
+                # Special handling for MPI executor - check once before child loop
+                if self._config.child_executor_name == "mpi":
+                    if self._executor.done(self._children_exec_ids["all"]):
+                        for child_id in self.children:
+                            done.add(child_id)
+            
+                for child_id in self.children:
+                    if child_id in done:
+                        continue
+
+                    ##look for results
+                    result = self._comm.recv_message_from_child(Result, child_id)
+                    if result is not None:
+                        self.logger.info(f"{self.node_id}: Received result from {child_id}.")
+                        ##final status of the child
+                        final_status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=5.0)
+                        if final_status is not None:
+                            children_status[child_id] = final_status
+                            self.logger.info(f"{self.node_id}: Received final status from {child_id}")
+                            self.logger.info(f"{self.node_id}: Final status {final_status}")
+                        ##
+                        results[child_id] = result
+                        done.add(child_id)
+                        self._comm.send_message_to_child(child_id, Action(sender=self.node_id, type=ActionType.STOP))
+                    
+                    # For non-MPI executors, check individual exec_ids
+                    if self._config.child_executor_name != "mpi":
+                        if child_id not in self._children_exec_ids:
+                            self.logger.error(f"{child_id} not in exec_id map!!")
+                            raise RuntimeError
+                        else:
+                            exec_id = self._children_exec_ids[child_id]
+                            if self._executor.done(exec_id):
+                                done.add(child_id)
+            
             ##send status to parent
             if time.time() > next_report_time:
-                ##receive status updates
-                status = self._comm.recv_message_from_child(Status,child_id=child_id,timeout=0.1)
-                if status is not None:
-                    children_status[child_id] = status
+                with self._timer("report_status"):
+                    ##receive status updates from ALL children
+                    for child_id in self.children:
+                        status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.1)
+                        if status is not None:
+                            children_status[child_id] = status
 
-                self._status = sum(children_status.values(), Status())
-                if self.parent:
-                    self._comm.send_message_to_parent(self._status)
-                else:
-                    if isinstance(self._status,Status):
-                        self.logger.info(f"{self.node_id}: Status: {self._status}")
-                next_report_time = time.time() + self._config.report_interval
+                    self._status = sum(children_status.values(), Status())
+                    if self.parent:
+                        self._comm.send_message_to_parent(self._status)
+                    else:
+                        if isinstance(self._status, Status):
+                            self.logger.info(f"{self.node_id}: Status: {self._status}")
+                    next_report_time = time.time() + self._config.report_interval
 
+            time.sleep(0.001)
             if len(done) == len(self.children):
                 self.logger.info(f"{self.node_id}: All children are done")
                 break
-        ##Create a new result from all the results
-        data: List[Result] = []
-        for child_id, result in results.items():
-            if isinstance(result.data,list):
-                data.extend(result.data)
-            elif isinstance(result.data, Result):
-                data.append(result.data)
-            else:
-                raise ValueError(f"{self.node_id}: Received unknown type result from child {child_id}")
+        with self._timer("collect_results"):
+            ##Create a new result from all the results
+            data: List[Result] = []
+            for child_id, result in results.items():
+                if isinstance(result.data,list):
+                    data.extend(result.data)
+                elif isinstance(result.data, Result):
+                    data.append(result.data)
+                else:
+                    raise ValueError(f"{self.node_id}: Received unknown type result from child {child_id}")
+                    
+            new_result = Result(sender = self.node_id, data = data)
+
+        with self._timer("report_to_parent"):
+            #report it to parent
+            if self.parent:
+                success = self._comm.send_message_to_parent(new_result)
+
+                if not success:
+                    self.logger.warning(f"{self.node_id}: Failed to send results to parent")
+                else:
+                    self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
                 
-        new_result = Result(sender = self.node_id, data = data)
-
-        #report it to parent
-        if self.parent:
-            success = self._comm.send_message_to_parent(new_result)
-
-            if not success:
-                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
-            else:
-                self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
-            
-            ##also send the final_status
-            self._status = sum(children_status.values(), Status())
-            success = self._comm.send_message_to_parent(self._status)
-            if not success:
-                self.logger.warning(f"{self.node_id}: Failed to send status to parent")
-            else:
-                self.logger.info(f"{self.node_id}: Succesfully sent status to parent")
-                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                self._status.to_file(fname)
-        else:
-            try:
+                ##also send the final_status
                 self._status = sum(children_status.values(), Status())
-                #write to a json file
-                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                self._status.to_file(fname)
-                self.logger.info(f"{self.node_id}: Successfully reported final status")
-            except Exception as e:
-                self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
+                success = self._comm.send_message_to_parent(self._status)
+                if not success:
+                    self.logger.warning(f"{self.node_id}: Failed to send status to parent")
+                else:
+                    self.logger.info(f"{self.node_id}: Succesfully sent status to parent")
+                    fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                    self._status.to_file(fname)
+            else:
+                try:
+                    self._status = sum(children_status.values(), Status())
+                    #write to a json file
+                    fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                    self._status.to_file(fname)
+                    self.logger.info(f"{self.node_id}: Successfully reported final status")
+                except Exception as e:
+                    self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
         
-        #wait for my parent to instruct me
-        while True and self.parent is not None:
-            msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
-            if msg is not None:
-                if msg.type == ActionType.STOP:
-                    self.logger.info(f"{self.node_id}: Received stop from parent")
-                    break
-            time.sleep(1.0)
+        with self._timer("wait_for_stop"):
+            #wait for my parent to instruct me
+            while True and self.parent is not None:
+                msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
+                if msg is not None:
+                    if msg.type == ActionType.STOP:
+                        self.logger.info(f"{self.node_id}: Received stop from parent")
+                        break
+                time.sleep(1.0)
+        
         self.stop()
-
         return new_result
 
     def stop(self):
+        if self._config.profile:
+            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
+            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
+            with open(fname,"w") as f:
+                json.dump(self._comm._profile_info, f, indent=2)
+        
+        if self._config.profile == "timeline":
+            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
+            # Compute statistics for all timed events
+            stats = {}
+            for event_name, timings in self._event_timings.items():
+                if timings:  # Check if list is not empty
+                    stats[event_name] = {
+                        'mean': sum(timings) / len(timings),
+                        'sum': sum(timings),
+                        'std': (sum((x - sum(timings) / len(timings)) ** 2 for x in timings) / len(timings)) ** 0.5 if len(timings) > 1 else 0.0,
+                        'count': len(timings)
+                    }
+
+            # Write statistics to file
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_timeline_stats.json")
+            with open(fname, "w") as f:
+                json.dump(stats, f, indent=2)
+            
         self._comm.stop_async_recv()
         self._comm.clear_cache()
         self._comm.close()        
         self._executor.shutdown()
-        

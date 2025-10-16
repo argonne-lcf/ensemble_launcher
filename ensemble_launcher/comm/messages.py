@@ -62,7 +62,7 @@ class Result(Message):
     data: Any = None
     task_id: str = None
     success: bool = True
-    error_message: Optional[str] = None
+    exception: Optional[str] = None
 
 @dataclass
 class TaskUpdate(Message):
@@ -76,3 +76,7 @@ class HeartBeat(Message):
 @dataclass
 class Action(Message):
     type: Optional[ActionType] = None
+
+@dataclass
+class TaskRequest(Message):
+    ntasks: int = 0
