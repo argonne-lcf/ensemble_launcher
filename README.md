@@ -77,8 +77,8 @@ Create a JSON configuration file describing your task ensemble:
 {
     "ensembles": {
         "example_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 1,
+            "nnodes": 1,
+            "ppn": 1,
             "cmd_template": "./exe -a {arg1} -b {arg2}",
             "arg1": "linspace(0, 10, 5)",
             "arg2": "linspace(0, 1, 5)",
@@ -209,8 +209,8 @@ Pin tasks to specific CPUs and GPUs for optimal performance:
 {
     "ensembles": {
         "pinned_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 4,
+            "nnodes": 1,
+            "ppn": 4,
             "cmd_template": "./gpu_code",
             "cpu_affinity": "0,1,2,3",
             "gpu_affinity": "0,1,2,3",
@@ -269,8 +269,8 @@ Execute binaries and shell commands with files as inputs:
 {
     "ensembles": {
         "shell_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 1,
+            "nnodes": 1,
+            "ppn": 1,
             "cmd_template": "./simulation --config {config_file}",
             "config_file": ["config1.json", "config2.json", "config3.json"],
             "relation": "one-to-one"
