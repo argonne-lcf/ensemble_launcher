@@ -156,7 +156,7 @@ from ensemble_launcher import EnsembleLauncher
 
 el = EnsembleLauncher(
     ensemble_file="config.json",
-    Nodes=["node-001", "node-002"],  # Optional: auto-detects from PBS_NODEFILE
+    Nodes=["node-001", "node-002"],  # Optional: auto-detects from PBS_NODEFILE, works only on PBS
     pin_resources=True,              # Enable CPU/GPU pinning
     return_stdout=True               # Capture task output
 )
@@ -219,7 +219,16 @@ Pin tasks to specific CPUs and GPUs for optimal performance:
     }
 }
 ```
+Resources are pinned using the `gpu_selector` option in the LauncherConfig (defaults to "ZE_AFFINITY_MASK" for Intel GPUs). The specific string the `gpu_selector` is set to depends on the SystemConfig. For example, setting:
 
+```python
+system_config = SystemConfig(
+    name="my_cluster",
+    cpus=list(range(104)),          # Specific CPU IDs (optional)
+    gpus=['0','0','1','1','2','3']  # Specific GPU IDs (optional)
+)
+```
+will overload the GPU 0 and 1 and the Scheduler assumes that node has a 6 GPUs instead of 4 GPUs.
 ---
 
 ## Execution Modes
@@ -251,7 +260,7 @@ el = EnsembleLauncher(
 )
 results = el.run()
 ```
-
+Note that, internally, the dictionary definition of the ensemble is converted to a collection of Task()s. 
 ### Shell Commands
 
 Execute binaries and shell commands with files as inputs:
@@ -268,6 +277,22 @@ Execute binaries and shell commands with files as inputs:
         }
     }
 }
+```
+which is launched using the following script. 
+
+```python
+```python
+from ensemble_launcher import EnsembleLauncher
+
+if __name__ == '__main__':
+    # Auto-configure based on system and workload
+    el = EnsembleLauncher("config.json")
+    results = el.run()
+    
+    # Write results to file
+    from ensemble_launcher import write_results_to_json
+    write_results_to_json(results, "results.json")
+```
 ```
 
 ---
@@ -326,11 +351,12 @@ Enable logging for detailed execution traces:
 launcher_config = LauncherConfig(
     worker_logs=True,
     master_logs=True,
-    report_interval=5.0  # Report status every 5 seconds
+    report_interval=5.0,  # Report status every 5 seconds
+    profile = "basic" or "timeline" #basic ouputs the communication latencies and task runtime. timeline outputs the mean, std, sum, and counts of various events in the orchestrator
 )
 ```
 
-Logs are written to `logs/master-*.log` and `logs/worker-*.log`.
+Logs are written to `logs/master-*.log` and `logs/worker-*.log`. Profiles are written to `profiles/*`
 
 ---
 
@@ -383,7 +409,10 @@ LauncherConfig(
     nlevels: int = 1,
     return_stdout: bool = False,
     worker_logs: bool = False,
-    master_logs: bool = False
+    master_logs: bool = False,
+    nchildren: Optional[int] = None #Forces number of children at every level
+    profile: Optional[Literal["basic","timeline"]] = None
+    gpu_selector: str = "ZE_AFFINITY_MASK"
 )
 ```
 

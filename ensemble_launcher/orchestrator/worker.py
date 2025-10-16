@@ -170,7 +170,9 @@ class Worker(Node):
         self._scheduler = TaskScheduler(self.logger, self._tasks,cluster=LocalClusterResource(self.logger, self._nodes, self._sys_info))
 
         ##lazy executor creation
-        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,"profile":self._config.profile})
+        self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,
+                                                                                                             "profile":self._config.profile,
+                                                                                                             "gpu_selector":self._config.gpu_selector})
 
         ##Lazy comm creation
         self._create_comm()

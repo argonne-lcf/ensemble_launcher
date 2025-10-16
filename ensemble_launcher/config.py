@@ -24,6 +24,7 @@ class LauncherConfig(BaseModel):
     master_logs: bool = False
     nchildren: Optional[int] = None ##Setting this will fix the number of children at each level
     profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
+    gpu_selector: str = "ZE_AFFINITY_MASK"
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""
