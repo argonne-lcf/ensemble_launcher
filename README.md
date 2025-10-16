@@ -1,427 +1,488 @@
-# ensemble_launcher
-A lightweight tool for launching and managing ensembles
+# Ensemble Launcher
+
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
+A lightweight, scalable tool for launching and orchestrating task ensembles across HPC clusters with intelligent resource management and hierarchical execution.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+  - [Basic Configuration](#basic-configuration)
+  - [Advanced Configuration](#advanced-configuration)
+  - [Resource Pinning](#resource-pinning)
+- [Execution Modes](#execution-modes)
+- [Examples](#examples)
+- [Performance Tuning](#performance-tuning)
+- [API Reference](#api-reference)
+- [Testing](#testing)
+- [Contributing](#contributing)
+- [Support](#support)
+
+---
+
+## Features
+
+- **Flexible Execution**: Support for serial, MPI, and mixed workloads
+- **Intelligent Scheduling**: Automatic resource allocation with customizable policies
+- **Hierarchical Architecture**: Efficient master-worker patterns for large-scale deployments (1-2048+ nodes)
+- **Multiple Communication Backends**: Choose between Python multiprocessing, [ZMQ](https://zeromq.org/), or [DragonHPC](https://dragonhpc.org/portal/index.html) for performance at scale
+- **Resource Pinning**: Fine-grained CPU and GPU affinity control
+- **Real-time Monitoring**: Track task execution with configurable status updates
+- **Fault Tolerance**: Graceful handling of task failures with detailed error reporting
+- **Python & Shell Support**: Execute Python callables or shell commands seamlessly
+
+---
 
 ## Installation
 
-To install `ensemble_launcher`, clone the repository and install the required dependencies:
+### Requirements
+
+- Python 3.6+
+- numpy
+- matplotlib
+- scienceplots
+- pytest
+- cloudpickle
+- pydantic
+- pyzmq
+
+### Optional Dependencies
+
+- MPI implementation (for distributed execution via `mpirun` or `mpiexec`)
+- [DragonHPC](https://github.com/DragonHPC/dragon) (for extreme-scale deployment on HPC systems)
+
+### Quick Install
 
 ```bash
-git clone https://github.com/your-repo/ensemble_launcher.git
+git clone https://github.com/argonne-lcf/ensemble_launcher.git
 cd ensemble_launcher
-python3 -m pip install -e ./
+python3 -m pip install .
 ```
 
-## Usage
+---
 
-1. **Create a Configuration File**: Define your ensembles and tasks in a JSON file. Below is an example configuration file (`tests/simple_test/config.json`) and an explanation of its options:
+## Quick Start
+
+### 1. Define Your Ensemble
+
+Create a JSON configuration file describing your task ensemble:
 
 ```json
 {
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "local",
-        "ncores_per_nodes": 1,
-        "ngpus_per_node": 1
-    },
     "ensembles": {
         "example_ensemble": {
             "num_nodes": 1,
             "num_processes_per_node": 1,
-            "num_gpus_per_process": 1,
-            "launcher": "mpi",
-            "launcher_options": {
-                "np": 1,
-                "ppn": 1,
-                "cpu-bind": "depth",
-                "depth": 1
-            },
-            "relation": "one-to-one",
             "cmd_template": "./exe -a {arg1} -b {arg2}",
             "arg1": "linspace(0, 10, 5)",
             "arg2": "linspace(0, 1, 5)",
-            "run_dir": "./run_dir",
-            "env":{
-                "var":"value"
-            }
+            "relation": "one-to-one"
         }
     }
 }
 ```
 
-### Explanation of Configuration Options:
+The configuration specifies an ensemble with:
 
-- **poll_interval**: Time interval (in seconds) to check the status of running tasks.
-- **update_interval**: Time interval (in seconds) to update the ensemble configuration. Set to `null` to disable updates.
-- **sys_info**: System-specific information:
-  - **name**: Name of the system (e.g., `local`, `aurora`).
-  - **ncores_per_nodes**: Number of CPU cores available per node.
-  - **ngpus_per_node**: Number of GPUs available per node.
-- **ensembles**: A dictionary defining the ensembles to be executed:
-  - **example_ensemble**: Name of the ensemble.
-    - **num_nodes**: Number of nodes required per task in the ensemble. Can be varied for each task
-    - **num_processes_per_node**: Number of processes per node used per task.
-    - **num_gpus_per_process**: Number of GPUs allocated per process per task.
-    - **launcher**: Task launcher type (`mpi` or `bash`).
-    - **launcher_options**: Additional options for the launcher:
-      - **cpu-bind**: CPU binding strategy (e.g., `depth`, `list`).
-      - **depth**: Depth of CPU binding.
-    - **relation**: Relationship between task parameters (`one-to-one` or `many-to-many`).
-    - **pre_launch_cmd**: A linux cmd to be executed before launching running the below. (eg. cp -r * ./run_dir)
-    - **cmd_template**: Template for the command to execute, with placeholders for task-specific arguments. Variable arguments should be surrounded by `{}`.
-    - **arg1**, **arg2**: Task-specific arguments, which can be defined using functions like `linspace`.
-    - **run_dir**: Directory where task outputs and logs will be stored.
-    - **env**: A dictionary of environment variables to set for the tasks:
-      - **key**: Name of the environment variable.
-      - **value**: Value of the environment variable. Can be a static value or dynamically generated.
+- Tasks running on a single node with a single process per node
+- Tasks executed with `./exe -a {arg1} -b {arg2}` taking two input arguments
+- The values of the two input arguments are defined as 5 linearly spaced numbers between 0-10 and 0-1 for `arg1` and `arg2`, respectively.
+- The raletionship between the values of the two arguments is set to `one-to-one`, meaning the ensemble consists of 5 tasks, one for each pair of values. 
 
-2. **Write a launcher script**: Write a simple launcher script. An example is given below
+**Supported Relations:**
+- `one-to-one`: Pair parameters element-wise (N tasks)
+- `many-to-many`: Cartesian product of parameters (N×M tasks)
+
+### 2. Create a Launcher Script
+
 ```python
-import time
-from ensemble_launcher import ensemble_launcher
-
-"""
-Instead of manual generation from step 1, config file can also be generated on the fly. For example,
-
-import json
-ntasks=1000
-config = {
-            "poll_interval":1,
-            "sys_info":{
-                "name":"aurora",
-                "ncores_per_node":104,
-                "ngpus_per_node":12
-            },
-            "ensembles":{
-                        "inference":{
-                                "num_nodes":1,
-                                "num_processes_per_node":1,
-                                "num_gpus_per_process":1,
-                                "launcher":"mpi",
-                                "relation":"one-to-one",
-                                "cmd_template":"<args> {opts}",
-                                "opts":list(range(ntasks)),
-                                "run_dir":[f"./run_dir/task_{i}" for i in range(ntasks)]
-                            }
-                    }
-        }
-fname = "./config.json"
-with open(fname,"w") as f:
-    json.dump(config, f, indent=4)
-"""
-
+from ensemble_launcher import EnsembleLauncher
 
 if __name__ == '__main__':
-    el = ensemble_launcher("config.json")
-    start_time = time.perf_counter()
-    total_poll_time = el.run_tasks()
-    end_time = time.perf_counter()
-    total_run_time = end_time - start_time
-    print(f"{total_run_time=}")
+    # Auto-configure based on system and workload
+    el = EnsembleLauncher("config.json")
+    results = el.run()
+    
+    # Write results to file
+    from ensemble_launcher import write_results_to_json
+    write_results_to_json(results, "results.json")
 ```
 
-3. **Run the launcher script**: To launch the script
+### 3. Execute
+
 ```bash
-python3 launcher_ensemble_launcher.py
+python3 launcher_script.py
 ```
-4. **Monitor Progress**: Check the `outputs` directory for logs and status updates.
+
+---
+
+## Architecture
+
+![Ensemble Launcher Architecture](assets/el.png)
+
+### Key Components
+
+- **EnsembleLauncher**: Main API entry point with auto-configuration
+- **Global/Local Master**: Orchestrates workers, handles task distribution and aggregation
+- **Worker**: Executes tasks using configured executor
+- **Scheduler**: Allocates resources across cluster nodes with intelligent policies
+- **Executors**: Backend task launching engines (Python multiprocessing, MPI, DragonHPC)
+- **Communication Layer**: ZMQ or Python multiprocessing pipes
+
+### Hierarchical Execution Model
+
+The master-worker architecture scales from single nodes to thousands of nodes:
+- **Single Node** (nlevels=0): Direct execution without master overhead
+- **Small Scale** (nlevels=1): Global master coordinates workers directly
+- **Large Scale** (nlevels=2): Global master → Local masters → Workers for thousands of tasks
+- **Extreme Scale** (nlevels=3): Deep hierarchy for supercomputer-scale deployments
+
+---
+
+## Configuration
+
+### Basic Configuration
+
+The launcher automatically configures itself based on your workload and system:
+
+```python
+from ensemble_launcher import EnsembleLauncher
+
+el = EnsembleLauncher(
+    ensemble_file="config.json",
+    Nodes=["node-001", "node-002"],  # Optional: auto-detects from PBS_NODEFILE, works only on PBS
+    pin_resources=True,              # Enable CPU/GPU pinning
+    return_stdout=True               # Capture task output
+)
+```
+
+### Advanced Configuration
+
+For fine-grained control, explicitly configure system and launcher settings:
+
+```python
+from ensemble_launcher import EnsembleLauncher
+from ensemble_launcher.config import SystemConfig, LauncherConfig
+
+# Define system resources
+system_config = SystemConfig(
+    name="my_cluster",
+    ncpus=104,                      # CPUs per node
+    ngpus=12,                       # GPUs per node
+    cpus=list(range(104)),          # Specific CPU IDs (optional)
+    gpus=list(range(12))            # Specific GPU IDs (optional)
+)
+
+# Configure launcher behavior
+launcher_config = LauncherConfig(
+    child_executor_name="mpi",      # multiprocessing, mpi, dragon
+    task_executor_name="mpi",       # Executor for tasks
+    comm_name="zmq",                # multiprocessing, zmq, dragon
+    nlevels=2,                      # Hierarchy depth (auto-computed if None)
+    report_interval=10.0,           # Status update frequency (seconds)
+    return_stdout=True,             # Capture stdout
+    worker_logs=True,               # Enable worker logging
+    master_logs=True                # Enable master logging
+)
+
+el = EnsembleLauncher(
+    ensemble_file="config.json",
+    system_config=system_config,
+    launcher_config=launcher_config,
+    pin_resources=True
+)
+
+results = el.run()
+```
+
+### Resource Pinning
+
+Pin tasks to specific CPUs and GPUs for optimal performance:
+
+```json
+{
+    "ensembles": {
+        "pinned_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 4,
+            "cmd_template": "./gpu_code",
+            "cpu_affinity": "0,1,2,3",
+            "gpu_affinity": "0,1,2,3",
+            "ngpus_per_process": 1
+        }
+    }
+}
+```
+Resources are pinned using the `gpu_selector` option in the LauncherConfig (defaults to "ZE_AFFINITY_MASK" for Intel GPUs). The specific string the `gpu_selector` is set to depends on the SystemConfig. For example, setting:
+
+```python
+system_config = SystemConfig(
+    name="my_cluster",
+    cpus=list(range(104)),          # Specific CPU IDs (optional)
+    gpus=['0','0','1','1','2','3']  # Specific GPU IDs (optional)
+)
+```
+will overload the GPU 0 and 1 and the Scheduler assumes that node has a 6 GPUs instead of 4 GPUs.
+---
+
+## Execution Modes
+
+### Python Callables
+
+Execute Python functions directly:
+
+```python
+def my_simulation(param_a, param_b):
+    # Your simulation code
+    return result
+
+from ensemble_launcher.ensemble import Task
+
+tasks = {
+    "task-1": Task(
+        task_id="task-1",
+        nnodes=1,
+        ppn=1,
+        executable=my_simulation,
+        args=(10, 0.5)
+    )
+}
+
+el = EnsembleLauncher(
+    ensemble_file=tasks,  # Pass dict directly
+    return_stdout=True
+)
+results = el.run()
+```
+Note that, internally, the dictionary definition of the ensemble is converted to a collection of Task()s. 
+### Shell Commands
+
+Execute binaries and shell commands with files as inputs:
+
+```json
+{
+    "ensembles": {
+        "shell_ensemble": {
+            "num_nodes": 1,
+            "num_processes_per_node": 1,
+            "cmd_template": "./simulation --config {config_file}",
+            "config_file": ["config1.json", "config2.json", "config3.json"],
+            "relation": "one-to-one"
+        }
+    }
+}
+```
+which is launched using the following script. 
+
+```python
+```python
+from ensemble_launcher import EnsembleLauncher
+
+if __name__ == '__main__':
+    # Auto-configure based on system and workload
+    el = EnsembleLauncher("config.json")
+    results = el.run()
+    
+    # Write results to file
+    from ensemble_launcher import write_results_to_json
+    write_results_to_json(results, "results.json")
+```
+```
+
+---
 
 ## Examples
 
-Following are example .json config files for various mpiexec commands used at ALCF
+See the [`examples`](examples/) directory for complete workflow samples:
 
-Example 1: 2 nodes, 4 ranks/node, 1 thread/rank
+### C++ Examples
+- [`examples/c++/workflow_pattern1.py`](examples/c++/workflow_pattern1.py) - Basic parallel execution
+- [`examples/c++/workflow_pattern2.py`](examples/c++/workflow_pattern2.py) - Parameter sweeps
+- [`examples/c++/workflow_pattern3.py`](examples/c++/workflow_pattern3.py) - Complex dependencies
+
+<!-- ### Python Examples
+- [`examples/python/mpi_example.py`](examples/python/mpi_example.py) - MPI-based execution
+- [`examples/python/serial_example.py`](examples/python/serial_example.py) - Serial task execution -->
+
+---
+
+## Performance Tuning
+
+### Communication Backend Selection
+
+| Backend          | Best For                    | Nodes    |
+|------------------|-----------------------------|----------|
+| `multiprocessing`| Single node, small ensembles| 1        |
+| `zmq`            | Multi-node, large scale     | 2-2048+  |
+
+### Hierarchy Levels
+
+The launcher automatically determines hierarchy depth based on node count, but you can override it with:
+
+```python
+launcher_config = LauncherConfig(
+    nlevels=0   # Direct worker execution (single node)
+    nlevels=1   # Master + Workers (up to ~64 nodes)
+    nlevels=2   # Master + Sub-masters + Workers (64-2048 nodes)
+    nlevels=3   # Deep hierarchy (2048+ nodes)
+)
+```
+
+**Auto-computed hierarchy:**
+- 1 node: `nlevels=0` (worker only)
+- 2-64 nodes: `nlevels=1` (master + workers)
+- 65-2048 nodes: `nlevels=2` (master + sub-masters + workers)
+- 2048+ nodes: `nlevels=3` (deep hierarchy)
+
+### Monitoring and Debugging
+
+Enable logging for detailed execution traces:
+
+```python
+# import logging
+# logging.basicConfig(level=logging.INFO)
+
+launcher_config = LauncherConfig(
+    worker_logs=True,
+    master_logs=True,
+    report_interval=5.0,  # Report status every 5 seconds
+    profile = "basic" or "timeline" #basic ouputs the communication latencies and task runtime. timeline outputs the mean, std, sum, and counts of various events in the orchestrator
+)
+```
+
+Logs are written to `logs/master-*.log` and `logs/worker-*.log`. Profiles are written to `profiles/*`
+
+---
+
+## API Reference
+
+### EnsembleLauncher
+
+```python
+EnsembleLauncher(
+    ensemble_file: Union[str, Dict[str, Dict]],
+    system_config: SystemConfig = SystemConfig(name="local"),
+    launcher_config: Optional[LauncherConfig] = None,
+    Nodes: Optional[List[str]] = None,
+    pin_resources: bool = True,
+    return_stdout: bool = False
+)
+```
+
+**Parameters:**
+- `ensemble_file`: Path to JSON config or dict of task definitions
+- `system_config`: System resource configuration
+- `launcher_config`: Launcher behavior configuration (auto-configured if None)
+- `Nodes`: List of compute nodes (auto-detected if None)
+- `pin_resources`: Enable CPU/GPU affinity
+- `return_stdout`: Capture task stdout
+
+**Methods:**
+- `run()`: Execute ensemble and return results
+
+### SystemConfig
+
+```python
+SystemConfig(
+    name: str,
+    ncpus: int = mp.cpu_count(),
+    ngpus: int = 0,
+    cpus: List[int] = [],
+    gpus: List[Union[str, int]] = []
+)
+```
+
+### LauncherConfig
+
+```python
+LauncherConfig(
+    child_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing",
+    task_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing",
+    comm_name: Literal["multiprocessing","zmq","dragon"] = "multiprocessing",
+    report_interval: float = 10.0,
+    nlevels: int = 1,
+    return_stdout: bool = False,
+    worker_logs: bool = False,
+    master_logs: bool = False,
+    nchildren: Optional[int] = None #Forces number of children at every level
+    profile: Optional[Literal["basic","timeline"]] = None
+    gpu_selector: str = "ZE_AFFINITY_MASK"
+)
+```
+
+---
+
+## Testing
+
+Run the test suite:
 
 ```bash
-  mpiexec -n 8 -ppn 4 --depth 1 --cpu-bind=depth <app> <app_args>
+pytest tests/
 ```
 
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 2,
-            "num_processes_per_node": 4,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "depth",
-                "depth": 1
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir",
-        }
-    }
-}
-```
-Example 2: 2 nodes, 2 ranks/node, 2 thread/rank
-```bash
-  OMP_PLACES=threads OMP_NUM_THREADS=2 mpiexec -n 4 -ppn 2 --depth 2 --cpu-bind=depth <app> <app_args>
-```
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 2,
-            "num_processes_per_node": 2,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "depth",
-                "depth": 2
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir",
-            "env":{
-              "OMP_PLACES": "threads",
-              "OMP_NUM_THREADS": 2,
-            }
-        }
-    }
-}
-```
-Example 3: 2 nodes, 2 ranks/node, 1 thread/rank, compact fashion
-```bash
-  mpiexec -n 4 -ppn 2 --cpu-bind=list:0:104 <app> <app_args>
-```
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 2,
-            "num_processes_per_node": 2,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "list:0:104"
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir"
-        }
-    }
-}
-```
-
-Example 4: 1 node, 12 ranks/node
+Run specific tests:
 
 ```bash
-  mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 <app> <app_args>
+pytest tests/test_el.py          # End-to-end tests
+pytest tests/test_executor.py    # Executor tests
+pytest tests/test_master.py      # Master/Worker tests
 ```
 
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 12,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir"
-        }
-    }
-}
-```
-
-Example 5: 1 node, 12 ranks/node, 1 thread/rank, 1 rank/GPU tile
-
-```bash
-mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 gpu_tile_compact.sh <app> <app_args>
-```
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 12,
-            "num_gpus_per_process":1,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir",
-            "env":{
-              "ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"
-            }
-        }
-    }
-}
-```
-
-Example 6: 1 node, 6 ranks/node, 1 thread/rank, 1 rank/GPU device
-
-```bash
-mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 gpu_dev_compact.sh <app> <app_args>
-```
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 6,
-            "num_gpus_per_process":2,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir",
-            "env":{
-              "ZE_FLAT_DEVICE_HIERARCHY":"COMPOSITE"
-            }
-        }
-    }
-}
-```
-
-Example 7: 1 node, 12 ranks/node, 1 thread/rank, and any other MPI options
-
-```bash
-mpiexec -n 12 -ppn 12 --cpu-bind=list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99 <other mpi options> <app> <app_args>
-```
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": 1,
-            "num_processes_per_node": 12,
-            "launcher": "mpi",
-            "launcher_options": {
-                "cpu-bind": "list:0-7:8-15:16-23:24-31:32-39:40-47:52-59:60-67:68-75:76-83:84-91:92-99"
-            },
-            "relation": "one-to-one",
-            "cmd_template": "<any other mpi options> <app> <constant args> <variable args>",
-            "<variable args>": [1,2,....],
-            "run_dir": "./run_dir",
-        }
-    }
-}
-```
-
-Examples of other general ensembles
-
-Example 1: An ensemble with N tasks. Each task usese 1 node, 12 ranks/node, and they have identical args
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": [1,1,1,1,1........N],
-            "num_processes_per_node": 12,
-            "launcher": "mpi",
-            "relation": "one-to-one",
-            "cmd_template": "<any other mpi options> <app> <constant args>",
-            "run_dir": "./run_dir",
-        }
-    }
-}
-```
-
-Example 2: A scaling test using 1-128 nodes and 104 ranks/node
-
-```json
-{
-    "poll_interval": 1,
-    "update_interval": null,
-    "sys_info": {
-        "name": "aurora",
-        "ncores_per_nodes": 104,
-        "ngpus_per_node": 12
-    },
-    "ensembles": {
-        "example_ensemble": {
-            "num_nodes": [1,2,4,8,16,32,64,128],
-            "num_processes_per_node": 104,
-            "launcher": "mpi",
-            "relation": "one-to-one",
-            "cmd_template": "<app> <constant args> <variable args>",
-            "<variable_args>":[1,...]
-            "run_dir": ["./run_dir_1","./run_dir_2","./run_dir_4","./run_dir_8","./run_dir_16","./run_dir_32","./run_dir_64","./run_dir_128"],
-        }
-    }
-}
-```
+---
 
 ## Contributing
 
-Contributions are welcome! Please fork the repository, make your changes, and submit a pull request.
+We welcome contributions! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Development Setup
+
+```bash
+git clone https://github.com/argonne-lcf/ensemble_launcher.git
+cd ensemble_launcher
+python3 -m pip install -e ".[dev]"
+pytest tests/
+```
+
+---
 
 ## Support
 
-If you encounter any issues, feel free to open an issue on the GitHub repository or contact the maintainers.
+- **Issues**: [GitHub Issues](https://github.com/argonne-lcf/ensemble_launcher/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/argonne-lcf/ensemble_launcher/discussions)
+- **Documentation**: See [`examples`](examples/) directory
+
+---
+
+## Acknowledgments
+
+This work was supported by the U.S. Department of Energy, Office of Science, under contract DE-AC02-06CH11357.
+
+---
+
+## Citation
+
+If you use Ensemble Launcher in your research, please cite:
+
+```bibtex
+@software{ensemble_launcher,
+  title = {Ensemble Launcher: Scalable Task Orchestration for HPC},
+  author = {Argonne National Laboratory},
+  year = {2025},
+  url = {https://github.com/argonne-lcf/ensemble_launcher}
+}
+```
 
 
 

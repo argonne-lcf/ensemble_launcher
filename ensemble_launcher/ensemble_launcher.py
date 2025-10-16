@@ -1,270 +1,130 @@
-import json
-import os, stat
-import socket
-import time
-import threading
-import multiprocessing as mp
-try:
-    import dragon
-    DRAGON_AVAILABLE = True
-except ImportError:
-    DRAGON_AVAILABLE = False
-import numpy as np
+import json, sys
+from typing import Dict, List, Optional, Union
 
-from .helper_functions import *
-from .ensemble import *
-from .worker import *
-from .master import *
-from .Node import *
+from .ensemble import TaskFactory, Task
+from .config import SystemConfig, LauncherConfig
+from .helper_functions import get_nodes
+from ensemble_launcher.scheduler.resource import NodeResourceCount, NodeResourceList
+from ensemble_launcher.orchestrator import Master, Worker
 
 import logging
 
-class ensemble_launcher:
+logger = logging.getLogger(__name__)
+
+class EnsembleLauncher:
     def __init__(self,
-                 config_file:str,
-                 ncores_per_node:int=None,
-                 ngpus_per_node:int=None,
-                 parallel_backend="multiprocessing",
-                 logging_level=logging.INFO,
-                 force_level:str=None,
-                 heartbeat_interval:int=1) -> None:
-        self.update_interval = None ##how often to update the ensembles in secs
-        self.poll_interval = 60 ##how often to poll the running tasks in secs
-        self.parallel_backend = parallel_backend
-        self.logging_level = logging_level
-        self.comm_config = None
-        self.heartbeat_interval = heartbeat_interval
-
-
-        self.ensembles = {}
-        self.start_time = time.time()
-        self.last_update_time = time.time()
-        self.config_file = config_file
-        ##system info
-        self.sys_info = {}
-        self.read_input_file()
-        os.makedirs(os.path.join(os.getcwd(),"outputs"),exist_ok=True)
-
-        assert parallel_backend in ["multiprocessing","dragon","mpi"]
-
-        if self.parallel_backend == "dragon":
-            if not DRAGON_AVAILABLE:
-                raise ImportError("Dragon is not available. Please install dragon to use this backend.")
-            mp.set_start_method("dragon")
-        elif self.parallel_backend == "mpi":
-            assert self.comm_config["comm_layer"] == "zmq", "MPI backend requires zmq communication layer."
+                 ensemble_file: Union[str, Dict[str, Union[Dict, Task]]],
+                 system_config: SystemConfig = SystemConfig(name="local"),
+                 launcher_config: Optional[LauncherConfig] = None,
+                 Nodes: Optional[List[str]] = None,
+                 pin_resources: bool = True,
+                 return_stdout: bool = False) -> None:
+        self.ensemble_file = ensemble_file
+        self.system_config = system_config
+        self.launcher_config = launcher_config
+        self.pin_resources = pin_resources
+        if isinstance(self.ensemble_file, dict) and \
+            all([isinstance(t, Task) for t in self.ensemble_file.values()]):
+            self._tasks = self.ensemble_file
         else:
-            pass
-        ##
-        
-        ##update the system info. NOTE: precedence order config > inputs > functions
-        if "ncores_per_node" not in self.sys_info.keys():
-            self.sys_info["ncores_per_node"] = self.get_cores_per_node() if ncores_per_node is None else ncores_per_node
-        if "ngpus_per_node" not in self.sys_info.keys():
-            self.sys_info["ngpus_per_node"] = 0 if ngpus_per_node is None else ngpus_per_node
-        ##
-        self.total_nodes = self.get_nodes()
-        # self.pids_per_ensemble = {en:[0] for en in self.ensembles.keys()}
-        # if self.global_master.n_children > 1:
-        #     self.distribute_procs()
-        self.all_tasks = {}
-        for en,e in self.ensembles.items():
-            self.all_tasks.update(e.get_task_infos())
-        
+            self._tasks = self._generate_tasks()
 
-        ###this is to just communicate with the global master
-        self.el_node = self._init_global_master(True,name="el_node",logger=True)
-        if force_level is not None:
-            self.el_node.logger.info(f"Force level is set to {force_level}.")
-            assert force_level in ["single","double"]
-            if force_level == "double":
-                self.global_master = self._init_global_master(True)
-            else:
-                self.global_master = self._init_global_master(False)
+        logger.info(f"Created {len(self._tasks)} tasks")
+
+        if Nodes:
+            self.nodes = Nodes
         else:
-            if len(self.total_nodes) > 128:
-                self.el_node.logger.info(f"Running in multi level mode with {len(self.total_nodes)} nodes.")
-                self.global_master = self._init_global_master(True)
-            else:
-                self.el_node.logger.info(f"Running in single level mode with {len(self.total_nodes)} nodes.")
-                self.global_master = self._init_global_master(False)
+            self.nodes = get_nodes()
+            logger.info(f"Found {len(self.nodes)} nodes for execution.")
         
-        self.el_node.add_child(self.global_master.node_id,self.global_master)
-        return None
+        if len(self.nodes) == 0:
+            raise ValueError(f"No compute nodes to execute tasks")
+        #analyze the tasks to get launcher parameters like 
+        # - task_executor_name
+        # - number of levels
+        # - comm_name
+        # - children_executor_name
+        if self.launcher_config is None:
+            task_np = [task.nnodes*task.ppn for task in self._tasks.values()]
+            nnodes = len(self.nodes)
+            if all([np==1 for np in task_np]):
+                #all serial tasks
+                task_executor_name = "multiprocessing"
+            else:
+                #some serial and some mpi
+                task_executor_name = "mpi"
+
+            if nnodes == 1:
+                comm_name = "multiprocessing"
+                nlevels = 0 ##Just the worker would be good enough
+            else:
+                #nnodes > 1
+                comm_name = "zmq"
+                if nnodes <= 64:
+                    nlevels = 1
+                elif nnodes > 64 and nnodes <= 256:
+                    nlevels = 2
+                elif nnodes  > 256 and nnodes <= 2048:
+                    nlevels = 2
+                else:
+                    nlevels = 3
+            
+            if nlevels == 0:
+                child_executor_name = "multiprocessing"
+            else:
+                child_executor_name = "mpi"
+        
+            self.launcher_config = LauncherConfig(child_executor_name=child_executor_name,
+                                                  task_executor_name=task_executor_name,
+                                                  comm_name=comm_name,
+                                                  nlevels=nlevels,
+                                                  return_stdout=return_stdout,
+                                                  master_logs=True,
+                                                  worker_logs=True)
+        
+        logger.info(f"LauncherConfig: {self.launcher_config}")
+
+        self._launcher = self._create_launcher()
+
+
     
+    def _generate_tasks(self) -> Dict[str, Task]:
+        if isinstance(self.ensemble_file, str):
+            with open(self.ensemble_file, "r") as file:
+                data = json.load(file)
+                ensemble_infos = data["ensembles"]
+        else:
+            ensemble_infos = self.ensemble_file
+        
+        tasks = {}
+        for name, info in ensemble_infos.items():
+            tasks.update(TaskFactory.get_tasks(name,info))
+        return tasks
 
-    def _init_global_master(self,is_global_master:bool,name:str="global_master",logger:bool=False):
-        return master(
-                name,
-                self.all_tasks,
-                self.total_nodes,
-                self.sys_info,
-                parallel_backend=self.parallel_backend,
-                n_children=max(1,len(self.total_nodes)//128) if is_global_master else None,
-                max_children_nnodes=self.max_nodes_per_master,
-                comm_config=self.comm_config,
-                launcher_config=self.launcher_config,
-                is_global_master=is_global_master,
-                logging_level=self.logging_level,
-                update_interval=self.update_interval,
-                logger=logger,
-                heartbeat_interval=self.heartbeat_interval
+
+    def _create_launcher(self):
+        if self.launcher_config.nlevels == 0:
+            return Worker(
+                "main",
+                self.launcher_config,
+                NodeResourceList.from_config(self.system_config) if self.pin_resources else NodeResourceCount.from_config(self.system_config),
+                Nodes = self.nodes,
+                tasks = self._tasks
+            )
+        else:
+            return Master(
+                "main",
+                self.launcher_config,
+                NodeResourceList.from_config(self.system_config) if self.pin_resources else NodeResourceCount.from_config(self.system_config),
+                Nodes = self.nodes,
+                tasks = self._tasks
             )
 
-    """
-    Function reads the input file and builds the ensembles
-    NOTES:
-    1. It is expected that when a system info is present in the input file. It should atleast have the name.
-        The reason for this is to know how to build the launch command.
-    """
-    def read_input_file(self):
-        with open(self.config_file, "r") as file:
-            data = json.load(file)
-            self.update_interval = data.get("update_interval",None)
-            self.poll_interval = data.get("poll_interval",600)
-            self.max_nodes_per_master = data.get("max_nodes_per_master",None)
-            self.logfile = data.get("logfile","log.txt")
-            if "sys_info" in data.keys():
-                assert "name" in data["sys_info"]
-                self.sys_info.update(data["sys_info"])
-            else:
-                self.sys_info["name"] = "local"
-            self.comm_config = data.get("comm_config",{"comm_layer":"multiprocessing"})
-            self.launcher_config = data.get("launcher_config",{
-                "mode": "mpi"
-            })
-            self.sys_info.update()
-            ensembles_info = data["ensembles"]
-            for ensemble_name,ensemble_info in ensembles_info.items():
-                self.ensembles[ensemble_name] = ensemble(ensemble_name,ensemble_info,system=self.sys_info["name"])
-        return None
-
-    def get_nodes(self) -> list:
-        node_list = []
-        node_file = os.getenv("PBS_NODEFILE",None)
-        if node_file is not None and os.path.exists(node_file):
-            with open(node_file, "r") as f:
-                node_list = f.readlines()
-                node_list = [(node.split(".")[0]).strip() for node in node_list]
-        else:
-            node_list = [socket.gethostname()]
-        return node_list
+    def run(self):
+        """Simply blocks untils all the tasks are done"""
+        results = self._launcher.run()
+        return results
     
-    def get_cores_per_node(self):
-        if os.getenv("NCPUS") is not None:
-            return int(os.getenv("NCPUS"))
-        else:
-            return os.cpu_count()
-
-    def get_nfd(self,process)->int:
-        if process is None:
-            return 0
-        pid = process.pid
-        fd_path = f'/proc/{pid}/fd'
-        try:
-            open_fds = os.listdir(fd_path)
-            return len(open_fds)
-        except:
-            return 0
-    
-    def update_ensembles(self)-> dict:
-        deleted_tasks = {}
-        with open(self.config_file, "r") as file:
-            data = json.load(file)
-            ensemble_infos = data["ensembles"]
-            for ensemble_name,ensemble_info in ensemble_infos.items():
-                deleted_tasks.update(self.ensembles[ensemble_name].update_ensemble(ensemble_info))
-        return deleted_tasks
-
-    def run_tasks(self):
-        self.last_update_time = time.time()
-        if self.comm_config["comm_layer"] == "zmq":
-            self.el_node.setup_zmq_sockets()
-            if self.el_node.logger: self.el_node.logger.info(f"ZMQ sockets setup complete with {self.el_node.comm_config}.")
-            self.el_node.children[self.global_master.node_id].parent_address = self.el_node.my_address
-        # Note: multiprocessing.Process already inherits parent environment variables by default
-        process = mp.Process(target=self.global_master.run_children, args=(True,))
-        process.start()
-        if self.el_node.comm_config["comm_layer"] == "zmq":
-            msg = self.el_node.recv_from_child(self.global_master.node_id,timeout=5)  # Wait for the global master to be ready
-            if msg == "READY":
-                if self.el_node.logger: self.el_node.logger.info(f"Global master is ready.")
-                self.el_node.send_to_child(self.global_master.node_id,"CONTINUE")
-        if self.update_interval is not None:
-            while process.is_alive():
-                time.sleep(self.update_interval)
-                ##delete the tasks
-                deleted_tasks = self.update_ensembles()
-                for task_id in deleted_tasks:
-                    del self.all_tasks[task_id]
-                ##add any new tasks
-                new_tasks = {}
-                for en,e in self.ensembles.items():
-                    for task_id in e.get_task_ids():
-                        if task_id not in self.all_tasks:
-                            task_info = e.get_task_info(task_id)
-                            new_tasks[task_id] = task_info
-                            self.all_tasks[task_id] = task_info
-                # Check if tasks have changed
-                if len(deleted_tasks) > 0 or len(new_tasks) > 0:
-                    self.el_node.logger.info(f"Tasks have been updated. {len(deleted_tasks)} tasks deleted. {len(new_tasks)} tasks added")
-                    ###update the global master tasks
-                    self.commit_update(deleted_tasks,new_tasks)
-                else:
-                    self.el_node.logger.debug("No changes in tasks detected.")
-        process.join()
-    
-        return
-
-    def commit_update(self,deleted_tasks:dict,new_tasks:dict):
-        nsuccess = 0
-        pid = 0
-        child_name = self.global_master.node_id
-        self.el_node.logger.debug("Sending update to global master")
-        ###this block the child process
-        self.el_node.send_to_child(child_name,("SYNC",))
-        msg = None
-        while msg != "SYNCED":
-            msg = self.el_node.recv_from_child(child_name,timeout=0.5)
-        self.el_node.logger.debug(f"Synced with global master")
-        self.el_node.send_to_child(child_name,("UPDATE",
-                            deleted_tasks,
-                            new_tasks))
-        msg=self.el_node.recv_from_child(child_name,timeout=300)  # Wait for confirmation
-        self.el_node.logger.info(f"Received {msg} from global master")
-
-            
-
-        
-            
-                
-
-
-
-#****************deprecated functions****************
-    # ##pool all the tasks and split them among available processes
-    # def distribute_procs(self)->None:
-    #     ntasks_per_proc = sum([e.ntasks for e in self.ensembles.values()])//self.global_master.n_children
-    #     cum_tasks = 0
-    #     for en,e in self.ensembles.items():
-    #         start = cum_tasks//ntasks_per_proc
-    #         end = (cum_tasks+e.ntasks)//ntasks_per_proc + 1
-    #         if start == end:
-    #             self.pids_per_ensemble[en] = [start]
-    #         else:
-    #             self.pids_per_ensemble[en] = [i for i in range(start,end+1)]
-    #         self.pids_per_ensemble[en] = [i for i in self.pids_per_ensemble[en] if i < self.global_master.n_children]
-    #         self.ensembles[en].set_np(len(self.pids_per_ensemble[en]))
-    #         cum_tasks+=e.ntasks
-    #         e.save_ensemble_status()
-    #     return None
-
-    # def split_nodes(self)->list:
-    #     my_nodes = []
-    #     if len(self.total_nodes)<self.global_master.n_children:
-    #         raise ValueError("Total number of nodes < number of parallel task launchers! Please set nparallel = 1")
-    #     nn = len(self.total_nodes)//self.global_master.n_children
-    #     for i in range(self.global_master.n_children):
-    #         my_nodes.append(self.total_nodes[i*nn:(i+1)*nn])
-    #     my_nodes[-1].extend(self.total_nodes[(i+1)*nn:])
-    #     return my_nodes
+    def run_async(self):
+        """Creates a client Node that can be used to update the tasks etc"""
+        raise NotImplementedError(f"Async mode is not implemented yet")

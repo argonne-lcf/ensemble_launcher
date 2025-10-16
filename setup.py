@@ -10,11 +10,13 @@ setup(
         "numpy",
         "matplotlib",
         "scienceplots",
-        "pytest"
+        "pytest",
+        "cloudpickle",
+        "pydantic",
+        "pyzmq"  
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
-        "zmq": ["pyzmq"],
     },
     python_requires=">=3.6",
 )
