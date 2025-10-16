@@ -229,6 +229,7 @@ system_config = SystemConfig(
 )
 ```
 will overload the GPU 0 and 1 and the Scheduler assumes that node has a 6 GPUs instead of 4 GPUs.
+
 ---
 
 ## Execution Modes
