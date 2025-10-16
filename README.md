@@ -31,7 +31,7 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 - **Flexible Execution**: Support for serial, MPI, and mixed workloads
 - **Intelligent Scheduling**: Automatic resource allocation with customizable policies
 - **Hierarchical Architecture**: Efficient master-worker patterns for large-scale deployments (1-2048+ nodes)
-- **Multiple Communication Backends**: Choose between multiprocessing, ZMQ, or Dragon for optimal performance
+- **Multiple Communication Backends**: Choose between Python multiprocessing, [ZMQ](https://zeromq.org/), or [DragonHPC](https://dragonhpc.org/portal/index.html) for performance at scale
 - **Resource Pinning**: Fine-grained CPU and GPU affinity control
 - **Real-time Monitoring**: Track task execution with configurable status updates
 - **Fault Tolerance**: Graceful handling of task failures with detailed error reporting
@@ -51,15 +51,18 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 - cloudpickle
 - pydantic
 - pyzmq
-- MPI implementation (optional, for distributed execution)
-- dragonhpc (optional, for extreme-scale HPC systems)
+
+### Optional Dependencies
+
+- MPI implementation (for distributed execution via `mpirun` or `mpiexec`)
+- [DragonHPC](https://github.com/DragonHPC/dragon) (for extreme-scale deployment on HPC systems)
 
 ### Quick Install
 
 ```bash
 git clone https://github.com/argonne-lcf/ensemble_launcher.git
 cd ensemble_launcher
-python3 -m pip install -e .
+python3 -m pip install .
 ```
 
 ---
@@ -84,6 +87,13 @@ Create a JSON configuration file describing your task ensemble:
     }
 }
 ```
+
+The configuration specifies an ensemble with:
+
+- Tasks running on a single node with a single process per node
+- Tasks executed with `./exe -a {arg1} -b {arg2}` taking two input arguments
+- The values of the two input arguments are defined as 5 linearly spaced numbers between 0-10 and 0-1 for `arg1` and `arg2`, respectively.
+- The raletionship between the values of the two arguments is set to `one-to-one`, meaning the ensemble consists of 5 tasks, one for each pair of values. 
 
 **Supported Relations:**
 - `one-to-one`: Pair parameters element-wise (N tasks)
@@ -119,18 +129,18 @@ python3 launcher_script.py
 ### Key Components
 
 - **EnsembleLauncher**: Main API entry point with auto-configuration
-- **Master**: Orchestrates workers, handles task distribution and aggregation
+- **Global/Local Master**: Orchestrates workers, handles task distribution and aggregation
 - **Worker**: Executes tasks using configured executor
 - **Scheduler**: Allocates resources across cluster nodes with intelligent policies
-- **Executors**: Backend engines (Multiprocessing, MPI, Dragon)
-- **Communication Layer**: ZMQ or multiprocessing pipes
+- **Executors**: Backend task launching engines (Python multiprocessing, MPI, DragonHPC)
+- **Communication Layer**: ZMQ or Python multiprocessing pipes
 
 ### Hierarchical Execution Model
 
 The master-worker architecture scales from single nodes to thousands of nodes:
 - **Single Node** (nlevels=0): Direct execution without master overhead
-- **Small Scale** (nlevels=1): Master coordinates workers directly
-- **Large Scale** (nlevels=2): Master → Sub-masters → Workers for thousands of tasks
+- **Small Scale** (nlevels=1): Global master coordinates workers directly
+- **Large Scale** (nlevels=2): Global master → Local masters → Workers for thousands of tasks
 - **Extreme Scale** (nlevels=3): Deep hierarchy for supercomputer-scale deployments
 
 ---
@@ -244,7 +254,7 @@ results = el.run()
 
 ### Shell Commands
 
-Execute shell commands with parameter sweeps:
+Execute binaries and shell commands with files as inputs:
 
 ```json
 {
@@ -288,7 +298,7 @@ See the [`examples`](examples/) directory for complete workflow samples:
 
 ### Hierarchy Levels
 
-The launcher automatically determines hierarchy depth based on node count, but you can override:
+The launcher automatically determines hierarchy depth based on node count, but you can override it with:
 
 ```python
 launcher_config = LauncherConfig(
