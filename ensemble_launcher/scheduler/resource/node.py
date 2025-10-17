@@ -135,8 +135,8 @@ class NodeResourceList(NodeResource):
     def _add_impl(self, other: NodeResource) -> 'NodeResourceList':
         if isinstance(other, NodeResourceList):
             return NodeResourceList(
-                cpus=tuple((Counter(self.cpus) | Counter(other.cpus)).elements()),
-                gpus=tuple((Counter(self.gpus) | Counter(other.gpus)).elements())
+                cpus=tuple((Counter(self.cpus) + Counter(other.cpus)).elements()),
+                gpus=tuple((Counter(self.gpus) + Counter(other.gpus)).elements())
             )
         elif isinstance(other, NodeResourceCount):
             # Convert count to consecutive IDs and add

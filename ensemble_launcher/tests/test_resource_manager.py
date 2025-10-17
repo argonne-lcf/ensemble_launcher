@@ -44,6 +44,7 @@ def test_resource_overload():
         assert Counter(alloc.gpus) == Counter([0]*5), f"{Counter(alloc.gpus)} != {Counter([0]*5)}"
     
     cluster.deallocate(allocated_job)
+    print(cluster)
 
 if __name__ == "__main__":
     test_resource()
