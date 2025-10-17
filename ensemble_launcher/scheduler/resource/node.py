@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 from ensemble_launcher.config import SystemConfig
+from collections import Counter
 
 @dataclass(frozen=True, eq=True)
 class NodeResource(ABC):
@@ -134,8 +135,8 @@ class NodeResourceList(NodeResource):
     def _add_impl(self, other: NodeResource) -> 'NodeResourceList':
         if isinstance(other, NodeResourceList):
             return NodeResourceList(
-                cpus=tuple(set(self.cpus) | set(other.cpus)),
-                gpus=tuple(set(self.gpus) | set(other.gpus))
+                cpus=tuple((Counter(self.cpus) | Counter(other.cpus)).elements()),
+                gpus=tuple((Counter(self.gpus) | Counter(other.gpus)).elements())
             )
         elif isinstance(other, NodeResourceCount):
             # Convert count to consecutive IDs and add
@@ -151,8 +152,8 @@ class NodeResourceList(NodeResource):
     
     def _sub_impl(self, other: NodeResource) -> 'NodeResourceList':
         if isinstance(other, NodeResourceList):
-            remaining_cpus = tuple(set(self.cpus) - set(other.cpus))
-            remaining_gpus = tuple(set(self.gpus) - set(other.gpus))
+            remaining_cpus = tuple((Counter(self.cpus) - Counter(other.cpus)).elements())
+            remaining_gpus = tuple((Counter(self.gpus) - Counter(other.gpus)).elements())
             return NodeResourceList(
                 cpus=remaining_cpus,
                 gpus=remaining_gpus
@@ -171,8 +172,8 @@ class NodeResourceList(NodeResource):
         """Check if another resource is contained within this list-based resource."""
         if isinstance(other, NodeResourceList):
             # Check if all CPUs and GPUs in 'other' are available in 'self'
-            return (set(other.cpus).issubset(set(self.cpus)) and 
-                    set(other.gpus).issubset(set(self.gpus)))
+            return ((Counter(other.cpus) <= Counter(self.cpus)) and 
+                    (Counter(other.gpus) <= Counter(self.gpus)))
         elif isinstance(other, NodeResourceCount):
             # Check if we have enough resources
             return (other.ncpus <= self.cpu_count and 
@@ -184,8 +185,8 @@ class NodeResourceList(NodeResource):
         if not isinstance(other, NodeResourceList):
             # Fall back to parent class equality for cross-type comparison
             return super().__eq__(other)
-        return (set(self.cpus) == set(other.cpus) and 
-                set(self.gpus) == set(other.gpus))
+        return (Counter(self.cpus) == Counter(other.cpus) and 
+                Counter(self.gpus) == Counter(other.gpus))
     
     def __hash__(self) -> int:
         """Hash based on sorted CPU and GPU tuples for use in sets/dicts."""

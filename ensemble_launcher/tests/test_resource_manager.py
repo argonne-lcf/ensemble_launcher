@@ -2,6 +2,7 @@ from ensemble_launcher.scheduler.resource import NodeResourceList, LocalClusterR
 import logging
 
 logger = logging.getLogger()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 def test_resource():
     import copy
@@ -25,5 +26,25 @@ def test_resource():
     
     # assert cluster == cluster_copy, "Cluster is not the same"
 
+def test_resource_overload():
+    from collections import Counter
+    sys_info = NodeResourceList(cpus=list(range(10)),gpus=[0 for _ in range(10)])
+    cluster = LocalClusterResource(logger, nodes=[f"node:{str(i)}" for i in range(2)],system_info=sys_info)
+
+    # cluster_copy = copy.deepcopy(cluster.nodes)
+
+    resources = []
+    resources.append(NodeResourceList(cpus=[1,3,5,7,9],gpus=[0]*5))
+
+    job = JobResource(resources=resources)    
+    allocated,allocated_job = cluster.allocate(job)
+
+    for req,alloc in zip(job.resources,allocated_job.resources):
+        print(alloc)
+        assert Counter(alloc.gpus) == Counter([0]*5), f"{Counter(alloc.gpus)} != {Counter([0]*5)}"
+    
+    cluster.deallocate(allocated_job)
+
 if __name__ == "__main__":
     test_resource()
+    test_resource_overload()
