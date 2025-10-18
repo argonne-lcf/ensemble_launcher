@@ -196,8 +196,6 @@ class MPIExecutor(Executor):
         return result[1]
 
     def done(self, task_id: str):
-        if self._profile and task_id in self._profile_info:
-            self._profile_info[task_id]["done"] += 1
         process = self._processes[task_id]
         return process.poll() is not None
 

@@ -474,7 +474,7 @@ class Master(Node):
                             self.logger.info(f"{self.node_id}: Status: {self._status}")
                     next_report_time = time.time() + self._config.report_interval
 
-            time.sleep(0.001)
+            time.sleep(0.01)
             if len(done) == len(self.children):
                 self.logger.info(f"{self.node_id}: All children are done")
                 break
