@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 @executor_registry.register("multiprocessing")
 class MultiprocessingExecutor(Executor):
-    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True, profile: bool = False):
+    def __init__(self,logger=logger,
+                 gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True, profile: bool = False):
+        self.logger = logger
         self._executor = ProcessPoolExecutor()
         self._futures: Dict[str, mp.Process] = {}
         self._gpu_selector = gpu_selector
@@ -48,7 +50,7 @@ class MultiprocessingExecutor(Executor):
         if req.gpu_count > 0:
             if isinstance(req, NodeResourceCount):
                 gpu_ids = ",".join([str(gpu) for gpu in req.gpu_count])
-                logger.warning(f"Received non-zero gpu request using NodeResourceCount. Oversubscribing")
+                self.logger.warning(f"Received non-zero gpu request using NodeResourceCount. Oversubscribing")
             elif isinstance(req, NodeResourceList):
                 gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
             env.update({self._gpu_selector: gpu_ids})
@@ -58,7 +60,7 @@ class MultiprocessingExecutor(Executor):
         elif isinstance(fn, str):
             future = self._executor.submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout))
         else:
-            logger.warning(f"Can only excute either a str or a callable")
+            self.logger.warning(f"Can only excute either a str or a callable")
             return None
         
         if self._profile:
@@ -78,7 +80,7 @@ class MultiprocessingExecutor(Executor):
             self._record_profile_stop(task_id)
             return True
         except TimeoutError:
-            logger.warning(f"Task {task_id} did not complete within the timeout.")
+            self.logger.warning(f"Task {task_id} did not complete within the timeout.")
             return False
 
     def result(self, task_id: str, timeout = None) -> Any:

@@ -206,6 +206,7 @@ class Master(Node):
     def _create_children(self) -> Dict[str, Node]:
         assignments,remove_tasks = self._assign_children(self._tasks, self._scheduler.cluster.nodes)
         self._child_assignment = assignments
+        self.logger.info(f"Children assignment: {self._child_assignment}")
 
         children = {}
         if self.level + 1 == self._config.nlevels:
@@ -260,7 +261,8 @@ class Master(Node):
         self._scheduler = WorkerScheduler(self.logger, cluster=LocalClusterResource(self.logger, self._nodes,self._sys_info))
 
         #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile})
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile,
+                                                                                                               "logger": self.logger})
 
         ##create children
         children = self._create_children()

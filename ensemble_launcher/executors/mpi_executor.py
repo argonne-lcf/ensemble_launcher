@@ -16,11 +16,13 @@ logger = logging.getLogger(__name__)
 
 @executor_registry.register("mpi")
 class MPIExecutor(Executor):
-    def __init__(self,gpu_selector: str = "ZE_AFFINITY_MASK",
+    def __init__(self,logger=logger, 
+                 gpu_selector: str = "ZE_AFFINITY_MASK",
                  tmp_dir:str = ".mpiexec_tmp",
                  mpiexec:str = "mpirun",
                  return_stdout: bool = True,
                  profile: bool = False):
+        self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
         self.mpiexec = mpiexec
@@ -64,14 +66,14 @@ class MPIExecutor(Executor):
                 cores = ":".join(map(str, job_resource.resources[0].cpus))
             else:
                 ##TODO: implement host file option
-                logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
+                self.logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
                 cores = ":".join(map(str, job_resource.resources[0].cpus))
             launcher_cmd.append("--cpu-bind")
             launcher_cmd.append(f"list:{cores}")
         
             if ngpus_per_process > 0:
                 ##defaults to Aurora (Level zero)
-                logger.info(f"Using {self.gpu_selector} for pinning GPUs")
+                self.logger.info(f"Using {self.gpu_selector} for pinning GPUs")
                 common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
                 use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
                 if use_common_gpus:
@@ -127,7 +129,7 @@ class MPIExecutor(Executor):
         elif isinstance(task,str):
             task_cmd = [s.strip() for s in task.split()]
         else:
-            logger.warning("Can only execute either a callable or a string")
+            self.logger.warning("Can only execute either a callable or a string")
             return None
 
         if " ".join(resource_pinning_cmd).strip() == "-np 1" and len(additional_mpi_opts) == 0:
@@ -139,7 +141,7 @@ class MPIExecutor(Executor):
         merged_env.update(resource_pinning_env)
         merged_env.update(env)
 
-        logger.info(f"executing: {' '.join(cmd)}")
+        self.logger.info(f"executing: {' '.join(cmd)}")
         if self._return_stdout:
             p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
@@ -160,7 +162,7 @@ class MPIExecutor(Executor):
             self._record_profile_stop(task_id)
             return True
         except Exception as e:
-            logger.warning(f"Failed to kill task {task_id} with an exception {e}")
+            self.logger.warning(f"Failed to kill task {task_id} with an exception {e}")
         return False
 
     def wait(self, task_id: str, timeout: float = None):
@@ -168,9 +170,10 @@ class MPIExecutor(Executor):
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            logger.warning(f"Process {task_id} timed out after {timeout} seconds.")
+            self.logger.warning(f"Process {task_id} timed out after {timeout} seconds.")
             return False
         stdout = None
+        stderr = None
         if self._return_stdout:
             stdout, stderr = process.communicate()
         self._results[task_id] = (stdout,stderr)
@@ -211,6 +214,6 @@ class MPIExecutor(Executor):
                     else:
                         self.wait(task_id)
             except Exception as e:
-                logger.warning(f"Failed to kill process {task_id}: {e}")
+                self.logger.warning(f"Failed to kill process {task_id}: {e}")
         self._processes.clear()
         self._results.clear()

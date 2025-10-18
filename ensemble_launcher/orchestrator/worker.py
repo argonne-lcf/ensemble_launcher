@@ -172,7 +172,8 @@ class Worker(Node):
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,
                                                                                                              "profile":self._config.profile,
-                                                                                                             "gpu_selector":self._config.gpu_selector})
+                                                                                                             "gpu_selector":self._config.gpu_selector,
+                                                                                                             "logger":self.logger})
 
         ##Lazy comm creation
         self._create_comm()
@@ -203,6 +204,7 @@ class Worker(Node):
             ##lazy init
             self._lazy_init()
         
+        self.logger.info(f"Running {self._tasks.keys()} tasks")
         with self._timer("heartbeat_sync"):
             self._comm.async_recv()
             #sync with parent
