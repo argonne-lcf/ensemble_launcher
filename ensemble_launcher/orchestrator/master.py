@@ -155,7 +155,7 @@ class Master(Node):
                 y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
 
                 # Interpolate in log2 space
-                log2_nworkers = np.interp(self.level + 1, x_vals, y_vals)
+                log2_nworkers = int(np.interp(self.level + 1, x_vals, y_vals))
 
                 # Convert back from log2 space
                 nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
@@ -474,7 +474,7 @@ class Master(Node):
                             self.logger.info(f"{self.node_id}: Status: {self._status}")
                     next_report_time = time.time() + self._config.report_interval
 
-            time.sleep(0.01)
+            time.sleep(0.1)
             if len(done) == len(self.children):
                 self.logger.info(f"{self.node_id}: All children are done")
                 break
