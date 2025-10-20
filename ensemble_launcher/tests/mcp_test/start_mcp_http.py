@@ -1,7 +1,7 @@
 from ensemble_launcher.mcp import Server
 from sim_script import sim
 
-mcp = Server()
+mcp = Server(port=9276)
 
 tool = mcp.ensemble_tool(sim)
 
