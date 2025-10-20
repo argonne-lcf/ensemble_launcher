@@ -96,7 +96,7 @@ class ZMQComm(Comm):
             self.dealer_poller = zmq.Poller()
             self.dealer_poller.register(self.dealer_socket, zmq.POLLIN)
             self.logger.info(f"{self.node_info.node_id}: connected to:{self.parent_address}")
-            time.sleep(1.0)
+            # time.sleep(1.0)
 
     def _send_to_parent(self, data: Any) -> bool:
         if self.node_info.parent_id is None:
