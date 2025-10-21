@@ -17,6 +17,7 @@ setup(
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
+        "mcp": ["mcp","paramiko"],
     },
-    python_requires=">=3.6",
+    python_requires=">=3.10",
 )
