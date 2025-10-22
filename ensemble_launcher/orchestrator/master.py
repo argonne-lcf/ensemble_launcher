@@ -420,10 +420,9 @@ class Master(Node):
         children_status = {}
         results: Dict[str, Result] = {}
         
+        done = set()
         while True:
             with self._timer("check_children"):
-                done = set()
-                
                 # Special handling for MPI executor - check once before child loop
                 if self._config.child_executor_name == "mpi":
                     if self._executor.done(self._children_exec_ids["all"]):
@@ -563,4 +562,4 @@ class Master(Node):
         self._comm.stop_async_recv()
         self._comm.clear_cache()
         self._comm.close()        
-        self._executor.shutdown()
+        self._executor.shutdown(force=True)
