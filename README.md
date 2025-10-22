@@ -56,6 +56,7 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 
 - MPI implementation (for distributed execution via `mpirun` or `mpiexec`)
 - [DragonHPC](https://github.com/DragonHPC/dragon) (for extreme-scale deployment on HPC systems)
+- [mcp](https://github.com/modelcontextprotocol/python-sdk?tab=readme-ov-file) and [paramiko] (https://www.paramiko.org/) for hosting mcp server on HPC compute nodes
 
 ### Quick Install
 
@@ -281,7 +282,7 @@ Execute binaries and shell commands with files as inputs:
 ```
 which is launched using the following script. 
 
-```python
+
 ```python
 from ensemble_launcher import EnsembleLauncher
 
@@ -294,6 +295,45 @@ if __name__ == '__main__':
     from ensemble_launcher import write_results_to_json
     write_results_to_json(results, "results.json")
 ```
+
+## MCP
+
+Transform @mcp.tool into ensemble tool that can perform an ensemble of tool executions using a single AI tool call
+
+```python
+from ensemble_launcher.mcp import Server
+from sim_script import sim
+
+mcp = Server(port=9276)
+
+tool = mcp.ensemble_tool(sim)
+"""
+or
+
+@mcp.ensemble_tool
+def sim(a:float,b:float)->str:
+    return "Done sim"
+
+or 
+
+from ensemble_launcher.config import LaucherConfig, SystemConfig
+@mcp.ensemble_tool(launcher_config = LauncherConfig(...), system_config = SystemConfig(...))
+def sim(a: float, b:floar)->str:
+    return "Done sim"
+"""
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+```
+
+We also provide some tooling for port forwarding between compute and login nodes. In the client script do the following
+
+```python
+from ensemble_launcher.mcp import start_tunnel, stop_tunnel
+if __name__ == "__main__":
+    ret = start_tunnel("<User name>","<Job head node host name>",9276,9276)
+    asyncio.run(main())
+    stop_tunnel(*ret)
 ```
 
 ---
@@ -310,6 +350,9 @@ See the [`examples`](examples/) directory for complete workflow samples:
 <!-- ### Python Examples
 - [`examples/python/mpi_example.py`](examples/python/mpi_example.py) - MPI-based execution
 - [`examples/python/serial_example.py`](examples/python/serial_example.py) - Serial task execution -->
+
+### MCP examples
+- [`examples/mcp/combustion_agent`](examples/mcp/combustion_agent/) - A simple combustion agent
 
 ---
 
