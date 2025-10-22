@@ -351,6 +351,9 @@ See the [`examples`](examples/) directory for complete workflow samples:
 - [`examples/python/mpi_example.py`](examples/python/mpi_example.py) - MPI-based execution
 - [`examples/python/serial_example.py`](examples/python/serial_example.py) - Serial task execution -->
 
+### MCP examples
+- [`examples/mcp/combustion_agent`](examples/mcp/combustion_agent/) - A simple combustion agent
+
 ---
 
 ## Performance Tuning
