@@ -19,6 +19,7 @@ import socket
 import json
 from contextlib import contextmanager
 from collections import defaultdict
+from .utils import load_str
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -310,16 +311,15 @@ class Master(Node):
                             resources=child_resources, nodes=child_head_nodes
                     )
                 env = os.environ.copy()
-                os.makedirs(os.path.join(os.getcwd(),".tmp"),exist_ok=True)
-                fname = os.path.join(os.getcwd(),".tmp",f"{self.node_id}_children_obj.pkl")
-                with open(fname,"wb") as f:
-                    cloudpickle.dump(child_obj_dict,f)
-                if isinstance(list(children.values())[0], Worker):
-                    self.logger.info(f"Launching worker using one shot mpiexec")
-                    self._children_exec_ids["all"] = self._executor.start(req, Worker.load,task_args=(fname,), env = env)
-                else:
-                    self.logger.info(f"Launching master using one shot mpiexec")
-                    self._children_exec_ids["all"] = self._executor.start(req, Master.load, task_args=(fname,), env = env)
+                dirname = os.path.join(os.getcwd(),f".tmp_{self.node_id}")
+                os.makedirs(dirname,exist_ok=True)
+                for k,v in child_obj_dict.items():
+                    fname = os.path.join(dirname,f"{k}_child_obj.pkl")
+                    with open(fname,"wb") as f:
+                        cloudpickle.dump(v,f)
+                self.logger.info(f"Launching worker using one shot mpiexec")
+                load_str_embed = load_str.replace("dirname",f"'{dirname}'")
+                self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c" ,load_str_embed] , env = env)
             else:
                 for child_idx, (child_name,child_obj) in enumerate(children.items()):
                     child_nodes = child_obj.nodes
@@ -339,24 +339,22 @@ class Master(Node):
                 return self._results() #should return and report
     
     @classmethod
-    def load(cls, fname: str):
+    def load(cls, dirname: str):
         """
             This method loads the master object from a file. 
             The file is pickled as Dict[hostname, Master]
         """
-        with open(fname, "rb") as f:
-            obj_dict: Dict[str, 'Master'] = cloudpickle.load(f)
         hostname = socket.gethostname()
+        fname = os.path.join(dirname,f"{hostname}_child_obj.pkl")
+    
         master_obj = None
         try:
-            master_obj = obj_dict[hostname]
-        except KeyError:
-            for key in obj_dict.keys():
-                if hostname in key:
-                    master_obj = obj_dict[key]
-                    break
+            with open(fname, "rb") as f:
+                master_obj: 'Master' = cloudpickle.load(f)
+        except:
+            pass
         if master_obj is None:
-            print(f"failed loading child from {fname}{list(obj_dict.keys())}")
+            print(f"failed loading child from {fname}")
             return
         master_obj.run()
 

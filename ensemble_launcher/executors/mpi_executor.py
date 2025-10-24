@@ -106,7 +106,7 @@ class MPIExecutor(Executor):
         return launcher_cmd, env
 
     def start(self,job_resource: JobResource, 
-                task: Union[str, Callable], 
+                task: Union[str, Callable, List], 
                 task_args: Tuple = (), 
                 task_kwargs: Dict[str,Any] = {}, 
                 env: Dict[str, Any] = {},
@@ -128,6 +128,8 @@ class MPIExecutor(Executor):
             task_cmd = ["python", "-c", generate_python_exec_command(task,task_args,task_kwargs,tmp_fname)]
         elif isinstance(task,str):
             task_cmd = [s.strip() for s in task.split()]
+        elif isinstance(task, List):
+            task_cmd = task
         else:
             self.logger.warning("Can only execute either a callable or a string")
             return None

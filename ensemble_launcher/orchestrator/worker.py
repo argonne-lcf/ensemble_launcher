@@ -268,25 +268,23 @@ class Worker(Node):
         return all_results
     
     @classmethod
-    def load(cls, fname: str):
+    def load(cls, dirname: str):
         """
             This method loads the master object from a file. 
             The file is pickled as Dict[hostname, Master]
         """
-        with open(fname, "rb") as f:
-            obj_dict: Dict[str, 'Worker'] = cloudpickle.load(f)
         hostname = socket.gethostname()
+        fname = os.path.join(dirname,f"{hostname}_child_obj.pkl")
+    
         worker_obj = None
         try:
-            worker_obj = obj_dict[hostname]
-        except KeyError:
-            for key in obj_dict.keys():
-                if hostname in key:
-                    worker_obj = obj_dict[key]
-                    break
+            with open(fname, "rb") as f:
+                worker_obj: 'Worker' = cloudpickle.load(f)
+        except:
+            pass
         if worker_obj is None:
+            print(f"failed loading child from {fname}")
             return
-        
         worker_obj.run()
 
     def _results(self) -> Result:
