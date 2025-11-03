@@ -12,7 +12,10 @@ def get_nodes():
     with open(fname) as f:
         lines = f.readlines()
     
-    return [line.split(".")[0] for line in lines]
+    if len(lines) > 0:
+        return [line.split(".")[0] for line in lines]
+    else:
+        return [socket.gethostname()]
 
 
 def write_results_to_json(results: Result, fname: str = "./results.json"):
