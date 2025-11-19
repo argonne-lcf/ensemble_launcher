@@ -1,0 +1,2 @@
+load_str_master="from ensemble_launcher.orchestrator import Master;child=Master.deserialize(serial_master);child.run()"
+load_str_worker="from ensemble_launcher.orchestrator import Worker;child=Worker.deserialize(serial_worker);child.run()"
