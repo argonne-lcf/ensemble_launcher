@@ -107,3 +107,10 @@ class MPComm(Comm):
         ret._my_conn_to_child = self._my_conn_to_child
         ret._child_conn_to_me = self._child_conn_to_me
         return ret
+    
+    def asdict(self):
+        raise NotImplementedError("MPComm does not support asdict method.")
+    
+    @classmethod
+    def fromdict(cls, data: dict) -> "MPComm":
+        raise NotImplementedError("MPComm does not support fromdict method.")

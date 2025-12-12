@@ -227,6 +227,9 @@ class Comm(ABC):
 
     def init_cache(self):
         for child_id in self.node_info.children_ids:
+            if child_id in self._cache:
+                continue
+            self.logger.info(f"Initializing cache for child_id: {child_id}")
             self._cache[child_id] = MessageRoutingQueue()
         
         if self._profile:
@@ -234,7 +237,8 @@ class Comm(ABC):
             for child_id in self.node_info.children_ids:
                 self._profile_info[child_id] = {"latency":[], "datasize":[], "type":[]}
         
-        if self.node_info.parent_id:
+        if self.node_info.parent_id and self.node_info.parent_id not in self._cache:
+            self.logger.info(f"Initializing cache for parent_id: {self.node_info.parent_id}")
             self._cache[self.node_info.parent_id] = MessageRoutingQueue()
         
         if self._profile:
@@ -373,12 +377,12 @@ class Comm(ABC):
             status.append(self.sync_heartbeat_with_child(child_id, timeout=timeout))
         return all(status)
     
-    def async_recv(self):
-        """This method starts a thread that continuously monitor the endpoints and push to self._cache"""
+    def async_recv_parent(self):
+        """Start a thread that continuously monitors the parent endpoint and pushes to self._cache"""
         
         def _monitor_parent():
             """Monitor messages from parent and cache them"""
-            while getattr(self, '_stop_monitoring', False) is False:
+            while getattr(self, '_stop_monitoring_parent', False) is False:
                 try:
                     msg = self._recv_from_parent(timeout=0.1)
                     if msg is not None and self.node_info.parent_id is not None:
@@ -396,9 +400,24 @@ class Comm(ABC):
                     self.logger.error(f"Error monitoring parent: {e}")
                     time.sleep(0.1)  # Longer sleep on error
         
+        # Initialize cache if not already done
+        if not self._cache:
+            self.init_cache()
+        
+        # Initialize stop flag
+        self._stop_monitoring_parent = False
+        
+        # Start monitoring thread
+        if self.node_info.parent_id is not None:
+            self._parent_thread = threading.Thread(target=_monitor_parent, daemon=True)
+            self._parent_thread.start()
+    
+    def async_recv_children(self):
+        """Start a thread that continuously monitors the children endpoints and pushes to self._cache"""
+        
         def _monitor_children():
             """Monitor messages from all children and cache them"""
-            while getattr(self, '_stop_monitoring', False) is False:
+            while getattr(self, '_stop_monitoring_children', False) is False:
                 try:
                     messages_received = 0
                     for child_id in self.node_info.children_ids:
@@ -426,20 +445,17 @@ class Comm(ABC):
             self.init_cache()
         
         # Initialize stop flag
-        self._stop_monitoring = False
+        self._stop_monitoring_children = False
         
-        # Start monitoring threads
-        if self.node_info.parent_id is not None:
-            self._parent_thread = threading.Thread(target=_monitor_parent, daemon=True)
-            self._parent_thread.start()
-        
+        # Start monitoring thread
         if self.node_info.children_ids:
             self._children_thread = threading.Thread(target=_monitor_children, daemon=True)
             self._children_thread.start()
     
     def stop_async_recv(self):
         """Stop the async monitoring threads"""
-        self._stop_monitoring = True
+        self._stop_monitoring_parent = True
+        self._stop_monitoring_children = True
         if hasattr(self, '_parent_thread') and self._parent_thread.is_alive():
             self._parent_thread.join(timeout=1.0)
         if hasattr(self, '_children_thread') and self._children_thread.is_alive():

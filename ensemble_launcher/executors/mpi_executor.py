@@ -52,6 +52,8 @@ class MPIExecutor(Executor):
 
         launcher_cmd.append("-np")
         launcher_cmd.append(f"{ppn*nnodes}")
+        launcher_cmd.append("-ppn")
+        launcher_cmd.append(f"{ppn}")
         if not(len(job_resource.nodes) == 1 and \
                (job_resource.nodes[0] == socket.gethostname() or job_resource.nodes[0] == socket.gethostname().split(".")[0] )):
             launcher_cmd.append("--hosts")
@@ -186,7 +188,7 @@ class MPIExecutor(Executor):
         try:
             return self._results[task_id]
         except KeyError:
-            if self.wait(timeout=timeout):
+            if self.wait(task_id=task_id, timeout=timeout):
                 return self._results[task_id]
             else:
                 return None

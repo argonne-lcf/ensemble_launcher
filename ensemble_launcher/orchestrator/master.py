@@ -6,7 +6,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResour
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
-from ensemble_launcher.comm.messages import Status, Result, HeartBeat, Action, ActionType
+from ensemble_launcher.comm.messages import Status, Result, HeartBeat, Action, ActionType, TaskUpdate
 import copy
 import logging
 from itertools import accumulate
@@ -20,6 +20,7 @@ import json
 from contextlib import contextmanager
 from collections import defaultdict
 from .utils import load_str
+from dataclasses import asdict
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -206,13 +207,14 @@ class Master(Node):
 
     def _create_children(self) -> Dict[str, Node]:
         assignments,remove_tasks = self._assign_children(self._tasks, self._scheduler.cluster.nodes)
-        self._child_assignment = assignments
+        self._child_assignment = {}
         self.logger.info(f"Children assignment: {self._child_assignment}")
 
         children = {}
         if self.level + 1 == self._config.nlevels:
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".w{wid}"
+                self._child_assignment[child_id] = alloc
                 #create a worker
                 children[child_id] = \
                     Worker(
@@ -227,6 +229,7 @@ class Master(Node):
             #create a master again
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
+                self._child_assignment[child_id] = alloc
                 #create a worker
                 children[child_id] = \
                     Master(
@@ -256,7 +259,10 @@ class Master(Node):
 
     def _lazy_init(self) -> Dict[str, Node]:
         #lazy logger creation
+        tick = time.perf_counter()
         self._setup_logger()
+        tock = time.perf_counter()
+        self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
         self._scheduler = WorkerScheduler(self.logger, cluster=LocalClusterResource(self.logger, self._nodes,self._sys_info))
@@ -265,37 +271,47 @@ class Master(Node):
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile,
                                                                                                                "logger": self.logger})
 
+        ##create comm: Need to do this after the setting the children to properly create pipes
+        self._create_comm() ###This will only create picklable objects
+        ##lazy creation of non-pickable objects
+        if self._config.comm_name == "zmq":
+            self._comm.setup_zmq_sockets()
+
+        with self._timer("heartbeat_sync"):
+            self._comm.async_recv_parent() ###start the recv thread
+            ##heart beat sync with parent
+            if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+
+        task_update: TaskUpdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=5.0)
+        if task_update is not None:
+            self.logger.info(f"{self.node_id}: Received task update from parent")
+            for task in task_update.added_tasks:
+                self._tasks[task.task_id] = task
+        
+        self.logger.info(f"{self.node_id}: Have {len(self._tasks)} tasks after update from parent")
+
         ##create children
         children = self._create_children()
+        
         self.logger.info(f"{self.node_id} Created {len(children)} children: {children.keys()}")
 
         #add children
         for child_id, child in children.items():
             self.add_child(child_id, child.info())
             child.set_parent(self.info())
-        
-        ##create comm: Need to do this after the setting the children to properly create pipes
-        self._create_comm() ###This will only create picklable objects
-        for child_id, child in children.items():
-            ###TODO: Implement a comminfo to fix this!!!
             child.parent_comm = self.comm.pickable_copy()
         
-        ##lazy creation of non-pickable objects
-        if self._config.comm_name == "zmq":
-            self._comm.setup_zmq_sockets()
-        
+        self._comm.node_info = self.info()  ##update the node info with children ids
+        self._comm.init_cache()
+        self._comm.async_recv_children() ###start the recv thread for children
+
         return children
 
     def run(self):
         with self._timer("init"):
             children = self._lazy_init()
-
-        with self._timer("heartbeat_sync"):
-            self._comm.async_recv() ###start the recv thread
-            ##heart beat sync with parent
-            if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
         
         with self._timer("launch_children"):
             if self._config.child_executor_name == "mpi":
@@ -314,9 +330,10 @@ class Master(Node):
                 dirname = os.path.join(os.getcwd(),f".tmp_{self.node_id}")
                 os.makedirs(dirname,exist_ok=True)
                 for k,v in child_obj_dict.items():
-                    fname = os.path.join(dirname,f"{k}_child_obj.pkl")
-                    with open(fname,"wb") as f:
-                        cloudpickle.dump(v,f)
+                    fname = os.path.join(dirname,f"{k}_child_obj.json")
+                    with open(fname,"w") as f:
+                        self.logger.info(f"Saving child object dict {v.asdict()}, {k} to {fname}")
+                        json.dump(v.asdict(),f)
                 self.logger.info(f"Launching worker using one shot mpiexec")
                 load_str_embed = load_str.replace("dirname",f"'{dirname}'")
                 self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c" ,load_str_embed] , env = env)
@@ -334,8 +351,14 @@ class Master(Node):
 
         with self._timer("sync_with_children"):
             if not self._comm.sync_heartbeat_with_children(timeout=30.0):
+                self.logger.error(f"{self.node_id}: Can't connect to children.")
                 return self._get_child_exceptions() # Should return and report
             else:
+                for child_id in self.children:
+                    new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
+                    task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+                    self._comm.send_message_to_child(child_id, task_update)
+                    self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)}")
                 return self._results() #should return and report
     
     @classmethod
@@ -527,8 +550,13 @@ class Master(Node):
                     if msg.type == ActionType.STOP:
                         self.logger.info(f"{self.node_id}: Received stop from parent")
                         break
+        
                 time.sleep(1.0)
         
+        for child_id, exec_id in self._children_exec_ids.items():
+            result = self._executor.result(exec_id)
+            self.logger.info(f"{self.node_id}: Child {child_id} final (stdout,stderr): {result}")
+
         self.stop()
         return new_result
 
@@ -561,3 +589,47 @@ class Master(Node):
         self._comm.clear_cache()
         self._comm.close()        
         self._executor.shutdown(force=True)
+    
+    def asdict(self,include_tasks:bool = False) -> dict:
+        obj_dict = {
+            "type": "Master",
+            "node_id": self.node_id,
+            "nodes": self._nodes,
+            "config": self._config.model_dump_json(),
+            "system_info": asdict(self._sys_info),
+            "parent": asdict(self.parent) if self.parent else None,
+            "children": {child_id: asdict(child) for child_id, child in self.children.items()},
+            "parent_comm": self.parent_comm.asdict() if self.parent_comm else None
+        }
+
+        if include_tasks:
+            raise NotImplementedError("Including tasks in serialization is not implemented yet.")
+        
+        return obj_dict
+    
+    @classmethod
+    def fromdict(cls, data: dict) -> 'Master':
+        config = LauncherConfig.model_validate_json(data["config"])
+        system_info = NodeResourceList(**data["system_info"])
+        parent = NodeInfo(**data["parent"]) if data["parent"] else None
+        children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
+
+        if config.comm_name == "zmq":
+            # ZMQComm might need special handling due to non-picklable attributes
+            parent_comm = ZMQComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
+        elif config.comm_name == "multiprocessing":
+            parent_comm = MPComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
+        else:
+            raise ValueError(f"Unsupported comm type {config.comm_name}")
+
+        master = cls(
+            id=data["node_id"],
+            config=config,
+            system_info=system_info,
+            Nodes=data["nodes"],
+            tasks={},  # Tasks are not included in serialization
+            parent=parent,
+            children=children,
+            parent_comm=parent_comm
+        )
+        return master

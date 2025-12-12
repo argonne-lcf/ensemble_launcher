@@ -3,7 +3,7 @@ import time
 import os
 from typing import Any, TYPE_CHECKING, Tuple, Optional
 from ensemble_launcher.scheduler import TaskScheduler
-from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource
+from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource, NodeResourceList
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
@@ -15,6 +15,7 @@ import socket
 import json
 from contextlib import contextmanager
 from collections import defaultdict
+from dataclasses import asdict
 
 
 class Worker(Node):
@@ -164,7 +165,10 @@ class Worker(Node):
 
     def _lazy_init(self):
         #lazy logger creation
+        tick = time.perf_counter()
         self._setup_logger()
+        tock = time.perf_counter()
+        self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
         self._scheduler = TaskScheduler(self.logger, self._tasks,cluster=LocalClusterResource(self.logger, self._nodes, self._sys_info))
@@ -204,13 +208,19 @@ class Worker(Node):
             ##lazy init
             self._lazy_init()
         
-        self.logger.info(f"Running {self._tasks.keys()} tasks")
         with self._timer("heartbeat_sync"):
-            self._comm.async_recv()
+            self._comm.async_recv_parent()
             #sync with parent
             if self.parent and not self._comm.sync_heartbeat_with_parent(timeout=30.0):
                 self.logger.error(f"{self.node_id}: Failed to connect to parent")
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        
+        task_update: TaskUpdate = self._comm.recv_message_from_parent(TaskUpdate)
+        if task_update is not None:
+            self.logger.info(f"{self.node_id}: Received task update from parent")
+            self._update_tasks(task_update)
+        
+        self.logger.info(f"Running {list(self._tasks.keys())} tasks")
 
         next_report_time = time.time() + self._config.report_interval
         
@@ -342,5 +352,49 @@ class Worker(Node):
         self._comm.clear_cache()
         self._comm.close()
         self._executor.shutdown()
+    
+    def asdict(self,include_tasks:bool = False) -> dict:
+        obj_dict = {
+            "type": "Worker",
+            "node_id": self.node_id,
+            "nodes": self._nodes,
+            "config": self._config.model_dump_json(),
+            "system_info": asdict(self._sys_info),
+            "parent": asdict(self.parent) if self.parent else None,
+            "children": {child_id: asdict(child) for child_id, child in self.children.items()},
+            "parent_comm": self.parent_comm.asdict() if self.parent_comm else None
+        }
+
+        if include_tasks:
+            raise NotImplementedError("Including tasks in serialization is not implemented yet.")
+        
+        return obj_dict
+    
+    @classmethod
+    def fromdict(cls, data: dict) -> 'Worker':
+        config = LauncherConfig.model_validate_json(data["config"])
+        system_info = NodeResourceList(**data["system_info"])
+        parent = NodeInfo(**data["parent"]) if data["parent"] else None
+        children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
+
+        if config.comm_name == "zmq":
+            # ZMQComm might need special handling due to non-picklable attributes
+            parent_comm = ZMQComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
+        elif config.comm_name == "multiprocessing":
+            parent_comm = MPComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
+        else:
+            raise ValueError(f"Unsupported comm type {config.comm_name}")
+
+        worker = cls(
+            id=data["node_id"],
+            config=config,
+            system_info=system_info,
+            Nodes=data["nodes"],
+            tasks={},  # Tasks are not included in serialization
+            parent=parent,
+            children=children,
+            parent_comm=parent_comm
+        )
+        return worker
 
 
