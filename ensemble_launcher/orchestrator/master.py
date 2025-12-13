@@ -17,6 +17,7 @@ import numpy as np
 import cloudpickle
 import socket
 import json
+import base64
 from contextlib import contextmanager
 from collections import defaultdict
 from .utils import load_str
@@ -315,27 +316,48 @@ class Master(Node):
         with self._timer("launch_children"):
             if self._config.child_executor_name == "mpi":
                 ##launch all children in a single shot
-                child_obj_dict = {}
                 child_head_nodes = []
                 child_resources = []
-                for child_name,child_obj in children.items():
-                    child_head_nodes.append(child_obj.nodes[0])
+                child_obj_dict = {}
+                
+                for child_name, child_obj in children.items():
+                    head_node = child_obj.nodes[0]
+                    child_head_nodes.append(head_node)
                     child_resources.append(NodeResourceCount(ncpus=1))
-                    child_obj_dict[child_head_nodes[-1]] = child_obj
-                req = JobResource(
-                            resources=child_resources, nodes=child_head_nodes
-                    )
+                    child_obj_dict[head_node] = child_obj
+                
+                # Build combined dictionary structure
+                common_keys = ["type", "config", "system_info", "parent", "parent_comm"]
+                first_child = next(iter(child_obj_dict.values()))
+                first_dict = first_child.asdict()
+                
+                # Initialize with common keys from first child
+                final_dict = {key: first_dict[key] for key in common_keys}
+                
+                # Initialize per-host keys as empty dicts
+                for key in first_dict.keys():
+                    if key not in common_keys:
+                        final_dict[key] = {}
+                
+                # Populate per-host values
+                for hostname, child_obj in child_obj_dict.items():
+                    child_dict = child_obj.asdict()
+                    for key, value in child_dict.items():
+                        if key not in common_keys:
+                            final_dict[key][hostname] = value
+                
+                # Create embedded command string
+                json_str = json.dumps(final_dict, default=str)
+                json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                common_keys_str = ','.join(common_keys)
+                load_str_embed = load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+                load_str_embed = load_str_embed.replace("common_keys_str", f"'{common_keys_str}'")
+                
+                req = JobResource(resources=child_resources, nodes=child_head_nodes)
                 env = os.environ.copy()
-                dirname = os.path.join(os.getcwd(),f".tmp_{self.node_id}")
-                os.makedirs(dirname,exist_ok=True)
-                for k,v in child_obj_dict.items():
-                    fname = os.path.join(dirname,f"{k}_child_obj.json")
-                    with open(fname,"w") as f:
-                        self.logger.info(f"Saving child object dict {v.asdict()}, {k} to {fname}")
-                        json.dump(v.asdict(),f)
+                
                 self.logger.info(f"Launching worker using one shot mpiexec")
-                load_str_embed = load_str.replace("dirname",f"'{dirname}'")
-                self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c" ,load_str_embed] , env = env)
+                self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
             else:
                 for child_idx, (child_name,child_obj) in enumerate(children.items()):
                     child_nodes = child_obj.nodes

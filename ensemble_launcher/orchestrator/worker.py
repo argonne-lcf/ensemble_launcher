@@ -215,10 +215,12 @@ class Worker(Node):
                 self.logger.error(f"{self.node_id}: Failed to connect to parent")
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
         
-        task_update: TaskUpdate = self._comm.recv_message_from_parent(TaskUpdate)
+        task_update: TaskUpdate = self._comm.recv_message_from_parent(TaskUpdate, timeout=10.0)
         if task_update is not None:
             self.logger.info(f"{self.node_id}: Received task update from parent")
             self._update_tasks(task_update)
+        else:
+            self.logger.warning(f"{self.node_id}: No task update received from parent at start")
         
         self.logger.info(f"Running {list(self._tasks.keys())} tasks")
 

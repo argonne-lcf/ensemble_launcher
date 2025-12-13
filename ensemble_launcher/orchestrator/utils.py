@@ -1,14 +1,13 @@
-load_str="from datetime import datetime;"\
-         "import socket, os, json;"\
-         "from ensemble_launcher.orchestrator.worker import Worker;"\
-         "from ensemble_launcher.orchestrator.master import Master;"\
-         "hostname = socket.gethostname();"\
-         "start=datetime.now();"\
-         "fname = os.path.join(dirname,f\'{hostname}_child_obj.json\');"\
-         "f = open(fname, 'r');"\
-         "child_dict = json.load(f);"\
-         "f.close();"\
-         "after_deserialization = datetime.now();"\
-         "child_obj = Worker.fromdict(child_dict) if child_dict['type'] == 'Worker' else Master.fromdict(child_dict);"\
-         "child_obj.run();" \
-         "print(child_obj.node_id, start, after_deserialization);"
+load_str = "import base64, json, socket; "\
+           "from datetime import datetime; "\
+           "from ensemble_launcher.orchestrator.worker import Worker; "\
+           "from ensemble_launcher.orchestrator.master import Master; "\
+           "hostname = socket.gethostname(); "\
+           "start = datetime.now(); "\
+           "all_children_dict = json.loads(base64.b64decode(json_str_b64).decode('utf-8')); "\
+           "common_keys = common_keys_str.split(','); "\
+           "child_dict = {key: all_children_dict[key][hostname] if key not in common_keys and isinstance(all_children_dict[key], dict) and hostname in all_children_dict[key] else all_children_dict[key] for key in all_children_dict.keys()}; "\
+           "after_deserialization = datetime.now(); "\
+           "child_obj = Worker.fromdict(child_dict) if child_dict['type'] == 'Worker' else Master.fromdict(child_dict); "\
+           "child_obj.run(); "\
+           "print(child_obj.node_id, start, after_deserialization);"
