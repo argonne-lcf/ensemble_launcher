@@ -45,6 +45,10 @@ class ZMQComm(Comm):
         
         self._router_cache = None
 
+    def update_node_info(self, node_info: NodeInfo):
+        self.node_info = node_info
+        self.init_cache()
+        
     def init_cache(self):
         super().init_cache()
         self._init_router_cache()

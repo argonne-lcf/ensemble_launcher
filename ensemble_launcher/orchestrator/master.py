@@ -303,8 +303,7 @@ class Master(Node):
             child.set_parent(self.info())
             child.parent_comm = self.comm.pickable_copy()
         
-        self._comm.node_info = self.info()  ##update the node info with children ids
-        self._comm.init_cache()
+        self._comm.update_node_info(self.info())  ##update the node info with children ids
         self._comm.async_recv_children() ###start the recv thread for children
 
         return children

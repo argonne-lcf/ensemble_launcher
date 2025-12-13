@@ -25,7 +25,7 @@ def test_master():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     m = Master(
-        "test",LauncherConfig(return_stdout=True,master_logs=False, worker_logs=False),sys_info,nodes,tasks
+        "test",LauncherConfig(return_stdout=True,master_logs=True, worker_logs=True),sys_info,nodes,tasks
     )
 
     result = m.run()
@@ -79,6 +79,6 @@ def test_master_multilevel():
     assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
     
 if __name__ == "__main__":
-    # test_master()
+    test_master()
     # test_master_zmq_comm()
-    test_master_multilevel()
+    # test_master_multilevel()

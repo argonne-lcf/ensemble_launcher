@@ -377,6 +377,11 @@ class Comm(ABC):
             status.append(self.sync_heartbeat_with_child(child_id, timeout=timeout))
         return all(status)
     
+    def async_recv(self):
+        """Start async monitoring threads for parent and children"""
+        self.async_recv_parent()
+        self.async_recv_children()
+        
     def async_recv_parent(self):
         """Start a thread that continuously monitors the parent endpoint and pushes to self._cache"""
         
