@@ -183,7 +183,7 @@ class ZMQComm(Comm):
                 if timeout is not None and time.time() - start_time >= timeout:
                     break
 
-                socks = dict(self.router_poller.poll(100)) #wait for 100ms
+                socks = dict(self.router_poller.poll(1)) #wait for 1ms
                 if self.router_socket in socks and socks[self.router_socket] == zmq.POLLIN:
                     msg = self.router_socket.recv_multipart()
                     sender_id = msg[0].decode()  # Convert bytes to string for child_id

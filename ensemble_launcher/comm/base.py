@@ -398,9 +398,6 @@ class Comm(ABC):
                                     self._profile_info[self.node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
                                     self._profile_info[self.node_info.parent_id]["datasize"].append(0.0)
                                     self._profile_info[self.node_info.parent_id]["type"].append(type(msg).__name__)
-                    else:
-                        # Add small sleep when no messages to reduce CPU usage
-                        time.sleep(0.01)
                 except Exception as e:
                     self.logger.error(f"Error monitoring parent: {e}")
                     time.sleep(0.1)  # Longer sleep on error
@@ -424,9 +421,8 @@ class Comm(ABC):
             """Monitor messages from all children and cache them"""
             while getattr(self, '_stop_monitoring_children', False) is False:
                 try:
-                    messages_received = 0
                     for child_id in self.node_info.children_ids:
-                        msg = self._recv_from_child(child_id, timeout=0.01)  # Shorter timeout
+                        msg = self._recv_from_child(child_id, timeout=0.1)
                         if msg is not None:
                             if isinstance(msg, Message):
                                 if self._profile:
@@ -435,15 +431,11 @@ class Comm(ABC):
                                         self._profile_info[child_id]["datasize"].append(0.0)
                                         self._profile_info[child_id]["type"].append(type(msg).__name__)
                                 self._cache[child_id].put(msg)
-                                messages_received += 1
-                    
-                    # Only sleep if no messages were received to reduce CPU usage
-                    if messages_received == 0:
-                        time.sleep(0.01)
+                # No sleep needed - _recv_from_child handles blocking
                         
                 except Exception as e:
                     self.logger.error(f"Error monitoring children: {e}")
-                    time.sleep(0.1)  # Longer sleep on error
+                    time.sleep(0.1)  # Only sleep on error
         
         # Initialize cache if not already done
         if not self._cache:
