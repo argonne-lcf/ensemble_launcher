@@ -18,12 +18,20 @@ class MPComm(Comm):
         
         self._my_conn_to_child = {}
         self._child_conn_to_me = {}
+        self._my_conn_to_parent = None
+        self._setup_pipes()
+    
+    def _setup_pipes(self):
         for child_id in self.node_info.children_ids:
             self._my_conn_to_child[child_id], self._child_conn_to_me[child_id] = mp.Pipe()
         
-        self._my_conn_to_parent = None
+
         if self._parent_comm:
             self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
+
+    def update_node_info(self, node_info: NodeInfo):
+        self.node_info = node_info
+        self._setup_pipes()
 
     def _send_to_parent(self, data: Any) -> bool:
         if self._my_conn_to_parent is None:
@@ -107,3 +115,10 @@ class MPComm(Comm):
         ret._my_conn_to_child = self._my_conn_to_child
         ret._child_conn_to_me = self._child_conn_to_me
         return ret
+    
+    def asdict(self):
+        raise NotImplementedError("MPComm does not support asdict method.")
+    
+    @classmethod
+    def fromdict(cls, data: dict) -> "MPComm":
+        raise NotImplementedError("MPComm does not support fromdict method.")

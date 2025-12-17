@@ -7,6 +7,7 @@ from typing import Any, Optional
 import cloudpickle
 from logging import Logger
 import queue
+from dataclasses import asdict
 
 
 try:
@@ -44,49 +45,60 @@ class ZMQComm(Comm):
         
         self._router_cache = None
 
-    
+    def update_node_info(self, node_info: NodeInfo):
+        self.node_info = node_info
+        self.init_cache()
+        
+    def init_cache(self):
+        super().init_cache()
+        self._init_router_cache()
+        
     def _init_router_cache(self):
         # ZMQ-specific raw data cache using FIFO queues (preserves message order)
-        self._router_cache: Dict[str, queue.Queue] = {}
+        if self._router_cache is None:
+            self._router_cache: Dict[str, queue.Queue] = {}
+            
         for child_id in self.node_info.children_ids:
-            self._router_cache[child_id] = queue.Queue()
+            if child_id not in self._router_cache:
+                self._router_cache[child_id] = queue.Queue()
         
         if self.node_info.parent_id:
-            self._router_cache[self.node_info.parent_id] = queue.Queue()
+            if self.node_info.parent_id not in self._router_cache:
+                self._router_cache[self.node_info.parent_id] = queue.Queue()
 
     def setup_zmq_sockets(self):
         if not self._router_cache:
             self._init_router_cache()
 
         self.zmq_context = zmq.Context()
-        if len(self.node_info.children_ids) > 0:
-            self.router_socket = self.zmq_context.socket(zmq.ROUTER)
-            self.router_socket.setsockopt(zmq.IDENTITY,f"{self.node_info.node_id}".encode())
-            try:
-                self.router_socket.bind(f"tcp://{self.my_address}")
-                self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
-            except zmq.error.ZMQError as e:
-                if "Address already in use" in str(e):
-                    # Try binding up to 3 times with different ports
-                    max_attempts = 10
-                    for attempt in range(max_attempts):
-                        try:
-                            port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
-                            self.logger.info(f"{self.node_info.node_id}: Attempt {attempt+1}/{max_attempts}: Trying to bind to port {port} instead.")
-                            self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
-                            self.router_socket.bind(f"tcp://{self.my_address}")
-                            self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
-                            break  # Break out of the retry loop if binding succeeds
-                        except zmq.error.ZMQError as retry_error:
-                            if "Address already in use" in str(retry_error) and attempt < max_attempts - 1:
-                                self.logger.warning(f"{self.node_info.node_id}: Port {port} also in use, retrying...")
-                                continue
-                            else:
-                                raise retry_error
-                else:
-                    raise e
-            self.router_poller = zmq.Poller()
-            self.router_poller.register(self.router_socket, zmq.POLLIN)
+        # if len(self.node_info.children_ids) > 0:
+        self.router_socket = self.zmq_context.socket(zmq.ROUTER)
+        self.router_socket.setsockopt(zmq.IDENTITY,f"{self.node_info.node_id}".encode())
+        try:
+            self.router_socket.bind(f"tcp://{self.my_address}")
+            self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
+        except zmq.error.ZMQError as e:
+            if "Address already in use" in str(e):
+                # Try binding up to 3 times with different ports
+                max_attempts = 10
+                for attempt in range(max_attempts):
+                    try:
+                        port = int(self.my_address.split(':')[-1]) + random.randint(1, 1000)
+                        self.logger.info(f"{self.node_info.node_id}: Attempt {attempt+1}/{max_attempts}: Trying to bind to port {port} instead.")
+                        self.my_address = f"{self.my_address.rsplit(':', 1)[0]}:{port}"
+                        self.router_socket.bind(f"tcp://{self.my_address}")
+                        self.logger.info(f"{self.node_info.node_id}: Successfully bound to {self.my_address}")
+                        break  # Break out of the retry loop if binding succeeds
+                    except zmq.error.ZMQError as retry_error:
+                        if "Address already in use" in str(retry_error) and attempt < max_attempts - 1:
+                            self.logger.warning(f"{self.node_info.node_id}: Port {port} also in use, retrying...")
+                            continue
+                        else:
+                            raise retry_error
+            else:
+                raise e
+        self.router_poller = zmq.Poller()
+        self.router_poller.register(self.router_socket, zmq.POLLIN)
 
         if self.parent_address is not None:
             self.dealer_socket = self.zmq_context.socket(zmq.DEALER)
@@ -171,7 +183,7 @@ class ZMQComm(Comm):
                 if timeout is not None and time.time() - start_time >= timeout:
                     break
 
-                socks = dict(self.router_poller.poll(100)) #wait for 100ms
+                socks = dict(self.router_poller.poll(1)) #wait for 1ms
                 if self.router_socket in socks and socks[self.router_socket] == zmq.POLLIN:
                     msg = self.router_socket.recv_multipart()
                     sender_id = msg[0].decode()  # Convert bytes to string for child_id
@@ -229,3 +241,17 @@ class ZMQComm(Comm):
         ret = ZMQComm(None, node_info=self.node_info, parent_address=self.parent_address)
         ret.my_address = self.my_address
         return ret
+    
+    def asdict(self):
+        base_dict = {}
+        base_dict["node_info"] = asdict(self.node_info) if self.node_info else None
+        base_dict["parent_address"] = self.parent_address
+        base_dict["my_address"] = self.my_address
+        return base_dict
+    
+    @classmethod
+    def fromdict(cls, data: Dict[str, Any]) -> "ZMQComm":
+        node_info = NodeInfo(**data["node_info"]) if data.get("node_info") else None
+        comm = cls(None, node_info=node_info, parent_address=data.get("parent_address"))
+        comm.my_address = data.get("my_address")
+        return comm

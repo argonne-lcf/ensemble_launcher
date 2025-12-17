@@ -227,6 +227,9 @@ class Comm(ABC):
 
     def init_cache(self):
         for child_id in self.node_info.children_ids:
+            if child_id in self._cache:
+                continue
+            self.logger.info(f"Initializing cache for child_id: {child_id}")
             self._cache[child_id] = MessageRoutingQueue()
         
         if self._profile:
@@ -234,7 +237,8 @@ class Comm(ABC):
             for child_id in self.node_info.children_ids:
                 self._profile_info[child_id] = {"latency":[], "datasize":[], "type":[]}
         
-        if self.node_info.parent_id:
+        if self.node_info.parent_id and self.node_info.parent_id not in self._cache:
+            self.logger.info(f"Initializing cache for parent_id: {self.node_info.parent_id}")
             self._cache[self.node_info.parent_id] = MessageRoutingQueue()
         
         if self._profile:
@@ -374,11 +378,16 @@ class Comm(ABC):
         return all(status)
     
     def async_recv(self):
-        """This method starts a thread that continuously monitor the endpoints and push to self._cache"""
+        """Start async monitoring threads for parent and children"""
+        self.async_recv_parent()
+        self.async_recv_children()
+        
+    def async_recv_parent(self):
+        """Start a thread that continuously monitors the parent endpoint and pushes to self._cache"""
         
         def _monitor_parent():
             """Monitor messages from parent and cache them"""
-            while getattr(self, '_stop_monitoring', False) is False:
+            while getattr(self, '_stop_monitoring_parent', False) is False:
                 try:
                     msg = self._recv_from_parent(timeout=0.1)
                     if msg is not None and self.node_info.parent_id is not None:
@@ -389,20 +398,31 @@ class Comm(ABC):
                                     self._profile_info[self.node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
                                     self._profile_info[self.node_info.parent_id]["datasize"].append(0.0)
                                     self._profile_info[self.node_info.parent_id]["type"].append(type(msg).__name__)
-                    else:
-                        # Add small sleep when no messages to reduce CPU usage
-                        time.sleep(0.01)
                 except Exception as e:
                     self.logger.error(f"Error monitoring parent: {e}")
                     time.sleep(0.1)  # Longer sleep on error
         
+        # Initialize cache if not already done
+        if not self._cache:
+            self.init_cache()
+        
+        # Initialize stop flag
+        self._stop_monitoring_parent = False
+        
+        # Start monitoring thread
+        if self.node_info.parent_id is not None:
+            self._parent_thread = threading.Thread(target=_monitor_parent, daemon=True)
+            self._parent_thread.start()
+    
+    def async_recv_children(self):
+        """Start a thread that continuously monitors the children endpoints and pushes to self._cache"""
+        
         def _monitor_children():
             """Monitor messages from all children and cache them"""
-            while getattr(self, '_stop_monitoring', False) is False:
+            while getattr(self, '_stop_monitoring_children', False) is False:
                 try:
-                    messages_received = 0
                     for child_id in self.node_info.children_ids:
-                        msg = self._recv_from_child(child_id, timeout=0.01)  # Shorter timeout
+                        msg = self._recv_from_child(child_id, timeout=0.1)
                         if msg is not None:
                             if isinstance(msg, Message):
                                 if self._profile:
@@ -411,35 +431,28 @@ class Comm(ABC):
                                         self._profile_info[child_id]["datasize"].append(0.0)
                                         self._profile_info[child_id]["type"].append(type(msg).__name__)
                                 self._cache[child_id].put(msg)
-                                messages_received += 1
-                    
-                    # Only sleep if no messages were received to reduce CPU usage
-                    if messages_received == 0:
-                        time.sleep(0.01)
+                # No sleep needed - _recv_from_child handles blocking
                         
                 except Exception as e:
                     self.logger.error(f"Error monitoring children: {e}")
-                    time.sleep(0.1)  # Longer sleep on error
+                    time.sleep(0.1)  # Only sleep on error
         
         # Initialize cache if not already done
         if not self._cache:
             self.init_cache()
         
         # Initialize stop flag
-        self._stop_monitoring = False
+        self._stop_monitoring_children = False
         
-        # Start monitoring threads
-        if self.node_info.parent_id is not None:
-            self._parent_thread = threading.Thread(target=_monitor_parent, daemon=True)
-            self._parent_thread.start()
-        
+        # Start monitoring thread
         if self.node_info.children_ids:
             self._children_thread = threading.Thread(target=_monitor_children, daemon=True)
             self._children_thread.start()
     
     def stop_async_recv(self):
         """Stop the async monitoring threads"""
-        self._stop_monitoring = True
+        self._stop_monitoring_parent = True
+        self._stop_monitoring_children = True
         if hasattr(self, '_parent_thread') and self._parent_thread.is_alive():
             self._parent_thread.join(timeout=1.0)
         if hasattr(self, '_children_thread') and self._children_thread.is_alive():
