@@ -31,10 +31,12 @@ def launch_recursive_node(nodes, parent_comm=None, comm_type: str = "mp", parent
     p.start()
     comm.async_recv() ##start the recv
     if node_info.parent_id is not None:
-        comm.sync_heartbeat_with_parent(timeout=30.0)
+        if not comm.sync_heartbeat_with_parent(timeout=30.0):
+            raise RuntimeError(f"Node {node_info.node_id} failed to sync heartbeat with parent {node_info.parent_id}")
     
     if node_info.children_ids:
-        comm.sync_heartbeat_with_children(timeout=30.0)
+        if not comm.sync_heartbeat_with_children(timeout=30.0):
+            raise RuntimeError(f"Node {node_info.node_id} failed to sync heartbeat with children {node_info.children_ids}")
 
 
     if node_info.parent_id:

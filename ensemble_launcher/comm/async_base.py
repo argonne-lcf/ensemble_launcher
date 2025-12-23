@@ -1,0 +1,289 @@
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional, Type, Union, overload
+from .messages import Message, HeartBeat, Status, all_messages
+from .nodeinfo import NodeInfo
+from dataclasses import dataclass, field
+import time
+from logging import Logger
+from datetime import datetime
+import asyncio
+from asyncio import Queue, LifoQueue
+
+
+class AsyncMessageRoutingQueue:
+    """An async routing queue that organizes messages by type using separate LifoQueues. Not thread-safe."""
+    
+    def __init__(self,logger: Logger, message_types: Optional[List[Type[Message]]] = None):
+        self.logger = logger
+        self._queues: Dict[Type[Message], Union[Queue, LifoQueue]] = {}
+        self._message_types = message_types
+        if message_types is not None:
+            for msg_type in message_types:
+                if msg_type == Status:
+                    self._queues[msg_type] = LifoQueue()
+                else:
+                    self._queues[msg_type] = Queue()
+    
+    async def put(self, message: Message):
+        """Put a message into the appropriate type-specific queue"""
+        msg_type = type(message)
+        if msg_type not in self._queues:
+            if msg_type == Status:
+                self._queues[msg_type] = LifoQueue()
+            else:
+                self._queues[msg_type] = Queue()
+            self.logger.debug(f"Created new queue for message type: {msg_type.__name__}")
+        await self._queues[msg_type].put(message)
+    
+    async def get(self, msg_type: Type[Message], timeout: Optional[float] = None) -> Optional[Message]:
+        """Get the latest message of a specific type or any type if msg_type is None"""
+        
+        # Get specific message type
+        if msg_type not in self._queues:
+            self.logger.warning(f"No messages of type {msg_type.__name__} available")
+            return None
+        
+        try:
+            msg = await asyncio.wait_for(self._queues[msg_type].get(), timeout=timeout)
+            self.logger.debug(f"Retrieved message of type {msg_type.__name__} with timeout {timeout}")
+            return msg
+        except asyncio.TimeoutError:
+            self.logger.debug(f"No messages of type {msg_type.__name__} available within timeout {timeout}s")
+            return None
+        except asyncio.QueueEmpty:
+            self.logger.debug(f"Queue of type {msg_type.__name__} is empty")
+            return None
+    
+    def get_nowait(self, msg_type: Type[Message]) -> Optional[Message]:
+        """Get the latest message of a specific type or any type without blocking"""
+        # Get specific message type
+        if msg_type not in self._queues:
+            self.logger.warning(f"No messages of type {msg_type.__name__} available")
+            return None
+        
+        try:
+            msg = self._queues[msg_type].get_nowait()
+            self.logger.debug(f"Retrieved message of type {msg_type.__name__} without blocking")
+            return msg
+        except asyncio.QueueEmpty:
+            self.logger.debug(f"No messages of type {msg_type.__name__} available in queue")
+            return None
+    
+    def clear(self, msg_type: Optional[Type[Message]] = None):
+        """Clear messages of a specific type or all types"""
+        if msg_type is not None:
+            if msg_type in self._queues:
+                try:
+                    while True:
+                        self._queues[msg_type].get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+        else:
+            # Clear all queues
+            for queue_obj in self._queues.values():
+                try:
+                    while True:
+                        queue_obj.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            self._queues.clear()
+    
+    def empty(self, msg_type: Optional[Type[Message]] = None) -> bool:
+        """Check if a specific message type queue or all queues are empty"""
+        if msg_type is not None:
+            if msg_type not in self._queues:
+                self.logger.warning(f"No messages of type {msg_type.__name__} available")
+                return True
+            return self._queues[msg_type].empty()
+        else:
+            return all(queue_obj.empty() for queue_obj in self._queues.values())
+
+class AsyncComm(ABC):
+    def __init__(self, 
+                 logger: Logger,
+                 node_info: NodeInfo, 
+                 parent_comm: "AsyncComm"= None, 
+                 heartbeat_interval: int = 1,
+                 profile: bool = False):
+        
+        self.logger = logger
+        self._node_info = node_info
+        self.last_update_time = time.time()
+        self.last_heartbeat_time = None
+        self.heartbeat_interval = heartbeat_interval
+        self._parent_comm = parent_comm
+        self._cache: Dict[str, AsyncMessageRoutingQueue] = {}
+        self._profile = profile
+        self._profile_info: Dict[str, Dict[str,List]] = {}
+        self._stop_event = None
+
+    async def init_cache(self):
+        for child_id in self._node_info.children_ids:
+            if child_id in self._cache:
+                continue
+            self.logger.info(f"Initializing cache for child_id: {child_id}")
+            self._cache[child_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
+        
+        if self._profile:
+            for child_id in self._node_info.children_ids:
+                self._profile_info[child_id] = {"latency":[], "datasize":[], "type":[]}
+        
+        if self._node_info.parent_id and self._node_info.parent_id not in self._cache:
+            self.logger.info(f"Initializing cache for parent_id: {self._node_info.parent_id}")
+            self._cache[self._node_info.parent_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
+        
+        if self._profile:
+            self._profile_info[self._node_info.parent_id] = {"latency":[], "datasize":[], "type":[]}
+
+    async def update_node_info(self,node_info: NodeInfo):
+        self._node_info = node_info
+        self.init_cache()
+
+    @abstractmethod
+    async def _send_to_parent(self, data: Any, **kwargs) -> bool:
+        pass
+
+    @abstractmethod
+    async def _recv_from_parent(self, timeout: Optional[float] = None, **kwargs) -> Any:
+        pass
+
+    @abstractmethod
+    async def _send_to_child(self, child_id: str, data: Any, **kwargs) -> bool:
+        pass
+
+    @abstractmethod
+    async def _recv_from_child(self, child_id: str, timeout: Optional[float] = None, **kwargs) -> Any:
+        pass
+
+    @abstractmethod
+    async def close(self):
+        pass
+
+    @abstractmethod
+    async def pickable_copy(self):
+        pass
+
+    async def start_monitors(self):
+        """Start background tasks to monitor communication endpoints."""
+        await self.init_cache()
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        
+        if self._node_info.parent_id is not None:
+            asyncio.create_task(self._monitor_parent_messages())
+
+        if len(self._node_info.children_ids) > 0:                
+            asyncio.create_task(self._monitor_children_messages())
+
+    async def _monitor_parent_messages(self):
+        """Monitor messages from parent and cache them"""
+        while not self._stop_event.is_set():
+            try:
+                msg = await self._recv_from_parent()
+                if msg is not None and self._node_info.parent_id is not None:
+                    if isinstance(msg, Message):
+                        await self._cache[self._node_info.parent_id].put(msg)
+                        if self._profile:
+                            self._profile_info[self._node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
+                            self._profile_info[self._node_info.parent_id]["datasize"].append(0.0)
+                            self._profile_info[self._node_info.parent_id]["type"].append(type(msg).__name__)
+            except Exception as e:
+                self.logger.error(f"Error monitoring parent: {e}")
+                await asyncio.sleep(0.1)  # Longer sleep on error
+
+    async def _monitor_children_messages(self):
+        """Monitor messages from all children and cache them"""
+        while not self._stop_event.is_set():
+            try:
+                for child_id in self._node_info.children_ids:
+                    msg = await self._recv_from_child(child_id)
+                    if msg is not None:
+                        if isinstance(msg, Message):
+                            await self._cache[child_id].put(msg)
+                            if self._profile:
+                                self._profile_info[child_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
+                                self._profile_info[child_id]["datasize"].append(0.0)
+                                self._profile_info[child_id]["type"].append(type(msg).__name__)
+            except Exception as e:
+                self.logger.error(f"Error monitoring children: {e}")
+                await asyncio.sleep(0.1)  # Only sleep on error
+
+    async def recv_message_from_child(self,cls: Type[Message], child_id: str, block: bool = False, timeout: Optional[float] = None) -> Message | None:
+        """
+            Receive a specific message type from child node with efficient type-based caching.
+            If block is False: 
+                timeout is None, it will return immediately if no message is available.
+                timeout is specified, it will wait up to timeout seconds for a message of the specified type.
+            If block is True:
+                timeout is None, it will wait indefinitely for a message of the specified type.
+                timeout is specified, it will wait up to timeout seconds for a message of the specified type.
+        """
+        if child_id not in self._cache:
+            return None
+        
+        if block is False and timeout is None:
+            # First check cache for existing message of this type
+            routing_queue = self._cache[child_id]
+            msg = routing_queue.get_nowait(cls)
+        else:
+            routing_queue = self._cache[child_id]
+            msg = await routing_queue.get(cls, timeout=timeout)
+        
+        return msg
+
+    async def send_message_to_child(self, child_id: str, msg: Message) -> bool:
+        return await self._send_to_child(child_id=child_id, data=msg)
+
+    async def send_message_to_parent(self, msg: Message) -> bool:
+        """Send a message to the parent node."""
+        return await self._send_to_parent(data=msg)
+
+    async def recv_message_from_parent(self, cls: Type[Message], block: bool = False, timeout: Optional[float] = None) -> Message | None:
+        """Receive a specific message type from parent node with efficient type-based caching.
+            If block is False: 
+                timeout is None, it will return immediately if no message is available.
+                timeout is specified, it will wait up to timeout seconds for a message of the specified type.
+            If block is True:
+                timeout is None, it will wait indefinitely for a message of the specified type.
+                timeout is specified, it will wait up to timeout seconds for a message of the specified type.
+        """
+        parent_id = self._node_info.parent_id
+        if parent_id is None or parent_id not in self._cache:
+            self.logger.warning("No parent available to receive message from.")
+            return None
+        
+        if block is False and timeout is None:
+            # First check cache for existing message of this type
+            routing_queue = self._cache[parent_id]
+            msg = routing_queue.get_nowait(cls)
+        else:
+            routing_queue = self._cache[parent_id]
+            msg = await routing_queue.get(cls, timeout=timeout)
+        return msg
+
+    async def sync_heartbeat_with_parent(self, timeout: Optional[float] = None) -> bool:
+        #heart beat sync with parent
+        if self._node_info.parent_id is None:
+            return True
+        
+        await self.send_message_to_parent(HeartBeat())
+        msg = await self.recv_message_from_parent(HeartBeat,timeout=timeout)
+        if msg is not None:
+            return True
+        return False
+        
+    async def sync_heartbeat_with_child(self, child_id: str, timeout: Optional[float] = None) -> bool:
+        if len(self._node_info.children_ids) == 0:
+            return True
+    
+        msg = await self.recv_message_from_child(HeartBeat,child_id, timeout=timeout)
+        await self.send_message_to_child(child_id, HeartBeat())
+        if msg is not None:
+            return True
+        return False
+    
+    async def clear_cache(self):
+        """Close all cache queues and clear remaining messages"""
+        for routing_queue in self._cache.values():
+            routing_queue.clear()
+        self._cache.clear()

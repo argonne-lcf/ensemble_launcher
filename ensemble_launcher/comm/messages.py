@@ -80,3 +80,5 @@ class Action(Message):
 @dataclass
 class TaskRequest(Message):
     ntasks: int = 0
+
+all_messages = [Status, Result, HeartBeat, Message, Action, TaskUpdate, TaskRequest]
