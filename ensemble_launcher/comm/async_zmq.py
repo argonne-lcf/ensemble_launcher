@@ -148,8 +148,8 @@ class AsyncZMQComm(AsyncComm):
 
     async def _send_to_parent(self, data: Any) -> bool:
         if self._node_info.parent_id is None:
-            self.logger.error(f"{self._node_info.node_id}: No parent connection available to {self._node_info.parent_id}")
-            raise RuntimeError(f"No parent connection available to {self._node_info.parent_id}")
+            self.logger.warning(f"{self._node_info.node_id}: No parent connection available to {self._node_info.parent_id}")
+            return False
         
         try:
             self.dealer_socket.send(cloudpickle.dumps(data))
@@ -213,7 +213,7 @@ class AsyncZMQComm(AsyncComm):
                 try:
                     while True:
                         cache_queue.get_nowait()
-                except queue.Empty:
+                except asyncio.QueueEmpty:
                     pass
             self._router_cache.clear()
             

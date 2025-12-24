@@ -175,3 +175,9 @@ class ExecutorRegistry:
             raise
 
 executor_registry = ExecutorRegistry()            
+
+
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+executor_registry.register("async_threadpool")(ThreadPoolExecutor)
+executor_registry.register("async_processpool")(ProcessPoolExecutor)
