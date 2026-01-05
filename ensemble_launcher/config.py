@@ -14,7 +14,7 @@ class SystemConfig(BaseModel):
 
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
-    child_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing"
+    child_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool"] = "multiprocessing"
     task_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool"] = "multiprocessing"
     comm_name: Literal["multiprocessing","zmq","dragon","async_zmq"] = "multiprocessing"
     report_interval: float = 10.0
@@ -23,6 +23,7 @@ class LauncherConfig(BaseModel):
     worker_logs: bool = False
     master_logs: bool = False
     nchildren: Optional[int] = None ##Setting this will fix the number of children at each level
+    sequential_child_launch: bool = False ##If True, launch children one by one even for MPI executor
     profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
     gpu_selector: str = "ZE_AFFINITY_MASK"
 

@@ -7,7 +7,7 @@ from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, Node
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, ZMQComm, MPComm
-from ensemble_launcher.comm import Status, Result, Action, ActionType, TaskUpdate
+from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate
 from ensemble_launcher.executors import executor_registry, AsyncThreadPoolExecutor, AsyncProcessPoolExecutor
 import logging
 import cloudpickle
@@ -59,7 +59,7 @@ class AsyncWorker(Node):
         else:
             self._timer = self._noop_timer
         
-        self._lock = threading.RLock()
+        self._lock = None #lazy init
 
         self._stop_submission = asyncio.Event()
         self._stop_reporting = asyncio.Event()
@@ -141,7 +141,7 @@ class AsyncWorker(Node):
     def _create_comm(self):
         if self._config.comm_name == "async_zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = AsyncZMQComm(self.logger, self.info(), parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
+            self._comm = AsyncZMQComm(self.logger.getChild('comm'), self.info(), parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
@@ -153,8 +153,9 @@ class AsyncWorker(Node):
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
+        self._lock = threading.RLock()
         ##init scheduler
-        self._scheduler = AsyncTaskScheduler(self.logger, self._tasks,cluster=AsyncLocalClusterResource(self.logger, self._nodes, self._sys_info))
+        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=AsyncLocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
 
         self._scheduler.start_monitoring()
 
@@ -163,7 +164,7 @@ class AsyncWorker(Node):
 
         self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor] = \
             executor_registry.create_executor(self._config.task_executor_name, kwargs={"gpu_selector":self._config.gpu_selector,
-                                                                                                             "logger":self.logger})
+                                                                                                             "logger":self.logger.getChild('executor')})
         
         ##Lazy comm creation
         self._create_comm()
@@ -240,6 +241,8 @@ class AsyncWorker(Node):
             if self.parent and not await self._comm.sync_heartbeat_with_parent(timeout=30.0):
                 self.logger.error(f"{self.node_id}: Failed to connect to parent")
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            else:
+                self.logger.info(f"{self.node_id}: Connected to parent")
         
         task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate, timeout=10.0)
         if task_update is not None:
@@ -296,44 +299,34 @@ class AsyncWorker(Node):
                 fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
                 self.logger.info(f"{final_status}")
                 final_status.to_file(fname)
-
-        with self._timer("wait_for_stop"):
-            self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
-            while True and self.parent is not None:
-                msg = await self._comm.recv_message_from_parent(Action,timeout=1.0)
-                if msg is not None:
-                    if msg.type == ActionType.STOP:
-                        self.logger.info(f"{self.node_id}: Received stop from parent")
-                        break
-                time.sleep(1.0)
         
         await self.stop()
+        self.logger.info(f"{self.node_id} stopped")
         return all_results
 
-    async def _results(self) -> Result:
-        results = []
+    async def _results(self) -> ResultBatch:
+        result_batch = ResultBatch(sender=self.node_id)
         for task_id,task in self._tasks.items():
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
                 task_result = Result(task_id=task_id,
                                     data=self._tasks[task_id].result,
                                     exception=str(self._tasks[task_id].exception))
-                results.append(task_result)
+                result_batch.add_result(task_result)
             else:
                 self.logger.warning(f"Task {task_id} status {task.status}")
-
-        new_result = Result(
-            sender=self.node_id,
-            data=results
-        )
         
-        status = await self._comm.send_message_to_parent(new_result)
+        status = await self._comm.send_message_to_parent(result_batch)
         if self.parent:
             if status:
                 self.logger.info(f"{self.node_id}: Successfully sent the results to parent")
             else:
                 self.logger.warning(f"{self.node_id}: Failed to send results to parent")
-        return new_result
-        
+        return result_batch
+    
+    def create_an_event_loop(self):
+        """This fuction is the entry point for a new process"""
+        asyncio.run(self.run())
+
     async def stop(self):
         if self._config.profile:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
@@ -369,7 +362,7 @@ class AsyncWorker(Node):
     
     def asdict(self,include_tasks:bool = False) -> dict:
         obj_dict = {
-            "type": "Worker",
+            "type": "AsyncWorker",
             "node_id": self.node_id,
             "nodes": self._nodes,
             "config": self._config.model_dump_json(),

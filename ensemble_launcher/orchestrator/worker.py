@@ -7,7 +7,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResou
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
-from ensemble_launcher.comm import Status, Result, HeartBeat, Message, Action, ActionType, TaskUpdate
+from ensemble_launcher.comm import Status, Result, ResultBatch, HeartBeat, Message, Action, ActionType, TaskUpdate
 from ensemble_launcher.executors import executor_registry, Executor
 import logging
 import cloudpickle
@@ -103,10 +103,10 @@ class Worker(Node):
     
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
-            self._comm = MPComm(self.logger, self.info(),self.parent_comm if self.parent_comm else None, profile=self._config.profile)
+            self._comm = MPComm(self.logger.getChild('comm'), self.info(),self.parent_comm if self.parent_comm else None, profile=self._config.profile)
         elif self._config.comm_name == "zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = ZMQComm(self.logger, self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
+            self._comm = ZMQComm(self.logger.getChild('comm'), self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
@@ -171,13 +171,13 @@ class Worker(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
-        self._scheduler = TaskScheduler(self.logger, self._tasks,cluster=LocalClusterResource(self.logger, self._nodes, self._sys_info))
+        self._scheduler = TaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
 
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,
                                                                                                              "profile":self._config.profile,
                                                                                                              "gpu_selector":self._config.gpu_selector,
-                                                                                                             "logger":self.logger})
+                                                                                                             "logger":self.logger.getChild('executor')})
 
         ##Lazy comm creation
         self._create_comm()
@@ -266,15 +266,15 @@ class Worker(Node):
                 fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
                 final_status.to_file(fname)
 
-        with self._timer("wait_for_stop"):
-            self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
-            while True and self.parent is not None:
-                msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
-                if msg is not None:
-                    if msg.type == ActionType.STOP:
-                        self.logger.info(f"{self.node_id}: Received stop from parent")
-                        break
-                time.sleep(1.0)
+        # with self._timer("wait_for_stop"):
+        #     self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
+        #     while True and self.parent is not None:
+        #         msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
+        #         if msg is not None:
+        #             if msg.type == ActionType.STOP:
+        #                 self.logger.info(f"{self.node_id}: Received stop from parent")
+        #                 break
+        #         time.sleep(1.0)
         
         self._stop()
         return all_results
@@ -299,27 +299,22 @@ class Worker(Node):
             return
         worker_obj.run()
 
-    def _results(self) -> Result:
-        results = []
+    def _results(self) -> ResultBatch:
+        result_batch = ResultBatch(sender=self.node_id)
         for task_id,task in self._tasks.items():
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
                 task_result = Result(task_id=task_id,
                                     data=self._tasks[task_id].result,
                                     exception=str(self._tasks[task_id].exception))
-                results.append(task_result)
-
-        new_result = Result(
-            sender=self.node_id,
-            data=results
-        )
+                result_batch.add_result(task_result)
         
-        status = self._comm.send_message_to_parent(new_result)
+        status = self._comm.send_message_to_parent(result_batch)
         if self.parent:
             if status:
                 self.logger.info(f"{self.node_id}: Successfully sent the results to parent")
             else:
                 self.logger.warning(f"{self.node_id}: Failed to send results to parent")
-        return new_result
+        return result_batch
         
     def _stop(self):
         if self._config.profile:

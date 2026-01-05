@@ -102,9 +102,9 @@ class AsyncZMQComm(AsyncComm):
             self.dealer_socket.connect(f"tcp://{self.parent_address}")
             self.logger.info(f"{self._node_info.node_id}: connected to:{self.parent_address}")
 
-    async def start_monitors(self):
+    async def start_monitors(self,**kwargs):
         """Start background tasks to monitor ZMQ sockets."""
-        await super().start_monitors()
+        await super().start_monitors(**kwargs)
         if self._node_info.parent_id is not None:
             asyncio.create_task(self._monitor_parent_socket())
         if len(self._node_info.children_ids) > 0:

@@ -137,7 +137,7 @@ class AsyncComm(ABC):
 
     async def update_node_info(self,node_info: NodeInfo):
         self._node_info = node_info
-        self.init_cache()
+        await self.init_cache()
 
     @abstractmethod
     async def _send_to_parent(self, data: Any, **kwargs) -> bool:
@@ -163,16 +163,16 @@ class AsyncComm(ABC):
     async def pickable_copy(self):
         pass
 
-    async def start_monitors(self):
+    async def start_monitors(self, parent_only: bool = False, children_only: bool = False):
         """Start background tasks to monitor communication endpoints."""
         await self.init_cache()
         if self._stop_event is None:
             self._stop_event = asyncio.Event()
         
-        if self._node_info.parent_id is not None:
+        if self._node_info.parent_id is not None and not children_only:
             asyncio.create_task(self._monitor_parent_messages())
 
-        if len(self._node_info.children_ids) > 0:                
+        if len(self._node_info.children_ids) > 0 and not parent_only:                
             asyncio.create_task(self._monitor_children_messages())
 
     async def _monitor_parent_messages(self):
@@ -195,6 +195,11 @@ class AsyncComm(ABC):
         """Monitor messages from all children and cache them"""
         while not self._stop_event.is_set():
             try:
+                if len(self._node_info.children_ids) == 0:
+                    self.logger.debug("No children to monitor.")
+                    await asyncio.sleep(0.1)  # Prevent busy wait if no children
+                    continue
+                
                 for child_id in self._node_info.children_ids:
                     msg = await self._recv_from_child(child_id)
                     if msg is not None:
@@ -264,6 +269,7 @@ class AsyncComm(ABC):
     async def sync_heartbeat_with_parent(self, timeout: Optional[float] = None) -> bool:
         #heart beat sync with parent
         if self._node_info.parent_id is None:
+            self.logger.warning("No parent to sync heartbeat with.")
             return True
         
         await self.send_message_to_parent(HeartBeat())
@@ -274,6 +280,7 @@ class AsyncComm(ABC):
         
     async def sync_heartbeat_with_child(self, child_id: str, timeout: Optional[float] = None) -> bool:
         if len(self._node_info.children_ids) == 0:
+            self.logger.warning("No children to sync heartbeat with.")
             return True
     
         msg = await self.recv_message_from_child(HeartBeat,child_id, timeout=timeout)
