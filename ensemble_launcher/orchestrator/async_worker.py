@@ -8,7 +8,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, ZMQComm, MPComm
 from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate
-from ensemble_launcher.executors import executor_registry, AsyncThreadPoolExecutor, AsyncProcessPoolExecutor
+from ensemble_launcher.executors import executor_registry, AsyncThreadPoolExecutor, AsyncProcessPoolExecutor, AsyncMPIExecutor
 import logging
 import cloudpickle
 import socket
@@ -160,11 +160,19 @@ class AsyncWorker(Node):
         self._scheduler.start_monitoring()
 
         ##lazy executor creation
-        assert self._config.task_executor_name == "async_processpool" or self._config.task_executor_name == "async_threadpool"
+        assert self._config.task_executor_name == "async_processpool" or \
+            self._config.task_executor_name == "async_threadpool" or \
+            self._config.task_executor_name == "async_mpi", f"Unsupported executor {self._config.task_executor_name} in AsyncWorker"
 
-        self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor] = \
-            executor_registry.create_executor(self._config.task_executor_name, kwargs={"gpu_selector":self._config.gpu_selector,
-                                                                                                             "logger":self.logger.getChild('executor')})
+        kwargs = {}
+        kwargs["logger"] = self.logger.getChild('executor')
+        kwargs["gpu_selector"] = self._config.gpu_selector
+        if self._config.task_executor_name == "async_mpi":
+            kwargs["use_ppn"] = self._config.use_mpi_ppn
+            kwargs["return_stdout"] = self._config.return_stdout
+            kwargs["pin_resources"] = self._config.pin_resources
+        self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor] = \
+            executor_registry.create_executor(self._config.task_executor_name, kwargs=kwargs)
         
         ##Lazy comm creation
         self._create_comm()
@@ -194,6 +202,7 @@ class AsyncWorker(Node):
     
     async def _submit_ready_tasks(self):
         while not self._stop_submission.is_set():
+            self.logger.debug("In submit ready tasks loop")
             try:
                 task_id, req = await self._scheduler.ready_tasks.get()
         
@@ -201,9 +210,9 @@ class AsyncWorker(Node):
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 future = self._executor.submit(req, task.executable,
-                                                                task_args=task.args,
-                                                                task_kwargs=task.kwargs,
-                                                                env=task.env)
+                                                    task_args=task.args,
+                                                    task_kwargs=task.kwargs,
+                                                    env=task.env)
                 future.add_done_callback(self.create_done_callback(task))
                 self._futures[task_id] = future
                 task.status = TaskStatus.RUNNING

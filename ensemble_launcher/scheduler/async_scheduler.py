@@ -5,7 +5,6 @@ from typing import List, Dict, Any, Union, Set, Tuple
 from .policy import policy_registry, Policy
 from  logging import Logger
 import copy
-import threading
 import asyncio
 from asyncio import Queue, PriorityQueue
 from .scheduler import Scheduler
@@ -28,24 +27,20 @@ class WorkerScheduler(AsyncScheduler):
     def __init__(self, logger: Logger, cluster: ClusterResource):
         super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}
-        self._lock = threading.RLock()
     
     def assign(self, worker_id: str,  worker_resource: JobResource):
-        with self._lock:
-            allocated, resource = self.cluster.allocate(worker_resource)
-            if allocated:
-                self.workers[worker_id] = resource
-            return allocated, resource
+        allocated, resource = self.cluster.allocate(worker_resource)
+        if allocated:
+            self.workers[worker_id] = resource
+        return allocated, resource
     
     def free(self, worker_id: str):
-        with self._lock:
-            if worker_id in self.workers:
-                return self.cluster.deallocate(self.workers[worker_id])
-            return None
+        if worker_id in self.workers:
+            return self.cluster.deallocate(self.workers[worker_id])
+        return None
     
     def get_worker_assignment(self):
-        with self._lock:
-            return copy.deepcopy(self.workers)
+        return copy.deepcopy(self.workers)
 
 class AsyncTaskScheduler(AsyncScheduler):
     def __init__(self, 
@@ -79,8 +74,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._consecutive_failed_allocations = 0
         self._monitoring_task = None
         self._event_loop = None  # Will be set when monitoring starts
-
-        self._lock = threading.RLock()
     
     def _buld_task_resource_req(self, task: Task) -> JobResource:
         req = JobResource(
@@ -117,12 +110,12 @@ class AsyncTaskScheduler(AsyncScheduler):
 
                 #interrupt sleep to allow other coroutines to when no tasks are available
                 if self._sorted_tasks.empty():
-                    await asyncio.sleep(0.0)
+                    self._stop_monitoring.set()
                 
                 unallocated_tasks = []
                 allocated_count = 0
                 
-                self.logger.info("In Schdeuler monitor loop")
+                self.logger.debug("In Scheduler monitor loop")
                 # Try to allocate all pending tasks
                 for _ in range(self._sorted_tasks.qsize()):
                     if self._stop_monitoring.is_set():
@@ -134,11 +127,10 @@ class AsyncTaskScheduler(AsyncScheduler):
                         break
                     
                     # Thread-safe access to tasks
-                    with self._lock:
-                        if task_id not in self.tasks:
-                            self.logger.warning(f"Task {task_id} no longer exists, skipping")
-                            continue
-                        task = self.tasks[task_id]
+                    if task_id not in self.tasks:
+                        self.logger.warning(f"Task {task_id} no longer exists, skipping")
+                        continue
+                    task = self.tasks[task_id]
                     
                     req = self._buld_task_resource_req(task)
                     
@@ -149,8 +141,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                         await self.ready_tasks.put((task_id, resource))
                         
                         # Track as running
-                        with self._lock:
-                            self._running_tasks[task_id] = resource
+                        self._running_tasks[task_id] = resource
                         
                         allocated_count += 1
                         self.logger.debug(f"Task {task_id} ready for execution")
@@ -212,18 +203,17 @@ class AsyncTaskScheduler(AsyncScheduler):
         Check if all tasks are complete and signal completion event.
         Thread-safe - called from executor callbacks.
         """
-        with self._lock:
-            remaining = set(self.tasks.keys()) - (self._successful_tasks | self._failed_tasks)
-            self.logger.debug(f"Checking completion: {len(remaining)} tasks remaining")
-            if not remaining:
-                self.logger.info("All tasks completed")
-                if self._event_loop is not None:
-                    self.logger.info(f"Setting _all_tasks_done event via stored loop {self._event_loop}")
-                    self._event_loop.call_soon_threadsafe(self._all_tasks_done.set)
-                    self.logger.info("Event set scheduled")
-                else:
-                    self.logger.warning("No event loop stored, setting event directly (may not work!)")
-                    self._all_tasks_done.set()
+        remaining = set(self.tasks.keys()) - (self._successful_tasks | self._failed_tasks)
+        self.logger.debug(f"Checking completion: {len(remaining)} tasks remaining")
+        if not remaining:
+            self.logger.info("All tasks completed")
+            if self._event_loop is not None:
+                self.logger.info(f"Setting _all_tasks_done event via stored loop {self._event_loop}")
+                self._event_loop.call_soon_threadsafe(self._all_tasks_done.set)
+                self.logger.info("Event set scheduled")
+            else:
+                self.logger.warning("No event loop stored, setting event directly (may not work!)")
+                self._all_tasks_done.set()
 
     async def wait_for_completion(self):
         """
@@ -235,103 +225,100 @@ class AsyncTaskScheduler(AsyncScheduler):
         self.logger.info("Done waiting for task completion!")
 
     def add_task(self, task: Task) -> bool:
-        with self._lock:
-            try:
-                if task.nnodes > len(self.cluster.nodes):
-                    raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
-                self.tasks[task.task_id] = task
-                self._sorted_tasks.put_nowait((self.scheduler_policy.get_score(task),task.task_id))
-                return True
-            except Exception as e:
-                self.logger.error(f"Failed to add task {task.task_id}: {e}")
-                return False
+        try:
+            if task.nnodes > len(self.cluster.nodes):
+                raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
+            self.tasks[task.task_id] = task
+            self._sorted_tasks.put_nowait((self.scheduler_policy.get_score(task),task.task_id))
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to add task {task.task_id}: {e}")
+            return False
     
     def delete_task(self, task: Task) -> bool:
         if task.task_id not in self.tasks:
             self.logger.warning(f"Unknown task: {task.task_id}")
             return False
         
-        with self._lock:
-            try:
-                # Remove from tasks dict
-                del self.tasks[task.task_id]
+        try:
+            # Remove from tasks dict
+            del self.tasks[task.task_id]
 
-                # Remove from sorted tasks queue
-                temp_items = []
-                while not self._sorted_tasks.empty():
-                    try:
-                        priority, tid = self._sorted_tasks.get_nowait()
-                        if tid != task.task_id:
-                            temp_items.append((priority, tid))
-                    except asyncio.QueueEmpty:
-                        break
-                    
-                # Put back all items except the deleted task
-                for item in temp_items:
-                    self._sorted_tasks.put_nowait(item)
+            # Remove from sorted tasks queue
+            temp_items = []
+            while not self._sorted_tasks.empty():
+                try:
+                    priority, tid = self._sorted_tasks.get_nowait()
+                    if tid != task.task_id:
+                        temp_items.append((priority, tid))
+                except asyncio.QueueEmpty:
+                    break
+                
+            # Put back all items except the deleted task
+            for item in temp_items:
+                self._sorted_tasks.put_nowait(item)
 
 
-                # Remove from ready tasks queue if present
-                temp_ready = []
-                while not self.ready_tasks.empty():
-                    try:
-                        tid, resource = self.ready_tasks.get_nowait()
-                        if tid != task.task_id:
-                            temp_ready.append((tid, resource))
-                        else:
-                            # Deallocate resource if task is in ready queue
-                            self.cluster.deallocate(resource)
-                    except asyncio.QueueEmpty:
-                        break
+            # Remove from ready tasks queue if present
+            temp_ready = []
+            while not self.ready_tasks.empty():
+                try:
+                    tid, resource = self.ready_tasks.get_nowait()
+                    if tid != task.task_id:
+                        temp_ready.append((tid, resource))
+                    else:
+                        # Deallocate resource if task is in ready queue
+                        self.cluster.deallocate(resource)
+                except asyncio.QueueEmpty:
+                    break
 
-                # Put back all items except the deleted task
-                for item in temp_ready:
-                    self.ready_tasks.put_nowait(item)
+            # Put back all items except the deleted task
+            for item in temp_ready:
+                self.ready_tasks.put_nowait(item)
 
-                # If running, free the resources
-                if task.task_id in self._running_tasks:
-                    self.cluster.deallocate(self._running_tasks[task.task_id])
+            # If running, free the resources
+            if task.task_id in self._running_tasks:
+                self.cluster.deallocate(self._running_tasks[task.task_id])
 
-                # Remove from running and status sets
-                del self._running_tasks[task.task_id]
+            # Remove from running and status sets
+            del self._running_tasks[task.task_id]
 
-                # Remove all occurrences from done_tasks
-                if task.task_id in self._done_tasks:
-                    del self._done_tasks[task.task_id]
+            # Remove all occurrences from done_tasks
+            if task.task_id in self._done_tasks:
+                del self._done_tasks[task.task_id]
 
-                #remove from failed and succesful tasks
-                self._failed_tasks.discard(task.task_id)
-                self._successful_tasks.discard(task.task_id)
+            #remove from failed and succesful tasks
+            self._failed_tasks.discard(task.task_id)
+            self._successful_tasks.discard(task.task_id)
 
-                return True
-            except Exception as e:
-                self.logger.warning(f"Failed to delete task {task.task_id}: {e}")
-                return False
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to delete task {task.task_id}: {e}")
+            return False
     
     def free(self, task_id: str, status: TaskStatus):
-        with self._lock:
-            if task_id in self.tasks:
-                if task_id not in self._running_tasks:
-                    self.logger.error(f"{task_id} is not running")
-                    raise RuntimeError
+        if task_id in self.tasks:
+            if task_id not in self._running_tasks:
+                self.logger.error(f"{task_id} is not running")
+                raise RuntimeError
 
-                # deallocate
-                self.cluster.deallocate(self._running_tasks[task_id])
+            # deallocate
+            self.cluster.deallocate(self._running_tasks[task_id])
 
-                # delete from running tasks
-                del self._running_tasks[task_id]
+            # delete from running tasks
+            del self._running_tasks[task_id]
 
-                # Add to done tasks
-                self._done_tasks[task_id] += 1
+            # Add to done tasks
+            self._done_tasks[task_id] += 1
 
-                # add to failed/successful tasks
-                if status == TaskStatus.FAILED:
-                    self._failed_tasks.add(task_id)
-                elif status == TaskStatus.SUCCESS:
-                    self._successful_tasks.add(task_id)
-                    self._failed_tasks.discard(task_id)
+            # add to failed/successful tasks
+            if status == TaskStatus.FAILED:
+                self._failed_tasks.add(task_id)
+            elif status == TaskStatus.SUCCESS:
+                self._successful_tasks.add(task_id)
+                self._failed_tasks.discard(task_id)
 
-                self.logger.debug(f"Freed {task_id}")
+            self.logger.debug(f"Freed {task_id}")
         self._check_all_tasks_done()
         return None
     

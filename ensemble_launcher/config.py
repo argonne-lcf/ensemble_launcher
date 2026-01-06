@@ -16,7 +16,7 @@ class SystemConfig(BaseModel):
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
     child_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool"] = "multiprocessing"
-    task_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool"] = "multiprocessing"
+    task_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool","async_mpi"] = "multiprocessing"
     comm_name: Literal["multiprocessing","zmq","dragon","async_zmq"] = "multiprocessing"
     report_interval: float = 10.0
     nlevels: int = 1
@@ -28,6 +28,8 @@ class LauncherConfig(BaseModel):
     profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
     gpu_selector: str = "ZE_AFFINITY_MASK"
     log_level: int = logging.INFO
+    use_mpi_ppn: bool = True ##If True, use -ppn flag when launching MPI jobs
+    pin_resources: bool = True ##If True, pin resources when using MPI executors
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""
