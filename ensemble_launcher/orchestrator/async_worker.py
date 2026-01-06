@@ -58,8 +58,6 @@ class AsyncWorker(Node):
             self._timer = self._profile_timer
         else:
             self._timer = self._noop_timer
-        
-        self._lock = None #lazy init
 
         self._stop_submission = asyncio.Event()
         self._stop_reporting = asyncio.Event()
@@ -67,6 +65,7 @@ class AsyncWorker(Node):
         self._submission_task = None
 
         self._futures: Dict[str, Union[AsyncFuture,ConcurrentFuture]] = {}
+        self._event_loop = None
     
 
     @contextmanager
@@ -148,13 +147,13 @@ class AsyncWorker(Node):
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
         
     async def _lazy_init(self):
+        self._event_loop = asyncio.get_running_loop()
         #lazy logger creation
         tick = time.perf_counter()
         self._setup_logger()
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
-        self._lock = threading.RLock()
         ##init scheduler
         self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=AsyncLocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
 
@@ -176,19 +175,22 @@ class AsyncWorker(Node):
 
     def create_done_callback(self, task: Task):
         def done_callback(future):
-            task_id = task.task_id
-            with self._lock:
-                if task_id in self._tasks:
-                    exception = future.exception()
-                    task.end_time = time.time()
-                    if exception is None:
-                        task.status = TaskStatus.SUCCESS
-                        task.result = future.result()
-                    else:
-                        task.status = TaskStatus.FAILED
-                        task.exception = str(exception)
-            self._scheduler.free(task_id, task.status)
+            self._event_loop.call_soon_threadsafe(self._task_callback, task, future)
         return done_callback
+    
+    def _task_callback(self, task: Task, future):
+        task_id = task.task_id
+        if task_id in self._tasks:
+            exception = future.exception()
+            task.end_time = time.time()
+            if exception is None:
+                task.status = TaskStatus.SUCCESS
+                task.result = future.result()
+            else:
+                task.status = TaskStatus.FAILED
+                task.exception = str(exception)
+            self._scheduler.free(task_id, task.status)
+
     
     async def _submit_ready_tasks(self):
         while not self._stop_submission.is_set():
