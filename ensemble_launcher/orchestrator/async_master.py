@@ -109,13 +109,13 @@ class AsyncMaster(Node):
             os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
             # Configure file handler for this specific self.self.logger
             file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/master-{self.node_id}.log'))
-            file_handler.setLevel(logging.INFO)
+            file_handler.setLevel(self._config.log_level)
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             file_handler.setFormatter(formatter)
             # Create instance self.self.logger and add handler
             self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
             self.logger.addHandler(file_handler)
-            self.logger.setLevel(logging.INFO)
+            self.logger.setLevel(self._config.log_level)
         else:
             self.logger = logging.getLogger(__name__)
 

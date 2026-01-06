@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 import multiprocessing as mp
 from typing import Literal, List, Union, Optional
 from difflib import get_close_matches
+import logging
 
 
 class SystemConfig(BaseModel):
@@ -26,6 +27,7 @@ class LauncherConfig(BaseModel):
     sequential_child_launch: bool = False ##If True, launch children one by one even for MPI executor
     profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
     gpu_selector: str = "ZE_AFFINITY_MASK"
+    log_level: int = logging.INFO
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

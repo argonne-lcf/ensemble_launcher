@@ -32,6 +32,7 @@ async def test_async_master(nlevels=1):
                               nlevels=nlevels,
                               child_executor_name="async_processpool",
                               task_executor_name="async_processpool", 
+                              log_level=logging.DEBUG,
                               worker_logs=True),sys_info,nodes,tasks
     )
 

@@ -102,12 +102,11 @@ class AsyncTaskScheduler(AsyncScheduler):
 
     async def _monitor_tasks(self) -> None:
         """
-        Monitor task queue and allocate resources.
-        Event-driven with minimal latency.
+        Monitors free resources and checks if any tasks can be allocated, and moves them to the ready queue.
         """
         self.logger.info("Starting task monitoring loop")
         
-        while not self._stop_monitoring.is_set() and not self._sorted_tasks.empty():
+        while not self._stop_monitoring.is_set():
             try:
                 # Wait for resources - will be cancelled when monitor is stopped
                 await self._cluster_resource.wait_for_free()
@@ -115,6 +114,10 @@ class AsyncTaskScheduler(AsyncScheduler):
                 # Check stop immediately
                 if self._stop_monitoring.is_set():
                     break
+
+                #interrupt sleep to allow other coroutines to when no tasks are available
+                if self._sorted_tasks.empty():
+                    await asyncio.sleep(0.0)
                 
                 unallocated_tasks = []
                 allocated_count = 0

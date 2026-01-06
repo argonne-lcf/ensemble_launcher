@@ -102,13 +102,14 @@ class AsyncWorker(Node):
         if self._config.worker_logs:
             os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
             file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/worker-{self.node_id}.log'))
-            file_handler.setLevel(logging.INFO)
+            file_handler.setLevel(self._config.log_level)
+            
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             file_handler.setFormatter(formatter)
 
             self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
             self.logger.addHandler(file_handler)
-            self.logger.setLevel(logging.INFO)
+            self.logger.setLevel(self._config.log_level)
         else:
             self.logger = logging.getLogger(__name__)
 
