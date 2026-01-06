@@ -7,10 +7,12 @@ import multiprocessing as mp
 import os
 import logging
 import asyncio
+import time
 
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 def echo(task_id: str):
+    time.sleep(1.0)
     return f"Hello from task {task_id}"
 
 def echo_stdout(task_id: str):
@@ -31,7 +33,7 @@ async def test_async_worker():
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
 
     w = AsyncWorker(
-        "test",LauncherConfig(task_executor_name="async_processpool", comm_name="async_zmq", worker_logs=True, report_interval=10.0),sys_info,nodes,tasks
+        "test",LauncherConfig(task_executor_name="async_processpool", comm_name="async_zmq", worker_logs=True, report_interval=100.0),sys_info,nodes,tasks
     )
 
     res = await w.run()

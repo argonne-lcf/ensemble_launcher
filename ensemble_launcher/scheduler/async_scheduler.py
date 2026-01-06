@@ -107,7 +107,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         """
         self.logger.info("Starting task monitoring loop")
         
-        while not self._stop_monitoring.is_set():
+        while not self._stop_monitoring.is_set() and not self._sorted_tasks.empty():
             try:
                 # Wait for resources - will be cancelled when monitor is stopped
                 await self._cluster_resource.wait_for_free()
@@ -153,27 +153,14 @@ class AsyncTaskScheduler(AsyncScheduler):
                         self.logger.debug(f"Task {task_id} ready for execution")
                     else:
                         unallocated_tasks.append((priority, task_id))
+                        # Only break if cluster has no free resources at all
+                        if self.cluster.free_cpus == 0:
+                            self.logger.debug("Cluster completely full, stopping allocation attempts")
+                            break
                 
                 # Put back unallocated tasks
                 for item in unallocated_tasks:
                     self._sorted_tasks.put_nowait(item)
-                
-                # Adaptive behavior based on allocation success
-                if allocated_count > 0:
-                    self.logger.info(f"Allocated {allocated_count} tasks for execution")
-                    self._consecutive_failed_allocations = 0
-                    # No sleep - immediately try next iteration
-                else:
-                    self._consecutive_failed_allocations += 1
-                    backoff_time = min(
-                                1.0,
-                                0.001 * (2 ** self._consecutive_failed_allocations)
-                            )
-                    self.logger.info(
-                                f"{len(unallocated_tasks)} tasks pending but cannot fit. "
-                                f"Backoff sleep for {backoff_time:.3f}s"
-                            )
-                    await asyncio.sleep(backoff_time)
                         
             except asyncio.CancelledError:
                 self.logger.info("Scheduler Monitor task cancelled")
@@ -192,6 +179,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         
         # Store the event loop for thread-safe event signaling
         self._event_loop = asyncio.get_event_loop()
+        self.cluster.set_event_loop(self._event_loop)
         self._stop_monitoring.clear()
         self._all_tasks_done.clear()
         self._consecutive_failed_allocations = 0

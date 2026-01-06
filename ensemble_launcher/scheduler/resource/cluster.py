@@ -227,6 +227,10 @@ class AsyncLocalClusterResource(LocalClusterResource):
         super().__init__(logger, nodes, system_info)
         self._resource_available = asyncio.Event()
         self._resource_available.set()
+        self._loop = None
+
+    def set_event_loop(self, loop):
+        self._loop = loop
 
     async def wait_for_free(self):
         """This will return only when thereare free resourcese"""
@@ -235,8 +239,7 @@ class AsyncLocalClusterResource(LocalClusterResource):
     async def signal_resource_available(self):
         """Signal that resources might be available. Used for waking up blocked waiters."""
         try:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self._resource_available.set)
+            self._loop.call_soon_threadsafe(self._resource_available.set)
         except RuntimeError:
             self._resource_available.set()
 
@@ -261,8 +264,7 @@ class AsyncLocalClusterResource(LocalClusterResource):
         if result:
             # Signal that resources are now available - instant notification
             try:
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(self._resource_available.set)
+                self._loop.call_soon_threadsafe(self._resource_available.set)
             except RuntimeError:
                 self._resource_available.set()
         return result
