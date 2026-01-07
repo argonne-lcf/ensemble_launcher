@@ -227,12 +227,12 @@ class AsyncZMQComm(AsyncComm):
         except Exception as e:
             self.logger.warning(f"{self._node_info.node_id}: Error during ZMQ cleanup: {e}")
     
-    async def pickable_copy(self) -> "AsyncZMQComm":
+    def pickable_copy(self) -> "AsyncZMQComm":
         ret = AsyncZMQComm(None, node_info=self._node_info, parent_address=self.parent_address)
         ret.my_address = self.my_address
         return ret
     
-    async def asdict(self):
+    def asdict(self):
         base_dict = {}
         base_dict["node_info"] = asdict(self._node_info) if self._node_info else None
         base_dict["parent_address"] = self.parent_address
@@ -240,7 +240,7 @@ class AsyncZMQComm(AsyncComm):
         return base_dict
     
     @classmethod
-    async def fromdict(cls, data: Dict[str, Any]) -> "AsyncZMQComm":
+    def fromdict(cls, data: Dict[str, Any]) -> "AsyncZMQComm":
         node_info = NodeInfo(**data["node_info"]) if data.get("node_info") else None
         comm = cls(None, node_info=node_info, parent_address=data.get("parent_address"))
         comm.my_address = data.get("my_address")

@@ -5,7 +5,7 @@ from .utils import run_callable_with_affinity, run_cmd, executor_registry
 import uuid
 from datetime import datetime
 
-@executor_registry.register("async_processpool")
+@executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
     def __init__(self,logger,
                  gpu_selector: str = "ZE_AFFINITY_MASK",
@@ -48,7 +48,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         return future
 
 
-@executor_registry.register("async_threadpool")
+@executor_registry.register("async_threadpool", type="async")
 class AsyncThreadPoolExecutor(ThreadPoolExecutor):
     def __init__(self, logger,
                  gpu_selector: str = "ZE_AFFINITY_MASK",

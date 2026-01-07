@@ -93,11 +93,11 @@ class AsyncTaskScheduler(AsyncScheduler):
             )
         return req
 
-    async def _monitor_tasks(self) -> None:
+    async def _monitor_resources(self) -> None:
         """
         Monitors free resources and checks if any tasks can be allocated, and moves them to the ready queue.
         """
-        self.logger.info("Starting task monitoring loop")
+        self.logger.info("Starting resource monitor")
         
         while not self._stop_monitoring.is_set():
             try:
@@ -110,6 +110,7 @@ class AsyncTaskScheduler(AsyncScheduler):
 
                 #interrupt sleep to allow other coroutines to when no tasks are available
                 if self._sorted_tasks.empty():
+                    self.logger.info("No tasks to schedule, resource monitor quitting")
                     self._stop_monitoring.set()
                 
                 unallocated_tasks = []
@@ -162,8 +163,6 @@ class AsyncTaskScheduler(AsyncScheduler):
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
-        
-        self.logger.info("Task monitoring loop stopped")
     
     def start_monitoring(self) -> asyncio.Task:
         """Start the monitoring task. Must be called from async context."""
@@ -177,12 +176,11 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._stop_monitoring.clear()
         self._all_tasks_done.clear()
         self._consecutive_failed_allocations = 0
-        self._monitor_task = asyncio.create_task(self._monitor_tasks())
-        self.logger.info("Started task monitoring")
+        self._monitor_task = asyncio.create_task(self._monitor_resources())
     
     async def stop_monitoring(self):
         """Stop the monitoring task gracefully."""
-        self.logger.info("Stopping task monitoring")
+        self.logger.info("Stopping resource monitoring")
         self._stop_monitoring.set()
         
         # Wake up the monitor loop if it's blocked waiting for resources
@@ -196,7 +194,7 @@ class AsyncTaskScheduler(AsyncScheduler):
             except asyncio.CancelledError:
                 pass
         
-        self.logger.info("Task monitoring stopped")
+        self.logger.info("Resource monitoring stopped")
 
     def _check_all_tasks_done(self):
         """
@@ -208,9 +206,8 @@ class AsyncTaskScheduler(AsyncScheduler):
         if not remaining:
             self.logger.info("All tasks completed")
             if self._event_loop is not None:
-                self.logger.info(f"Setting _all_tasks_done event via stored loop {self._event_loop}")
+                self.logger.debug(f"Setting _all_tasks_done event via stored loop {self._event_loop}")
                 self._event_loop.call_soon_threadsafe(self._all_tasks_done.set)
-                self.logger.info("Event set scheduled")
             else:
                 self.logger.warning("No event loop stored, setting event directly (may not work!)")
                 self._all_tasks_done.set()
@@ -220,9 +217,9 @@ class AsyncTaskScheduler(AsyncScheduler):
         Wait for all tasks to complete.
         This replaces the while loop in the worker's run() method.
         """
-        self.logger.info("Waiting for all tasks to complete")
+        self.logger.debug("Waiting for all tasks to complete")
         await self._all_tasks_done.wait()
-        self.logger.info("Done waiting for task completion!")
+        self.logger.debug("Done waiting for task completion!")
 
     def add_task(self, task: Task) -> bool:
         try:

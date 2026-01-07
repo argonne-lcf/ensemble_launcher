@@ -266,8 +266,16 @@ class AsyncMaster(Node):
         ##create a scheduler. maybe this can be removed??
         self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes,self._sys_info))
 
+        assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
+
+        kwargs = {}
+        kwargs["logger"] = self.logger.getChild('executor')
+        if self._config.child_executor_name == "async_mpi":
+            kwargs["use_ppn"] = self._config.use_mpi_ppn
+            kwargs["pin_resources"] = self._config.pin_resources
         #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"logger": self.logger.getChild('executor')})
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, 
+                                                                     kwargs=kwargs)
 
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
@@ -300,7 +308,7 @@ class AsyncMaster(Node):
         for child_id, child in children.items():
             self.add_child(child_id, child.info())
             child.set_parent(self.info())
-            child.parent_comm = await self.comm.pickable_copy()
+            child.parent_comm = self.comm.pickable_copy()
         
         await self._comm.update_node_info(self.info())  ##update the node info with children ids
 
@@ -313,7 +321,7 @@ class AsyncMaster(Node):
             children = await self._lazy_init()
         
         with self._timer("launch_children"):
-            if self._config.child_executor_name == "mpi":
+            if self._config.child_executor_name == "async_mpi":
                 if not self._config.sequential_child_launch:
                     ##launch all children in a single shot
                     child_head_nodes = []

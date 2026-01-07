@@ -160,7 +160,7 @@ class AsyncComm(ABC):
         pass
 
     @abstractmethod
-    async def pickable_copy(self):
+    def pickable_copy(self):
         pass
 
     async def start_monitors(self, parent_only: bool = False, children_only: bool = False):

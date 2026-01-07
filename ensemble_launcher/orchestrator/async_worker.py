@@ -127,7 +127,12 @@ class AsyncWorker(Node):
         add_status = {}
         del_status = {}
         for new_task in taskupdate.added_tasks:
+            self.logger.debug(f"Adding new task {new_task}")
             add_status[new_task.task_id] = self._scheduler.add_task(new_task)
+            if not add_status[new_task.task_id]:
+                self.logger.error(f"Failed to add new task {new_task.task_id}")
+            else:
+                self.logger.debug(f"Added new task {new_task.task_id}")
         
         ##delete tasks if needed
         for task in taskupdate.deleted_tasks:
@@ -157,12 +162,8 @@ class AsyncWorker(Node):
         ##init scheduler
         self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=AsyncLocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
 
-        self._scheduler.start_monitoring()
-
         ##lazy executor creation
-        assert self._config.task_executor_name == "async_processpool" or \
-            self._config.task_executor_name == "async_threadpool" or \
-            self._config.task_executor_name == "async_mpi", f"Unsupported executor {self._config.task_executor_name} in AsyncWorker"
+        assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
 
         kwargs = {}
         kwargs["logger"] = self.logger.getChild('executor')
@@ -202,11 +203,11 @@ class AsyncWorker(Node):
     
     async def _submit_ready_tasks(self):
         while not self._stop_submission.is_set():
-            self.logger.debug("In submit ready tasks loop")
             try:
                 task_id, req = await self._scheduler.ready_tasks.get()
         
                 task = self._tasks[task_id]
+                self.logger.debug(f"Submitting task {task_id}: {task.executable} with resources {req}")
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 future = self._executor.submit(req, task.executable,
@@ -217,6 +218,7 @@ class AsyncWorker(Node):
                 self._futures[task_id] = future
                 task.status = TaskStatus.RUNNING
             except asyncio.CancelledError:
+                self.logger.info("Submission loop cancelled")
                 break
             except Exception as e:
                 self.logger.error(f"Error in task submission loop: {e}", exc_info=True)
@@ -264,6 +266,9 @@ class AsyncWorker(Node):
             self.logger.warning(f"{self.node_id}: No task update received from parent at start")
         
         self.logger.info(f"Running {list(self._tasks.keys())} tasks")
+        self.logger.debug(f"Sorted tasks sizeL {self._scheduler._sorted_tasks.qsize()}")
+
+        self._scheduler.start_monitoring() #start the schduler monitoring
 
         ##start submission loop
         self._submission_task = asyncio.create_task(self._submit_ready_tasks())
@@ -271,7 +276,7 @@ class AsyncWorker(Node):
         ##start reporting loop
         self._reporting_task = asyncio.create_task(self.report_status())
 
-        self.logger.info("Started waiting")
+        self.logger.info("Started waiting for scheduler monitoring loop to complete")
         await self._scheduler.wait_for_completion()
 
         ##stop scheduler monitoring first
@@ -396,11 +401,9 @@ class AsyncWorker(Node):
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 
-        if config.comm_name == "zmq":
+        if config.comm_name == "async_zmq":
             # ZMQComm might need special handling due to non-picklable attributes
-            parent_comm = ZMQComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
-        elif config.comm_name == "multiprocessing":
-            parent_comm = MPComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
+            parent_comm = AsyncZMQComm.fromdict(data["parent_comm"]) if data["parent_comm"] else None
         else:
             raise ValueError(f"Unsupported comm type {config.comm_name}")
 

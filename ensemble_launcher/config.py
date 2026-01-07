@@ -1,9 +1,8 @@
 from pydantic import BaseModel, Field
 import multiprocessing as mp
-from typing import Literal, List, Union, Optional
+from typing import Literal, List, Union, Optional, TYPE_CHECKING
 from difflib import get_close_matches
 import logging
-
 
 class SystemConfig(BaseModel):
     """Input configuration of the system"""
@@ -15,8 +14,8 @@ class SystemConfig(BaseModel):
 
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
-    child_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool"] = "multiprocessing"
-    task_executor_name: Literal["multiprocessing","dragon","mpi",'async_processpool',"async_threadpool","async_mpi"] = "multiprocessing"
+    child_executor_name: str = "multiprocessing"
+    task_executor_name: str = "multiprocessing"
     comm_name: Literal["multiprocessing","zmq","dragon","async_zmq"] = "multiprocessing"
     report_interval: float = 10.0
     nlevels: int = 1

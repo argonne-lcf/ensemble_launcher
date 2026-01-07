@@ -15,7 +15,7 @@ from asyncio import Task
 
 logger = logging.getLogger(__name__)
 
-@executor_registry.register("async_mpi")
+@executor_registry.register("async_mpi", type="async")
 class AsyncMPIExecutor(Executor):
     def __init__(self,logger=logger, 
                  gpu_selector: str = "ZE_AFFINITY_MASK",
@@ -31,7 +31,6 @@ class AsyncMPIExecutor(Executor):
         self._processes: Dict[str,subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
-        self.logger.info(f"AsyncMPIExecutor initialized with return_stdout={self._return_stdout}")
         self.use_ppn = use_ppn
         self.pin_resources = pin_resources
         os.makedirs(self.tmp_dir,exist_ok=True)
