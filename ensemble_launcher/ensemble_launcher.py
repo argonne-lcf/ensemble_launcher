@@ -112,24 +112,24 @@ class EnsembleLauncher:
     def _create_launcher(self):
         """Create and return the appropriate launcher (Master or Worker) based on configuration."""
         resource_config = self._get_resource_config()
-        launcher_args = {
-            "name": "main",
-            "config": self.launcher_config,
-            "resource": resource_config,
-            "Nodes": self.nodes,
-            "tasks": self._tasks
-        }
+        launcher_args = (
+            "main",
+            self.launcher_config,
+            resource_config,
+            self.nodes,
+            self._tasks
+        )
         
         if self.launcher_config.nlevels == 0:
             if self.async_orchestrator:
-                return AsyncWorker(**launcher_args)
+                return AsyncWorker(*launcher_args)
             else:
-                return Worker(**launcher_args)
+                return Worker(*launcher_args)
         else:
             if self.async_orchestrator:
-                return AsyncMaster(**launcher_args)
+                return AsyncMaster(*launcher_args)
             else:
-                return Master(**launcher_args)
+                return Master(*launcher_args)
 
     def run(self):
         """Simply blocks untils all the tasks are done"""

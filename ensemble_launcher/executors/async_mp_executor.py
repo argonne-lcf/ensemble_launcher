@@ -40,7 +40,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         if callable(fn):
             future = super().submit(run_callable_with_affinity,*(fn, task_args, task_kwargs, cpu_id, env))
         elif isinstance(fn, str):
-            future = super().submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout))
+            future = super().submit(run_cmd,*(fn, task_args, task_kwargs, cpu_id, env))
         else:
             self.logger.warning(f"Can only excute either a str or a callable")
             return None
