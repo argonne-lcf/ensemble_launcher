@@ -5,7 +5,7 @@ from ensemble_launcher.scheduler import WorkerScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource, NodeResourceCount
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
-from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, ZMQComm, MPComm, NodeInfo, Comm
+from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
 from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, ResultBatch
 import copy
 import logging
