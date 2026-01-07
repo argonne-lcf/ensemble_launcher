@@ -7,7 +7,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResou
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
-from ensemble_launcher.comm import Status, Result, ResultBatch, HeartBeat, Message, Action, ActionType, TaskUpdate
+from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate
 from ensemble_launcher.executors import executor_registry, Executor
 import logging
 import cloudpickle
