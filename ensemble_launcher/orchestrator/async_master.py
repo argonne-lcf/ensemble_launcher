@@ -272,7 +272,6 @@ class AsyncMaster(Node):
         kwargs["logger"] = self.logger.getChild('executor')
         if self._config.child_executor_name == "async_mpi":
             kwargs["use_ppn"] = self._config.use_mpi_ppn
-            kwargs["pin_resources"] = self._config.pin_resources
         #create executor
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, 
                                                                      kwargs=kwargs)
@@ -633,7 +632,7 @@ class AsyncMaster(Node):
     @classmethod
     def fromdict(cls, data: dict) -> 'AsyncMaster':
         config = LauncherConfig.model_validate_json(data["config"])
-        system_info = NodeResourceList(**data["system_info"])
+        system_info = NodeResourceList(**data["system_info"]) if "cpus" in data["system_info"] else NodeResourceCount(**data["system_info"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 

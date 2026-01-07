@@ -3,7 +3,7 @@ import time
 import os
 from typing import Tuple, Optional
 from ensemble_launcher.scheduler import AsyncTaskScheduler
-from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, NodeResource, NodeResourceList
+from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, NodeResource, NodeResourceList, NodeResourceCount
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, ZMQComm, MPComm
@@ -171,7 +171,6 @@ class AsyncWorker(Node):
         if self._config.task_executor_name == "async_mpi":
             kwargs["use_ppn"] = self._config.use_mpi_ppn
             kwargs["return_stdout"] = self._config.return_stdout
-            kwargs["pin_resources"] = self._config.pin_resources
         self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor] = \
             executor_registry.create_executor(self._config.task_executor_name, kwargs=kwargs)
         
@@ -397,7 +396,7 @@ class AsyncWorker(Node):
     @classmethod
     def fromdict(cls, data: dict) -> 'AsyncWorker':
         config = LauncherConfig.model_validate_json(data["config"])
-        system_info = NodeResourceList(**data["system_info"])
+        system_info = NodeResourceList(**data["system_info"]) if "cpus" in data["system_info"] else NodeResourceCount(**data["system_info"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 

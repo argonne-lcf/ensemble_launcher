@@ -28,7 +28,6 @@ class LauncherConfig(BaseModel):
     gpu_selector: str = "ZE_AFFINITY_MASK"
     log_level: int = logging.INFO
     use_mpi_ppn: bool = True ##If True, use -ppn flag when launching MPI jobs
-    pin_resources: bool = True ##If True, pin resources when using MPI executors
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

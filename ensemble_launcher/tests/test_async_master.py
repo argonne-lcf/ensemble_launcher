@@ -2,7 +2,7 @@ from ensemble_launcher.orchestrator import Worker
 from ensemble_launcher.ensemble import Task
 import socket
 from ensemble_launcher.config import SystemConfig, LauncherConfig
-from ensemble_launcher.scheduler.resource import NodeResourceList, JobResource
+from ensemble_launcher.scheduler.resource import NodeResourceList, NodeResourceCount
 from ensemble_launcher.orchestrator import AsyncMaster
 import logging
 from utils import echo, echo_stdout
@@ -56,7 +56,7 @@ async def test_async_mpi_master(nlevels=1):
                  )
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
 
     m = AsyncMaster(
         "test",
@@ -69,7 +69,6 @@ async def test_async_mpi_master(nlevels=1):
                         log_level=logging.INFO,
                         worker_logs=True,
                         use_mpi_ppn=False,
-                        pin_resources=False,
                         sequential_child_launch=True),
         sys_info,nodes,tasks
     )

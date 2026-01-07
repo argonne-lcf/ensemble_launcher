@@ -2,7 +2,7 @@ from ensemble_launcher.orchestrator import AsyncWorker
 from ensemble_launcher.ensemble import Task
 import socket
 from ensemble_launcher.config import SystemConfig, LauncherConfig
-from ensemble_launcher.scheduler.resource import NodeResourceList, JobResource
+from ensemble_launcher.scheduler.resource import NodeResourceList, JobResource, NodeResourceCount
 import multiprocessing as mp
 import os
 import logging
@@ -55,10 +55,10 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
                  args=(f"task-{i}",))
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
 
     w = AsyncWorker(
-        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, pin_resources=False, log_level=logging.DEBUG, return_stdout=True),sys_info,nodes,tasks
+        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, log_level=logging.DEBUG, return_stdout=True),sys_info,nodes,tasks
     )
 
     res = await w.run()

@@ -22,8 +22,7 @@ class AsyncMPIExecutor(Executor):
                  tmp_dir:str = ".mpiexec_tmp",
                  mpiexec:str = "mpirun",
                  return_stdout: bool = True,
-                 use_ppn: bool = True,
-                 pin_resources: bool = True):
+                 use_ppn: bool = True):
         self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
@@ -32,7 +31,6 @@ class AsyncMPIExecutor(Executor):
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
         self.use_ppn = use_ppn
-        self.pin_resources = pin_resources
         os.makedirs(self.tmp_dir,exist_ok=True)
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
@@ -56,7 +54,7 @@ class AsyncMPIExecutor(Executor):
             launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
         ##resource pinning
-        if isinstance(job_resource.resources[0],NodeResourceList) and self.pin_resources:
+        if isinstance(job_resource.resources[0],NodeResourceList):
             common_cpus = set.intersection(*[set(node_resource.cpus) for node_resource in job_resource.resources])
 
             use_common_cpus = common_cpus == set(job_resource.resources[0].cpus)

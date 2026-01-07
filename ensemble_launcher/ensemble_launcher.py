@@ -5,7 +5,8 @@ from .ensemble import TaskFactory, Task
 from .config import SystemConfig, LauncherConfig
 from .helper_functions import get_nodes
 from ensemble_launcher.scheduler.resource import NodeResourceCount, NodeResourceList
-from ensemble_launcher.orchestrator import Master, Worker
+from ensemble_launcher.orchestrator import Master, Worker, AsyncMaster, AsyncWorker
+import asyncio
 
 import logging
 
@@ -18,11 +19,12 @@ class EnsembleLauncher:
                  launcher_config: Optional[LauncherConfig] = None,
                  Nodes: Optional[List[str]] = None,
                  pin_resources: bool = True,
-                 return_stdout: bool = False) -> None:
+                 async_orchestrator: bool = False) -> None:
         self.ensemble_file = ensemble_file
         self.system_config = system_config
         self.launcher_config = launcher_config
         self.pin_resources = pin_resources
+        self.async_orchestrator = async_orchestrator
         if isinstance(self.ensemble_file, dict) and \
             all([isinstance(t, Task) for t in self.ensemble_file.values()]):
             self._tasks = self.ensemble_file
@@ -49,17 +51,17 @@ class EnsembleLauncher:
             nnodes = len(self.nodes)
             if all([np==1 for np in task_np]):
                 #all serial tasks
-                task_executor_name = "multiprocessing"
+                task_executor_name = "multiprocessing" if async_orchestrator == False else "async_processpool"
             else:
                 #some serial and some mpi
-                task_executor_name = "mpi"
+                task_executor_name = "mpi" if async_orchestrator == False else "async_mpi"
 
             if nnodes == 1:
-                comm_name = "multiprocessing"
+                comm_name = "multiprocessing" if async_orchestrator == False else "async_zmq"
                 nlevels = 0 ##Just the worker would be good enough
             else:
                 #nnodes > 1
-                comm_name = "zmq"
+                comm_name = "zmq" if async_orchestrator == False else "async_zmq"
                 if nnodes <= 64:
                     nlevels = 1
                 elif nnodes > 64 and nnodes <= 256:
@@ -70,23 +72,21 @@ class EnsembleLauncher:
                     nlevels = 3
             
             if nlevels == 0:
-                child_executor_name = "multiprocessing"
+                child_executor_name = "multiprocessing" if async_orchestrator == False else "async_processpool"
             else:
-                child_executor_name = "mpi"
+                child_executor_name = "mpi" if async_orchestrator == False else "async_mpi"
         
             self.launcher_config = LauncherConfig(child_executor_name=child_executor_name,
                                                   task_executor_name=task_executor_name,
                                                   comm_name=comm_name,
                                                   nlevels=nlevels,
-                                                  return_stdout=return_stdout,
+                                                  return_stdout=True,
                                                   master_logs=True,
-                                                  worker_logs=True)
+                                                  worker_logs=True,)
         
         logger.info(f"LauncherConfig: {self.launcher_config}")
 
         self._launcher = self._create_launcher()
-
-
     
     def _generate_tasks(self) -> Dict[str, Task]:
         if isinstance(self.ensemble_file, str):
@@ -102,29 +102,42 @@ class EnsembleLauncher:
         return tasks
 
 
-    def _create_launcher(self):
-        if self.launcher_config.nlevels == 0:
-            return Worker(
-                "main",
-                self.launcher_config,
-                NodeResourceList.from_config(self.system_config) if self.pin_resources else NodeResourceCount.from_config(self.system_config),
-                Nodes = self.nodes,
-                tasks = self._tasks
-            )
+    def _get_resource_config(self):
+        """Get the appropriate resource configuration based on pin_resources setting."""
+        if self.pin_resources:
+            return NodeResourceList.from_config(self.system_config)
         else:
-            return Master(
-                "main",
-                self.launcher_config,
-                NodeResourceList.from_config(self.system_config) if self.pin_resources else NodeResourceCount.from_config(self.system_config),
-                Nodes = self.nodes,
-                tasks = self._tasks
-            )
+            return NodeResourceCount.from_config(self.system_config)
+
+    def _create_launcher(self):
+        """Create and return the appropriate launcher (Master or Worker) based on configuration."""
+        resource_config = self._get_resource_config()
+        launcher_args = {
+            "name": "main",
+            "config": self.launcher_config,
+            "resource": resource_config,
+            "Nodes": self.nodes,
+            "tasks": self._tasks
+        }
+        
+        if self.launcher_config.nlevels == 0:
+            if self.async_orchestrator:
+                return AsyncWorker(**launcher_args)
+            else:
+                return Worker(**launcher_args)
+        else:
+            if self.async_orchestrator:
+                return AsyncMaster(**launcher_args)
+            else:
+                return Master(**launcher_args)
 
     def run(self):
         """Simply blocks untils all the tasks are done"""
-        results = self._launcher.run()
+        if self.async_orchestrator:
+            results = asyncio.run(self._launcher.run())
+        else:
+            results = self._launcher.run()
         return results
     
-    def run_async(self):
-        """Creates a client Node that can be used to update the tasks etc"""
-        raise NotImplementedError(f"Async mode is not implemented yet")
+    async def run_async(self):
+        raise NotImplementedError("non blocking run not implemented yet")
