@@ -290,14 +290,14 @@ class AsyncWorker(Node):
             try:
                 await self._submission_task
             except asyncio.CancelledError:
-                pass
+                self.logger.debug("Submission task cancelled")
         self.logger.info("Stopped submission loop!")
         if self._reporting_task:
             self._reporting_task.cancel()
             try:
                 await self._reporting_task
             except asyncio.CancelledError:
-                pass
+                self.logger.debug("Reporting task cancelled")
         
         self.logger.info("Stopped reporting loop!")
 
