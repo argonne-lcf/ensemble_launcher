@@ -1,6 +1,6 @@
 from .async_worker import AsyncWorker
 from .node import Node
-from ensemble_launcher.executors import executor_registry, MPIExecutor, Executor
+from ensemble_launcher.executors import executor_registry, Executor
 from ensemble_launcher.scheduler import WorkerScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource, NodeResourceCount
 from ensemble_launcher.config import SystemConfig, LauncherConfig
