@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import asdict
 import threading
 import asyncio
-from asyncio import Future as AsyncFuture
+AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
 
 
