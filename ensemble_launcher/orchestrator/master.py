@@ -6,7 +6,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResour
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
-from ensemble_launcher.comm.messages import Status, Result, ResultBatch, HeartBeat, Action, ActionType, TaskUpdate
+from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate
 import copy
 import logging
 from itertools import accumulate

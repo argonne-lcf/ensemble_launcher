@@ -10,8 +10,6 @@ from ensemble_launcher.comm import AsyncComm, AsyncZMQComm
 from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate
 from ensemble_launcher.executors import executor_registry, AsyncThreadPoolExecutor, AsyncProcessPoolExecutor, AsyncMPIExecutor
 import logging
-import cloudpickle
-import socket
 import json
 from contextlib import contextmanager
 from collections import defaultdict

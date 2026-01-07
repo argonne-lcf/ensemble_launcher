@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 import multiprocessing as mp
-from typing import Literal, List, Union, Optional, TYPE_CHECKING
+from typing import Literal, List, Union, Optional
 from difflib import get_close_matches
 import logging
 
