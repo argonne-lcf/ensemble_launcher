@@ -19,7 +19,7 @@ import socket
 import json
 import base64
 import asyncio
-from asyncio import Future as AsyncFuture
+AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import contextmanager
 from collections import defaultdict
