@@ -65,6 +65,28 @@ class Result(Message):
     exception: Optional[str] = None
 
 @dataclass
+class ResultBatch(Message):
+    data: List[Result] = field(default_factory=list)
+
+    def add_result(self, result: Result):
+        self.data.append(result)
+    
+    def to_dict(self):
+        return {r.task_id: r.data for r in self.data}
+    
+    def __add__(self, other) -> 'ResultBatch':
+        if not isinstance(other, ResultBatch):
+            raise TypeError(f"Cannot add ResultBatch and {type(other)}")  # Should raise, not return
+        return ResultBatch(
+            sender=self.sender,
+            receiver=self.receiver,
+            data=self.data + other.data
+        )
+    
+    def __radd__(self, other) -> 'ResultBatch':
+        return self.__add__(other)
+
+@dataclass
 class TaskUpdate(Message):
     added_tasks: List[Task] = field(default_factory=list)  # Should be callable
     deleted_tasks: List[Task] = field(default_factory=list)  # Should be callable
@@ -80,3 +102,5 @@ class Action(Message):
 @dataclass
 class TaskRequest(Message):
     ntasks: int = 0
+
+all_messages = [Status, Result, HeartBeat, Message, Action, TaskUpdate, TaskRequest]

@@ -1,5 +1,5 @@
-from ensemble_launcher.orchestrator import Worker
-from ensemble_launcher.orchestrator import AsyncWorker
+from ensemble_launcher.orchestrator import  Master
+from ensemble_launcher.orchestrator import  AsyncMaster
 from ensemble_launcher.ensemble import Task
 import socket
 from ensemble_launcher.config import SystemConfig, LauncherConfig
@@ -13,14 +13,9 @@ import csv
 import json
 from datetime import datetime
 from pathlib import Path
+from utils import echo
 
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-def echo(sleep: float):
-    import time
-    time.sleep(sleep)
-    return
-
 
 async def benchmark_async_worker(ntasks_per_core=10, sleep_time=1.0,async_worker=False):
     ##create tasks
@@ -38,7 +33,7 @@ async def benchmark_async_worker(ntasks_per_core=10, sleep_time=1.0,async_worker
 
     run_time = {}
 
-    w = AsyncWorker("test",LauncherConfig(task_executor_name="async_processpool",comm_name="async_zmq",worker_logs=False),sys_info,nodes,tasks)
+    w = AsyncMaster("test",LauncherConfig(task_executor_name="async_processpool",child_executor_name="async_processpool",comm_name="async_zmq",worker_logs=False,master_logs=False),sys_info,nodes,tasks)
 
     tic = time.perf_counter()
     res = await w.run()
@@ -64,7 +59,7 @@ def benchmark_worker(ntasks_per_core=10, sleep_time=1.0,async_worker=False):
 
     run_time = {}
     # for exec in ["multiprocessing","mpi"]:
-    w = Worker("test",LauncherConfig(task_executor_name="multiprocessing",comm_name="zmq",worker_logs=False),sys_info,nodes,tasks)
+    w = Master("test",LauncherConfig(task_executor_name="multiprocessing",child_executor_name="multiprocessing",comm_name="zmq",worker_logs=False),sys_info,nodes,tasks)
 
     tic = time.perf_counter()
     res = w.run()
@@ -73,7 +68,7 @@ def benchmark_worker(ntasks_per_core=10, sleep_time=1.0,async_worker=False):
     
     return run_time
 
-def run_strong_scaling_experiment(total_work_per_core=10.0, output_file="strong_scaling_results.csv", async_only=False):
+def run_strong_scaling_experiment(total_work_per_core=10.0, output_file="strong_scaling_results.csv"):
     """
     Run strong scaling experiment where total work per core is constant.
     Total work = ntasks_per_core * sleep_time
@@ -81,7 +76,6 @@ def run_strong_scaling_experiment(total_work_per_core=10.0, output_file="strong_
     Args:
         total_work_per_core: Total work time per core in seconds (default: 10.0)
         output_file: Output CSV file name
-        async_only: If True, run only async worker benchmarks
     """
     # Define test configurations: (ntasks_per_core, sleep_time)
     # Keep total_work_per_core constant
@@ -109,14 +103,11 @@ def run_strong_scaling_experiment(total_work_per_core=10.0, output_file="strong_
         print(f"  Ideal runtime: {total_work_per_core}s")
         
         # Run sync benchmark
-        if not async_only:
-            try:
-                sync_run_time = benchmark_worker(ntasks, sleep_time)
-                sync_time = sync_run_time.get("processpool", None)
-            except Exception as e:
-                print(f"  Sync benchmark failed: {e}")
-                sync_time = None
-        else:
+        try:
+            sync_run_time = benchmark_worker(ntasks, sleep_time)
+            sync_time = sync_run_time.get("processpool", None)
+        except Exception as e:
+            print(f"  Sync benchmark failed: {e}")
             sync_time = None
         
         # Run async benchmark
@@ -191,14 +182,12 @@ if __name__ == "__main__":
                        help='Total work per core for strong scaling (default: 10.0s)')
     parser.add_argument('--output', type=str, default='strong_scaling_results.csv',
                        help='Output CSV file for strong scaling results')
-    parser.add_argument('--async-only', action='store_true',
-                       help='Run only async worker benchmarks')
 
     args = parser.parse_args()
 
     if args.strong_scaling:
         # Run strong scaling experiment
-        run_strong_scaling_experiment(args.total_work, args.output, args.async_only)
+        run_strong_scaling_experiment(args.total_work, args.output)
     else:
         # Run single benchmark
         ntasks = args.ntasks_per_core or 1
@@ -210,16 +199,14 @@ if __name__ == "__main__":
         print(f"  Total tasks: {mp.cpu_count() * ntasks}")
         print("-" * 40)
 
-        if not args.async_only:
-            run_time = benchmark_worker(ntasks, sleep)
+        run_time = benchmark_worker(ntasks, sleep)
         async_run_time = asyncio.run(benchmark_async_worker(ntasks, sleep))
 
         print("\nBenchmark Results:")
         print("-" * 40)
-        if not args.async_only:
-            print("Sync Results:")
-            for executor, time_taken in run_time.items():
-                print(f"{executor:>15}: {time_taken:.3f} seconds")
+        print("Sync Results:")
+        for executor, time_taken in run_time.items():
+            print(f"{executor:>15}: {time_taken:.3f} seconds")
         print("Async Results:")
         for executor, time_taken in async_run_time.items():
             print(f"async {executor:>10}: {time_taken:.3f} seconds")

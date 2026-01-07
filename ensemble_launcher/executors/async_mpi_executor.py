@@ -6,23 +6,23 @@ from .utils import gen_affinity_bash_script_1, gen_affinity_bash_script_2, gener
 import os
 import stat
 import uuid
-import shlex
 import socket
-from datetime import datetime
 
-from .base import Executor
+from concurrent.futures import Executor
+import asyncio
+from asyncio import Task
+
 
 logger = logging.getLogger(__name__)
 
-@executor_registry.register("mpi")
-class MPIExecutor(Executor):
+@executor_registry.register("async_mpi", type="async")
+class AsyncMPIExecutor(Executor):
     def __init__(self,logger=logger, 
                  gpu_selector: str = "ZE_AFFINITY_MASK",
                  tmp_dir:str = ".mpiexec_tmp",
                  mpiexec:str = "mpirun",
                  return_stdout: bool = True,
-                 profile: bool = False,
-                 use_ppn: bool = True,):
+                 use_ppn: bool = True):
         self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
@@ -30,17 +30,8 @@ class MPIExecutor(Executor):
         self._processes: Dict[str,subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
-        self._profile = profile
-        self._profile_info: Dict[str, Dict] = {}
         self.use_ppn = use_ppn
         os.makedirs(self.tmp_dir,exist_ok=True)
-
-    def _record_profile_stop(self, task_id: str):
-        """Helper method to record profiling stop time and duration"""
-        if self._profile and task_id in self._profile_info and "stop" not in self._profile_info[task_id]:
-            self._profile_info[task_id]["stop"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._profile_info[task_id]["duration"] = (datetime.now() - self._profile_info[task_id]["start"]).total_seconds()
-            self._profile_info[task_id]["start"] = self._profile_info[task_id]["start"].strftime("%Y-%m-%d %H:%M:%S")
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
         """Function to build the mpi cmd from the job resources"""
@@ -110,14 +101,14 @@ class MPIExecutor(Executor):
 
         return launcher_cmd, env
 
-    def start(self,job_resource: JobResource, 
+    def submit(self,job_resource: JobResource, 
                 task: Union[str, Callable, List], 
                 task_args: Tuple = (), 
                 task_kwargs: Dict[str,Any] = {}, 
                 env: Dict[str, Any] = {},
                 mpi_args: Tuple = (),
                 mpi_kwargs:Dict[str, Any] = {},
-                serial_launch: bool = False):
+                serial_launch: bool = False) -> Task:
         # task is a str command
         task_id = str(uuid.uuid4())
 
@@ -147,80 +138,58 @@ class MPIExecutor(Executor):
         merged_env = os.environ.copy()
         merged_env.update(resource_pinning_env)
         merged_env.update(env)
-
-        self.logger.info(f"executing: {' '.join(cmd)}")
-        if self._return_stdout:
-            p = subprocess.Popen(cmd, env=merged_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        else:
-            p = subprocess.Popen(cmd, env=merged_env)
         
-        if self._profile:
-            self._profile_info[task_id] = {"start": datetime.now()}
+        asyncio_task = asyncio.create_task(self._subprocess_task(task_id, cmd, merged_env))
+
+        return asyncio_task
+    
+    async def _subprocess_task(self, task_id: str, cmd: List[str], merged_env: Dict[str, Any]):
+        self.logger.debug(f"executing: {' '.join(cmd)}")
+        
+        # We separate the executable from the arguments
+        program = cmd[0]
+        args = cmd[1:]
+        
+        if self._return_stdout:
+            p = await asyncio.create_subprocess_exec(
+                program, 
+                *args,
+                env=merged_env, 
+                stdout=asyncio.subprocess.PIPE, 
+                stderr=asyncio.subprocess.PIPE
+            )
+        else:
+            p = await asyncio.create_subprocess_exec(
+                program, 
+                *args, 
+                env=merged_env, 
+                stdout=asyncio.subprocess.DEVNULL, 
+                stderr=asyncio.subprocess.DEVNULL
+            )
         
         self._processes[task_id] = p
-        return task_id
-    
-    def stop(self, task_id: str, force: bool = False):
+        
         try:
-            if force:
-                self._processes[task_id].kill()
-            else:
-                self._processes[task_id].terminate()
-            self._record_profile_stop(task_id)
-            return True
-        except Exception as e:
-            self.logger.warning(f"Failed to kill task {task_id} with an exception {e}")
-        return False
+            std_out, std_err = await p.communicate()
+            
+            out_str = std_out.decode() if std_out else ""
+            err_str = std_err.decode() if std_err else ""
+            
+            if p.returncode != 0:
+                self.logger.error(f"Task {task_id} failed with return code {p.returncode}")
+                self.logger.error(f"stderr: {err_str}")
+                raise RuntimeError(f"Task {task_id} failed with return code {p.returncode}")
+            return out_str
+            
+        finally:
+            if task_id in self._processes:
+                del self._processes[task_id]
 
-    def wait(self, task_id: str, timeout: float = None):
-        process = self._processes[task_id]
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"Process {task_id} timed out after {timeout} seconds.")
-            return False
-        stdout = None
-        stderr = None
-        if self._return_stdout:
-            stdout, stderr = process.communicate()
-        self._results[task_id] = (stdout,stderr)
-        self._record_profile_stop(task_id)
-        return True
-    
-    def result(self, task_id: str, timeout:float = None):
-        try:
-            return self._results[task_id]
-        except KeyError:
-            if self.wait(task_id=task_id, timeout=timeout):
-                return self._results[task_id]
-            else:
-                return None
-    
-    def exception(self, task_id: str):
-        self.wait(task_id)
-        self._record_profile_stop(task_id)
-        return_code = self._processes[task_id].poll()
-        if return_code == 0:
-            return None
-        result = self._results.get(task_id, (None, None))
-        return result[1]
-
-    def done(self, task_id: str):
-        process = self._processes[task_id]
-        return process.poll() is not None
-
-    def running(self, task_id: str):
-        return not self.done(task_id)
-    
-    def shutdown(self, force:bool = False):
+    def shutdown(self, force: bool = False):
         for task_id, process in self._processes.items():
-            try:
-                if process.poll() is None:
-                    if force:
-                        process.kill()
-                    else:
-                        self.wait(task_id)
-            except Exception as e:
-                self.logger.warning(f"Failed to kill process {task_id}: {e}")
+            if process.returncode is None:
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
         self._processes.clear()
-        self._results.clear()

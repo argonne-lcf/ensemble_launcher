@@ -19,7 +19,7 @@ class Scheduler:
         self.logger = logger
         self._cluster_resource = cluster_resource
         
-    def assign(self):
+    def assign(self, *args, **kwargs):
         raise NotImplementedError
     
     @property

@@ -159,7 +159,6 @@ el = EnsembleLauncher(
     ensemble_file="config.json",
     Nodes=["node-001", "node-002"],  # Optional: auto-detects from PBS_NODEFILE, works only on PBS
     pin_resources=True,              # Enable CPU/GPU pinning
-    return_stdout=True               # Capture task output
 )
 ```
 
@@ -196,7 +195,8 @@ el = EnsembleLauncher(
     ensemble_file="config.json",
     system_config=system_config,
     launcher_config=launcher_config,
-    pin_resources=True
+    pin_resources=True,
+    async_orchestrator=False #use event driven orchestrator (only for zmq communication backend)
 )
 
 results = el.run()
@@ -258,7 +258,6 @@ tasks = {
 
 el = EnsembleLauncher(
     ensemble_file=tasks,  # Pass dict directly
-    return_stdout=True
 )
 results = el.run()
 ```
@@ -415,7 +414,7 @@ EnsembleLauncher(
     launcher_config: Optional[LauncherConfig] = None,
     Nodes: Optional[List[str]] = None,
     pin_resources: bool = True,
-    return_stdout: bool = False
+    async_orchestrator: bool = False
 )
 ```
 
@@ -425,7 +424,7 @@ EnsembleLauncher(
 - `launcher_config`: Launcher behavior configuration (auto-configured if None)
 - `Nodes`: List of compute nodes (auto-detected if None)
 - `pin_resources`: Enable CPU/GPU affinity
-- `return_stdout`: Capture task stdout
+- `async_orchestrator`: Use event-driven orchestrator (only for ZMQ backend)
 
 **Methods:**
 - `run()`: Execute ensemble and return results

@@ -1,6 +1,7 @@
 from typing import Any, Optional
 import multiprocessing as mp
-from .base import Comm, NodeInfo
+from .base import Comm
+from .nodeinfo import NodeInfo
 from logging import Logger
 
 class MPComm(Comm):
@@ -22,81 +23,82 @@ class MPComm(Comm):
         self._setup_pipes()
     
     def _setup_pipes(self):
-        for child_id in self.node_info.children_ids:
+        for child_id in self._node_info.children_ids:
             self._my_conn_to_child[child_id], self._child_conn_to_me[child_id] = mp.Pipe()
         
 
         if self._parent_comm:
-            self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self.node_info.node_id]
+            self._my_conn_to_parent = self._parent_comm._child_conn_to_me[self._node_info.node_id]
 
     def update_node_info(self, node_info: NodeInfo):
-        self.node_info = node_info
+        self._node_info = node_info
         self._setup_pipes()
 
     def _send_to_parent(self, data: Any) -> bool:
         if self._my_conn_to_parent is None:
-            self.logger.warning(f"{self.node_info.node_id}: No parent connection available")
+            self.logger.warning(f"{self._node_info.node_id}: No parent connection available")
             return False
             
         try:
             self._my_conn_to_parent.send(data)
-            self.logger.debug(f"{self.node_info.node_id}: Sent message to parent: {data}")
+            self.logger.debug(f"{self._node_info.node_id}: Sent message to parent: {data}")
             return True 
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Sending message to parent failed with {e}")
+            self.logger.warning(f"{self._node_info.node_id}: Sending message to parent failed with {e}")
             return False
 
     def _recv_from_parent(self, timeout: Optional[float] = None) -> Any:
         # Fixed: Added None check for parent connection
         if self._my_conn_to_parent is None:
-            self.logger.debug(f"{self.node_info.node_id}: No parent connection available")
+            self.logger.debug(f"{self._node_info.node_id}: No parent connection available")
             return None
             
         try:
             if self._my_conn_to_parent.poll(timeout):
                 msg = self._my_conn_to_parent.recv()
-                self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from parent.")
+                self.logger.debug(f"{self._node_info.node_id}: Received message {msg} from parent.")
                 return msg
-            self.logger.debug(f"{self.node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
+            self.logger.debug(f"{self._node_info.node_id}: No message received from parent within timeout {timeout} seconds.")
             return None
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
+            self.logger.warning(f"{self._node_info.node_id}: Receiving message failed with exception {e}!")  # Fixed typo
             return None
 
     def _send_to_child(self, child_id: str, data: Any) -> bool:
         # Fixed: Added validation for child_id existence
         if child_id not in self._my_conn_to_child:
-            self.logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            self.logger.warning(f"{self._node_info.node_id}: No connection to child {child_id}")
             return False
             
         try:
             self._my_conn_to_child[child_id].send(data)
-            self.logger.debug(f"{self.node_info.node_id}: Sent message to child {child_id}")
+            self.logger.debug(f"{self._node_info.node_id}: Sent message to child {child_id}")
             return True
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Sending message to child {child_id} failed with {e}")
+            self.logger.warning(f"{self._node_info.node_id}: Sending message to child {child_id} failed with {e}")
             return False
 
     def _recv_from_child(self, child_id: str, timeout: Optional[float] = None) -> Any:
         # Fixed: Added validation for child_id existence
         if child_id not in self._my_conn_to_child:
-            self.logger.warning(f"{self.node_info.node_id}: No connection to child {child_id}")
+            self.logger.warning(f"{self._node_info.node_id}: No connection to child {child_id}")
             return None
             
         try:
-            self.logger.debug(f"{self.node_info.node_id}: recv_from_child pipe {child_id}")
+            self.logger.debug(f"{self._node_info.node_id}: recv_from_child pipe {child_id}")
             if self._my_conn_to_child[child_id].poll(timeout):
                 msg = self._my_conn_to_child[child_id].recv()
-                self.logger.debug(f"{self.node_info.node_id}: Received message {msg} from child {child_id}.")
+                self.logger.debug(f"{self._node_info.node_id}: Received message {msg} from child {child_id}.")
                 return msg
-            self.logger.debug(f"{self.node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
+            self.logger.debug(f"{self._node_info.node_id}: No message received from child {child_id} within timeout {timeout} seconds.")
             return None
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
+            self.logger.warning(f"{self._node_info.node_id}: Receiving message from child {child_id} failed with exception {e}!")
             return None
 
     def close(self):
         """Clean up connections."""
+        super().clear_cache()
         try:
             # Close child connections
             for child_id in list(self._my_conn_to_child.keys()):
@@ -107,11 +109,11 @@ class MPComm(Comm):
             # Note: Parent connection is owned by parent, so we don't close it
             
         except Exception as e:
-            self.logger.warning(f"{self.node_info.node_id}: Error during cleanup: {e}")
+            self.logger.warning(f"{self._node_info.node_id}: Error during cleanup: {e}")
     
     def pickable_copy(self):
         """These might not be usable. These are just to capture the metadata to send to the children"""
-        ret = MPComm(None,self.node_info,parent_comm=self._parent_comm)
+        ret = MPComm(None,self._node_info,parent_comm=self._parent_comm)
         ret._my_conn_to_child = self._my_conn_to_child
         ret._child_conn_to_me = self._child_conn_to_me
         return ret

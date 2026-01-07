@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 import multiprocessing as mp
 from typing import Literal, List, Union, Optional
 from difflib import get_close_matches
-
+import logging
 
 class SystemConfig(BaseModel):
     """Input configuration of the system"""
@@ -14,17 +14,20 @@ class SystemConfig(BaseModel):
 
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
-    child_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing"
-    task_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing"
-    comm_name: Literal["multiprocessing","zmq","dragon"] = "multiprocessing"
+    child_executor_name: str = "multiprocessing"
+    task_executor_name: str = "multiprocessing"
+    comm_name: Literal["multiprocessing","zmq","dragon","async_zmq"] = "multiprocessing"
     report_interval: float = 10.0
     nlevels: int = 1
     return_stdout: bool = False
     worker_logs: bool = False
     master_logs: bool = False
     nchildren: Optional[int] = None ##Setting this will fix the number of children at each level
+    sequential_child_launch: bool = False ##If True, launch children one by one even for MPI executor
     profile: Optional[Literal["basic","timeline"]] = None ##Setting this will print output some profiling information like communication latency, execution time of each task for every nodes
     gpu_selector: str = "ZE_AFFINITY_MASK"
+    log_level: int = logging.INFO
+    use_mpi_ppn: bool = True ##If True, use -ppn flag when launching MPI jobs
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

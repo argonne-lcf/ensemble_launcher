@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Dict, Any, Type
+from typing import Callable, Tuple, Dict, Any, Type, List
 import cloudpickle
 import base64
 from ensemble_launcher.comm.queue import QueueProtocol
@@ -160,12 +160,30 @@ def gen_affinity_bash_script_2(ngpus_per_process: int, gpu_selector: str) -> str
 class ExecutorRegistry:
     def __init__(self):
         self._available_executors: Dict = {}
+        self._sync_executors: List = []
+        self._async_executors: List = []
 
-    def register(self,name:str):
+    def register(self,name:str, type: str = "sync"):
         def decorator(cls: Type[Any]):
             self._available_executors[name] = cls
+            if type == "sync":
+                self._sync_executors.append(name)
+            elif type == "async":
+                self._async_executors.append(name)
             return cls
         return decorator
+    
+    @property
+    def available_executors(self) -> List[str]:
+        return list(self._available_executors.keys())
+    
+    @property
+    def sync_executors(self) -> List[str]:
+        return self._sync_executors
+    
+    @property
+    def async_executors(self) -> List[str]:
+        return self._async_executors
     
     def create_executor(self,name:str ,args:Tuple = (), kwargs:Dict ={}):
         try:
@@ -175,3 +193,9 @@ class ExecutorRegistry:
             raise
 
 executor_registry = ExecutorRegistry()            
+
+
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+executor_registry.register("async_threadpool")(ThreadPoolExecutor)
+executor_registry.register("async_processpool")(ProcessPoolExecutor)
