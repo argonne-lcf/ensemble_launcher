@@ -22,7 +22,7 @@ class AsyncScheduler(Scheduler):
         super().__init__(logger=logger, cluster_resource=cluster_resource)
 
 
-class WorkerScheduler(AsyncScheduler):
+class AsyncWorkerScheduler(AsyncScheduler):
     def __init__(self, logger: Logger, cluster: ClusterResource):
         super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}

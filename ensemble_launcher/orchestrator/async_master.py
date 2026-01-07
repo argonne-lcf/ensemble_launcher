@@ -1,7 +1,7 @@
 from .async_worker import AsyncWorker
 from .node import Node
 from ensemble_launcher.executors import executor_registry, Executor
-from ensemble_launcher.scheduler import WorkerScheduler
+from ensemble_launcher.scheduler import AsyncWorkerScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResource, NodeResourceList, NodeResource, NodeResourceCount
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
@@ -261,7 +261,7 @@ class AsyncMaster(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
-        self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes,self._sys_info))
+        self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes,self._sys_info))
 
         assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
 
