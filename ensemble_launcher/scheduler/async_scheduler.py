@@ -9,7 +9,6 @@ import asyncio
 from asyncio import Queue, PriorityQueue
 from .scheduler import Scheduler
 from collections import Counter
-import time
 
 # self.logger = logging.getself.logger(__name__)
 
