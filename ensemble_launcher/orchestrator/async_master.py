@@ -9,7 +9,7 @@ from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
 from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, ResultBatch
 import logging
 from itertools import accumulate
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Union
 import os
 import time
 import numpy as np
