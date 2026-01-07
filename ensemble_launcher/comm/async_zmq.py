@@ -17,7 +17,7 @@ try:
     import zmq
     from zmq.asyncio import Poller, Context, Socket
     ZMQ_AVAILABLE = True
-except:
+except ImportError:
     ZMQ_AVAILABLE = False
 
 # logger = logging.getLogger(__name__)
