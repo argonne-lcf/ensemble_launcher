@@ -3,7 +3,6 @@ from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList, 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from .utils import run_callable_with_affinity, run_cmd, executor_registry
 import uuid
-from datetime import datetime
 
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
