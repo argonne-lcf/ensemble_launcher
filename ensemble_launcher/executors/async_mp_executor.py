@@ -63,7 +63,6 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
                task_kwargs: Dict = {},
                env: Dict[str, Any] = {}):
         
-        task_id = str(uuid.uuid4())
         if len(job_resource.nodes) > 1 or job_resource.resources[0].cpu_count > 1:
             raise ValueError("MultiProcessingExecutor can only execute serial tasks")
         
