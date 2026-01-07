@@ -7,7 +7,6 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
 from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, ResultBatch
-import copy
 import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Any, Union
