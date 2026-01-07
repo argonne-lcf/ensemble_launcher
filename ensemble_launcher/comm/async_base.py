@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Type, Union
 from .messages import Message, HeartBeat, Status, all_messages
 from .nodeinfo import NodeInfo
-from dataclasses import dataclass, field
 import time
 from logging import Logger
 from datetime import datetime
