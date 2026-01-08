@@ -123,6 +123,100 @@ python3 launcher_script.py
 
 ---
 
+## Command Line Interface (CLI)
+
+Ensemble Launcher provides a command-line interface for quick execution without writing launcher scripts.
+
+### Basic Usage
+
+After installation, use the `el` command:
+
+```bash
+el config.json
+```
+
+Alternatively, run as a Python module:
+
+```bash
+python -m ensemble_launcher.cli config.json
+```
+
+### CLI Options
+
+```bash
+el --help
+```
+
+**Available Options:**
+
+- `--ensemble-file` (required): Path to the ensemble configuration JSON file
+- `--system-config-file` (optional): Path to the system configuration JSON file
+- `--launcher-config-file` (optional): Path to the launcher configuration JSON file
+- `--nodes-str` (optional): Comma-separated list of compute nodes (e.g., "node-001,node-002,node-003")
+- `--pin-resources / --no-pin-resources`: Enable/disable CPU/GPU resource pinning (default: enabled)
+- `--async-orchestrator / --no-async-orchestrator`: Use event-driven orchestrator (default: disabled, only works with ZMQ)
+
+### Examples
+
+**Simple execution with default settings:**
+```bash
+el my_ensemble.json
+```
+
+**With custom configurations:**
+```bash
+el my_ensemble.json \
+    --system-config-file system.json \
+    --launcher-config-file launcher.json
+```
+
+**Specify compute nodes:**
+```bash
+el my_ensemble.json \
+    --nodes-str "node-001,node-002,node-003,node-004"
+```
+
+**Use async orchestrator with ZMQ:**
+```bash
+el my_ensemble.json \
+    --async-orchestrator
+```
+
+**Disable resource pinning:**
+```bash
+el my_ensemble.json \
+    --no-pin-resources
+```
+
+### Configuration Files
+
+**System Configuration (system.json):**
+```json
+{
+    "name": "my_cluster",
+    "ncpus": 104,
+    "ngpus": 12,
+    "cpus": [0, 1, 2, 3, 4],
+    "gpus": [0, 1, 2, 3]
+}
+```
+
+**Launcher Configuration (launcher.json):**
+```json
+{
+    "child_executor_name": "mpi",
+    "task_executor_name": "mpi",
+    "comm_name": "zmq",
+    "nlevels": 2,
+    "report_interval": 10.0,
+    "return_stdout": true,
+    "worker_logs": true,
+    "master_logs": true
+}
+```
+
+---
+
 ## Architecture
 
 ![Ensemble Launcher Architecture](assets/el.png)
