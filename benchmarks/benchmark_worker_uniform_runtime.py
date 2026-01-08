@@ -73,6 +73,106 @@ def benchmark_worker(ntasks_per_core=10, sleep_time=1.0,async_worker=False):
     
     return run_time
 
+def run_weak_scaling_experiment(sleep_time=0.1, output_file="weak_scaling_results.csv", async_only=False):
+    """
+    Run weak scaling experiment where task granularity is constant.
+    Vary the number of tasks per core while keeping sleep_time constant.
+    
+    Args:
+        sleep_time: Sleep time per task in seconds (default: 0.1)
+        output_file: Output CSV file name
+        async_only: If True, run only async worker benchmarks
+    """
+    # Define test configurations: vary ntasks_per_core
+    # Keep sleep_time constant
+    ntasks_per_core_values = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+    
+    print(f"Weak Scaling Experiment")
+    print(f"Task sleep time: {sleep_time}s (constant)")
+    print(f"Number of CPU cores: {mp.cpu_count()}")
+    print(f"Total configurations: {len(ntasks_per_core_values)}")
+    print("=" * 60)
+    
+    results = []
+    
+    for i, ntasks in enumerate(ntasks_per_core_values, 1):
+        work_per_core = ntasks * sleep_time
+        print(f"\n[{i}/{len(ntasks_per_core_values)}] Running: {ntasks} tasks/core × {sleep_time}s sleep")
+        print(f"  Total tasks: {ntasks * mp.cpu_count()}")
+        print(f"  Work per core: {work_per_core:.2f}s")
+        print(f"  Ideal runtime: {work_per_core:.2f}s")
+        
+        # Run sync benchmark
+        if not async_only:
+            try:
+                sync_run_time = benchmark_worker(ntasks, sleep_time)
+                sync_time = sync_run_time.get("processpool", None)
+            except Exception as e:
+                print(f"  Sync benchmark failed: {e}")
+                sync_time = None
+        else:
+            sync_time = None
+        
+        # Run async benchmark
+        try:
+            async_run_time = asyncio.run(benchmark_async_worker(ntasks, sleep_time))
+            async_time = async_run_time.get("processpool", None)
+        except Exception as e:
+            print(f"  Async benchmark failed: {e}")
+            async_time = None
+        
+        result = {
+            'ntasks_per_core': ntasks,
+            'sleep_time': sleep_time,
+            'work_per_core': work_per_core,
+            'ideal_runtime': work_per_core,
+            'total_tasks': ntasks * mp.cpu_count(),
+            'ncores': mp.cpu_count(),
+            'sync_runtime': sync_time,
+            'async_runtime': async_time,
+            'sync_efficiency': work_per_core / sync_time if sync_time else None,
+            'async_efficiency': work_per_core / async_time if async_time else None,
+            'sync_overhead': sync_time - work_per_core if sync_time else None,
+            'async_overhead': async_time - work_per_core if async_time else None,
+        }
+        
+        results.append(result)
+        
+        if sync_time:
+            print(f"  Sync runtime: {sync_time:.3f}s (efficiency: {result['sync_efficiency']:.2%})")
+        if async_time:
+            print(f"  Async runtime: {async_time:.3f}s (efficiency: {result['async_efficiency']:.2%})")
+    
+    # Save results to CSV
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+    
+    print("\n" + "=" * 60)
+    print(f"Results saved to: {output_path.absolute()}")
+    
+    # Also save metadata
+    metadata = {
+        'timestamp': datetime.now().isoformat(),
+        'sleep_time': sleep_time,
+        'ncores': mp.cpu_count(),
+        'hostname': socket.gethostname(),
+        'nconfigurations': len(ntasks_per_core_values)
+    }
+    
+    metadata_file = output_path.with_suffix('.json')
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Metadata saved to: {metadata_file.absolute()}")
+    
+    return results
+
+
 def run_strong_scaling_experiment(total_work_per_core=10.0, output_file="strong_scaling_results.csv", async_only=False):
     """
     Run strong scaling experiment where total work per core is constant.
@@ -186,11 +286,15 @@ if __name__ == "__main__":
     parser.add_argument('--sleep-time', type=float, default=None,
                        help='Sleep time for each task in seconds (for single run)')
     parser.add_argument('--strong-scaling', action='store_true',
-                       help='Run strong scaling experiment')
+                       help='Run strong scaling experiment (constant total work)')
+    parser.add_argument('--weak-scaling', action='store_true',
+                       help='Run weak scaling experiment (constant task granularity)')
     parser.add_argument('--total-work', type=float, default=10.0,
                        help='Total work per core for strong scaling (default: 10.0s)')
-    parser.add_argument('--output', type=str, default='strong_scaling_results.csv',
-                       help='Output CSV file for strong scaling results')
+    parser.add_argument('--task-sleep', type=float, default=0.1,
+                       help='Task sleep time for weak scaling (default: 0.1s)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output CSV file for scaling results (default: auto-generated based on experiment type)')
     parser.add_argument('--async-only', action='store_true',
                        help='Run only async worker benchmarks')
 
@@ -198,7 +302,12 @@ if __name__ == "__main__":
 
     if args.strong_scaling:
         # Run strong scaling experiment
-        run_strong_scaling_experiment(args.total_work, args.output, args.async_only)
+        output_file = args.output or 'strong_scaling_results.csv'
+        run_strong_scaling_experiment(args.total_work, output_file, args.async_only)
+    elif args.weak_scaling:
+        # Run weak scaling experiment
+        output_file = args.output or 'weak_scaling_results.csv'
+        run_weak_scaling_experiment(args.task_sleep, output_file, args.async_only)
     else:
         # Run single benchmark
         ntasks = args.ntasks_per_core or 1
