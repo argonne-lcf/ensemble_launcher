@@ -13,11 +13,17 @@ setup(
         "pytest",
         "cloudpickle",
         "pydantic",
-        "pyzmq"  
+        "pyzmq",
+        "typer"
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
         "mcp": ["mcp","paramiko"],
+    },
+    entry_points={
+        "console_scripts": [
+            "el=ensemble_launcher.cli:el",
+        ],
     },
     python_requires=">=3.10",
 )
