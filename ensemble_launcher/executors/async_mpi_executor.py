@@ -178,6 +178,7 @@ class AsyncMPIExecutor(Executor):
             if p.returncode != 0:
                 self.logger.error(f"Task {task_id} failed with return code {p.returncode}")
                 self.logger.error(f"stderr: {err_str}")
+                self.logger.error(f"stdout: {out_str}")
                 raise RuntimeError(f"Task {task_id} failed with return code {p.returncode}")
             return out_str
             

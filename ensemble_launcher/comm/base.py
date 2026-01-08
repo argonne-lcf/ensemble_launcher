@@ -39,7 +39,7 @@ class MessageRoutingQueue:
         
         # Get specific message type
         if msg_type not in self._queues:
-            self.logger.warning(f"No messages of type {msg_type.__name__} available")
+            self.logger.debug(f"No messages of type {msg_type.__name__} available")
             return None
         
         try:
@@ -53,7 +53,7 @@ class MessageRoutingQueue:
     
         # Get specific message type
         if msg_type not in self._queues:
-            self.logger.warning(f"No messages of type {msg_type.__name__} available")
+            self.logger.debug(f"No messages of type {msg_type.__name__} available")
             return None
         
         try:
@@ -87,7 +87,7 @@ class MessageRoutingQueue:
     
         if msg_type is not None:
             if msg_type not in self._queues:
-                self.logger.warning(f"No messages of type {msg_type.__name__} available")
+                self.logger.debug(f"No messages of type {msg_type.__name__} available")
                 return True
             return self._queues[msg_type].empty()
         else:

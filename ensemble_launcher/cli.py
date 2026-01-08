@@ -2,6 +2,7 @@ import typer
 from ensemble_launcher.config import LauncherConfig, SystemConfig
 from typing import Optional
 from ensemble_launcher import EnsembleLauncher
+import json
 
 el = typer.Typer()
 
@@ -29,8 +30,13 @@ def main(ensemble_file: str,
 
             async_orchestrator (bool): Whether to use an asynchronous orchestrator.
     """
-    system_config = SystemConfig.from_json(system_config_file) if system_config_file else SystemConfig(name="local")
-    launcher_config = LauncherConfig.from_json(launcher_config_file) if launcher_config_file else None
+    with open(system_config_file, "r") as f:
+        config_dict = json.load(f)  
+    system_config = SystemConfig.model_validate(config_dict) if system_config_file else SystemConfig(name="local")
+
+    with open(launcher_config_file, "r") as f:
+        config_dict = json.load(f)
+    launcher_config = LauncherConfig.model_validate(config_dict) if launcher_config_file else None
     nodes = nodes_str.split(",") if nodes_str else None
 
     launcher = EnsembleLauncher(
