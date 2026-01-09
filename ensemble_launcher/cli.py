@@ -59,6 +59,10 @@ def main(ensemble_file: str,
         async_orchestrator=async_orchestrator
     )
     results = launcher.run()
+
+    with open("results.json", "w") as f:
+        json.dump(results.to_dict(), f, indent=2)
+        
     return results
 
 if __name__ == "__main__":
