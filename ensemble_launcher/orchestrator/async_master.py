@@ -535,21 +535,39 @@ class AsyncMaster(Node):
         self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
         with self._timer("collect_results"):
-            ##Create a new result from all the results
-            data: List[Result] = []
+            retry_children = set(self.children.keys())
             result_batch = ResultBatch(sender=self.node_id)
-            for child_id in self.children:
-                result_batch += await self._comm.recv_message_from_child(ResultBatch, child_id=child_id, timeout=5.0)
+            max_retries = 10
+            for retry in range(max_retries):
+                for child_id in retry_children.copy():
+                    temp_result_batch: ResultBatch = await self._comm.recv_message_from_child(ResultBatch, child_id=child_id, timeout=1.0)
+                    if temp_result_batch is not None:
+                        result_batch += temp_result_batch
+                        retry_children.remove(child_id)
+                if len(retry_children) == 0:
+                    break
+            if len(retry_children) > 0:
+                self.logger.warning(f"{self.node_id}: Failed to receive results from children {retry_children} after {max_retries} retries")
 
-        for child_id in self.children:
-            status = await self._comm.recv_message_from_child(Status, child_id=child_id)
-            if status is not None:
-                if child_id not in self._children_status:
-                    self._children_status[child_id] = status
-                elif status.timestamp > self._children_status[child_id].timestamp:
-                    self._children_status[child_id] = status
+        #collect final status from children
+        with self._timer("collect_status"):
+            retry_children = set(self.children.keys())
+            max_retries = 2
+            for retry in range(max_retries):
+                for child_id in retry_children.copy():
+                    status = await self._comm.recv_message_from_child(Status, child_id=child_id) # no wait call
+                    if status is not None:
+                        if child_id not in self._children_status:
+                            self._children_status[child_id] = status
+                        elif status.timestamp > self._children_status[child_id].timestamp:
+                            self._children_status[child_id] = status
+                        retry_children.remove(child_id)
+                if len(retry_children) == 0:
+                    break
+            if len(retry_children) > 0:
+                self.logger.warning(f"{self.node_id}: Failed to receive status from children {retry_children} after {max_retries} retries")
         
-        self.logger.info(f"Status from children: {self._children_status}")
+        self.logger.debug(f"Status from children: {self._children_status}")
 
         #send final results to parent
         if self.parent:
