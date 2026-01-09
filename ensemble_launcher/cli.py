@@ -30,13 +30,24 @@ def main(ensemble_file: str,
 
             async_orchestrator (bool): Whether to use an asynchronous orchestrator.
     """
-    with open(system_config_file, "r") as f:
-        config_dict = json.load(f)  
-    system_config = SystemConfig.model_validate(config_dict) if system_config_file else SystemConfig(name="local")
+    try:
+        with open(system_config_file, "r") as f:
+            config_dict = json.load(f)  
+        system_config = SystemConfig.model_validate(config_dict)
+    except Exception as e:
+        print(f"loading system configuration failed with exception {e}")
+        print("Falling back to default local system configuration")
+        system_config = SystemConfig(name="local")
 
-    with open(launcher_config_file, "r") as f:
-        config_dict = json.load(f)
-    launcher_config = LauncherConfig.model_validate(config_dict) if launcher_config_file else None
+    try:
+        with open(launcher_config_file, "r") as f:
+            config_dict = json.load(f)
+        launcher_config = LauncherConfig.model_validate(config_dict)
+    except Exception as e:
+        print(f"loading launcher configuration failed with exception {e}")
+        print("Falling back to default launcher configuration")
+        launcher_config = None
+
     nodes = nodes_str.split(",") if nodes_str else None
 
     launcher = EnsembleLauncher(
