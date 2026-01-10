@@ -11,10 +11,10 @@ import asyncio
 
 # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-async def test_async_master(nlevels=1):
+async def test_async_master(nlevels=1,ntask_per_core=1):
     ##create tasks
     tasks = {}
-    for i in range(12):
+    for i in range(12*ntask_per_core):
         tasks[f"task-{i}"] = \
             Task(task_id=f"task-{i}",
                  nnodes=1,
@@ -38,8 +38,6 @@ async def test_async_master(nlevels=1):
 
     resultbatch = await m.run()
     results = {r.task_id:r.data for r in resultbatch.data}
-
-    print(results)
     
     assert len(results) > 0 and  all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
@@ -79,6 +77,9 @@ async def test_async_mpi_master(nlevels=1):
     assert len(results) > 0 and  all([result.strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
     
 if __name__ == "__main__":
-    asyncio.run(test_async_mpi_master(nlevels=3))
+    print("Testing Async Master with ProcessPool Executor for 1 task per core")
+    asyncio.run(test_async_master(nlevels=3,ntask_per_core=1))
+    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
+    asyncio.run(test_async_master(nlevels=3,ntask_per_core=10))
     # test_master_zmq_comm()
     # test_master_multilevel()

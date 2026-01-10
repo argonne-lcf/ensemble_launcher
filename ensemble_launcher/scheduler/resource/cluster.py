@@ -8,7 +8,6 @@ import time
 import copy
 from logging import Logger
 from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList
-import threading
 # from SimAIBench.config import server_registry
 import asyncio
 
@@ -30,7 +29,6 @@ class ClusterResource(ABC):
         self._system_info = system_info
         self._nodes: Dict[str, NodeResource] = {node: copy.deepcopy(system_info) for node in nodes}
         self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
-        self._lock = threading.RLock()
 
     @property
     def system_info(self) -> NodeResource:
@@ -38,18 +36,15 @@ class ClusterResource(ABC):
     
     @property
     def free_cpus(self) -> int:
-        with self._lock:
-            return sum([node.cpu_count for node in self._nodes.values()])
+        return sum([node.cpu_count for node in self._nodes.values()])
 
     @property
     def free_gpus(self) -> int:
-        with self._lock:
-            return sum([node.gpu_count for node in self._nodes.values()])
+        return sum([node.gpu_count for node in self._nodes.values()])
     
     @property
     def nodes(self) -> List[str]:
-        with self._lock:
-            return list(self._nodes.keys())
+        return list(self._nodes.keys())
     
     @abstractmethod
     def allocate(self, job_resource: JobResource):
@@ -59,8 +54,13 @@ class ClusterResource(ABC):
     def deallocate(self, job_resource: JobResource):
         pass
 
-    def _can_allocate(self, job_resource: JobResource) -> bool | List[str]:
-        """Check if the job resource can be allocated."""
+    def _can_allocate(self, job_resource: JobResource) -> List[str]:
+        """Check if the job resource can be allocated.
+        
+        Returns:
+            List[str]: List of node names where allocation can happen. 
+                      Empty list if allocation is not possible.
+        """
         self.logger.debug(f"Checking allocation feasibility for job with {len(job_resource.resources)} resources")
         
         if not job_resource.nodes:
@@ -95,24 +95,23 @@ class ClusterResource(ABC):
             for node_id, node_name in enumerate(job_resource.nodes):
                 if node_name not in self._nodes:
                     self.logger.error(f"Node {node_name} not found in cluster")
-                    return False
+                    return []
                 
                 available = self._nodes[node_name]
                 resource_req = job_resource.resources[node_id]
                 
                 if resource_req not in available:
                     self.logger.warning(f"Node {node_name} cannot satisfy resource requirement: need {resource_req}, available {available}")
-                    return False
+                    return []
             
             self.logger.debug("All specified nodes can satisfy requirements")
-            return True
+            return job_resource.nodes
     
     def get_status(self):
         """Returns current free resources i.e self._nodes dict"""
-        with self._lock:
-            free_cpus = sum([node.cpu_count for node in self._nodes.values()])
-            free_gpus = sum([node.gpu_count for node in self._nodes.values()])
-            return (free_cpus, free_gpus)
+        free_cpus = sum([node.cpu_count for node in self._nodes.values()])
+        free_gpus = sum([node.gpu_count for node in self._nodes.values()])
+        return (free_cpus, free_gpus)
     
     def __eq__(self, other) -> bool:
         """Check equality between two ClusterResource instances."""
@@ -157,52 +156,51 @@ class LocalClusterResource(ClusterResource):
     def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:
         """Allocate specific resource IDs."""
         self.logger.debug(f"Starting allocation for job with {len(job_resource.resources)} resource requirements")
-        with self._lock:
-            allocation_result = self._can_allocate(job_resource)
-            if not allocation_result:
-                self.logger.debug("Allocation failed: insufficient resources")
-                return False, job_resource
+        allocation_result = self._can_allocate(job_resource)
+        if not allocation_result:
+            self.logger.debug("Allocation failed: insufficient resources")
+            return False, job_resource
 
-            # Track original state before allocation
-            original_state = {}
-            allocated_resources = []
+        # Track original state before allocation
+        original_state = {}
+        allocated_resources = []
 
-            if not job_resource.nodes:
-                allocated_nodes = allocation_result
-                self.logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
+        if not job_resource.nodes:
+            allocated_nodes = allocation_result
+            self.logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
 
-                # Capture original state and perform allocation
-                for node_id, node_name in enumerate(allocated_nodes):
-                    resource_req = job_resource.resources[node_id]
-                    original_state[node_name] = self._nodes[node_name]
-                    self.logger.debug(f"Requesting {resource_req} from node {node_name}")
-                    self._nodes[node_name] = self._nodes[node_name] - resource_req
+            # Capture original state and perform allocation
+            for node_id, node_name in enumerate(allocated_nodes):
+                resource_req = job_resource.resources[node_id]
+                original_state[node_name] = self._nodes[node_name]
+                self.logger.debug(f"Requesting {resource_req} from node {node_name}")
+                self._nodes[node_name] = self._nodes[node_name] - resource_req
 
-                    # Calculate what was actually allocated
-                    allocated_resource = original_state[node_name] - self._nodes[node_name]
-                    allocated_resources.append(allocated_resource)
-                    self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
-                    self.logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
+                # Calculate what was actually allocated
+                allocated_resource = original_state[node_name] - self._nodes[node_name]
+                allocated_resources.append(allocated_resource)
+                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
+                self.logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
 
-                # Return JobResource with actual allocated resources
-                self.logger.debug(f"Allocation successful.")
-                return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
-            else:
-                self.logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
+            # Return JobResource with actual allocated resources
+            self.logger.debug(f"Allocation successful.")
+            return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
+        else:
+            self.logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
 
-                # Handle specified nodes case
-                for node_id, node_name in enumerate(job_resource.nodes):
-                    resource_req = job_resource.resources[node_id]
-                    original_state[node_name] = self._nodes[node_name]
-                    self._nodes[node_name] = self._nodes[node_name] - resource_req
+            # Handle specified nodes case
+            for node_id, node_name in enumerate(job_resource.nodes):
+                resource_req = job_resource.resources[node_id]
+                original_state[node_name] = self._nodes[node_name]
+                self._nodes[node_name] = self._nodes[node_name] - resource_req
 
-                    # Calculate what was actually allocated
-                    allocated_resource = original_state[node_name] - self._nodes[node_name]
-                    allocated_resources.append(allocated_resource)
-                    self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
+                # Calculate what was actually allocated
+                allocated_resource = original_state[node_name] - self._nodes[node_name]
+                allocated_resources.append(allocated_resource)
+                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
 
-                self.logger.debug("Allocation successful")
-                return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
+            self.logger.debug("Allocation successful")
+            return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
     
     def deallocate(self, job_resource: JobResource) -> bool:
         """Deallocate the resources"""
@@ -212,14 +210,13 @@ class LocalClusterResource(ClusterResource):
         
         self.logger.debug(f"Starting deallocation for {len(job_resource.nodes)} nodes: {job_resource.nodes}")
         
-        with self._lock:
-            for node_id, node_name in enumerate(job_resource.nodes):
-                resource_req = job_resource.resources[node_id]
-                self._nodes[node_name] += resource_req
-                self.logger.debug(f"Deallocated {resource_req} from node {node_name}")
+        for node_id, node_name in enumerate(job_resource.nodes):
+            resource_req = job_resource.resources[node_id]
+            self._nodes[node_name] += resource_req
+            self.logger.debug(f"Deallocated {resource_req} from node {node_name}")
 
-            self.logger.debug("Deallocation successful")
-            return True
+        self.logger.debug("Deallocation successful")
+        return True
 
 
 class AsyncLocalClusterResource(LocalClusterResource):
@@ -228,12 +225,14 @@ class AsyncLocalClusterResource(LocalClusterResource):
         self._resource_available = asyncio.Event()
         self._resource_available.set()
         self._loop = None
+        self._min_resources: Optional[JobResource] = None
 
     def set_event_loop(self, loop):
         self._loop = loop
 
-    async def wait_for_free(self):
-        """This will return only when thereare free resourcese"""
+    async def wait_for_free(self, min_resources: Optional[JobResource]=None):
+        """This will return only when thereare free resources"""
+        self._min_resources = min_resources
         await self._resource_available.wait()
     
     async def signal_resource_available(self):
@@ -246,8 +245,20 @@ class AsyncLocalClusterResource(LocalClusterResource):
     def allocate(self, job_resource):
         allocated,allocated_resource = super().allocate(job_resource)
         
-        with self._lock:
+        if allocated:
+            # Check if we should clear the event
+            should_clear = False
+            
             if all([node_resource.is_empty() for node_resource in self._nodes.values()]):
+                # Cluster completely empty
+                should_clear = True
+            elif self._min_resources is not None:
+                # Check if we can still satisfy minimum requirement
+                can_allocate_min = self._can_allocate(self._min_resources)
+                if not can_allocate_min:
+                    should_clear = True
+            
+            if should_clear:
                 self._resource_available.clear()
 
         return allocated, allocated_resource
@@ -263,8 +274,28 @@ class AsyncLocalClusterResource(LocalClusterResource):
         
         if result:
             # Signal that resources are now available - instant notification
-            try:
-                self._loop.call_soon_threadsafe(self._resource_available.set)
-            except RuntimeError:
-                self._resource_available.set()
+            if self._min_resources is None:
+                self.logger.debug("No minimum resource requirement set, setting resource available event")
+                try:
+                    self._loop.call_soon_threadsafe(self._resource_available.set)
+                except RuntimeError:
+                    self._resource_available.set()
+            else:
+                can_allocate = self._can_allocate(self._min_resources)
+                if can_allocate:
+                    self.logger.debug(f"Minimum resource requirement met, setting resource available event. Requirement: {self._min_resources}, Available nodes: {can_allocate}")
+                    try:
+                        self._loop.call_soon_threadsafe(self._resource_available.set)
+                    except RuntimeError:
+                        self._resource_available.set()
         return result
+    
+    def set_resource_available(self):
+        """Set the resource available event."""
+        self.logger.debug("Setting resource available event")
+        self._resource_available.set()
+
+    def clear_resource_available(self):
+        """Clear the resource available event."""
+        self.logger.debug("Clearing resource available event")
+        self._resource_available.clear()

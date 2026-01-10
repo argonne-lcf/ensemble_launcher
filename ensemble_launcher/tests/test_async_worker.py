@@ -9,7 +9,7 @@ import logging
 import asyncio
 import time
 
-logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 def echo(task_id: str):
     time.sleep(1.0)
@@ -18,10 +18,10 @@ def echo(task_id: str):
 def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
 
-async def test_async_worker(task_executor="async_processpool"):
+async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1):
     ##create tasks
     tasks = {}
-    for i in range(12):
+    for i in range(12*ntasks_per_core):
         tasks[f"task-{i}"] = \
             Task(task_id=f"task-{i}",
                  nnodes=1,
@@ -69,5 +69,9 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
     assert len(results) > 0 and all([result.strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
 if __name__ == "__main__":
-    # asyncio.run(test_async_worker(task_executor="async_processpool"))
-    asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
+    print("Testing Async Worker with ProcessPool Executor for 1 task per core")
+    asyncio.run(test_async_worker(task_executor="async_processpool"))
+    print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")
+    asyncio.run(test_async_worker(task_executor="async_processpool",ntasks_per_core=10))
+    # print("Testing Async Worker with MPI Executor")
+    # asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))

@@ -199,6 +199,7 @@ class AsyncWorker(Node):
 
     
     async def _submit_ready_tasks(self):
+        self.logger.info("Starting task submission loop")
         while not self._stop_submission.is_set():
             try:
                 task_id, req = await self._scheduler.ready_tasks.get()

@@ -92,6 +92,32 @@ class AsyncTaskScheduler(AsyncScheduler):
             )
         return req
 
+    def _find_min_resource_req(self) -> JobResource:
+        """
+        Find the minimum resource requirement among PENDING tasks only.
+        """
+        if self._sorted_tasks.empty():
+            return None
+        
+        # Get pending task IDs from sorted_tasks queue
+        pending_task_ids = [task_id for _, task_id in list(self._sorted_tasks._queue)]
+        
+        if not pending_task_ids:
+            return None
+        
+        pending_tasks = [self.tasks[tid] for tid in pending_task_ids if tid in self.tasks]
+        
+        if not pending_tasks:
+            return None
+            
+        min_nnodes = min(task.nnodes for task in pending_tasks)
+        min_ppn = min(task.ppn for task in pending_tasks)
+        min_ngpus = min(task.ngpus_per_process*task.ppn for task in pending_tasks)
+        
+        return JobResource(
+            resources=[NodeResourceCount(ncpus=min_ppn, ngpus=min_ngpus) for _ in range(min_nnodes)]
+        )
+    
     async def _monitor_resources(self) -> None:
         """
         Monitors free resources and checks if any tasks can be allocated, and moves them to the ready queue.
@@ -101,7 +127,10 @@ class AsyncTaskScheduler(AsyncScheduler):
         while not self._stop_monitoring.is_set():
             try:
                 # Wait for resources - will be cancelled when monitor is stopped
-                await self._cluster_resource.wait_for_free()
+                min_req = self._find_min_resource_req()
+                self.logger.debug(f"Waiting for free resources with min requirement: {min_req}. Current free resources: {self.cluster.get_status()}")
+                await self._cluster_resource.wait_for_free(min_resources=min_req)
+                self.logger.debug(f"Resource monitor woke up, checking for task allocation. Current free resources: {self.cluster.get_status()}")
                 
                 # Check stop immediately
                 if self._stop_monitoring.is_set():
@@ -115,12 +144,11 @@ class AsyncTaskScheduler(AsyncScheduler):
                 unallocated_tasks = []
                 allocated_count = 0
                 
-                self.logger.debug("In Scheduler monitor loop")
                 # Try to allocate all pending tasks
                 for _ in range(self._sorted_tasks.qsize()):
                     if self._stop_monitoring.is_set():
                         break
-                    
+
                     try:
                         priority, task_id = await self._sorted_tasks.get()
                     except asyncio.QueueEmpty:
@@ -148,9 +176,15 @@ class AsyncTaskScheduler(AsyncScheduler):
                     else:
                         unallocated_tasks.append((priority, task_id))
                         # Only break if cluster has no free resources at all
-                        if self.cluster.free_cpus == 0:
-                            self.logger.debug("Cluster completely full, stopping allocation attempts")
+                        if not self.cluster._resource_available.is_set():
+                            self.logger.debug("No more free resources available")
                             break
+                        else:
+                            self.logger.debug(f"Insufficient resources for task {task_id}. Resources requested: {req}. Free resources: {self.cluster.get_status()}")
+                
+                if allocated_count == 0:
+                    self.logger.warning("No tasks allocated in this cycle. Clearing resource available event to wait for new resources.")
+                    self._cluster_resource.clear_resource_available()
                 
                 # Put back unallocated tasks
                 for item in unallocated_tasks:
