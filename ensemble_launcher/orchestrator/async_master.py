@@ -6,7 +6,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResour
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
-from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, ResultBatch
+from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, NodeUpdate, ResultBatch
 import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Union
@@ -287,6 +287,24 @@ class AsyncMaster(Node):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
+        # Receive node update from parent if it has a parent
+        if self.parent:
+            node_update: NodeUpdate = await self._comm.recv_message_from_parent(NodeUpdate, timeout=10.0)
+            if node_update is not None:
+                self.logger.info(f"{self.node_id}: Received node update from parent")
+                if node_update.nodes:
+                    self._nodes = node_update.nodes
+                    self.logger.info(f"{self.node_id}: Updated nodes list with {len(self._nodes)} nodes")
+                else:
+                    self.logger.warning(f"{self.node_id}: Received empty node update from parent")
+            else:
+                self.logger.warning(f"{self.node_id}: No node update received from parent at start")
+        
+        # Validate that nodes are initialized
+        if not self._nodes:
+            self.logger.error(f"{self.node_id}: Nodes not initialized!")
+            raise RuntimeError(f"{self.node_id}: Nodes must be initialized before execution")
+
         task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate,timeout=5.0)
         if task_update is not None:
             self.logger.info(f"{self.node_id}: Received task update from parent")
@@ -407,10 +425,18 @@ class AsyncMaster(Node):
                 if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
                     self.logger.error(f"Failed to sync heartbeat with child {child_id}")
                     return await self._get_child_exceptions()
+                
+                # Send node update first
+                child_nodes = self._child_assignment[child_id]["nodes"]
+                node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
+                await self._comm.send_message_to_child(child_id, node_update)
+                self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes)} nodes")
+                
+                # Then send task update
                 new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
                 task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
                 await self._comm.send_message_to_child(child_id, task_update)
-                self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)}")
+                self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
             
             asyncio.create_task(self.report_status())
             return await self._results() #should return and report
@@ -631,7 +657,6 @@ class AsyncMaster(Node):
         obj_dict = {
             "type": "AsyncMaster",
             "node_id": self.node_id,
-            "nodes": self._nodes,
             "config": self._config.model_dump_json(),
             "system_info": asdict(self._sys_info),
             "parent": asdict(self.parent) if self.parent else None,
@@ -661,7 +686,7 @@ class AsyncMaster(Node):
             id=data["node_id"],
             config=config,
             system_info=system_info,
-            Nodes=data["nodes"],
+            Nodes=[],  # Nodes will be received via NodeUpdate message
             tasks={},  # Tasks are not included in serialization
             parent=parent,
             children=children,
