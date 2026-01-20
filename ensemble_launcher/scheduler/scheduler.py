@@ -1,4 +1,4 @@
-from .resource import NodeResourceList, JobResource, LocalClusterResource, ClusterResource
+from .resource import NodeResourceList, JobResource, LocalClusterResource, ClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
 from typing import List, Dict, Any, Union, Set
@@ -36,7 +36,8 @@ class Scheduler:
 
 
 class WorkerScheduler(Scheduler):
-    def __init__(self, logger: Logger, cluster: ClusterResource):
+    def __init__(self, logger: Logger, nodes: List[str], system_info: NodeResource):
+        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
         super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}
         self._lock = threading.RLock()
@@ -62,8 +63,10 @@ class TaskScheduler(Scheduler):
     def __init__(self, 
                  logger: Logger,
                  tasks: Dict[str, Task], 
-                 cluster: ClusterResource, 
+                 nodes: List[str],
+                 system_info: NodeResource,
                  policy: Union[str,Policy]= "large_resource_policy"):
+        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
         super().__init__(logger, cluster)
         self._lock = threading.RLock()
         self.tasks: Dict[str, Task] = tasks

@@ -30,6 +30,14 @@ class ClusterResource(ABC):
         self._nodes: Dict[str, NodeResource] = {node: copy.deepcopy(system_info) for node in nodes}
         self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
 
+    def update_nodes(self, nodes: List[str], system_info: Optional[NodeResource]=None):
+        """Update the cluster nodes and their system information."""
+        self.logger.info(f"Updating cluster nodes to {len(nodes)} nodes with each node config {system_info.__repr__()}")
+        if system_info is not None:
+            self._system_info = system_info
+        self._nodes = {node: copy.deepcopy(self._system_info) for node in nodes}
+        self.logger.debug(f"Updated node configuration: {list(self._nodes.keys())}")
+
     @property
     def system_info(self) -> NodeResource:
         return self._system_info

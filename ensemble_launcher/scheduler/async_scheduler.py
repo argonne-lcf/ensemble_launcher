@@ -1,4 +1,4 @@
-from .resource import NodeResourceList, JobResource, ClusterResource, AsyncLocalClusterResource
+from .resource import NodeResourceList, JobResource, ClusterResource, AsyncLocalClusterResource, LocalClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
 from typing import List, Dict, Union, Set, Tuple
@@ -23,7 +23,8 @@ class AsyncScheduler(Scheduler):
 
 
 class AsyncWorkerScheduler(AsyncScheduler):
-    def __init__(self, logger: Logger, cluster: ClusterResource):
+    def __init__(self, logger: Logger, nodes: List[str], system_info: NodeResource):
+        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
         super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}
     
@@ -45,8 +46,10 @@ class AsyncTaskScheduler(AsyncScheduler):
     def __init__(self, 
                  logger: Logger,
                  tasks: Dict[str, Task], 
-                 cluster: AsyncLocalClusterResource, 
+                 nodes: List[str],
+                 system_info: NodeResource,
                  policy: Union[str,Policy]= "large_resource_policy"):
+        cluster = AsyncLocalClusterResource(logger.getChild('cluster'), nodes, system_info)
         super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
         if isinstance(policy, str):

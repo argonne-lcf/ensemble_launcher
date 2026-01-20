@@ -171,7 +171,7 @@ class Worker(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
-        self._scheduler = TaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
+        self._scheduler = TaskScheduler(self.logger.getChild('scheduler'), self._tasks, self._nodes, self._sys_info)
 
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,

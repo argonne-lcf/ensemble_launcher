@@ -261,7 +261,7 @@ class AsyncMaster(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
-        self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes,self._sys_info))
+        self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), self._nodes, self._sys_info)
 
         assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
 
@@ -294,6 +294,7 @@ class AsyncMaster(Node):
                 self.logger.info(f"{self.node_id}: Received node update from parent")
                 if node_update.nodes:
                     self._nodes = node_update.nodes
+                    self._scheduler.cluster.update_nodes(self._nodes)
                     self.logger.info(f"{self.node_id}: Updated nodes list with {len(self._nodes)} nodes")
                 else:
                     self.logger.warning(f"{self.node_id}: Received empty node update from parent")

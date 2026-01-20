@@ -125,6 +125,7 @@ class AsyncWorker(Node):
         if nodeupdate.nodes:
             self.logger.info(f"Updating nodes from parent: {len(nodeupdate.nodes)} nodes")
             self._nodes = nodeupdate.nodes
+            self._scheduler.cluster.update_nodes(self._nodes)
             return True
         else:
             self.logger.warning("Received empty node update from parent")
@@ -168,7 +169,7 @@ class AsyncWorker(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
-        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=AsyncLocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
+        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self._nodes, self._sys_info)
 
         ##lazy executor creation
         assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
