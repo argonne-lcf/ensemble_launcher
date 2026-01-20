@@ -110,6 +110,10 @@ class TaskUpdate(Message):
     deleted_tasks: List[Task] = field(default_factory=list)  # Should be callable
 
 @dataclass
+class NodeUpdate(Message):
+    nodes: List[str] = field(default_factory=list)  # Should be callable
+
+@dataclass
 class HeartBeat(Message):
     alive: bool = True
 
@@ -121,4 +125,4 @@ class Action(Message):
 class TaskRequest(Message):
     ntasks: int = 0
 
-all_messages = [Status, Result, HeartBeat, Message, Action, TaskUpdate, TaskRequest]
+all_messages = [Status, Result, HeartBeat, Message, Action, TaskUpdate, NodeUpdate, TaskRequest]

@@ -7,7 +7,7 @@ from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, Node
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm
-from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate
+from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate, NodeUpdate
 from ensemble_launcher.executors import executor_registry, AsyncThreadPoolExecutor, AsyncProcessPoolExecutor, AsyncMPIExecutor
 import logging
 import json
@@ -120,6 +120,17 @@ class AsyncWorker(Node):
             nfree_gpus=self._scheduler.cluster.free_gpus
         )
 
+    def _update_nodes(self, nodeupdate: NodeUpdate) -> bool:
+        """Update the nodes list from parent."""
+        if nodeupdate.nodes:
+            self.logger.info(f"Updating nodes from parent: {len(nodeupdate.nodes)} nodes")
+            self._nodes = nodeupdate.nodes
+            self._scheduler.cluster.update_nodes(self._nodes)
+            return True
+        else:
+            self.logger.warning("Received empty node update from parent")
+            return False
+
     def _update_tasks(self, taskupdate: TaskUpdate) -> Tuple[Dict[str, bool],Dict[str,bool]]:
         ##Add the tasks to scheduler
         add_status = {}
@@ -158,7 +169,7 @@ class AsyncWorker(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
-        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks,cluster=AsyncLocalClusterResource(self.logger.getChild('cluster'), self._nodes, self._sys_info))
+        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self._nodes, self._sys_info)
 
         ##lazy executor creation
         assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
@@ -255,6 +266,19 @@ class AsyncWorker(Node):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             else:
                 self.logger.info(f"{self.node_id}: Connected to parent")
+        
+        # Receive node update from parent
+        node_update: NodeUpdate = await self._comm.recv_message_from_parent(NodeUpdate, timeout=10.0)
+        if node_update is not None:
+            self.logger.info(f"{self.node_id}: Received node update from parent")
+            self._update_nodes(node_update)
+        else:
+            self.logger.warning(f"{self.node_id}: No node update received from parent at start")
+        
+        # Validate that nodes are initialized
+        if not self._nodes:
+            self.logger.error(f"{self.node_id}: Nodes not initialized!")
+            raise RuntimeError(f"{self.node_id}: Nodes must be initialized before execution")
         
         task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate, timeout=10.0)
         if task_update is not None:
@@ -379,7 +403,6 @@ class AsyncWorker(Node):
         obj_dict = {
             "type": "AsyncWorker",
             "node_id": self.node_id,
-            "nodes": self._nodes,
             "config": self._config.model_dump_json(),
             "system_info": asdict(self._sys_info),
             "parent": asdict(self.parent) if self.parent else None,
@@ -409,7 +432,7 @@ class AsyncWorker(Node):
             id=data["node_id"],
             config=config,
             system_info=system_info,
-            Nodes=data["nodes"],
+            Nodes=[],  # Nodes will be received via NodeUpdate message
             tasks={},  # Tasks are not included in serialization
             parent=parent,
             children=children,

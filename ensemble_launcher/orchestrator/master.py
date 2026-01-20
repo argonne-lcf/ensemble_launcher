@@ -266,7 +266,7 @@ class Master(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
-        self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), cluster=LocalClusterResource(self.logger.getChild('cluster'), self._nodes,self._sys_info))
+        self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), self._nodes, self._sys_info)
 
         #create executor
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile,
