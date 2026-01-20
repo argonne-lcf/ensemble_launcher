@@ -1,4 +1,4 @@
-from .resource import NodeResourceList, JobResource, ClusterResource, AsyncLocalClusterResource, LocalClusterResource, NodeResource
+from .resource import NodeResourceList, JobResource, AsyncLocalClusterResource, LocalClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
 from typing import List, Dict, Union, Set, Tuple
