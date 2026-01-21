@@ -2,15 +2,16 @@ from ensemble_launcher.orchestrator import Worker
 from ensemble_launcher.ensemble import Task
 import socket
 from ensemble_launcher.config import SystemConfig, LauncherConfig
-from ensemble_launcher.scheduler.resource import NodeResourceList, NodeResourceCount
+from ensemble_launcher.scheduler.resource import NodeResourceList, NodeResourceCount, JobResource
 from ensemble_launcher.orchestrator import AsyncMaster
 import logging
 from utils import echo, echo_stdout
 import asyncio
+import pytest
 
 
 # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
+@pytest.mark.asyncio
 async def test_async_master(nlevels=1,ntask_per_core=1):
     ##create tasks
     tasks = {}
@@ -24,6 +25,7 @@ async def test_async_master(nlevels=1,ntask_per_core=1):
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = AsyncMaster(
         "test",LauncherConfig(return_stdout=True,
@@ -33,7 +35,7 @@ async def test_async_master(nlevels=1,ntask_per_core=1):
                               child_executor_name="async_processpool",
                               task_executor_name="async_processpool", 
                               log_level=logging.DEBUG,
-                              worker_logs=True),sys_info,nodes,tasks
+                              worker_logs=True),job_resource,tasks
     )
 
     resultbatch = await m.run()
@@ -41,6 +43,7 @@ async def test_async_master(nlevels=1,ntask_per_core=1):
     
     assert len(results) > 0 and  all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
+@pytest.mark.asyncio
 async def test_async_mpi_master(nlevels=1):
     ##create tasks
     tasks = {}
@@ -55,6 +58,7 @@ async def test_async_mpi_master(nlevels=1):
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = AsyncMaster(
         "test",
@@ -68,7 +72,7 @@ async def test_async_mpi_master(nlevels=1):
                         worker_logs=True,
                         use_mpi_ppn=False,
                         sequential_child_launch=True),
-        sys_info,nodes,tasks
+        job_resource,tasks
     )
 
     resultbatch = await m.run()
@@ -81,5 +85,5 @@ if __name__ == "__main__":
     asyncio.run(test_async_master(nlevels=3,ntask_per_core=1))
     print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
     asyncio.run(test_async_master(nlevels=3,ntask_per_core=10))
-    # test_master_zmq_comm()
-    # test_master_multilevel()
+    print("Testing Async Master with MPI Executor")
+    asyncio.run(test_async_mpi_master(nlevels=2))

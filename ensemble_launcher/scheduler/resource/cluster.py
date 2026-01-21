@@ -23,26 +23,21 @@ class ClusterResource(ABC):
         implementations must provide the allocate() and deallocate() methods.
     """
 
-    def __init__(self, logger: Logger, nodes: List[str], system_info: NodeResource):
+    def __init__(self, logger: Logger, nodes: JobResource):
         self.logger = logger
-        self.logger.info(f"Initializing {self.__class__.__name__} with {len(nodes)} nodes with each node config {system_info.__repr__()}")
-        self._system_info = system_info
-        self._nodes: Dict[str, NodeResource] = {node: copy.deepcopy(system_info) for node in nodes}
+        self.update_nodes(nodes)
         self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
 
-    def update_nodes(self, nodes: List[str], system_info: Optional[NodeResource]=None):
+    def update_nodes(self, nodes: JobResource):
         """Update the cluster nodes and their system information."""
-        config_obj = system_info if system_info is not None else self._system_info
-        config_repr = repr(config_obj) if config_obj is not None else "None"
-        self.logger.info(f"Updating cluster nodes to {len(nodes)} nodes with each node config {config_repr}")
-        if system_info is not None:
-            self._system_info = system_info
-        self._nodes = {node: copy.deepcopy(self._system_info) for node in nodes}
-        self.logger.debug(f"Updated node configuration: {list(self._nodes.keys())}")
-
-    @property
-    def system_info(self) -> NodeResource:
-        return self._system_info
+        try:
+            self.logger.info(f"Updating cluster nodes to {len(nodes.nodes)} nodes")
+            self._nodes = nodes.to_dict()
+            self.logger.debug(f"Updated node configuration: {list(self._nodes.keys())}")
+        except Exception as e:
+            self._nodes = {}
+            self.logger.warning(f"Failed to update cluster nodes: {e}")
+            
     
     @property
     def free_cpus(self) -> int:
@@ -53,8 +48,8 @@ class ClusterResource(ABC):
         return sum([node.gpu_count for node in self._nodes.values()])
     
     @property
-    def nodes(self) -> List[str]:
-        return list(self._nodes.keys())
+    def nodes(self) -> JobResource:
+        return JobResource.from_dict(self._nodes)
     
     @abstractmethod
     def allocate(self, job_resource: JobResource):
@@ -128,10 +123,6 @@ class ClusterResource(ABC):
         if not isinstance(other, ClusterResource):
             return False
         
-        # Check if system_info is equal
-        if self._system_info != other._system_info:
-            return False
-        
         # Check if nodes dictionaries have same keys
         if set(self._nodes.keys()) != set(other._nodes.keys()):
             return False
@@ -156,11 +147,9 @@ class LocalClusterResource(ClusterResource):
     """
     Manages resource allocation and deallocation for a cluster of nodes.
     Attributes:
-        _system_info (NodeResource): The system information template for nodes.
         _nodes (Dict[str, NodeResource]): Mapping of node names to their available resources.
     Args:
         nodes (List[str]): List of node names in the cluster.
-        system_info (NodeResource): Resource information template applied to all nodes.
     """
 
     def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:
@@ -230,8 +219,8 @@ class LocalClusterResource(ClusterResource):
 
 
 class AsyncLocalClusterResource(LocalClusterResource):
-    def __init__(self, logger, nodes, system_info):
-        super().__init__(logger, nodes, system_info)
+    def __init__(self, logger, nodes):
+        super().__init__(logger, nodes)
         self._resource_available = asyncio.Event()
         self._resource_available.set()
         self._loop = None

@@ -6,7 +6,7 @@ from ensemble_launcher.scheduler.resource import LocalClusterResource, JobResour
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
-from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate
+from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate, NodeUpdate
 import copy
 import logging
 from itertools import accumulate
@@ -29,9 +29,8 @@ class Master(Node):
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
-                system_info: NodeResource,
-                Nodes:List[str],
-                tasks: Dict[str, Task],
+                Nodes: Optional[JobResource] = None,
+                tasks: Optional[Dict[str, Task]] = None,
                 parent: Optional[NodeInfo] = None,
                 children: Optional[Dict[str, NodeInfo]] = None,
                 parent_comm: Optional[Comm] = None):
@@ -40,7 +39,6 @@ class Master(Node):
         self._config = config
         self._parent_comm = parent_comm
         self._nodes = Nodes
-        self._sys_info = system_info
 
         ##lazily created in run
         self._executor = None
@@ -78,7 +76,15 @@ class Master(Node):
 
     @property
     def nodes(self):
-        return self._nodes
+        try:
+            return self._scheduler.cluster.nodes
+        except Exception as e:
+            return self._nodes
+    
+    @nodes.setter
+    def nodes(self, value: JobResource):
+        self._nodes = value
+        self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):
@@ -123,97 +129,16 @@ class Master(Node):
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
-    def _assign_children(self,
-                        tasks:Dict[str, Task],
-                        nodes:list):
-        """
-        Assign tasks to workers based on resource requirements.
-        """
-        
-        # Step 1: Sort tasks by decreasing number of nodes required
-        sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
-        
-        ###remove tasks that have num nodes > total nodes of this master
-        removed_tasks = []
-        while sorted_tasks and sorted_tasks[0][1].nnodes > len(nodes):
-            removed_tasks.append((sorted_tasks.pop(0))[0])
-        
-        if len(removed_tasks) > 0:
-            self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
-
-        # Step 1: Calculate cumulative sum of nodes required for tasks
-        cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
-        
-        if self._config.nchildren is None:
-            # Step 2: Determine the max number of workers
-            nworkers_max = 0
-            while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
-                nworkers_max += 1
-
-            # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
-            # Calculate nworkers using log2 interpolation
-            if self._config.nlevels > 1:
-                # Create log2 space arrays for interpolation
-                x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
-                y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
-
-                # Interpolate in log2 space
-                log2_nworkers = int(np.interp(self.level + 1, x_vals, y_vals))
-
-                # Convert back from log2 space
-                nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
-            else:
-                nworkers = nworkers_max
-        else:
-            nworkers = self._config.nchildren
-        
-        if len(nodes) == 1:
-            children_assignments = {
-                wid: {
-                "nodes": nodes,
-                "task_ids": [task_id]        # List of task IDs assigned to the worker
-                }
-                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-            }
-        else:
-            if len(nodes) < nworkers:
-                self.logger.error(f"number of nodes < number of children")
-                raise RuntimeError
-            
-            # Step 4: Initialize worker assignments for the first set of tasks
-            nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
-            if sum(nnodes) < len(nodes):
-                nremaining = len(nodes) - sum(nnodes)
-                for i in range(nremaining):
-                    nnodes[i%nworkers] += 1
-            nnodes = list(accumulate(nnodes))
-            children_assignments = {
-                wid: {
-                "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
-                "task_ids": [task_id]        # List of task IDs assigned to the worker
-                }
-                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-            }
-        
-        
-
-        # Step 5: Assign remaining tasks to workers in a round-robin fashion
-        for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
-            # Determine the worker ID in a round-robin manner
-            worker_id = i % nworkers
-            # Add the task ID to the worker's task list
-            children_assignments[worker_id]["task_ids"].append(task_id)
-
-        return children_assignments, removed_tasks
-
-    def _create_children(self) -> Dict[str, Node]:
-        assignments,remove_tasks = self._assign_children(self._tasks, self._scheduler.cluster.nodes)
+    def _create_children(self, include_tasks: bool = False) -> Dict[str, Node]:
+        assignments, remove_tasks = self._scheduler.assign(self._tasks, self.level)
+        if len(remove_tasks) > 0:
+            self.logger.warning(f"Removed tasks due to resource constraints: {remove_tasks}")
         self._child_assignment = {}
         self.logger.info(f"Children assignment: {self._child_assignment}")
 
         children = {}
         if self.level + 1 == self._config.nlevels:
-            for wid,alloc in assignments.items():
+            for wid, alloc in assignments.items():
                 child_id = self.node_id+f".w{wid}"
                 self._child_assignment[child_id] = alloc
                 #create a worker
@@ -221,14 +146,13 @@ class Master(Node):
                     Worker(
                         child_id,
                         config=self._config,
-                        system_info=self._scheduler.cluster.system_info,
-                        Nodes=alloc["nodes"],
-                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]},
+                        Nodes=alloc["job_resource"],
+                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
         else:
             #create a master again
-            for wid,alloc in assignments.items():
+            for wid, alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
                 self._child_assignment[child_id] = alloc
                 #create a worker
@@ -236,27 +160,11 @@ class Master(Node):
                     Master(
                         child_id,
                         config=self._config,
-                        system_info=self._scheduler.cluster.system_info,
-                        Nodes=alloc["nodes"],
-                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]},
+                        Nodes=alloc["job_resource"],
+                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
         return children
-
-    # def _build_launch_cmd(self) -> str:
-    #     ##save the state of the child obj        
-    #     for child_name,child_obj in self.children.items():
-    #             with open(os.path.join(os.getcwd(),".obj",f"{child_name}.pkl"),"wb") as f:
-    #                 cloudpickle.dump(child_obj,f)
-
-    #     if self.level + 1 == self._config.nlevels:
-    #         cmd = f"python -m ensemble_launcher.orchestrator.worker"+\
-    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-    #     else:   
-    #         cmd = f"python -m ensemble_launcher.orchestrator.master"+\
-    #                     f" {os.path.join(os.getcwd(),'.obj',f'{child_name}.pkl')}"
-    #     return cmd
-    
 
     def _lazy_init(self) -> Dict[str, Node]:
         #lazy logger creation
@@ -266,11 +174,12 @@ class Master(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
-        self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), self._nodes, self._sys_info)
+        self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), self.nodes, self._config)
 
         #create executor
         self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile,
-                                                                                                               "logger": self.logger.getChild('executor')})
+                                                                                                               "logger": self.logger.getChild('executor'),
+                                                                                                               "use_ppn": self._config.use_mpi_ppn})
 
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
@@ -284,6 +193,24 @@ class Master(Node):
             if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+
+        # Receive node update from parent if it has a parent
+        if self.parent:
+            node_update: NodeUpdate = self._comm.recv_message_from_parent(NodeUpdate, timeout=10.0)
+            if node_update is not None:
+                self.logger.info(f"{self.node_id}: Received node update from parent")
+                if node_update.nodes:
+                    self.nodes = node_update.nodes
+                    self.logger.info(f"{self.node_id}: Updated nodes list with {len(self.nodes.nodes)} nodes")
+                else:
+                    self.logger.warning(f"{self.node_id}: Received empty node update from parent")
+            else:
+                self.logger.warning(f"{self.node_id}: No node update received from parent at start")
+        
+        # Validate that nodes are initialized
+        if not self.nodes:
+            self.logger.error(f"{self.node_id}: Nodes not initialized!")
+            raise RuntimeError(f"{self.node_id}: Nodes must be initialized before execution")
 
         task_update: TaskUpdate = self._comm.recv_message_from_parent(TaskUpdate,timeout=5.0)
         if task_update is not None:
@@ -322,13 +249,13 @@ class Master(Node):
                     child_obj_dict = {}
                     
                     for child_name, child_obj in children.items():
-                        head_node = child_obj.nodes[0]
+                        head_node = child_obj.nodes.nodes[0]
                         child_head_nodes.append(head_node)
                         child_resources.append(NodeResourceCount(ncpus=1))
                         child_obj_dict[head_node] = child_obj
                     
                     # Build combined dictionary structure
-                    common_keys = ["type", "config", "system_info", "parent", "parent_comm"]
+                    common_keys = ["type", "config", "parent", "parent_comm"]
                     first_child = next(iter(child_obj_dict.values()))
                     first_dict = first_child.asdict()
                     
@@ -383,7 +310,7 @@ class Master(Node):
                         self._children_exec_ids[child_name] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
             else:
                 for child_idx, (child_name,child_obj) in enumerate(children.items()):
-                    child_nodes = child_obj.nodes
+                    child_nodes = child_obj.nodes.nodes
                     req = JobResource(
                             resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
                         )
@@ -398,12 +325,29 @@ class Master(Node):
                 self.logger.error(f"{self.node_id}: Can't connect to children.")
                 return self._get_child_exceptions() # Should return and report
             else:
-                for child_id in self.children:
-                    new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
-                    task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
-                    self._comm.send_message_to_child(child_id, task_update)
-                    self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)}")
-                return self._results() #should return and report
+                self.logger.info(f"{self.node_id}: Synced heartbeat with children")
+            
+            # Send node allocation to each child
+            for child_id in self.children:
+                child_nodes = self._child_assignment[child_id]["job_resource"]
+                node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
+                success = self._comm.send_message_to_child(child_id, node_update)
+                if success:
+                    self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
+                else:
+                    self.logger.error(f"{self.node_id}: Failed to send node update to {child_id}")
+            
+            # Send task updates to each child
+            for child_id in self.children:
+                new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
+                task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+                success = self._comm.send_message_to_child(child_id, task_update)
+                if success:
+                    self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
+                else:
+                    self.logger.error(f"{self.node_id}: Failed to send task update to {child_id}")
+            
+            return self._results() #should return and report
     
     @classmethod
     def load(cls, dirname: str):
@@ -634,9 +578,7 @@ class Master(Node):
         obj_dict = {
             "type": "Master",
             "node_id": self.node_id,
-            "nodes": self._nodes,
             "config": self._config.model_dump_json(),
-            "system_info": asdict(self._sys_info),
             "parent": asdict(self.parent) if self.parent else None,
             "children": {child_id: asdict(child) for child_id, child in self.children.items()},
             "parent_comm": self.parent_comm.asdict() if self.parent_comm else None
@@ -650,7 +592,6 @@ class Master(Node):
     @classmethod
     def fromdict(cls, data: dict) -> 'Master':
         config = LauncherConfig.model_validate_json(data["config"])
-        system_info = NodeResourceList(**data["system_info"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 
@@ -665,8 +606,7 @@ class Master(Node):
         master = cls(
             id=data["node_id"],
             config=config,
-            system_info=system_info,
-            Nodes=data["nodes"],
+            Nodes=None,  # Nodes will be sent via NodeUpdate
             tasks={},  # Tasks are not included in serialization
             parent=parent,
             children=children,

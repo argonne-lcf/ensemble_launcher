@@ -4,9 +4,10 @@ from typing import Dict, List, Optional, Union
 from .ensemble import TaskFactory, Task
 from .config import SystemConfig, LauncherConfig
 from .helper_functions import get_nodes
-from ensemble_launcher.scheduler.resource import NodeResourceCount, NodeResourceList
+from ensemble_launcher.scheduler.resource import NodeResourceCount, NodeResourceList, JobResource
 from ensemble_launcher.orchestrator import Master, Worker, AsyncMaster, AsyncWorker
 import asyncio
+import copy
 
 import logging
 
@@ -112,11 +113,13 @@ class EnsembleLauncher:
     def _create_launcher(self):
         """Create and return the appropriate launcher (Master or Worker) based on configuration."""
         resource_config = self._get_resource_config()
+        nodes = JobResource(
+            resources=[copy.deepcopy(resource_config) for _ in self.nodes],nodes=self.nodes
+        )
         launcher_args = (
             "main",
             self.launcher_config,
-            resource_config,
-            self.nodes,
+            nodes,
             self._tasks
         )
         

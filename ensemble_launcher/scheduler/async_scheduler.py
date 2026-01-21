@@ -1,8 +1,9 @@
 from .resource import NodeResourceList, JobResource, AsyncLocalClusterResource, LocalClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
+from ensemble_launcher.config import LauncherConfig
 from typing import List, Dict, Union, Set, Tuple
-from .policy import policy_registry, Policy
+from .policy import policy_registry, Policy, WorkerPolicy
 from  logging import Logger
 import copy
 import asyncio
@@ -23,21 +24,72 @@ class AsyncScheduler(Scheduler):
 
 
 class AsyncWorkerScheduler(AsyncScheduler):
-    def __init__(self, logger: Logger, nodes: List[str], system_info: NodeResource):
-        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
+    def __init__(self, logger: Logger, 
+                 nodes: JobResource, 
+                 config: LauncherConfig):
+        cluster = AsyncLocalClusterResource(logger.getChild('cluster'), nodes)
         super().__init__(logger, cluster)
+        
+        self._config = config
+        # Initialize policy - uses the registered state instance
+        self.policy: WorkerPolicy = policy_registry.create_policy(self._config.worker_scheduler_policy, 
+                                                                  policy_kwargs={"nchildren": self._config.nchildren, 
+                                                                                "nlevels":self._config.nlevels})
+        
+        # Track worker assignments
         self.workers: Dict[str, JobResource] = {}
+
+    def assign(self, 
+               tasks: Dict[str, Task], 
+               level: int
+               ) -> Tuple[Dict[str, Dict], List[str]]:
+        """
+        Use policy to assign workers and allocate resources from cluster.
+        
+        Returns:
+            Tuple of (worker_assignments, removed_tasks)
+            where worker_assignments maps worker_id to {"job_resource": JobResource, "task_ids": [...]}
+        """
+        # Get worker assignments from policy - pass only runtime parameters
+        worker_assignments, removed_tasks = self.policy.get_worker_assignment(
+            tasks=tasks,
+            nodes=self.cluster.nodes,
+            level=level
+        )
+        
+        # Allocate resources for each worker
+        allocated_workers = {}
+        for worker_id, assignment in worker_assignments.items():
+            job_resource = assignment["job_resource"]
+            allocated, resource = self.cluster.allocate(job_resource)
+            
+            if allocated:
+                self.workers[worker_id] = resource
+                allocated_workers[worker_id] = {
+                    "job_resource": resource,
+                    "task_ids": assignment["task_ids"]
+                }
+            else:
+                self.logger.warning(f"Failed to allocate resources for worker {worker_id}")
+        
+        return allocated_workers, removed_tasks
     
-    def assign(self, worker_id: str,  worker_resource: JobResource):
-        allocated, resource = self.cluster.allocate(worker_resource)
-        if allocated:
-            self.workers[worker_id] = resource
-        return allocated, resource
-    
-    def free(self, worker_id: str):
+    def free(self, worker_id: str) -> bool:
+        """
+        Deallocate resources for a worker.
+        
+        Args:
+            worker_id: ID of the worker to free
+            
+        Returns:
+            True if deallocation was successful, False otherwise
+        """
         if worker_id in self.workers:
-            return self.cluster.deallocate(self.workers[worker_id])
-        return None
+            result = self.cluster.deallocate(self.workers[worker_id])
+            if result:
+                del self.workers[worker_id]
+            return result
+        return False
     
     def get_worker_assignment(self):
         return copy.deepcopy(self.workers)
@@ -46,10 +98,9 @@ class AsyncTaskScheduler(AsyncScheduler):
     def __init__(self, 
                  logger: Logger,
                  tasks: Dict[str, Task], 
-                 nodes: List[str],
-                 system_info: NodeResource,
+                 nodes: JobResource,
                  policy: Union[str,Policy]= "large_resource_policy"):
-        cluster = AsyncLocalClusterResource(logger.getChild('cluster'), nodes, system_info)
+        cluster = AsyncLocalClusterResource(logger.getChild('cluster'), nodes)
         super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
         if isinstance(policy, str):
@@ -212,7 +263,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._stop_monitoring.clear()
         self._all_tasks_done.clear()
         self._consecutive_failed_allocations = 0
-        self._monitor_task = asyncio.create_task(self._monitor_resources())
+        self._monitoring_task = asyncio.create_task(self._monitor_resources())
     
     async def stop_monitoring(self):
         """Stop the monitoring task gracefully."""
@@ -222,11 +273,11 @@ class AsyncTaskScheduler(AsyncScheduler):
         # Wake up the monitor loop if it's blocked waiting for resources
         await self._cluster_resource.signal_resource_available()
         
-        if self._monitor_task and not self._monitor_task.done():
+        if self._monitoring_task and not self._monitoring_task.done():
             # Cancel immediately instead of waiting
-            self._monitor_task.cancel()
+            self._monitoring_task.cancel()
             try:
-                await self._monitor_task
+                await self._monitoring_task
             except asyncio.CancelledError:
                 pass
         
@@ -259,7 +310,7 @@ class AsyncTaskScheduler(AsyncScheduler):
 
     def add_task(self, task: Task) -> bool:
         try:
-            if task.nnodes > len(self.cluster.nodes):
+            if task.nnodes > len(self.cluster.nodes.nodes):
                 raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
             self.tasks[task.task_id] = task
             self._sorted_tasks.put_nowait((self.scheduler_policy.get_score(task),task.task_id))

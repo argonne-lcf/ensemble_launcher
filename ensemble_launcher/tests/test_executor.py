@@ -37,9 +37,10 @@ def test_mp_executor():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12))
 
-    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
+    from ensemble_launcher.scheduler.resource import JobResource
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    scheduler = TaskScheduler(logger, tasks,cluster=cluster)
+    scheduler = TaskScheduler(logger, tasks, nodes=job_resource)
 
     ready_tasks = scheduler.get_ready_tasks()
 
@@ -70,18 +71,19 @@ def test_mpi_executor():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
 
-    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
+    from ensemble_launcher.scheduler.resource import JobResource
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    scheduler = TaskScheduler(logger, tasks,cluster=cluster)
+    scheduler = TaskScheduler(logger, tasks, nodes=job_resource)
 
     ready_tasks = scheduler.get_ready_tasks()
 
-    exec = MPIExecutor()
+    exec = MPIExecutor(use_ppn=False)
 
     exec_ids = {}
 
     for task_id,req in ready_tasks.items():
-        exec_ids[task_id] = exec.start(req,tasks[task_id].executable,task_args=(task_id,))
+        exec_ids[task_id] = exec.start(req,tasks[task_id].executable,task_args=(task_id,),task_kwargs={})
     
     results = {}
     for task_id in tasks:

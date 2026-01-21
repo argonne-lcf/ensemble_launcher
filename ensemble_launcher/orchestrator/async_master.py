@@ -30,9 +30,8 @@ class AsyncMaster(Node):
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
-                system_info: NodeResource,
-                Nodes:List[str],
-                tasks: Dict[str, Task],
+                Nodes: Optional[JobResource] = None,
+                tasks: Optional[Dict[str, Task]] = None,
                 parent: Optional[NodeInfo] = None,
                 children: Optional[Dict[str, NodeInfo]] = None,
                 parent_comm: Optional[AsyncComm] = None):
@@ -41,7 +40,6 @@ class AsyncMaster(Node):
         self._config = config
         self._parent_comm = parent_comm
         self._nodes = Nodes
-        self._sys_info = system_info
 
         ##lazily created in run
         self._executor = None
@@ -86,7 +84,15 @@ class AsyncMaster(Node):
 
     @property
     def nodes(self):
-        return self._nodes
+        try:
+            return self._scheduler.cluster.nodes
+        except Exception as e:
+            return self._nodes
+    
+    @nodes.setter
+    def nodes(self, value: JobResource):
+        self._nodes = value
+        self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):
@@ -127,91 +133,10 @@ class AsyncMaster(Node):
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
-    def _assign_children(self,
-                        tasks:Dict[str, Task],
-                        nodes:list):
-        """
-        Assign tasks to workers based on resource requirements.
-        """
-        
-        # Step 1: Sort tasks by decreasing number of nodes required
-        sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
-        
-        ###remove tasks that have num nodes > total nodes of this master
-        removed_tasks = []
-        while sorted_tasks and sorted_tasks[0][1].nnodes > len(nodes):
-            removed_tasks.append((sorted_tasks.pop(0))[0])
-        
-        if len(removed_tasks) > 0:
-            self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
-
-        # Step 1: Calculate cumulative sum of nodes required for tasks
-        cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
-        
-        if self._config.nchildren is None:
-            # Step 2: Determine the max number of workers
-            nworkers_max = 0
-            while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(nodes):
-                nworkers_max += 1
-
-            # Step 3: Do a simple interpolation in the log2 space to determine number of workers at the current level
-            # Calculate nworkers using log2 interpolation
-            if self._config.nlevels > 1:
-                # Create log2 space arrays for interpolation
-                x_vals = np.array([0, self._config.nlevels],dtype = float)  # level range
-                y_vals = np.array([0, np.log2(max(nworkers_max, 1))],dtype = float)  # log2 space range
-
-                # Interpolate in log2 space
-                log2_nworkers = int(np.interp(self.level + 1, x_vals, y_vals))
-
-                # Convert back from log2 space
-                nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
-            else:
-                nworkers = nworkers_max
-        else:
-            nworkers = self._config.nchildren
-        
-        if len(nodes) == 1:
-            children_assignments = {
-                wid: {
-                "nodes": nodes,
-                "task_ids": [task_id]        # List of task IDs assigned to the worker
-                }
-                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-            }
-        else:
-            if len(nodes) < nworkers:
-                self.logger.error(f"number of nodes < number of children")
-                raise RuntimeError
-            
-            # Step 4: Initialize worker assignments for the first set of tasks
-            nnodes = [task.nnodes for task_id,task in sorted_tasks[:nworkers]]
-            if sum(nnodes) < len(nodes):
-                nremaining = len(nodes) - sum(nnodes)
-                for i in range(nremaining):
-                    nnodes[i%nworkers] += 1
-            nnodes = list(accumulate(nnodes))
-            children_assignments = {
-                wid: {
-                "nodes": nodes[:nnodes[wid]] if wid == 0 else nodes[nnodes[wid-1]:nnodes[wid]],
-                "task_ids": [task_id]        # List of task IDs assigned to the worker
-                }
-                for wid, (task_id, task) in enumerate(sorted_tasks[:nworkers])
-            }
-        
-        
-
-        # Step 5: Assign remaining tasks to workers in a round-robin fashion
-        for i, (task_id, task) in enumerate(sorted_tasks[nworkers:]):
-            # Determine the worker ID in a round-robin manner
-            worker_id = i % nworkers
-            # Add the task ID to the worker's task list
-            children_assignments[worker_id]["task_ids"].append(task_id)
-
-        return children_assignments, removed_tasks
-
     def _create_children(self, include_tasks: bool = False) -> Dict[str, Node]:
-        assignments,remove_tasks = self._assign_children(self._tasks, self._scheduler.cluster.nodes)
+        assignments,remove_tasks = self._scheduler.assign(self._tasks, self.level)
+        if len(remove_tasks) > 0:
+            self.logger.warning(f"Removed tasks due to resource constraints: {remove_tasks}")
         self._child_assignment = {}
         self.logger.info(f"Children assignment: {self._child_assignment}")
 
@@ -225,8 +150,7 @@ class AsyncMaster(Node):
                     AsyncWorker(
                         child_id,
                         config=self._config,
-                        system_info=self._scheduler.cluster.system_info,
-                        Nodes=alloc["nodes"],
+                        Nodes=alloc["job_resource"],
                         tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
@@ -240,8 +164,7 @@ class AsyncMaster(Node):
                     AsyncMaster(
                         child_id,
                         config=self._config,
-                        system_info=self._scheduler.cluster.system_info,
-                        Nodes=alloc["nodes"],
+                        Nodes=alloc["job_resource"],
                         tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
@@ -261,7 +184,9 @@ class AsyncMaster(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
         ##create a scheduler. maybe this can be removed??
-        self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), self._nodes, self._sys_info)
+        self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), 
+                                                self.nodes, 
+                                                self._config)
 
         assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
 
@@ -293,16 +218,15 @@ class AsyncMaster(Node):
             if node_update is not None:
                 self.logger.info(f"{self.node_id}: Received node update from parent")
                 if node_update.nodes:
-                    self._nodes = node_update.nodes
-                    self._scheduler.cluster.update_nodes(self._nodes)
-                    self.logger.info(f"{self.node_id}: Updated nodes list with {len(self._nodes)} nodes")
+                    self.nodes = node_update.nodes
+                    self.logger.info(f"{self.node_id}: Updated nodes list with {len(self.nodes.nodes)} nodes")
                 else:
                     self.logger.warning(f"{self.node_id}: Received empty node update from parent")
             else:
                 self.logger.warning(f"{self.node_id}: No node update received from parent at start")
         
         # Validate that nodes are initialized
-        if not self._nodes:
+        if not self.nodes:
             self.logger.error(f"{self.node_id}: Nodes not initialized!")
             raise RuntimeError(f"{self.node_id}: Nodes must be initialized before execution")
 
@@ -337,14 +261,16 @@ class AsyncMaster(Node):
         
         with self._timer("launch_children"):
             if self._config.child_executor_name == "async_mpi":
-                if not self._config.sequential_child_launch:
+                first_headnode = next(iter(children.values())).nodes.resources[0]
+                worker_equality = all([child.nodes.resources[0] == first_headnode for child in children.values()])
+                if not self._config.sequential_child_launch and worker_equality:
                     ##launch all children in a single shot
                     child_head_nodes = []
                     child_resources = []
                     child_obj_dict = {}
                     
                     for child_name, child_obj in children.items():
-                        head_node = child_obj.nodes[0]
+                        head_node = child_obj.nodes.nodes[0]
                         child_head_nodes.append(head_node)
                         child_resources.append(NodeResourceCount(ncpus=1))
                         child_obj_dict[head_node] = child_obj
@@ -387,7 +313,7 @@ class AsyncMaster(Node):
                     ##launch children sequentially one by one
                     for child_idx, (child_name, child_obj) in enumerate(children.items()):
                         child_nodes = child_obj.nodes
-                        head_node = child_nodes[0]
+                        head_node = child_nodes.nodes[0]
                         
                         # Serialize child object
                         child_dict = child_obj.asdict()
@@ -409,7 +335,7 @@ class AsyncMaster(Node):
                         self._children_futures[child_name] = future
             else:
                 for child_idx, (child_name,child_obj) in enumerate(children.items()):
-                    child_nodes = child_obj.nodes
+                    child_nodes = child_obj.nodes.nodes
                     req = JobResource(
                             resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
                         )
@@ -428,10 +354,10 @@ class AsyncMaster(Node):
                     return await self._get_child_exceptions()
                 
                 # Send node update first
-                child_nodes = self._child_assignment[child_id]["nodes"]
+                child_nodes = self._child_assignment[child_id]["job_resource"]
                 node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
                 await self._comm.send_message_to_child(child_id, node_update)
-                self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes)} nodes")
+                self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
                 
                 # Then send task update
                 new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
@@ -659,7 +585,6 @@ class AsyncMaster(Node):
             "type": "AsyncMaster",
             "node_id": self.node_id,
             "config": self._config.model_dump_json(),
-            "system_info": asdict(self._sys_info),
             "parent": asdict(self.parent) if self.parent else None,
             "children": {child_id: asdict(child) for child_id, child in self.children.items()},
             "parent_comm": self.parent_comm.asdict() if self.parent_comm else None
@@ -673,7 +598,6 @@ class AsyncMaster(Node):
     @classmethod
     def fromdict(cls, data: dict) -> 'AsyncMaster':
         config = LauncherConfig.model_validate_json(data["config"])
-        system_info = NodeResourceList(**data["system_info"]) if "cpus" in data["system_info"] else NodeResourceCount(**data["system_info"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 
@@ -686,8 +610,7 @@ class AsyncMaster(Node):
         master = cls(
             id=data["node_id"],
             config=config,
-            system_info=system_info,
-            Nodes=[],  # Nodes will be received via NodeUpdate message
+            Nodes=None,  # Nodes will be received via NodeUpdate message
             tasks={},  # Tasks are not included in serialization
             parent=parent,
             children=children,

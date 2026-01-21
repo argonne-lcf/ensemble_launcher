@@ -22,7 +22,8 @@ class MPIExecutor(Executor):
                  mpiexec:str = "mpirun",
                  return_stdout: bool = True,
                  profile: bool = False,
-                 use_ppn: bool = True,):
+                 use_ppn: bool = True,
+                 **kwargs):
         self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)

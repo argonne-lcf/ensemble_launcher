@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 @executor_registry.register("multiprocessing")
 class MultiprocessingExecutor(Executor):
     def __init__(self,logger=logger,
-                 gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True, profile: bool = False):
+                 gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True, profile: bool = False,
+                 **kwargs):
         self.logger = logger
         self._executor = ProcessPoolExecutor()
         self._futures: Dict[str, mp.Process] = {}

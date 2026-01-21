@@ -1,7 +1,7 @@
 from .resource import NodeResourceList, JobResource, LocalClusterResource, ClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
-from typing import List, Dict, Any, Union, Set
+from typing import List, Dict, Any, Union, Set, Tuple
 from .policy import policy_registry, Policy
 from  logging import Logger
 import copy
@@ -36,24 +36,65 @@ class Scheduler:
 
 
 class WorkerScheduler(Scheduler):
-    def __init__(self, logger: Logger, nodes: List[str], system_info: NodeResource):
-        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
+    def __init__(self, logger: Logger, nodes: JobResource, config):
+        cluster = LocalClusterResource(logger.getChild('cluster'), nodes)
         super().__init__(logger, cluster)
         self.workers: Dict[str, JobResource] = {}
         self._lock = threading.RLock()
+        self._config = config
+        # Initialize policy - uses the registered state instance
+        from .policy import WorkerPolicy
+        self.policy: WorkerPolicy = policy_registry.create_policy(self._config.worker_scheduler_policy, 
+                                                                  policy_kwargs={"nchildren": self._config.nchildren, 
+                                                                                "nlevels":self._config.nlevels})
     
-    def assign(self, worker_id: str,  worker_resource: JobResource):
+    def assign(self, tasks: Dict[str, Task], level: int) -> Tuple[Dict[str, Dict], List[str]]:
+        """Use policy to assign workers and allocate resources from cluster.
+        
+        Returns:
+            Tuple of (worker_assignments, removed_tasks)
+            where worker_assignments maps worker_id to {"job_resource": JobResource, "task_ids": [...]}
+        """
         with self._lock:
-            allocated, resource = self.cluster.allocate(worker_resource)
-            if allocated:
-                self.workers[worker_id] = resource
-            return allocated, resource
+            # Get worker assignments from policy - pass only runtime parameters
+            worker_assignments, removed_tasks = self.policy.get_worker_assignment(
+                tasks=tasks,
+                nodes=self.cluster.nodes,
+                level=level
+            )
+            
+            # Allocate resources for each worker
+            allocated_workers = {}
+            for worker_id, assignment in worker_assignments.items():
+                job_resource = assignment["job_resource"]
+                allocated, resource = self.cluster.allocate(job_resource)
+                if allocated:
+                    self.workers[worker_id] = resource
+                    allocated_workers[worker_id] = {
+                        "job_resource": resource,
+                        "task_ids": assignment["task_ids"]
+                    }
+                else:
+                    self.logger.error(f"Failed to allocate resources for worker {worker_id}")
+            
+        return allocated_workers, removed_tasks
     
-    def free(self, worker_id: str):
+    def free(self, worker_id: str) -> bool:
+        """Deallocate resources for a worker.
+        
+        Args:
+            worker_id: ID of the worker to free
+            
+        Returns:
+            True if deallocation was successful, False otherwise
+        """
         with self._lock:
             if worker_id in self.workers:
-                return self.cluster.deallocate(self.workers[worker_id])
-            return None
+                result = self.cluster.deallocate(self.workers[worker_id])
+                if result:
+                    del self.workers[worker_id]
+                return result
+            return False
     
     def get_worker_assignment(self):
         with self._lock:
@@ -63,10 +104,9 @@ class TaskScheduler(Scheduler):
     def __init__(self, 
                  logger: Logger,
                  tasks: Dict[str, Task], 
-                 nodes: List[str],
-                 system_info: NodeResource,
+                 nodes: JobResource,
                  policy: Union[str,Policy]= "large_resource_policy"):
-        cluster = LocalClusterResource(logger.getChild('cluster'), nodes, system_info)
+        cluster = LocalClusterResource(logger.getChild('cluster'), nodes)
         super().__init__(logger, cluster)
         self._lock = threading.RLock()
         self.tasks: Dict[str, Task] = tasks
@@ -128,7 +168,7 @@ class TaskScheduler(Scheduler):
     def add_task(self, task: Task) -> bool:
         with self._lock:
             try:
-                if task.nnodes > len(self.cluster.nodes):
+                if task.nnodes > len(self.cluster.nodes.nodes):
                     raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
                 self.tasks[task.task_id] = task
                 self.sorted_tasks = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
