@@ -312,7 +312,7 @@ class AsyncTaskScheduler(AsyncScheduler):
     def add_task(self, task: Task) -> bool:
         try:
             if task.nnodes > len(self.cluster.nodes.nodes):
-                raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
+                raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes.nodes)} are available")
             self.tasks[task.task_id] = task
             self._sorted_tasks.put_nowait((self.scheduler_policy.get_score(task),task.task_id))
             return True

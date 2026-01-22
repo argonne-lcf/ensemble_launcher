@@ -92,7 +92,8 @@ class AsyncMaster(Node):
     @nodes.setter
     def nodes(self, value: JobResource):
         self._nodes = value
-        self._scheduler.cluster.update_nodes(value)
+        if self._scheduler is not None and getattr(self._scheduler, "cluster", None) is not None:
+            self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):

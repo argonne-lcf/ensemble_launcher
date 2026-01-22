@@ -153,7 +153,7 @@ class LocalClusterResource(ClusterResource):
     Attributes:
         _nodes (Dict[str, NodeResource]): Mapping of node names to their available resources.
     Args:
-        nodes (List[str]): List of node names in the cluster.
+        nodes (JobResource): Job resource containing node names and their resource configurations.
     """
 
     def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:

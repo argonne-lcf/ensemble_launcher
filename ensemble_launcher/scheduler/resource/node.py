@@ -272,8 +272,8 @@ class JobResource:
         nodes (List): A list of node identifiers where the job resources
             will be allocated. Defaults to an empty list.
     """
-    resources: List[NodeResource] = field(default_factory=list)
-    nodes: List =  field(default_factory=list)
+    resources: List[NodeResource]
+    nodes: List = field(default_factory=list)
 
     def __post_init__(self):
         if self.nodes:

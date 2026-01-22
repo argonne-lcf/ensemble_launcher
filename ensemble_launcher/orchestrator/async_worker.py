@@ -3,7 +3,7 @@ import time
 import os
 from typing import Tuple, Optional
 from ensemble_launcher.scheduler import AsyncTaskScheduler
-from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, NodeResource, NodeResourceList, NodeResourceCount, JobResource
+from ensemble_launcher.scheduler.resource import JobResource
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm
@@ -87,7 +87,8 @@ class AsyncWorker(Node):
     @nodes.setter
     def nodes(self, value: JobResource):
         self._nodes = value
-        self._scheduler.cluster.update_nodes(value)
+        if self._scheduler is not None:
+            self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):

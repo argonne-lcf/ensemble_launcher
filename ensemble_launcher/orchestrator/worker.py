@@ -3,7 +3,7 @@ import time
 import os
 from typing import Any, TYPE_CHECKING, Tuple, Optional
 from ensemble_launcher.scheduler import TaskScheduler
-from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResource, NodeResourceList, JobResource
+from ensemble_launcher.scheduler.resource import JobResource
 from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
@@ -79,7 +79,8 @@ class Worker(Node):
     @nodes.setter
     def nodes(self, value: JobResource):
         self._nodes = value
-        self._scheduler.cluster.update_nodes(value)
+        if self._scheduler is not None and getattr(self._scheduler, "cluster", None) is not None:
+            self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):

@@ -114,7 +114,7 @@ class EnsembleLauncher:
         """Create and return the appropriate launcher (Master or Worker) based on configuration."""
         resource_config = self._get_resource_config()
         nodes = JobResource(
-            resources=[copy.deepcopy(resource_config) for _ in self.nodes],nodes=self.nodes
+            resources=[copy.deepcopy(resource_config) for _ in self.nodes], nodes=self.nodes
         )
         launcher_args = (
             "main",

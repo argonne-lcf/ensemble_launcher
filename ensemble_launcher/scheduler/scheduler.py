@@ -1,7 +1,7 @@
 from .resource import NodeResourceList, JobResource, LocalClusterResource, ClusterResource, NodeResource
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
-from typing import List, Dict, Any, Union, Set, Tuple
+from typing import List, Dict, Union, Set, Tuple
 from .policy import policy_registry, Policy
 from  logging import Logger
 import copy
@@ -170,7 +170,7 @@ class TaskScheduler(Scheduler):
         with self._lock:
             try:
                 if task.nnodes > len(self.cluster.nodes.nodes):
-                    raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes)} are available")
+                    raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes.nodes)} are available")
                 self.tasks[task.task_id] = task
                 self.sorted_tasks = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
                 return True
