@@ -267,6 +267,7 @@ class AsyncWorker(Node):
         if node_update is not None:
             self.logger.info(f"{self.node_id}: Received node update from parent")
             self.nodes = node_update.nodes
+            self.logger.debug(f"{self.node_id}: Nodes details: {self.nodes}")
         else:
             self.logger.warning(f"{self.node_id}: No node update received from parent at start")
         

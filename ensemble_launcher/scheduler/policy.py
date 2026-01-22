@@ -133,6 +133,7 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
         if nlevels is None:
             raise ValueError("nlevels must be specified for GreedyBinPackingWorkerPolicy")
         self.nlevels = nlevels
+        self.logger.info(f"Initialized GreedyBinPackingWorkerPolicy with nlevels={self.nlevels}")
     
     def get_worker_assignment(self,
                         tasks: Dict[str, Task],
@@ -250,7 +251,8 @@ class SimpleSplitWorkerPolicy(WorkerPolicy):
         self.nchildren = nchildren
         if self.nchildren is None or self.nchildren <= 0:
             raise ValueError(f"nchildren must be positive, got {self.nchildren}")
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(__name__) if logger is None else logger
+        self.logger.info(f"Initialized SimpleSplitWorkerPolicy with nchildren={self.nchildren}")
     
     def get_worker_assignment(self,
                         tasks: Dict[str, Task],

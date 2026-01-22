@@ -220,6 +220,7 @@ class AsyncMaster(Node):
                 if node_update.nodes:
                     self.nodes = node_update.nodes
                     self.logger.info(f"{self.node_id}: Updated nodes list with {len(self.nodes.nodes)} nodes")
+                    self.logger.debug(f"{self.node_id}: Nodes details: {self.nodes}")
                 else:
                     self.logger.warning(f"{self.node_id}: Received empty node update from parent")
             else:
@@ -276,7 +277,7 @@ class AsyncMaster(Node):
                         child_obj_dict[head_node] = child_obj
                     
                     # Build combined dictionary structure
-                    common_keys = ["type", "config", "system_info", "parent", "parent_comm"]
+                    common_keys = ["type", "config", "parent", "parent_comm"]
                     first_child = next(iter(child_obj_dict.values()))
                     first_dict = first_child.asdict()
                     

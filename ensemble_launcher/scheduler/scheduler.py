@@ -46,7 +46,8 @@ class WorkerScheduler(Scheduler):
         from .policy import WorkerPolicy
         self.policy: WorkerPolicy = policy_registry.create_policy(self._config.worker_scheduler_policy, 
                                                                   policy_kwargs={"nchildren": self._config.nchildren, 
-                                                                                "nlevels":self._config.nlevels})
+                                                                                "nlevels":self._config.nlevels,
+                                                                                "logger": logger.getChild('policy')})
     
     def assign(self, tasks: Dict[str, Task], level: int) -> Tuple[Dict[str, Dict], List[str]]:
         """Use policy to assign workers and allocate resources from cluster.

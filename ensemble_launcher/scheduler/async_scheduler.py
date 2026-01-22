@@ -34,7 +34,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
         # Initialize policy - uses the registered state instance
         self.policy: WorkerPolicy = policy_registry.create_policy(self._config.worker_scheduler_policy, 
                                                                   policy_kwargs={"nchildren": self._config.nchildren, 
-                                                                                "nlevels":self._config.nlevels})
+                                                                                "nlevels":self._config.nlevels,
+                                                                                "logger": logger.getChild('policy')})
         
         # Track worker assignments
         self.workers: Dict[str, JobResource] = {}
