@@ -7,6 +7,7 @@ from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
 from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate, NodeUpdate
+from ensemble_launcher.profiling import get_registry, EventRegistry
 import copy
 import logging
 from itertools import accumulate
@@ -54,25 +55,21 @@ class Master(Node):
         self._status: Status = None
 
         self.logger = None
-        self._event_timings: Dict[str, List[float]] = defaultdict(list)  # Store all timing measurements
-        if self._config.profile == "timeline":
-            self._timer = self._profile_timer
-        else:
-            self._timer = self._noop_timer
+        
+        # Initialize event registry for perfetto profiling
+        self._registry: Optional[EventRegistry] = None
+        if self._config.profile == "perfetto":
+            self._registry = get_registry()
+            self._registry.enable()
     
-
     @contextmanager
-    def _profile_timer(self,event_name: str):
-        start_time = time.perf_counter()
-        try:
+    def _timer(self, event_name: str):
+        """Timer that records to event registry for Perfetto export."""
+        if self._registry:
+            with self._registry.measure(event_name, "master", node_id=self.node_id, pid=os.getpid()):
+                yield
+        else:
             yield
-        finally:
-            self._event_timings[event_name].append(time.perf_counter() - start_time)
-
-
-    @contextmanager
-    def _noop_timer(self, event_name: str):
-        yield
 
     @property
     def nodes(self):
@@ -545,27 +542,15 @@ class Master(Node):
         return result_batch
 
     def stop(self):
-        if self._config.profile:
+        if self._config.profile == "perfetto" and self._registry:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._comm._profile_info, f, indent=2)
-        
-        if self._config.profile == "timeline":
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            # Compute statistics for all timed events
-            stats = {}
-            for event_name, timings in self._event_timings.items():
-                if timings:  # Check if list is not empty
-                    stats[event_name] = {
-                        'mean': sum(timings) / len(timings),
-                        'sum': sum(timings),
-                        'std': (sum((x - sum(timings) / len(timings)) ** 2 for x in timings) / len(timings)) ** 0.5 if len(timings) > 1 else 0.0,
-                        'count': len(timings)
-                    }
-
-            # Write statistics to file
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_timeline_stats.json")
+            # Export to Perfetto format
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
+            self._registry.export_perfetto(fname)
+            
+            # Also export statistics
+            stats = self._registry.get_statistics()
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
             

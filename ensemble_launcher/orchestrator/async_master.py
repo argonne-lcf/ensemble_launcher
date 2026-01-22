@@ -7,6 +7,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
 from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, NodeUpdate, ResultBatch
+from ensemble_launcher.profiling import get_registry, EventRegistry
 import logging
 from itertools import accumulate
 from typing import Optional, List, Dict, Union
@@ -18,8 +19,7 @@ import base64
 import asyncio
 AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
-from contextlib import contextmanager
-from collections import defaultdict
+from contextlib import asynccontextmanager
 from .utils import async_load_str, async_simple_load_str
 from dataclasses import asdict
 import threading
@@ -54,11 +54,12 @@ class AsyncMaster(Node):
         self._children_results: Dict[str, Result] = {}
 
         self.logger = None
-        self._event_timings: Dict[str, List[float]] = defaultdict(list)  # Store all timing measurements
-        if self._config.profile == "timeline":
-            self._timer = self._profile_timer
-        else:
-            self._timer = self._noop_timer
+        
+        # Initialize event registry for perfetto profiling
+        self._registry: Optional[EventRegistry] = None
+        if self._config.profile == "perfetto":
+            self._registry = get_registry()
+            self._registry.enable()
         
         #asyncio event
         self._all_children_done_event = asyncio.Event()
@@ -67,20 +68,14 @@ class AsyncMaster(Node):
         self._event_loop = None  # Will be set in run()
         self._lock = None  # Protect _done_children
 
-    
-
-    @contextmanager
-    def _profile_timer(self,event_name: str):
-        start_time = time.perf_counter()
-        try:
+    @asynccontextmanager
+    async def _timer(self, event_name: str):
+        """Timer that records to event registry for Perfetto export."""
+        if self._registry:
+            with self._registry.measure(event_name, "async_master", node_id=self.node_id, pid=os.getpid()):
+                yield
+        else:
             yield
-        finally:
-            self._event_timings[event_name].append(time.perf_counter() - start_time)
-
-
-    @contextmanager
-    def _noop_timer(self, event_name: str):
-        yield
 
     @property
     def nodes(self):
@@ -196,7 +191,7 @@ class AsyncMaster(Node):
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
 
-        with self._timer("heartbeat_sync"):
+        async with self._timer("heartbeat_sync"):
             ##heart beat sync with parent
             if self.parent and not await self._comm.sync_heartbeat_with_parent(timeout=30.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
@@ -259,10 +254,10 @@ class AsyncMaster(Node):
         return children
 
     async def run(self):
-        with self._timer("init"):
+        async with self._timer("init"):
             children = await self._lazy_init()
         
-        with self._timer("launch_children"):
+        async with self._timer("launch_children"):
             if self._config.child_executor_name == "async_mpi":
                 first_headnode = next(iter(children.values())).nodes.resources[0]
                 worker_equality = all([child.nodes.resources[0] == first_headnode for child in children.values()])
@@ -350,7 +345,7 @@ class AsyncMaster(Node):
                     future.add_done_callback(self.create_done_callback(child_name))
                     self._children_futures[child_name] = future
 
-        with self._timer("sync_with_children"):
+        async with self._timer("sync_with_children"):
             for child_id in self.children:
                 if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
                     self.logger.error(f"Failed to sync heartbeat with child {child_id}")
@@ -493,7 +488,7 @@ class AsyncMaster(Node):
         self._stop_reporting_event.set()
         self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
-        with self._timer("collect_results"):
+        async with self._timer("collect_results"):
             retry_children = set(self.children.keys())
             result_batch = ResultBatch(sender=self.node_id)
             max_retries = 10
@@ -547,7 +542,7 @@ class AsyncMaster(Node):
             else:
                 self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
 
-        with self._timer("report_to_parent"):
+        async with self._timer("report_to_parent"):
             #report it to parent
             if self.parent:
                 final_status = sum(self._children_status.values(), Status())
@@ -571,29 +566,17 @@ class AsyncMaster(Node):
         return result_batch
 
     async def stop(self):
-        if self._config.profile:
+        if self._config.profile == "perfetto" and self._registry:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._comm.profile, f, indent=4)
-        
-        if self._config.profile == "timeline":
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            # Compute statistics for all timed events
-            stats = {}
-            for event_name, timings in self._event_timings.items():
-                stats[event_name] = {
-                    "count": len(timings),
-                    "total_time": sum(timings),
-                    "mean_time": sum(timings) / len(timings) if timings else 0,
-                    "min_time": min(timings) if timings else 0,
-                    "max_time": max(timings) if timings else 0,
-                }
-
-            # Write statistics to file
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_timeline_stats.json")
+            # Export to Perfetto format
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
+            self._registry.export_perfetto(fname)
+            
+            # Also export statistics
+            stats = self._registry.get_statistics()
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
             with open(fname, "w") as f:
-                json.dump(stats, f, indent=4)
+                json.dump(stats, f, indent=2)
             
         await self._comm.close()        
         self._executor.shutdown()
