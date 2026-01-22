@@ -28,6 +28,7 @@ class LauncherConfig(BaseModel):
     gpu_selector: str = "ZE_AFFINITY_MASK"
     log_level: int = logging.INFO
     use_mpi_ppn: bool = True ##If True, use -ppn flag when launching MPI jobs
+    worker_scheduler_policy: str = "greedy_worker_policy" ##Policy to use for worker scheduler
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

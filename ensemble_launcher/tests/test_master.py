@@ -23,9 +23,10 @@ def test_master():
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = Master(
-        "test",LauncherConfig(return_stdout=True,master_logs=True, worker_logs=True),sys_info,nodes,tasks
+        "test",LauncherConfig(return_stdout=True,master_logs=True, worker_logs=True),Nodes=job_resource,tasks=tasks
     )
 
     result = m.run()
@@ -46,9 +47,10 @@ def test_master_zmq_comm():
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = Master(
-        "test",LauncherConfig(comm_name="zmq",master_logs=False, worker_logs=False),sys_info,nodes,tasks
+        "test",LauncherConfig(comm_name="zmq",master_logs=False, worker_logs=False),Nodes=job_resource,tasks=tasks
     )
     result = m.run()
     results = {r.task_id:r.data for r in result.data}
@@ -68,9 +70,10 @@ def test_master_multilevel():
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = Master(
-        "test",LauncherConfig(child_executor_name="mpi",comm_name="zmq",nlevels=2,report_interval=0.1, return_stdout=True,master_logs=True, worker_logs=True),sys_info,nodes,tasks
+        "test",LauncherConfig(child_executor_name="mpi",comm_name="zmq",nlevels=2,report_interval=0.1, return_stdout=True,master_logs=True, worker_logs=True, use_mpi_ppn=False),Nodes=job_resource,tasks=tasks
     )
     ret_result = m.run()
     
@@ -79,6 +82,6 @@ def test_master_multilevel():
     assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
     
 if __name__ == "__main__":
-    test_master()
-    test_master_zmq_comm()
-    # test_master_multilevel()
+    # test_master()
+    # test_master_zmq_comm()
+    test_master_multilevel()

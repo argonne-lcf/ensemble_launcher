@@ -32,9 +32,10 @@ def test_worker():
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = Worker(
-        "test",LauncherConfig(executor_name="multiprocessing", return_stdout=True),sys_info,nodes,tasks
+        "test",LauncherConfig(task_executor_name="multiprocessing", return_stdout=True),job_resource,tasks
     )
 
     res = w.run()
@@ -57,9 +58,10 @@ def test_worker_in_mp():
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = Worker(
-        "test-worker",LauncherConfig(executor_name="multiprocessing", comm_name="zmq", return_stdout = True, profile="basic"),sys_info,nodes,tasks
+        "test-worker",LauncherConfig(task_executor_name="multiprocessing", comm_name="zmq", return_stdout = True, profile="basic"),job_resource,tasks
     )
     
     p = mp.Process(target=w.run)

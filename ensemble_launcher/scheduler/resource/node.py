@@ -72,6 +72,11 @@ class NodeResource(ABC):
     def __contains__(self, other) -> bool:
         """Check if another resource is contained within this one."""
         pass
+    
+    @abstractmethod
+    def divide(self, n: int) -> List['NodeResource']:
+        """Divide this resource into n approximately equal parts."""
+        pass
 
 
 @dataclass(frozen=True, eq=True)
@@ -107,6 +112,26 @@ class NodeResourceCount(NodeResource):
             return (other.cpu_count <= self.ncpus and 
                     other.gpu_count <= self.ngpus)
         return False
+    
+    def divide(self, n: int) -> List['NodeResourceCount']:
+        """Divide this resource into n approximately equal parts."""
+        if n <= 0:
+            raise ValueError("Division count must be positive")
+        
+        base_cpus = self.ncpus // n
+        cpu_remainder = self.ncpus % n
+        
+        base_gpus = self.ngpus // n
+        gpu_remainder = self.ngpus % n
+        
+        result = []
+        for i in range(n):
+            # First 'remainder' parts get one extra resource
+            cpus = base_cpus + (1 if i < cpu_remainder else 0)
+            gpus = base_gpus + (1 if i < gpu_remainder else 0)
+            result.append(NodeResourceCount(ncpus=cpus, ngpus=gpus))
+        
+        return result
     
     @classmethod
     def from_config(self, info: SystemConfig):
@@ -180,6 +205,37 @@ class NodeResourceList(NodeResource):
                     other.ngpus <= self.gpu_count)
         return False
     
+    def divide(self, n: int) -> List['NodeResourceList']:
+        """Divide this resource into n approximately equal parts."""
+        if n <= 0:
+            raise ValueError("Division count must be positive")
+        
+        # Divide CPUs
+        cpu_list = list(self.cpus)
+        base_cpus_per_part = len(cpu_list) // n
+        cpu_remainder = len(cpu_list) % n
+        
+        cpu_parts = []
+        start_idx = 0
+        for i in range(n):
+            count = base_cpus_per_part + (1 if i < cpu_remainder else 0)
+            cpu_parts.append(tuple(cpu_list[start_idx:start_idx + count]))
+            start_idx += count
+        
+        # Divide GPUs
+        gpu_list = list(self.gpus)
+        base_gpus_per_part = len(gpu_list) // n
+        gpu_remainder = len(gpu_list) % n
+        
+        gpu_parts = []
+        start_idx = 0
+        for i in range(n):
+            count = base_gpus_per_part + (1 if i < gpu_remainder else 0)
+            gpu_parts.append(tuple(gpu_list[start_idx:start_idx + count]))
+            start_idx += count
+        
+        return [NodeResourceList(cpus=cpu_parts[i], gpus=gpu_parts[i]) for i in range(n)]
+    
     def __eq__(self, other) -> bool:
         """Check equality based on CPU and GPU lists."""
         if not isinstance(other, NodeResourceList):
@@ -201,7 +257,7 @@ class NodeResourceList(NodeResource):
         )
 
 
-@dataclass(frozen=True, eq=True)
+@dataclass(eq=True)
 class JobResource:
     """
     Represents the computational resources required for a job.
@@ -217,7 +273,7 @@ class JobResource:
             will be allocated. Defaults to an empty list.
     """
     resources: List[NodeResource]
-    nodes: List =  field(default_factory=list)
+    nodes: List = field(default_factory=list)
 
     def __post_init__(self):
         if self.nodes:
@@ -242,9 +298,22 @@ class JobResource:
         """Check equality based on resources and nodes."""
         if not isinstance(other, JobResource):
             return False
-        return (self.resources == other.resources and 
-                self.nodes == other.nodes)
+        return (tuple(self.resources) == tuple(other.resources) and 
+                tuple(self.nodes) == tuple(other.nodes))
     
     def __hash__(self) -> int:
         """Hash based on resources and nodes for use in sets/dicts."""
         return hash((tuple(self.resources), tuple(self.nodes)))
+    
+    def to_dict(self) -> Dict[str, NodeResource]:
+        """Convert JobResource to a dictionary mapping node identifiers to resources."""
+        if not self.nodes:
+            raise ValueError("Cannot convert to dict without node identifiers")
+        return {node: resource for node, resource in zip(self.nodes, self.resources)}
+    
+    @classmethod
+    def from_dict(cls, resource_dict: Dict[str, NodeResource]) -> 'JobResource':
+        """Create a JobResource from a dictionary mapping node identifiers to resources."""
+        nodes = list(resource_dict.keys())
+        resources = list(resource_dict.values())
+        return cls(resources=resources, nodes=nodes)

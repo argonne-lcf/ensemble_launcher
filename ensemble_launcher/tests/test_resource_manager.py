@@ -8,7 +8,11 @@ def test_resource():
     import copy
     
     sys_info = NodeResourceList(cpus=list(range(10)),gpus=[])
-    cluster = LocalClusterResource(logger, nodes=[f"node:{str(i)}" for i in range(2)],system_info=sys_info)
+    cluster_nodes = JobResource(
+        resources=[sys_info, sys_info],
+        nodes=[f"node:{str(i)}" for i in range(2)]
+    )
+    cluster = LocalClusterResource(logger, nodes=cluster_nodes)
 
     # cluster_copy = copy.deepcopy(cluster.nodes)
 
@@ -29,7 +33,11 @@ def test_resource():
 def test_resource_overload():
     from collections import Counter
     sys_info = NodeResourceList(cpus=list(range(10)),gpus=[0 for _ in range(10)])
-    cluster = LocalClusterResource(logger, nodes=[f"node:{str(i)}" for i in range(2)],system_info=sys_info)
+    cluster_nodes = JobResource(
+        resources=[sys_info, sys_info],
+        nodes=[f"node:{str(i)}" for i in range(2)]
+    )
+    cluster = LocalClusterResource(logger, nodes=cluster_nodes)
 
     # cluster_copy = copy.deepcopy(cluster.nodes)
 

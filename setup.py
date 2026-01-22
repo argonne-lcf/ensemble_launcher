@@ -11,6 +11,7 @@ setup(
         "matplotlib",
         "scienceplots",
         "pytest",
+        "pytest-asyncio",
         "cloudpickle",
         "pydantic",
         "pyzmq",

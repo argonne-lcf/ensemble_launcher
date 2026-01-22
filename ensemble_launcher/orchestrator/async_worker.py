@@ -3,7 +3,7 @@ import time
 import os
 from typing import Tuple, Optional
 from ensemble_launcher.scheduler import AsyncTaskScheduler
-from ensemble_launcher.scheduler.resource import AsyncLocalClusterResource, NodeResource, NodeResourceList, NodeResourceCount
+from ensemble_launcher.scheduler.resource import JobResource
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm
@@ -26,9 +26,8 @@ class AsyncWorker(Node):
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
-                system_info: NodeResource,
-                Nodes:List[str],
-                tasks: Dict[str, Task],
+                Nodes: Optional[JobResource] = None,
+                tasks: Optional[Dict[str, Task]] = None,
                 parent: Optional[NodeInfo] = None,
                 children: Optional[Dict[str, NodeInfo]] = None,
                 parent_comm: Optional[AsyncComm] = None
@@ -38,7 +37,6 @@ class AsyncWorker(Node):
         self._tasks: Dict[str, Task] = tasks
         self._parent_comm = parent_comm
         self._nodes = Nodes
-        self._sys_info = system_info
 
         ##lazy init in run function
         self._comm = None
@@ -81,7 +79,16 @@ class AsyncWorker(Node):
 
     @property
     def nodes(self):
-        return self._nodes
+        try:
+            return self._scheduler.cluster.nodes
+        except Exception as e:
+            return self._nodes
+    
+    @nodes.setter
+    def nodes(self, value: JobResource):
+        self._nodes = value
+        if self._scheduler is not None:
+            self._scheduler.cluster.update_nodes(value)
     
     @property
     def parent_comm(self):
@@ -119,17 +126,6 @@ class AsyncWorker(Node):
             nfree_cores=self._scheduler.cluster.free_cpus,
             nfree_gpus=self._scheduler.cluster.free_gpus
         )
-
-    def _update_nodes(self, nodeupdate: NodeUpdate) -> bool:
-        """Update the nodes list from parent."""
-        if nodeupdate.nodes:
-            self.logger.info(f"Updating nodes from parent: {len(nodeupdate.nodes)} nodes")
-            self._nodes = nodeupdate.nodes
-            self._scheduler.cluster.update_nodes(self._nodes)
-            return True
-        else:
-            self.logger.warning("Received empty node update from parent")
-            return False
 
     def _update_tasks(self, taskupdate: TaskUpdate) -> Tuple[Dict[str, bool],Dict[str,bool]]:
         ##Add the tasks to scheduler
@@ -169,7 +165,7 @@ class AsyncWorker(Node):
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
         ##init scheduler
-        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self._nodes, self._sys_info)
+        self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self.nodes)
 
         ##lazy executor creation
         assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
@@ -271,12 +267,13 @@ class AsyncWorker(Node):
         node_update: NodeUpdate = await self._comm.recv_message_from_parent(NodeUpdate, timeout=10.0)
         if node_update is not None:
             self.logger.info(f"{self.node_id}: Received node update from parent")
-            self._update_nodes(node_update)
+            self.nodes = node_update.nodes
+            self.logger.debug(f"{self.node_id}: Nodes details: {self.nodes}")
         else:
             self.logger.warning(f"{self.node_id}: No node update received from parent at start")
         
         # Validate that nodes are initialized
-        if not self._nodes:
+        if not self.nodes:
             self.logger.error(f"{self.node_id}: Nodes not initialized!")
             raise RuntimeError(f"{self.node_id}: Nodes must be initialized before execution")
         
@@ -404,7 +401,6 @@ class AsyncWorker(Node):
             "type": "AsyncWorker",
             "node_id": self.node_id,
             "config": self._config.model_dump_json(),
-            "system_info": asdict(self._sys_info),
             "parent": asdict(self.parent) if self.parent else None,
             "children": {child_id: asdict(child) for child_id, child in self.children.items()},
             "parent_comm": self.parent_comm.asdict() if self.parent_comm else None
@@ -418,7 +414,6 @@ class AsyncWorker(Node):
     @classmethod
     def fromdict(cls, data: dict) -> 'AsyncWorker':
         config = LauncherConfig.model_validate_json(data["config"])
-        system_info = NodeResourceList(**data["system_info"]) if "cpus" in data["system_info"] else NodeResourceCount(**data["system_info"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
 
@@ -431,8 +426,7 @@ class AsyncWorker(Node):
         worker = cls(
             id=data["node_id"],
             config=config,
-            system_info=system_info,
-            Nodes=[],  # Nodes will be received via NodeUpdate message
+            Nodes=None,  # Nodes will be received via NodeUpdate message
             tasks={},  # Tasks are not included in serialization
             parent=parent,
             children=children,

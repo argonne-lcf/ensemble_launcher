@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from datetime import datetime
 from ensemble_launcher.ensemble import Task
+from ensemble_launcher.scheduler.resource import JobResource
 import enum
 import json
 
@@ -111,7 +112,7 @@ class TaskUpdate(Message):
 
 @dataclass
 class NodeUpdate(Message):
-    nodes: List[str] = field(default_factory=list)  # Should be callable
+    nodes: Optional[JobResource] = None
 
 @dataclass
 class HeartBeat(Message):

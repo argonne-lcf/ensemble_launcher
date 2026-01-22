@@ -8,6 +8,7 @@ import os
 import logging
 import asyncio
 import time
+import pytest
 
 # logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -18,6 +19,7 @@ def echo(task_id: str):
 def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
 
+@pytest.mark.asyncio
 async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1):
     ##create tasks
     tasks = {}
@@ -31,9 +33,10 @@ async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1)
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = AsyncWorker(
-        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, log_level=logging.DEBUG),sys_info,nodes,tasks
+        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, log_level=logging.DEBUG),job_resource,tasks
     )
 
     res = await w.run()
@@ -43,6 +46,7 @@ async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1)
 
     assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
+@pytest.mark.asyncio
 async def test_async_mpi_worker(task_executor="async_mpi"):
     ##create tasks
     tasks = {}
@@ -56,9 +60,10 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = AsyncWorker(
-        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, log_level=logging.DEBUG, return_stdout=True),sys_info,nodes,tasks
+        "test",LauncherConfig(task_executor_name=task_executor, comm_name="async_zmq", worker_logs=True, report_interval=100.0, use_mpi_ppn=False, log_level=logging.DEBUG, return_stdout=True),job_resource,tasks
     )
 
     res = await w.run()
@@ -73,5 +78,5 @@ if __name__ == "__main__":
     asyncio.run(test_async_worker(task_executor="async_processpool"))
     print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")
     asyncio.run(test_async_worker(task_executor="async_processpool",ntasks_per_core=10))
-    # print("Testing Async Worker with MPI Executor")
-    # asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
+    print("Testing Async Worker with MPI Executor")
+    asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))

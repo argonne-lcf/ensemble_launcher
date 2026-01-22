@@ -34,9 +34,10 @@ def test_scheduler():
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12))
 
-    cluster = LocalClusterResource(logger, nodes,system_info=sys_info)
+    from ensemble_launcher.scheduler.resource import JobResource
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    scheduler = TaskScheduler(logger, {task.task_id: task for task in tasks},cluster=cluster)
+    scheduler = TaskScheduler(logger, {task.task_id: task for task in tasks}, nodes=job_resource)
 
     # ready_tasks = scheduler.get_ready_tasks()
 
