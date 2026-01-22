@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @executor_registry.register("dragon")
 class DragonExecutor(Executor):
     def __init__(self,logger=logger,
-                 gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True, profile: bool = False):
+                 gpu_selector: str = "ZE_AFFINITY_MASK",return_stdout: bool = True):
         if not DRAGON_AVAILABLE:
             raise ModuleNotFoundError("Dragon is not available")
         self.logger = logger
@@ -34,15 +34,6 @@ class DragonExecutor(Executor):
         self._results: Dict[str, Any] = {}
         self._queues: Dict[str, QueueProtocol] = {}
         self._return_stdout = return_stdout
-        self._profile = profile
-        self._profile_info: Dict[str, Dict] = {}
-    
-    def _record_profile_stop(self, task_id: str):
-        """Helper method to record profiling stop time and duration"""
-        if self._profile and task_id in self._profile_info and "stop" not in self._profile_info[task_id]:
-            self._profile_info[task_id]["stop"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._profile_info[task_id]["duration"] = (datetime.now() - self._profile_info[task_id]["start"]).total_seconds()
-            self._profile_info[task_id]["start"] = self._profile_info[task_id]["start"].strftime("%Y-%m-%d %H:%M:%S")
     
     def start(self,job_resource: JobResource, 
                 fn: Union[Callable,str], 
@@ -123,9 +114,6 @@ class DragonExecutor(Executor):
             self.logger.warning(f"Can only excute either a str or a callable")
             return None
         
-        if self._profile:
-            self._profile_info[task_id] = {"start": datetime.now()}
-        
         self._processes[task_id] = p
 
         return task_id
@@ -137,7 +125,6 @@ class DragonExecutor(Executor):
                 p.kill()
             else:
                 p.terminate()
-            self._record_profile_stop(task_id)
         except Exception as e:
             self.logger.warning(f"stopping task {task_id} failed with an exception {e}")
         
@@ -157,16 +144,13 @@ class DragonExecutor(Executor):
                         while not q.empty():
                             result.append(q.get())
                         self._results[task_id] = result
-                        self._record_profile_stop(task_id)
                         return True
                     else:
                         self._results[task_id] = None
-                        self._record_profile_stop(task_id)
                         return True
                 except Exception as e:
                     self.logger.warning(f"Getting results from {task_id} failed with {e}")
                     self._results[task_id] = None
-                    self._record_profile_stop(task_id)
                     return True
 
         else:
@@ -179,16 +163,13 @@ class DragonExecutor(Executor):
                         while not q.empty():
                             result.append(q.get())
                         self._results[task_id] = result
-                        self._record_profile_stop(task_id)
                         return True
                     else:
                         self._results[task_id] = None
-                        self._record_profile_stop(task_id)
                         return True
                 except Exception as e:
                     self.logger.warning(f"Getting results from {task_id} failed with {e}")
                     self._results[task_id] = None
-                    self._record_profile_stop(task_id)
                     return True
             except TimeoutError:
                 self.logger.warning(f"Process {task_id} timed out after {timeout} seconds.")
@@ -205,7 +186,6 @@ class DragonExecutor(Executor):
 
     def exception(self, task_id: str):
         self.wait(task_id)
-        self._record_profile_stop(task_id)
         p = self._processes[task_id]
         if isinstance(p, Process):
             returncode = p.returncode
@@ -221,8 +201,6 @@ class DragonExecutor(Executor):
                 return None
 
     def done(self, task_id: str):
-        if self._profile and task_id in self._profile_info:
-            self._profile_info[task_id]["done"] += 1
         p = self._processes[task_id]
         if isinstance(p,Process):
             return not p.is_alive()

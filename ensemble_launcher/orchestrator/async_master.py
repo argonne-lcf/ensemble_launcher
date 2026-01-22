@@ -56,10 +56,7 @@ class AsyncMaster(Node):
         self.logger = None
         
         # Initialize event registry for perfetto profiling
-        self._registry: Optional[EventRegistry] = None
-        if self._config.profile == "perfetto":
-            self._registry = get_registry()
-            self._registry.enable()
+        self._event_registry: Optional[EventRegistry] = None
         
         #asyncio event
         self._all_children_done_event = asyncio.Event()
@@ -71,8 +68,8 @@ class AsyncMaster(Node):
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
-        if self._registry:
-            with self._registry.measure(event_name, "async_master", node_id=self.node_id, pid=os.getpid()):
+        if self._event_registry is not None:
+            with self._event_registry.measure(event_name, "async_master", node_id=self.node_id, pid=os.getpid()):
                 yield
         else:
             yield
@@ -123,8 +120,7 @@ class AsyncMaster(Node):
             self.logger.info(f"{self.node_id}: Starting comm init")
             self._comm = AsyncZMQComm(self.logger.getChild('comm'), 
                                  self.info(),
-                                 parent_address=self.parent_comm.my_address if self.parent_comm else None,
-                                 profile=self._config.profile)
+                                 parent_address=self.parent_comm.my_address if self.parent_comm else None)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
@@ -167,6 +163,9 @@ class AsyncMaster(Node):
         return children
 
     async def _lazy_init(self) -> Dict[str, Node]:
+        if self._config.profile == "perfetto":
+            self._event_registry = get_registry()
+            self._event_registry.enable()
 
         self._lock = threading.RLock()  # Protect _done_children
 
@@ -566,15 +565,17 @@ class AsyncMaster(Node):
         return result_batch
 
     async def stop(self):
-        if self._config.profile == "perfetto" and self._registry:
+        if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
             # Export to Perfetto format
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
-            self._registry.export_perfetto(fname)
+            self.logger.info(f"Exporting Perfetto trace to {fname}")
+            self._event_registry.export_perfetto(fname)
             
             # Also export statistics
-            stats = self._registry.get_statistics()
+            stats = self._event_registry.get_statistics()
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
+            self.logger.info(f"Exporting event statistics to {fname}")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
             

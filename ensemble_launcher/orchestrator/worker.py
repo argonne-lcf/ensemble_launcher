@@ -49,16 +49,13 @@ class Worker(Node):
         self.logger = None
 
         # Initialize event registry for perfetto profiling
-        self._registry: Optional[EventRegistry] = None
-        if self._config.profile == "perfetto":
-            self._registry = get_registry()
-            self._registry.enable()
+        self._event_registry: Optional[EventRegistry] = None
     
     @contextmanager
     def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
-        if self._registry:
-            with self._registry.measure(event_name, "worker", node_id=self.node_id, pid=os.getpid()):
+        if self._event_registry is not None:
+            with self._event_registry.measure(event_name, "worker", node_id=self.node_id, pid=os.getpid()):
                 yield
         else:
             yield
@@ -104,10 +101,10 @@ class Worker(Node):
     
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
-            self._comm = MPComm(self.logger.getChild('comm'), self.info(),self.parent_comm if self.parent_comm else None, profile=self._config.profile)
+            self._comm = MPComm(self.logger.getChild('comm'), self.info(),self.parent_comm if self.parent_comm else None)
         elif self._config.comm_name == "zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = ZMQComm(self.logger.getChild('comm'), self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
+            self._comm = ZMQComm(self.logger.getChild('comm'), self.info(),parent_address=self.parent_comm.my_address if self.parent_comm else None)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
@@ -165,6 +162,9 @@ class Worker(Node):
             self._free_task(task_id)
 
     def _lazy_init(self):
+        if self._config.profile == "perfetto":
+            self._event_registry = get_registry()
+            self._event_registry.enable()
         #lazy logger creation
         tick = time.perf_counter()
         self._setup_logger()
@@ -176,7 +176,6 @@ class Worker(Node):
 
         ##lazy executor creation
         self._executor: Executor = executor_registry.create_executor(self._config.task_executor_name,kwargs={"return_stdout": self._config.return_stdout,
-                                                                                                             "profile":self._config.profile,
                                                                                                              "gpu_selector":self._config.gpu_selector,
                                                                                                              "logger":self.logger.getChild('executor')})
 
@@ -331,24 +330,14 @@ class Worker(Node):
         return result_batch
         
     def _stop(self):
-        if self._config.profile:
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._comm._profile_info, f, indent=2)
-            
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_executor_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._executor._profile_info, f, indent=2)
-    
-        if self._config.profile == "perfetto" and self._registry:
+        if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
             # Export to Perfetto format
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
-            self._registry.export_perfetto(fname)
+            self._event_registry.export_perfetto(fname)
             
             # Also export statistics
-            stats = self._registry.get_statistics()
+            stats = self._event_registry.get_statistics()
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)

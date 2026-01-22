@@ -48,10 +48,7 @@ class AsyncWorker(Node):
         self.logger = None
 
         # Initialize event registry for perfetto profiling
-        self._registry: Optional[EventRegistry] = None
-        if self._config.profile == "perfetto":
-            self._registry = get_registry()
-            self._registry.enable()
+        self._event_registry: Optional[EventRegistry] = None
 
         self._stop_submission = asyncio.Event()
         self._stop_reporting = asyncio.Event()
@@ -64,8 +61,8 @@ class AsyncWorker(Node):
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
-        if self._registry:
-            with self._registry.measure(event_name, "async_worker", node_id=self.node_id, pid=os.getpid()):
+        if self._event_registry is not None:
+            with self._event_registry.measure(event_name, "async_worker", node_id=self.node_id, pid=os.getpid()):
                 yield
         else:
             yield
@@ -144,12 +141,16 @@ class AsyncWorker(Node):
     def _create_comm(self):
         if self._config.comm_name == "async_zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = AsyncZMQComm(self.logger.getChild('comm'), self.info(), parent_address=self.parent_comm.my_address if self.parent_comm else None, profile=self._config.profile)
+            self._comm = AsyncZMQComm(self.logger.getChild('comm'), self.info(), parent_address=self.parent_comm.my_address if self.parent_comm else None)
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
         
     async def _lazy_init(self):
+        if self._config.profile == "perfetto":
+            self._event_registry = get_registry()
+            self._event_registry.enable()
+
         self._event_loop = asyncio.get_running_loop()
         #lazy logger creation
         tick = time.perf_counter()
@@ -174,6 +175,13 @@ class AsyncWorker(Node):
     
     def _task_callback(self, task: Task, future):
         task_id = task.task_id
+        if self._config.profile == "perfetto" and self._event_registry is not None:
+            self._event_registry.record_end(
+                name=task.task_id,
+                category="task_execution",
+                node_id=self.node_id,
+                pid=os.getpid()
+            )
         if task_id in self._tasks:
             exception = future.exception()
             task.end_time = time.time()
@@ -196,6 +204,13 @@ class AsyncWorker(Node):
                 self.logger.debug(f"Submitting task {task_id}: {task.executable} with resources {req.resources} {task.env}")
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
+                if self._config.profile == "perfetto" and self._event_registry is not None:
+                    self._event_registry.record_begin(
+                        name=task.task_id,
+                        category="task_execution",
+                        node_id=self.node_id,
+                        pid=os.getpid()
+                    )
                 future = self._executor.submit(req, task.executable,
                                                     task_args=task.args,
                                                     task_kwargs=task.kwargs,
@@ -372,26 +387,18 @@ class AsyncWorker(Node):
         """This fuction is the entry point for a new process"""
         asyncio.run(self.run())
 
-    async def stop(self):
-        if self._config.profile:
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._comm._profile_info, f, indent=2)
-            
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_executor_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._executor._profile_info, f, indent=2)
-    
-        if self._config.profile == "perfetto" and self._registry:
+    async def stop(self):    
+        if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
             # Export to Perfetto format
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
-            self._registry.export_perfetto(fname)
+            self.logger.info(f"Exporting Perfetto trace to {fname}")
+            self._event_registry.export_perfetto(fname)
             
             # Also export statistics
-            stats = self._registry.get_statistics()
+            stats = self._event_registry.get_statistics()
             fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
+            self.logger.info(f"Exporting event statistics to {fname}")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
         

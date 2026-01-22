@@ -28,11 +28,10 @@ class AsyncZMQComm(AsyncComm):
                  node_info: NodeInfo,
                  parent_comm: "AsyncZMQComm" = None,              
                  heartbeat_interval:int=1,
-                 parent_address: str = None, ###parent comm is not always pickleble
-                 profile: bool = True
+                 parent_address: str = None ###parent comm is not always pickleble
                  ):
         
-        super().__init__(logger, node_info,parent_comm,heartbeat_interval,profile=profile)
+        super().__init__(logger, node_info,parent_comm,heartbeat_interval)
         if not ZMQ_AVAILABLE:
             self.logger.error(f"zmq is not available")
             raise ModuleNotFoundError

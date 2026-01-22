@@ -96,8 +96,7 @@ class AsyncComm(ABC):
                  logger: Logger,
                  node_info: NodeInfo, 
                  parent_comm: "AsyncComm"= None, 
-                 heartbeat_interval: int = 1,
-                 profile: bool = False):
+                 heartbeat_interval: int = 1):
         
         self.logger = logger
         self._node_info = node_info
@@ -106,8 +105,6 @@ class AsyncComm(ABC):
         self.heartbeat_interval = heartbeat_interval
         self._parent_comm = parent_comm
         self._cache: Dict[str, AsyncMessageRoutingQueue] = {}
-        self._profile = profile
-        self._profile_info: Dict[str, Dict[str,List]] = {}
         self._stop_event = None
 
     async def init_cache(self):
@@ -117,16 +114,9 @@ class AsyncComm(ABC):
             self.logger.info(f"Initializing cache for child_id: {child_id}")
             self._cache[child_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
         
-        if self._profile:
-            for child_id in self._node_info.children_ids:
-                self._profile_info[child_id] = {"latency":[], "datasize":[], "type":[]}
-        
         if self._node_info.parent_id and self._node_info.parent_id not in self._cache:
             self.logger.info(f"Initializing cache for parent_id: {self._node_info.parent_id}")
             self._cache[self._node_info.parent_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
-        
-        if self._profile:
-            self._profile_info[self._node_info.parent_id] = {"latency":[], "datasize":[], "type":[]}
 
     async def update_node_info(self,node_info: NodeInfo):
         self._node_info = node_info
@@ -190,10 +180,6 @@ class AsyncComm(ABC):
                     if isinstance(msg, Message):
                         failures = 0  # Reset on success
                         await self._cache[self._node_info.parent_id].put(msg)
-                        if self._profile:
-                            self._profile_info[self._node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
-                            self._profile_info[self._node_info.parent_id]["datasize"].append(0.0)
-                            self._profile_info[self._node_info.parent_id]["type"].append(type(msg).__name__)
                         self.logger.debug(f"Cached message from parent: {type(msg).__name__}")
             except asyncio.CancelledError:
                 self.logger.info("Parent monitor cancelled.")
