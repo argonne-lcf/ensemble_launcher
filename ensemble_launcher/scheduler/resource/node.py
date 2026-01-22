@@ -257,7 +257,7 @@ class NodeResourceList(NodeResource):
         )
 
 
-@dataclass(frozen=True, eq=True)
+@dataclass(eq=True)
 class JobResource:
     """
     Represents the computational resources required for a job.

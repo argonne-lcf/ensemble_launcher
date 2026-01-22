@@ -35,7 +35,7 @@ class ClusterResource(ABC):
             self._nodes = nodes.to_dict()
             self.logger.debug(f"Updated node configuration: {list(self._nodes.keys())}")
         except Exception as e:
-            self._nodes = {}
+            self._nodes = None
             self.logger.warning(f"Failed to update cluster nodes: {e}")
             
     
@@ -48,8 +48,12 @@ class ClusterResource(ABC):
         return sum([node.gpu_count for node in self._nodes.values()])
     
     @property
-    def nodes(self) -> JobResource:
-        return JobResource.from_dict(self._nodes)
+    def nodes(self) -> Optional[JobResource]:
+        try:
+            return JobResource.from_dict(self._nodes)
+        except Exception as e:
+            self.logger.error(f"Failed to retrieve nodes: {e}")
+            return None
     
     @abstractmethod
     def allocate(self, job_resource: JobResource):
