@@ -4,6 +4,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from .utils import run_callable_with_affinity, run_cmd, executor_registry
 import uuid
 
+def dummy_task():
+    return
+
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
     def __init__(self,logger,
@@ -12,6 +15,8 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         super().__init__(**kwargs)
         self.logger = logger
         self._gpu_selector = gpu_selector
+        
+        super().submit(dummy_task)
 
     def submit(self,job_resource: JobResource, 
                fn: Union[Callable,str], 
