@@ -26,7 +26,8 @@ class ClusterResource(ABC):
     def __init__(self, logger: Logger, nodes: JobResource):
         self.logger = logger
         self.update_nodes(nodes)
-        self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
+        if self._nodes is not None:
+            self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
 
     def update_nodes(self, nodes: JobResource):
         """Update the cluster nodes and their system information."""
