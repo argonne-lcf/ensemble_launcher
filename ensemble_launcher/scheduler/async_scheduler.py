@@ -2,7 +2,7 @@ from .resource import NodeResourceList, JobResource, AsyncLocalClusterResource, 
 from .resource import NodeResourceCount
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.config import LauncherConfig
-from typing import List, Dict, Union, Set, Tuple
+from typing import List, Dict, Union, Set, Tuple, Optional
 from .policy import policy_registry, Policy, WorkerPolicy
 from  logging import Logger
 import copy
@@ -10,6 +10,9 @@ import asyncio
 from asyncio import Queue, PriorityQueue
 from .scheduler import Scheduler
 from collections import Counter
+from ensemble_launcher.profiling import get_registry, EventRegistry
+import os
+import uuid
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -128,6 +131,11 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._consecutive_failed_allocations = 0
         self._monitoring_task = None
         self._event_loop = None  # Will be set when monitoring starts
+
+        self._event_registry: Optional[EventRegistry] = None
+        if os.environ.get("EL_ENABLE_PROFILING","0") == "1":
+            self._event_registry = get_registry()
+            
     
     def _buld_task_resource_req(self, task: Task) -> JobResource:
         req = JobResource(

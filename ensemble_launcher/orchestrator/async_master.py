@@ -166,6 +166,7 @@ class AsyncMaster(Node):
         if self._config.profile == "perfetto":
             self._event_registry = get_registry()
             self._event_registry.enable()
+            os.environ["EL_ENABLE_PROFILING"] = "1"
 
         self._lock = threading.RLock()  # Protect _done_children
 

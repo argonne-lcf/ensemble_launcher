@@ -39,7 +39,7 @@ class Event:
             - Note: Relative to first event's timestamp for display
             - Example: 1234.567890 seconds → 1234567890 microseconds in Perfetto
         
-        event_type (Literal["B", "E", "X", "i", "C", "M"]): 
+        event_type (Literal["B", "E", "b", "e", "X", "i", "C", "M"]): 
             - Type of event determines how Perfetto renders it
             - Perfetto field: "ph" (phase)
             - Values:
@@ -48,18 +48,33 @@ class Event:
                 - Use: Context managers, operations with known duration
                 - Single event contains both start time and duration
               
-              * "B" (Begin): Start marker of async operation
+              * "B" (Begin): Start marker of sync operation
                 - Shows: Left edge of a bar/span
                 - Renders: Paired with "E" to create a solid bar
-                - Use: Async operation start, must pair with "E"
+                - Use: Sync operation start on same thread, must pair with "E"
                 - Matching: B/E paired by same name + pid + tid
               
-              * "E" (End): End marker of async operation  
+              * "E" (End): End marker of sync operation  
                 - Shows: Right edge of a bar/span
                 - Renders: Paired with "B" to create a solid bar
-                - Use: Async operation end, must match "B" event
+                - Use: Sync operation end on same thread, must match "B" event
                 - Matching: Must have same name, pid, tid as the B event
                 - Result: B/E pair renders as solid bar (like X event)
+              
+              * "b" (Async Begin): Start marker of async operation
+                - Shows: Left edge of a bar/span (can span threads/processes)
+                - Renders: Paired with "e" to create a solid bar
+                - Use: Async operation start, must pair with "e"
+                - Matching: b/e paired by same name + scope + id (not pid/tid)
+                - Requires: id and scope fields must be set for proper rendering
+                - Note: scope helps namespace the IDs for Perfetto visualization
+              
+              * "e" (Async End): End marker of async operation
+                - Shows: Right edge of a bar/span (can span threads/processes)
+                - Renders: Paired with "b" to create a solid bar
+                - Use: Async operation end, must match "b" event
+                - Matching: Must have same name + scope + id as the b event
+                - Result: b/e pair renders as solid bar across threads
               
               * "i" (Instant): Point-in-time marker
                 - Shows: Vertical line or triangle marker
@@ -72,6 +87,21 @@ class Event:
               * "M" (Metadata): Process/thread naming
                 - Shows: Track labels in UI
                 - Use: Auto-generated for process/thread names
+              
+              * "s" (Flow Start): Start of a flow/connection (recommended for async)
+                - Shows: Arrow originating from this event
+                - Renders: Arrow connecting to matching "f" event
+                - Use: Track data/control flow across threads/processes
+                - Matching: Matched by "id" field with corresponding "f" event
+                - Benefit: Shows as visible arrows in Perfetto UI (not legacy)
+                - Best practice: Use instead of b/e for better Perfetto support
+              
+              * "f" (Flow Finish): End of a flow/connection
+                - Shows: Arrow pointing to this event
+                - Renders: Paired with "s" to create visible flow arrow
+                - Use: End of async operation, receives data/control
+                - Matching: Matched by "id" field with corresponding "s" event
+                - Result: Renders as arrow connecting events across tracks
         
         node_id (str): 
             - ID of node/component that generated this event
@@ -155,12 +185,13 @@ class Event:
     name: str
     category: str
     timestamp: float
-    event_type: Literal["B", "E", "X", "i", "C", "M"] = "X"  # B=begin, E=end, X=complete, i=instant, C=counter, M=metadata
+    event_type: Literal["B", "E", "b", "e", "X", "i", "C", "M", "s", "f"] = "X"  # B=sync begin, E=sync end, b=async begin, e=async end, X=complete, i=instant, C=counter, M=metadata, s=flow start, f=flow finish
     node_id: str = ""
     tid: Optional[int] = None
     pid: Optional[int] = None
     duration: Optional[float] = None
     task_id: Optional[str] = None
+    async_id: Optional[str] = None  # Required for async events (b/e)
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_perfetto_event(self, base_timestamp: float = 0) -> Dict[str, Any]:
@@ -185,9 +216,24 @@ class Event:
         }
         
         # Add duration for complete events (in microseconds)
-        # Note: B/E (Begin/End) events don't have duration, only X (Complete) events do
+        # Note: B/E/b/e (Begin/End) events don't have duration, only X (Complete) events do
         if self.event_type == "X" and self.duration is not None:
             event["dur"] = int(self.duration * 1_000_000)
+        
+        # Add async id and scope for async events (b/e)
+        # The scope field is required for Perfetto to properly render async events
+        if self.event_type in ("b", "e") and self.async_id is not None:
+            event["id"] = self.async_id
+            event["scope"] = self.name  # Use event name as scope for proper namespacing
+        
+        # Add id for flow events (s/f) - these render better in Perfetto than b/e
+        if self.event_type in ("s", "f") and self.async_id is not None:
+            event["id"] = self.async_id
+            event["bp"] = "e"  # Binding point: enclosing slice
+        
+        # Add scope for instant events (i) - required for proper rendering
+        if self.event_type == "i":
+            event["s"] = "t"  # Scope: t=thread, p=process, g=global
         
         # Add arguments (metadata + task_id + node_id)
         args = dict(self.metadata)
@@ -332,10 +378,10 @@ class EventRegistry:
         task_id: Optional[str] = None,
         **metadata
     ) -> float:
-        """Record a begin event (start of an operation).
+        """Record a sync begin event (start of a sync operation on same thread).
         
-        Use with record_end() for async operations where begin and end
-        happen in different contexts. Returns timestamp for use with record_end().
+        Use with record_end() for sync operations on the same thread.
+        For async operations that span threads, use record_async_begin() instead.
         
         Args:
             name: Event name
@@ -374,7 +420,7 @@ class EventRegistry:
         task_id: Optional[str] = None,
         **metadata
     ):
-        """Record an end event (end of an operation).
+        """Record a sync end event (end of a sync operation on same thread).
         
         Must be paired with a record_begin() call with the same name, pid, and tid.
         Perfetto matches B/E events by: name + pid + tid (all must match).
@@ -401,6 +447,180 @@ class EventRegistry:
         )
         self.record(event)
     
+    def record_async_begin(
+        self,
+        name: str,
+        category: str,
+        async_id: str,
+        node_id: str = "",
+        tid: Optional[int] = None,
+        pid: Optional[int] = None,
+        task_id: Optional[str] = None,
+        **metadata
+    ) -> float:
+        """Record an async begin event (start of an async operation).
+        
+        Use with record_async_end() for async operations that may span threads/processes.
+        Async events are matched by name + scope + async_id (not by pid/tid like sync events).
+        The scope field is automatically set to the event name for proper Perfetto rendering.
+        
+        Args:
+            name: Event name
+            category: Event category
+            async_id: Unique ID to match begin/end pair (required)
+            node_id: Node ID
+            tid: Thread ID (can differ between begin/end)
+            pid: Process ID (can differ between begin/end)
+            task_id: Task ID
+            **metadata: Additional metadata
+            
+        Returns:
+            Timestamp of the async begin event
+        """
+        timestamp = time.perf_counter()
+        event = Event(
+            name=name,
+            category=category,
+            timestamp=timestamp,
+            event_type="b",
+            node_id=node_id,
+            tid=tid,
+            pid=pid,
+            task_id=task_id,
+            async_id=async_id,
+            metadata=metadata
+        )
+        self.record(event)
+        return timestamp
+    
+    def record_async_end(
+        self,
+        name: str,
+        category: str,
+        async_id: str,
+        node_id: str = "",
+        tid: Optional[int] = None,
+        pid: Optional[int] = None,
+        task_id: Optional[str] = None,
+        **metadata
+    ):
+        """Record an async end event (end of an async operation).
+        
+        Must be paired with a record_async_begin() call with the same name and async_id.
+        Perfetto matches b/e events by: name + scope + async_id (pid/tid can differ).
+        The scope field is automatically set to the event name for proper Perfetto rendering.
+        
+        Args:
+            name: Event name (MUST match the async begin event exactly)
+            category: Event category
+            async_id: Unique ID to match begin/end pair (MUST match begin event)
+            node_id: Node ID
+            tid: Thread ID (can differ from begin event)
+            pid: Process ID (can differ from begin event)
+            task_id: Task ID
+            **metadata: Additional metadata
+        """
+        event = Event(
+            name=name,
+            category=category,
+            timestamp=time.perf_counter(),
+            event_type="e",
+            node_id=node_id,
+            tid=tid,
+            pid=pid,
+            task_id=task_id,
+            async_id=async_id,
+            metadata=metadata
+        )
+        self.record(event)
+    
+    def record_flow_start(
+        self,
+        name: str,
+        category: str,
+        flow_id: str,
+        node_id: str = "",
+        tid: Optional[int] = None,
+        pid: Optional[int] = None,
+        task_id: Optional[str] = None,
+        **metadata
+    ) -> float:
+        """Record a flow start event (beginning of async flow - RECOMMENDED).
+        
+        Flow events render as arrows in Perfetto UI, showing data/control flow
+        across threads and processes. Use these instead of async begin/end (b/e)
+        for better visualization in Perfetto.
+        
+        Args:
+            name: Event name
+            category: Event category
+            flow_id: Unique ID to match flow start/finish pair (required)
+            node_id: Node ID
+            tid: Thread ID where flow originates
+            pid: Process ID where flow originates
+            task_id: Task ID
+            **metadata: Additional metadata
+            
+        Returns:
+            Timestamp of the flow start event
+        """
+        timestamp = time.perf_counter()
+        event = Event(
+            name=name,
+            category=category,
+            timestamp=timestamp,
+            event_type="s",
+            node_id=node_id,
+            tid=tid,
+            pid=pid,
+            task_id=task_id,
+            async_id=flow_id,
+            metadata=metadata
+        )
+        self.record(event)
+        return timestamp
+    
+    def record_flow_finish(
+        self,
+        name: str,
+        category: str,
+        flow_id: str,
+        node_id: str = "",
+        tid: Optional[int] = None,
+        pid: Optional[int] = None,
+        task_id: Optional[str] = None,
+        **metadata
+    ):
+        """Record a flow finish event (end of async flow - RECOMMENDED).
+        
+        Must be paired with a record_flow_start() call with the same flow_id.
+        Perfetto will draw an arrow from the start event to this finish event,
+        clearly showing the flow of execution across threads/processes.
+        
+        Args:
+            name: Event name (should match the flow start event)
+            category: Event category
+            flow_id: Unique ID to match flow start/finish pair (MUST match start event)
+            node_id: Node ID
+            tid: Thread ID where flow ends (can differ from start)
+            pid: Process ID where flow ends (can differ from start)
+            task_id: Task ID
+            **metadata: Additional metadata
+        """
+        event = Event(
+            name=name,
+            category=category,
+            timestamp=time.perf_counter(),
+            event_type="f",
+            node_id=node_id,
+            tid=tid,
+            pid=pid,
+            task_id=task_id,
+            async_id=flow_id,
+            metadata=metadata
+        )
+        self.record(event)
+    
     def record_counter(
         self,
         name: str,
@@ -422,7 +642,11 @@ class EventRegistry:
         with self._lock:
             if self._base_timestamp is None:
                 self._base_timestamp = timestamp
-            self._counters[name].append((timestamp, value, node_id, pid or 0))
+            if name in self._counters:
+                last_entry = self._counters[name][-1]
+                self._counters[name].append((timestamp, last_entry[1]+value, node_id, pid or 0))
+            else:
+                self._counters[name].append((timestamp, value, node_id, pid or 0))
     
     @contextmanager
     def measure(

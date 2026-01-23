@@ -1,10 +1,15 @@
-from typing import Any, Dict, Callable, Tuple, Union
+from typing import Any, Dict, Callable, Tuple, Union, Optional
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList, NodeResourceCount
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from .utils import run_callable_with_affinity, run_cmd, executor_registry
 import uuid
 import os
 from logging import Logger
+from ensemble_launcher.profiling import get_registry, EventRegistry
+
+def dummy_task():
+    return
+
 
 def dummy_task():
     return
@@ -19,6 +24,10 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         self._gpu_selector = gpu_selector
         
         super().submit(dummy_task)
+
+        self._event_registry: Optional[EventRegistry] = None
+        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
+            self._event_registry: EventRegistry = get_registry()
 
     def submit(self,job_resource: JobResource, 
                fn: Union[Callable,str], 

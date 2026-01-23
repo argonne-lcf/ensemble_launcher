@@ -18,6 +18,7 @@ import threading
 import asyncio
 AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
+import uuid
 
 
 class AsyncWorker(Node):
@@ -176,11 +177,12 @@ class AsyncWorker(Node):
     def _task_callback(self, task: Task, future):
         task_id = task.task_id
         if self._config.profile == "perfetto" and self._event_registry is not None:
-            self._event_registry.record_end(
+            self._event_registry.record_async_end(
                 name=task.task_id,
                 category="task_execution",
                 node_id=self.node_id,
-                pid=os.getpid()
+                pid=os.getpid(),
+                async_id=task.task_id
             )
         if task_id in self._tasks:
             exception = future.exception()
@@ -191,11 +193,13 @@ class AsyncWorker(Node):
             else:
                 task.status = TaskStatus.FAILED
                 task.exception = str(exception)
+            
             self._scheduler.free(task_id, task.status)
 
     
     async def _submit_ready_tasks(self):
         self.logger.info("Starting task submission loop")
+
         while not self._stop_submission.is_set():
             try:
                 task_id, req = await self._scheduler.ready_tasks.get()
@@ -205,11 +209,19 @@ class AsyncWorker(Node):
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 if self._config.profile == "perfetto" and self._event_registry is not None:
-                    self._event_registry.record_begin(
+                    self._event_registry.record_async_begin(
                         name=task.task_id,
                         category="task_execution",
                         node_id=self.node_id,
-                        pid=os.getpid()
+                        pid=os.getpid(),
+                        async_id=task.task_id
+                    )
+                    self._event_registry.record_counter(
+                        name="tasks_submitted",
+                        category="task_execution",
+                        value=1,
+                        pid=os.getpid(),
+                        node_id=self.node_id
                     )
                 future = self._executor.submit(req, task.executable,
                                                     task_args=task.args,
@@ -324,10 +336,17 @@ class AsyncWorker(Node):
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()
 
+        id = str(uuid.uuid4)
+        self._event_registry.record_async_begin(
+            name="stopping_loops",
+            category="pre-teardown",
+            pid=os.getpid(),
+            async_id=id
+        )
         ##stop submission and reporting tasks
         self._stop_submission.set()
         self._stop_reporting.set()
-                
+        
         if self._submission_task:
             self._submission_task.cancel()
             try:
@@ -335,6 +354,7 @@ class AsyncWorker(Node):
             except asyncio.CancelledError:
                 self.logger.debug("Submission task cancelled")
         self.logger.info("Stopped submission loop!")
+
         if self._reporting_task:
             self._reporting_task.cancel()
             try:
@@ -343,6 +363,13 @@ class AsyncWorker(Node):
                 self.logger.debug("Reporting task cancelled")
         
         self.logger.info("Stopped reporting loop!")
+
+        self._event_registry.record_async_end(
+            name="stopping_loops",
+            category="pre-teardown",
+            pid=os.getpid(),
+            async_id=id
+        )
 
         async with self._timer("result_collection"):
             all_results = await self._results()
@@ -360,7 +387,21 @@ class AsyncWorker(Node):
                 self.logger.info(f"{final_status}")
                 final_status.to_file(fname)
         
+        id = str(uuid.uuid4)
+        self._event_registry.record_async_begin(
+            name="stop",
+            category="teardown",
+            pid=os.getpid(),
+            async_id=id
+        )
         await self.stop()
+        self._event_registry.record_async_end(
+            name="stop",
+            category="teardown",
+            pid=os.getpid(),
+            async_id=id
+        )
+
         self.logger.info(f"{self.node_id} stopped")
         return all_results
 
@@ -403,7 +444,6 @@ class AsyncWorker(Node):
                 json.dump(stats, f, indent=2)
         
         await self._comm.close()
-        # await self._scheduler.stop_monitoring()
         self._executor.shutdown()
     
     def asdict(self,include_tasks:bool = False) -> dict:

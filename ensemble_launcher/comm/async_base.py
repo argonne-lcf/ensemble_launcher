@@ -7,6 +7,8 @@ from logging import Logger
 from datetime import datetime
 import asyncio
 from asyncio import Queue, LifoQueue
+import os
+from ensemble_launcher.profiling import get_registry, EventRegistry
 
 
 class AsyncMessageRoutingQueue:
@@ -106,6 +108,10 @@ class AsyncComm(ABC):
         self._parent_comm = parent_comm
         self._cache: Dict[str, AsyncMessageRoutingQueue] = {}
         self._stop_event = None
+
+        self._event_registry: Optional[EventRegistry] = None
+        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
+            self.event_registry: EventRegistry = get_registry()
 
     async def init_cache(self):
         for child_id in self._node_info.children_ids:
