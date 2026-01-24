@@ -14,23 +14,17 @@ class AsyncMessageRoutingQueue:
     
     def __init__(self,logger: Logger, message_types: Optional[List[Type[Message]]] = None):
         self.logger = logger
-        self._queues: Dict[Type[Message], Union[Queue, LifoQueue]] = {}
+        self._queues: Dict[Type[Message], Queue] = {}
         self._message_types = message_types
         if message_types is not None:
             for msg_type in message_types:
-                if msg_type == Status:
-                    self._queues[msg_type] = LifoQueue()
-                else:
-                    self._queues[msg_type] = Queue()
+                self._queues[msg_type] = Queue()
     
     async def put(self, message: Message):
         """Put a message into the appropriate type-specific queue"""
         msg_type = type(message)
         if msg_type not in self._queues:
-            if msg_type == Status:
-                self._queues[msg_type] = LifoQueue()
-            else:
-                self._queues[msg_type] = Queue()
+            self._queues[msg_type] = Queue()
             self.logger.debug(f"Created new queue for message type: {msg_type.__name__}")
         await self._queues[msg_type].put(message)
     
@@ -154,9 +148,19 @@ class AsyncComm(ABC):
     async def _recv_from_child(self, child_id: str, timeout: Optional[float] = None, **kwargs) -> Any:
         pass
 
-    @abstractmethod
     async def close(self):
-        pass
+        """Base cleanup - cancel all monitoring tasks"""
+        if self._stop_event:
+            self._stop_event.set()
+        
+        # Cancel child monitor tasks if they exist
+        if hasattr(self, '_child_monitor_tasks'):
+            for task in self._child_monitor_tasks:
+                task.cancel()
+            if self._child_monitor_tasks:
+                await asyncio.gather(*self._child_monitor_tasks, return_exceptions=True)
+        
+        await self.clear_cache()
 
     @abstractmethod
     def pickable_copy(self):
@@ -176,41 +180,80 @@ class AsyncComm(ABC):
 
     async def _monitor_parent_messages(self):
         """Monitor messages from parent and cache them"""
+        self.logger.debug("Started monitoring parent")
+        failures = 0
+        
         while not self._stop_event.is_set():
             try:
                 msg = await self._recv_from_parent()
                 if msg is not None and self._node_info.parent_id is not None:
                     if isinstance(msg, Message):
+                        failures = 0  # Reset on success
                         await self._cache[self._node_info.parent_id].put(msg)
                         if self._profile:
                             self._profile_info[self._node_info.parent_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
                             self._profile_info[self._node_info.parent_id]["datasize"].append(0.0)
                             self._profile_info[self._node_info.parent_id]["type"].append(type(msg).__name__)
+                        self.logger.debug(f"Cached message from parent: {type(msg).__name__}")
+            except asyncio.CancelledError:
+                self.logger.info("Parent monitor cancelled.")
+                break
             except Exception as e:
-                self.logger.error(f"Error monitoring parent: {e}")
-                await asyncio.sleep(0.1)  # Longer sleep on error
+                failures += 1
+                self.logger.error(f"Error monitoring parent (failure {failures}): {e}")
+                if failures >= 10:
+                    await asyncio.sleep(0.1)  # Backoff after repeated failures
+        
+        self.logger.debug("Stopped monitoring parent")
 
-    async def _monitor_children_messages(self):
-        """Monitor messages from all children and cache them"""
+    async def _monitor_single_child(self, child_id: str):
+        """Dedicated monitor for a single child - runs in tight loop for instant message handling"""
+        self.logger.debug(f"Started monitoring child {child_id}")
+        failures = 0
+        
         while not self._stop_event.is_set():
             try:
-                if len(self._node_info.children_ids) == 0:
-                    self.logger.debug("No children to monitor.")
-                    await asyncio.sleep(0.1)  # Prevent busy wait if no children
-                    continue
+                # Blocking recv - instantly returns when message arrives
+                msg = await self._recv_from_child(child_id)
                 
-                for child_id in self._node_info.children_ids:
-                    msg = await self._recv_from_child(child_id)
-                    if msg is not None:
-                        if isinstance(msg, Message):
-                            await self._cache[child_id].put(msg)
-                            if self._profile:
-                                self._profile_info[child_id]["latency"].append((datetime.now() - msg.timestamp).total_seconds())
-                                self._profile_info[child_id]["datasize"].append(0.0)
-                                self._profile_info[child_id]["type"].append(type(msg).__name__)
+                if msg is not None and isinstance(msg, Message):
+                    failures = 0  # Reset failure counter on success
+                    await self._cache[child_id].put(msg)
+                    
+                    if self._profile:
+                        self._profile_info[child_id]["latency"].append(
+                            (datetime.now() - msg.timestamp).total_seconds()
+                        )
+                        self._profile_info[child_id]["datasize"].append(0.0)
+                        self._profile_info[child_id]["type"].append(type(msg).__name__)
+                    
+                    self.logger.debug(f"Cached message from child {child_id}: {type(msg).__name__}")
+                    
+            except asyncio.CancelledError:
+                self.logger.info(f"Monitor for child {child_id} cancelled.")
+                break
             except Exception as e:
-                self.logger.error(f"Error monitoring children: {e}")
-                await asyncio.sleep(0.1)  # Only sleep on error
+                failures += 1
+                self.logger.error(f"Error monitoring child {child_id} (failure {failures}): {e}")
+                if failures >= 10:
+                    await asyncio.sleep(0.1)  # Backoff after repeated failures
+        
+        self.logger.debug(f"Stopped monitoring child {child_id}")
+
+    async def _monitor_children_messages(self):
+        """Monitor messages from all children - one dedicated task per child"""
+        if len(self._node_info.children_ids) == 0:
+            self.logger.debug("No children to monitor.")
+            return
+        
+        # Create one monitoring task per child
+        self._child_monitor_tasks = [
+            asyncio.create_task(self._monitor_single_child(child_id), name=f"monitor_{child_id}")
+            for child_id in self._node_info.children_ids
+        ]
+        
+        # Wait for all tasks to complete (they run until stop_event is set)
+        await asyncio.gather(*self._child_monitor_tasks, return_exceptions=True)
 
     async def recv_message_from_child(self,cls: Type[Message], child_id: str, block: bool = False, timeout: Optional[float] = None) -> Message | None:
         """

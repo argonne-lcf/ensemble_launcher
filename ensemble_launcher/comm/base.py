@@ -15,22 +15,16 @@ class MessageRoutingQueue:
     
     def __init__(self,logger: Logger, message_types: Optional[List[Type[Message]]] = None):
         self.logger = logger
-        self._queues: Dict[Type[Message], Union[queue.Queue, queue.LifoQueue]] = {}
+        self._queues: Dict[Type[Message], queue.Queue] = {}
         if message_types is not None:
             for msg_type in message_types:
-                if msg_type == Status:
-                    self._queues[msg_type] = queue.LifoQueue()
-                else:
-                    self._queues[msg_type] = queue.Queue()
+                self._queues[msg_type] = queue.Queue()
     
     def put(self, message: Message):
         """Put a message into the appropriate type-specific queue"""
         msg_type = type(message)
         if msg_type not in self._queues:
-            if msg_type == Status:
-                self._queues[msg_type] = queue.LifoQueue()
-            else:
-                self._queues[msg_type] = queue.Queue()
+            self._queues[msg_type] = queue.Queue()
             self.logger.debug(f"Created new queue for message type: {msg_type.__name__}")
         self._queues[msg_type].put(message)
     

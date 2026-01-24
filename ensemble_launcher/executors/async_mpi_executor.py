@@ -181,7 +181,7 @@ class AsyncMPIExecutor(Executor):
                 self.logger.error(f"stderr: {err_str}")
                 self.logger.error(f"stdout: {out_str}")
                 raise RuntimeError(f"Task {task_id} failed with return code {p.returncode}")
-            return out_str
+            return out_str + "," + err_str
             
         finally:
             if task_id in self._processes:

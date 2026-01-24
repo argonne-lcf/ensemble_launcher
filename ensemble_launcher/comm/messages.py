@@ -36,6 +36,7 @@ class Status(Message):
     nsuccessful_tasks: int = 0
     nfree_cores: int = 0
     nfree_gpus: int = 0
+    tag: str = ""
 
     def __add__(self, other: Any) -> "Status":
         if not isinstance(other, Status):

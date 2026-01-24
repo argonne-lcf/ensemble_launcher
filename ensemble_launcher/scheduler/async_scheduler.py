@@ -238,7 +238,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                             self.logger.debug(f"Insufficient resources for task {task_id}. Resources requested: {req}. Free resources: {self.cluster.get_status()}")
                 
                 if allocated_count == 0:
-                    self.logger.warning("No tasks allocated in this cycle. Clearing resource available event to wait for new resources.")
+                    self.logger.debug("No tasks allocated in this cycle. Clearing resource available event to wait for new resources.")
                     self._cluster_resource.clear_resource_available()
                 
                 # Put back unallocated tasks

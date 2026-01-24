@@ -163,22 +163,10 @@ class AsyncWorker(Node):
         self._setup_logger()
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
-
+        
         ##init scheduler
         self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self.nodes)
 
-        ##lazy executor creation
-        assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
-
-        kwargs = {}
-        kwargs["logger"] = self.logger.getChild('executor')
-        kwargs["gpu_selector"] = self._config.gpu_selector
-        if self._config.task_executor_name == "async_mpi":
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
-            kwargs["return_stdout"] = self._config.return_stdout
-        self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor] = \
-            executor_registry.create_executor(self._config.task_executor_name, kwargs=kwargs)
-        
         ##Lazy comm creation
         self._create_comm()
         await self._comm.start_monitors()
@@ -212,7 +200,7 @@ class AsyncWorker(Node):
                 task_id, req = await self._scheduler.ready_tasks.get()
         
                 task = self._tasks[task_id]
-                self.logger.debug(f"Submitting task {task_id}: {task.executable} with resources {req}")
+                self.logger.debug(f"Submitting task {task_id}: {task.executable} with resources {req.resources} {task.env}")
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 future = self._executor.submit(req, task.executable,
@@ -227,7 +215,7 @@ class AsyncWorker(Node):
                 break
             except Exception as e:
                 self.logger.error(f"Error in task submission loop: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
+                raise e
 
     async def report_status(self):
         while not self._stop_reporting.is_set():
@@ -287,6 +275,19 @@ class AsyncWorker(Node):
         self.logger.info(f"Running {list(self._tasks.keys())} tasks")
         self.logger.debug(f"Sorted tasks sizeL {self._scheduler._sorted_tasks.qsize()}")
 
+        ##lazy executor creation
+        assert self._config.task_executor_name in executor_registry.async_executors, f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+
+        kwargs = {}
+        kwargs["logger"] = self.logger.getChild('executor')
+        kwargs["gpu_selector"] = self._config.gpu_selector
+        kwargs["max_workers"] = self.nodes.resources[0].cpu_count
+        if self._config.task_executor_name == "async_mpi":
+            kwargs["use_ppn"] = self._config.use_mpi_ppn
+            kwargs["return_stdout"] = self._config.return_stdout
+        self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor] = \
+            executor_registry.create_executor(self._config.task_executor_name, kwargs=kwargs)
+
         self._scheduler.start_monitoring() #start the schduler monitoring
 
         ##start submission loop
@@ -327,6 +328,7 @@ class AsyncWorker(Node):
         with self._timer("final_status"):
             ##also send the final status
             final_status = self.get_status()
+            final_status.tag = "final"
             success = await self._comm.send_message_to_parent(final_status)
             if success:
                 self.logger.info(f"{self.node_id}: Sent final status to parent")

@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Dict, Any, Type, List
+from typing import Callable, Tuple, Dict, Any, Type, List, Union, Optional
 import cloudpickle
 import base64
 from ensemble_launcher.comm.queue import QueueProtocol
@@ -9,17 +9,17 @@ logger = logging.getLogger(__name__)
 def run_callable_with_affinity(fn: Callable, 
                                args: Tuple = (), 
                                kwargs: Dict = {}, 
-                               cpu_id:int = None, 
+                               cpu_id: Optional[List[int]] = None, 
                                env: Dict[str, Any] = {}):
     """
     Function to run a callable on specific cpus and reset affinity after execution.
     """
     import os
     original_affinity = None
-    if cpu_id is not None:
+    if cpu_id is not None and len(cpu_id) > 0:
         try:
             original_affinity = os.sched_getaffinity(0)
-            os.sched_setaffinity(0, [cpu_id])
+            os.sched_setaffinity(0, cpu_id)
         except Exception as e:
             print(f"Setting affinity failed with exception {e}")
     original_env = os.environ.copy()
@@ -39,7 +39,7 @@ def run_callable_with_affinity(fn: Callable,
 def run_cmd(cmd: str, 
             args: Tuple = (), 
             kwargs: Dict = {}, 
-            cpu_id:int = None, 
+            cpu_id:Optional[List[int]] = None, 
             env: Dict[str, Any] = {},
             return_stdout: bool = False):
     import os
@@ -48,10 +48,10 @@ def run_cmd(cmd: str,
     cmd = [s.strip() for s in cmd.split()]
 
     original_affinity = None
-    if cpu_id is not None:
+    if cpu_id is not None and len(cpu_id) > 0:
         try:
             original_affinity = os.sched_getaffinity(0)
-            os.sched_setaffinity(0,[cpu_id])
+            os.sched_setaffinity(0, cpu_id)
         except Exception as e:
             print(f"Setting affinity failed with exception {e}")
     merged_env = os.environ.copy()

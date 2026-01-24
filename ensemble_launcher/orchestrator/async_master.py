@@ -183,22 +183,11 @@ class AsyncMaster(Node):
         self._setup_logger()
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
-        
-        ##create a scheduler. maybe this can be removed??
+
         self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), 
                                                 self.nodes, 
                                                 self._config)
-
-        assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
-
-        kwargs = {}
-        kwargs["logger"] = self.logger.getChild('executor')
-        if self._config.child_executor_name == "async_mpi":
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
-        #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, 
-                                                                     kwargs=kwargs)
-
+        
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
         ##lazy creation of non-pickable objects
@@ -239,6 +228,18 @@ class AsyncMaster(Node):
                 self._tasks[task.task_id] = task
         
         self.logger.info(f"{self.node_id}: Have {len(self._tasks)} tasks after update from parent")
+
+        assert self._config.child_executor_name in executor_registry.async_executors, f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
+
+        kwargs = {}
+        kwargs["logger"] = self.logger.getChild('executor')
+        kwargs["max_workers"] = self.nodes.resources[0].cpu_count
+        if self._config.child_executor_name == "async_mpi":
+            kwargs["use_ppn"] = self._config.use_mpi_ppn
+
+        #create executor
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, 
+                                                                     kwargs=kwargs)
 
         ##create children
         children = self._create_children()
@@ -339,7 +340,7 @@ class AsyncMaster(Node):
                 for child_idx, (child_name,child_obj) in enumerate(children.items()):
                     child_nodes = child_obj.nodes.nodes
                     req = JobResource(
-                            resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                            resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)], nodes=child_nodes[:1]
                         )
                     env = os.environ.copy()
                     
@@ -432,6 +433,9 @@ class AsyncMaster(Node):
                     if exception is not None:
                         exceptions[child_id] = exception
                         self.logger.error(f"Child {child_id} failed with exception: {exception}")
+                    else:
+                        result = future.result()
+                        self.logger.error(f"Child {child_id}: No child exception found! Got {result}")
                 except asyncio.CancelledError:
                     pass
 
@@ -506,21 +510,31 @@ class AsyncMaster(Node):
 
         #collect final status from children
         with self._timer("collect_status"):
-            retry_children = set(self.children.keys())
-            max_retries = 2
-            for retry in range(max_retries):
-                for child_id in retry_children.copy():
-                    status = await self._comm.recv_message_from_child(Status, child_id=child_id) # no wait call
+            remaining_children = set()
+            
+            # Check which children already have final status
+            for child_id in self.children.keys():
+                if child_id in self._children_status and self._children_status[child_id].tag == "final":
+                    self.logger.debug(f"{self.node_id}: Child {child_id} already has final status")
+                else:
+                    remaining_children.add(child_id)
+            
+            # For remaining children, drain their status queues
+            for child_id in remaining_children.copy():
+                empty_count = 0
+                while empty_count < 2:
+                    status = await self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.01)
                     if status is not None:
-                        if child_id not in self._children_status:
-                            self._children_status[child_id] = status
-                        elif status.timestamp > self._children_status[child_id].timestamp:
-                            self._children_status[child_id] = status
-                        retry_children.remove(child_id)
-                if len(retry_children) == 0:
-                    break
-            if len(retry_children) > 0:
-                self.logger.warning(f"{self.node_id}: Failed to receive status from children {retry_children} after {max_retries} retries")
+                        empty_count = 0  # Reset counter on successful recv
+                        self._children_status[child_id] = status
+                        if status.tag == "final":
+                            remaining_children.remove(child_id)
+                            break
+                    else:
+                        empty_count += 1  # Increment when queue is empty
+                
+            if len(remaining_children) > 0:
+                self.logger.warning(f"{self.node_id}: Failed to receive final status from children {remaining_children}")
         
         self.logger.debug(f"Status from children: {self._children_status}")
 
@@ -536,7 +550,9 @@ class AsyncMaster(Node):
         with self._timer("report_to_parent"):
             #report it to parent
             if self.parent:
-                success = await self._comm.send_message_to_parent(sum(self._children_status.values(), Status()))
+                final_status = sum(self._children_status.values(), Status())
+                final_status.tag = "final"
+                success = await self._comm.send_message_to_parent(final_status)
                 if not success:
                     self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
                 else:
