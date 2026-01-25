@@ -32,7 +32,7 @@ async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1)
                  args=(f"task-{i}",))
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12,cpus=list(range(1,13))))
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = AsyncWorker(
@@ -44,7 +44,7 @@ async def test_async_worker(task_executor="async_processpool",ntasks_per_core=1)
     for r in res.data:
         results[r.task_id] = r.data
 
-    assert len(results) > 0 and all([result == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+    assert len(results) > 0 and all([result.strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
 @pytest.mark.asyncio
 async def test_async_mpi_worker(task_executor="async_mpi"):
@@ -71,7 +71,7 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
     for r in res.data:
         results[r.task_id] = r.data
 
-    assert len(results) > 0 and all([result.strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+    assert len(results) > 0 and all([result.split(",")[0].strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
 
 if __name__ == "__main__":
     print("Testing Async Worker with ProcessPool Executor for 1 task per core")

@@ -46,7 +46,7 @@ class MultiprocessingExecutor(Executor):
         if isinstance(req, NodeResourceCount):
             cpu_id = None
         elif isinstance(req, NodeResourceList):
-            cpu_id = req.cpus[0]
+            cpu_id = req.cpus
         
         if req.gpu_count > 0:
             if isinstance(req, NodeResourceCount):

@@ -35,7 +35,7 @@ def test_mp_executor():
                                     args=(i,))
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12,cpus=list(range(1,13))))
 
     from ensemble_launcher.scheduler.resource import JobResource
     job_resource = JobResource(resources=[sys_info], nodes=nodes)

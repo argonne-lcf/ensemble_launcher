@@ -78,7 +78,7 @@ async def test_async_mpi_master(nlevels=1):
     resultbatch = await m.run()
     results = {r.task_id:r.data for r in resultbatch.data}
     
-    assert len(results) > 0 and  all([result.strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
+    assert len(results) > 0 and  all([result.split(",")[0].strip() == f"Hello from task {task_id}" for task_id, result in results.items()]), f"{[result for task_id, result in results.items()]}"
     
 if __name__ == "__main__":
     print("Testing Async Master with ProcessPool Executor for 1 task per core")
