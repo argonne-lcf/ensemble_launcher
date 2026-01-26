@@ -51,8 +51,19 @@ class AsyncMPIExecutor(Executor):
             launcher_cmd.append(f"{ppn}")
         if not(len(job_resource.nodes) == 1 and \
                (job_resource.nodes[0] == socket.gethostname() or job_resource.nodes[0] == socket.gethostname().split(".")[0] )):
-            launcher_cmd.append("--hosts")
-            launcher_cmd.append(f"{','.join(job_resource.nodes)}")
+            if nnodes > 512:
+                # Use hostfile for large node counts to avoid command line length limits
+                hostfile_id = str(uuid.uuid4())
+                hostfile_path = os.path.join(self.tmp_dir, f"hostfile_{hostfile_id}.txt")
+                with open(hostfile_path, "w") as f:
+                    for node in job_resource.nodes:
+                        f.write(f"{node}\n")
+                launcher_cmd.append("--hostfile")
+                launcher_cmd.append(hostfile_path)
+                self.logger.info(f"Created hostfile with {nnodes} nodes at {hostfile_path}")
+            else:
+                launcher_cmd.append("--hosts")
+                launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
         ##resource pinning
         if isinstance(job_resource.resources[0],NodeResourceList):
