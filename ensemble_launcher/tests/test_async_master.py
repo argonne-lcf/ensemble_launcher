@@ -24,7 +24,7 @@ async def test_async_master(nlevels=1,ntask_per_core=1):
                  args=(f"task-{i}",))
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceList.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",ncpus=12,cpus=list(range(1,13))))
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = AsyncMaster(

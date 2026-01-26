@@ -336,13 +336,6 @@ class AsyncWorker(Node):
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()
 
-        id = str(uuid.uuid4)
-        self._event_registry.record_async_begin(
-            name="stopping_loops",
-            category="pre-teardown",
-            pid=os.getpid(),
-            async_id=id
-        )
         ##stop submission and reporting tasks
         self._stop_submission.set()
         self._stop_reporting.set()
@@ -364,13 +357,6 @@ class AsyncWorker(Node):
         
         self.logger.info("Stopped reporting loop!")
 
-        self._event_registry.record_async_end(
-            name="stopping_loops",
-            category="pre-teardown",
-            pid=os.getpid(),
-            async_id=id
-        )
-
         async with self._timer("result_collection"):
             all_results = await self._results()
         
@@ -387,20 +373,7 @@ class AsyncWorker(Node):
                 self.logger.info(f"{final_status}")
                 final_status.to_file(fname)
         
-        id = str(uuid.uuid4)
-        self._event_registry.record_async_begin(
-            name="stop",
-            category="teardown",
-            pid=os.getpid(),
-            async_id=id
-        )
         await self.stop()
-        self._event_registry.record_async_end(
-            name="stop",
-            category="teardown",
-            pid=os.getpid(),
-            async_id=id
-        )
 
         self.logger.info(f"{self.node_id} stopped")
         return all_results

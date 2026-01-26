@@ -504,7 +504,7 @@ class AsyncMaster(Node):
                 self.logger.warning(f"{self.node_id}: Failed to receive results from children {retry_children} after {max_retries} retries")
 
         #collect final status from children
-        with self._timer("collect_status"):
+        async with self._timer("collect_status"):
             remaining_children = set()
             
             # Check which children already have final status

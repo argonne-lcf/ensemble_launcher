@@ -61,7 +61,7 @@ def test_worker_in_mp():
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     w = Worker(
-        "test-worker",LauncherConfig(task_executor_name="multiprocessing", comm_name="zmq", return_stdout = True, profile="basic"),job_resource,tasks
+        "test-worker",LauncherConfig(task_executor_name="multiprocessing", comm_name="zmq", return_stdout = True, profile="perfetto"),job_resource,tasks
     )
     
     p = mp.Process(target=w.run)
