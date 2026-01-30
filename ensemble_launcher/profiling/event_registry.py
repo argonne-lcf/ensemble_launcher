@@ -33,11 +33,11 @@ class Event:
             - Multiple categories: Can use comma-separated like "task,compute"
         
         timestamp (float): 
-            - Event start time in seconds (from time.perf_counter())
+            - Event start time in seconds (from time.time() - Unix epoch timestamp)
             - Perfetto field: "ts" (converted to microseconds)
             - Appears as: Horizontal position on timeline (when event occurs)
-            - Note: Relative to first event's timestamp for display
-            - Example: 1234.567890 seconds → 1234567890 microseconds in Perfetto
+            - Note: For distributed systems, use wall clock time for cross-node alignment
+            - Example: 1704067200.567890 seconds → timestamp in microseconds in Perfetto
         
         event_type (Literal["B", "E", "b", "e", "X", "i", "C", "M"]): 
             - Type of event determines how Perfetto renders it
@@ -264,7 +264,7 @@ class EventRegistry:
         self._enabled = enabled
         self._events: List[Event] = []
         self._lock = threading.Lock()
-        self._base_timestamp: Optional[float] = None
+        self._base_timestamp: Optional[float] = time.time()
         self._counters: Dict[str, List[tuple]] = defaultdict(list)  # For counter events
         
     def enable(self):
@@ -319,7 +319,7 @@ class EventRegistry:
         event = Event(
             name=name,
             category=category,
-            timestamp=time.perf_counter(),
+            timestamp=time.time(),
             event_type="i",
             node_id=node_id,
             tid=tid,
@@ -395,7 +395,7 @@ class EventRegistry:
         Returns:
             Timestamp of the begin event
         """
-        timestamp = time.perf_counter()
+        timestamp = time.time()
         event = Event(
             name=name,
             category=category,
@@ -437,7 +437,7 @@ class EventRegistry:
         event = Event(
             name=name,
             category=category,
-            timestamp=time.perf_counter(),
+            timestamp=time.time(),
             event_type="E",
             node_id=node_id,
             tid=tid,
@@ -477,7 +477,7 @@ class EventRegistry:
         Returns:
             Timestamp of the async begin event
         """
-        timestamp = time.perf_counter()
+        timestamp = time.time()
         event = Event(
             name=name,
             category=category,
@@ -523,7 +523,7 @@ class EventRegistry:
         event = Event(
             name=name,
             category=category,
-            timestamp=time.perf_counter(),
+            timestamp=time.time(),
             event_type="e",
             node_id=node_id,
             tid=tid,
@@ -564,7 +564,7 @@ class EventRegistry:
         Returns:
             Timestamp of the flow start event
         """
-        timestamp = time.perf_counter()
+        timestamp = time.time()
         event = Event(
             name=name,
             category=category,
@@ -610,7 +610,7 @@ class EventRegistry:
         event = Event(
             name=name,
             category=category,
-            timestamp=time.perf_counter(),
+            timestamp=time.time(),
             event_type="f",
             node_id=node_id,
             tid=tid,
@@ -638,7 +638,7 @@ class EventRegistry:
             node_id: Node ID
             pid: Process ID
         """
-        timestamp = time.perf_counter()
+        timestamp = time.time()
         with self._lock:
             if self._base_timestamp is None:
                 self._base_timestamp = timestamp
@@ -679,11 +679,11 @@ class EventRegistry:
             yield
             return
             
-        start_time = time.perf_counter()
+        start_time = time.time()
         try:
             yield
         finally:
-            duration = time.perf_counter() - start_time
+            duration = time.time() - start_time
             self.record_complete(
                 name=name,
                 category=category,
@@ -763,6 +763,10 @@ class EventRegistry:
         - Chrome/Edge: chrome://tracing
         - Perfetto UI: https://ui.perfetto.dev
         
+        The exported file includes a base_timestamp_seconds field for merging
+        traces from distributed systems. This represents the reference time
+        (from time.perf_counter()) that all event timestamps are relative to.
+        
         Args:
             filepath: Output file path (should end in .json)
             include_metadata: Include process/thread metadata
@@ -815,9 +819,15 @@ class EventRegistry:
                         "args": {"name": f"Thread {tid}"}
                     })
         
-        # Write to file
+        # Write to file with base timestamp for distributed trace merging
+        trace_data = {
+            "traceEvents": trace_events,
+            "base_timestamp_seconds": base_ts,
+            "displayTimeUnit": "ms"
+        }
+        
         with open(filepath, 'w') as f:
-            json.dump({"traceEvents": trace_events}, f, indent=2)
+            json.dump(trace_data, f, indent=2)
     
     def export_json(self, filepath: str):
         """Export events to simple JSON format.

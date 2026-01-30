@@ -212,13 +212,6 @@ class AsyncComm(ABC):
                     failures = 0  # Reset failure counter on success
                     await self._cache[child_id].put(msg)
                     
-                    if self._profile:
-                        self._profile_info[child_id]["latency"].append(
-                            (datetime.now() - msg.timestamp).total_seconds()
-                        )
-                        self._profile_info[child_id]["datasize"].append(0.0)
-                        self._profile_info[child_id]["type"].append(type(msg).__name__)
-                    
                     self.logger.debug(f"Cached message from child {child_id}: {type(msg).__name__}")
                     
             except asyncio.CancelledError:

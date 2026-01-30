@@ -22,7 +22,6 @@ from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from .utils import async_load_str, async_simple_load_str
 from dataclasses import asdict
-import threading
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -167,8 +166,6 @@ class AsyncMaster(Node):
             self._event_registry = get_registry()
             self._event_registry.enable()
             os.environ["EL_ENABLE_PROFILING"] = "1"
-
-        self._lock = threading.RLock()  # Protect _done_children
 
         # Store event loop for thread-safe event signaling from callbacks
         self._event_loop = asyncio.get_event_loop()
@@ -369,30 +366,32 @@ class AsyncMaster(Node):
     def create_an_event_loop(self):
         """This function is an entry point for the new process"""
         asyncio.run(self.run())
+    
+    def _mark_all_children_done(self):
+        """Mark all children as done (runs in event loop)."""
+        self._done_children = set(self.children.keys())
+        self._all_children_done_event.set()
+    
+    def _mark_child_done(self, child_id: str):
+        """Mark a single child as done (runs in event loop)."""
+        self._done_children.add(child_id)
+        if len(self._done_children) == len(self.children):
+            self._all_children_done_event.set()
 
     def create_done_callback(self, child_id: str):
         if child_id == "all":
             def _done_callback(future: ConcurrentFuture):
-                with self._lock:
-                    self._done_children = set(self.children.keys())
                 if self._event_loop is not None:
-                    self._event_loop.call_soon_threadsafe(self._all_children_done_event.set)
+                    self._event_loop.call_soon_threadsafe(self._mark_all_children_done)
                 else:
-                    self.logger.warning("No event loop stored, setting event directly (may not work!)")
-                    self._all_children_done_event.set()
+                    self.logger.warning("No event loop stored, can't mark children done!")
             return _done_callback
         else:
             def _done_callback(future: AsyncFuture):
-                with self._lock:
-                    self._done_children.add(child_id)
-                    all_done = len(self._done_children) == len(self.children)
-                
-                if all_done:
-                    if self._event_loop is not None:
-                        self._event_loop.call_soon_threadsafe(self._all_children_done_event.set)
-                    else:
-                        self.logger.warning("No event loop stored, setting event directly (may not work!)")
-                        self._all_children_done_event.set()
+                if self._event_loop is not None:
+                    self._event_loop.call_soon_threadsafe(self._mark_child_done, child_id)
+                else:
+                    self.logger.warning("No event loop stored, can't mark child done!")
             return _done_callback
 
     async def _get_child_exceptions(self) -> Result:
