@@ -2,8 +2,11 @@ import json
 import os
 import numpy as np
 import enum
-from typing import Optional, Union, Callable, Tuple, Dict, List, Any
+from typing import Optional, Union, Callable, Tuple, Dict, List, Any, TYPE_CHECKING
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from ensemble_launcher.scheduler.resource import JobResource
 
 
 class TaskStatus(enum.Enum):
@@ -32,6 +35,26 @@ class Task(BaseModel):
     start_time: Any = None
     end_time: Any = None
     
+    def get_resource_requirements(self) -> 'JobResource':
+        """Build JobResource requirements from this Task."""
+        from ensemble_launcher.scheduler.resource import JobResource, NodeResourceCount, NodeResourceList
+        
+        req = JobResource(
+            resources=[NodeResourceCount(ncpus=self.ppn, ngpus=self.ngpus_per_process*self.ppn) for i in range(self.nnodes)]
+        )
+        if len(self.cpu_affinity) > 0 or len(self.gpu_affinity) > 0:
+            if self.cpu_affinity and (self.ngpus_per_process > 0 and not self.gpu_affinity):
+                # Ignore cpu_affinity if gpu_affinity is not set
+                return req
+            
+            if self.gpu_affinity and not self.cpu_affinity:
+                # Ignore gpu_affinity if cpu_affinity is not set
+                return req
+            
+            req = JobResource(
+                resources=[NodeResourceList(cpus=tuple(self.cpu_affinity), gpus=tuple(self.gpu_affinity)) for node in range(self.nnodes)]
+            )
+        return req
 
 class TaskFactory:
     """A stateless generator of tasks from the ensemble json file"""

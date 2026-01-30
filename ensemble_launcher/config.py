@@ -29,6 +29,7 @@ class LauncherConfig(BaseModel):
     log_level: int = logging.INFO
     use_mpi_ppn: bool = True ##If True, use -ppn flag when launching MPI jobs
     worker_scheduler_policy: str = "greedy_worker_policy" ##Policy to use for worker scheduler
+    enable_dynamic_task_updates: bool = False ##If True, master will listen for task requests from worker children
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

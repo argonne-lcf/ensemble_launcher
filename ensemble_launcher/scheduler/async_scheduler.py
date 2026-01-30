@@ -135,25 +135,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._event_registry: Optional[EventRegistry] = None
         if os.environ.get("EL_ENABLE_PROFILING","0") == "1":
             self._event_registry = get_registry()
-            
-    
-    def _buld_task_resource_req(self, task: Task) -> JobResource:
-        req = JobResource(
-                resources=[NodeResourceCount(ncpus=task.ppn,ngpus=task.ngpus_per_process*task.ppn) for i in range(task.nnodes)]
-            )
-        if len(task.cpu_affinity) > 0 or len(task.gpu_affinity) > 0:
-            if task.cpu_affinity and (task.ngpus_per_process > 0 and not task.gpu_affinity):
-                self.logger.warning(f"Task {task.task_id}: Ignoring cpu_affinity as gpu_affinity is not set")
-                return req
-            
-            if task.gpu_affinity and not task.cpu_affinity:
-                self.logger.warning(f"Task {task.task_id}: Ignoring gpu_affinitiy as cpu_affinity is not set")
-                return req
-            
-            req = JobResource(
-                resources=[NodeResourceList(cpus=task.cpu_affinity, gpus=task.gpu_affinity) for node in range(task.nnodes)]
-            )
-        return req
 
     def _find_min_resource_req(self) -> JobResource:
         """
@@ -199,10 +180,36 @@ class AsyncTaskScheduler(AsyncScheduler):
                 if self._stop_monitoring.is_set():
                     break
 
-                #interrupt sleep to allow other coroutines to when no tasks are available
+                # Wait for tasks if queue is empty
                 if self._sorted_tasks.empty():
-                    self.logger.info("No tasks to schedule, resource monitor quitting")
-                    self._stop_monitoring.set()
+                    self.logger.info("No tasks available, waiting for new tasks")
+                    # Wait for either a task to be added or stop signal
+                    wait_task = asyncio.create_task(self._sorted_tasks.get())
+                    stop_task = asyncio.create_task(self._stop_monitoring.wait())
+                    
+                    done, pending = await asyncio.wait(
+                        [wait_task, stop_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    # Cancel pending tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Check which completed
+                    if stop_task in done:
+                        self.logger.info("Stop signal received while waiting for tasks")
+                        break
+                    
+                    # Put the task back
+                    if wait_task in done:
+                        priority, task_id = await wait_task
+                        self._sorted_tasks.put_nowait((priority, task_id))
+                        self.logger.info("New tasks available, resuming scheduling")
                 
                 unallocated_tasks = []
                 allocated_count = 0
@@ -223,7 +230,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                         continue
                     task = self.tasks[task_id]
                     
-                    req = self._buld_task_resource_req(task)
+                    req = task.get_resource_requirements()
                     
                     allocated, resource = self.cluster.allocate(req)
                     

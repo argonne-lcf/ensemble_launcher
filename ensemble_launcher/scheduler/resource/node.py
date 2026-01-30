@@ -317,3 +317,34 @@ class JobResource:
         nodes = list(resource_dict.keys())
         resources = list(resource_dict.values())
         return cls(resources=resources, nodes=nodes)
+    
+    def __contains__(self, other) -> bool:
+        """Check if another JobResource can be satisfied by this JobResource.
+        
+        Args:
+            other: Another JobResource to check
+            
+        Returns:
+            True if this JobResource can satisfy the other's requirements
+        """
+        if not isinstance(other, JobResource):
+            return False
+        
+        # If other requires more nodes than we have, it can't be contained
+        if len(other.resources) > len(self.resources):
+            return False
+        
+        # Try to match each required resource with an available resource
+        available = list(self.resources)
+        for required in other.resources:
+            # Find a resource that can satisfy this requirement
+            found = False
+            for i, avail in enumerate(available):
+                if required in avail:
+                    available.pop(i)
+                    found = True
+                    break
+            if not found:
+                return False
+        
+        return True

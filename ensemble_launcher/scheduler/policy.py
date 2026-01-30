@@ -147,6 +147,10 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
             nodes: JobResource containing available nodes and their resources
             level: Current level in the hierarchy
         """
+        if len(tasks) == 0:
+            self.logger.error("Greedy worker policy needs tasks")
+            raise ValueError("Needs Tasks for creating workers") 
+        
         nlevels = self.nlevels
         
         # Extract node names and resources from JobResource

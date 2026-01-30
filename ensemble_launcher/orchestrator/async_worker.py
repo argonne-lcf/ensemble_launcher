@@ -24,6 +24,8 @@ import uuid
 class AsyncWorker(Node):
     """Synchronous worker implementation - all operations in main loop"""
     
+    type = "AsyncWorker"
+    
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
@@ -236,6 +238,15 @@ class AsyncWorker(Node):
             except Exception as e:
                 self.logger.error(f"Error in task submission loop: {e}", exc_info=True)
                 raise e
+    
+    async def _receive_initial_tasks(self):
+        """Receive initial task assignment. Can be overridden by subclasses."""
+        task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate, timeout=10.0)
+        if task_update is not None:
+            self.logger.info(f"{self.node_id}: Received task update from parent")
+            self._update_tasks(task_update)
+        else:
+            self.logger.warning(f"{self.node_id}: No task update received from parent at start")
 
     async def report_status(self):
         while not self._stop_reporting.is_set():
@@ -257,6 +268,10 @@ class AsyncWorker(Node):
             except Exception as e:
                 self.logger.info(f"Reporting loop failed with error {e}")
                 await asyncio.sleep(0.1)
+    
+    async def _wait_for_stop_condition(self):
+        """Wait for completion condition. Can be overridden by subclasses."""
+        await self._scheduler.wait_for_completion()
 
     async def run(self) -> Result:
         async with self._timer("init"):
@@ -299,12 +314,7 @@ class AsyncWorker(Node):
         self._executor: Union[AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor] = \
             executor_registry.create_executor(self._config.task_executor_name, kwargs=kwargs)
 
-        task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate, timeout=10.0)
-        if task_update is not None:
-            self.logger.info(f"{self.node_id}: Received task update from parent")
-            self._update_tasks(task_update)
-        else:
-            self.logger.warning(f"{self.node_id}: No task update received from parent at start")
+        await self._receive_initial_tasks()
         
         self.logger.info(f"Running {list(self._tasks.keys())} tasks")
         self.logger.debug(f"Sorted tasks sizeL {self._scheduler._sorted_tasks.qsize()}")
@@ -330,8 +340,8 @@ class AsyncWorker(Node):
         ##start reporting loop
         self._reporting_task = asyncio.create_task(self.report_status())
 
-        self.logger.info("Started waiting for scheduler monitoring loop to complete")
-        await self._scheduler.wait_for_completion()
+        self.logger.info("Started waiting for stop condition")
+        await self._wait_for_stop_condition()
 
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()
@@ -421,7 +431,7 @@ class AsyncWorker(Node):
     
     def asdict(self,include_tasks:bool = False) -> dict:
         obj_dict = {
-            "type": "AsyncWorker",
+            "type": self.type,
             "node_id": self.node_id,
             "config": self._config.model_dump_json(),
             "parent": asdict(self.parent) if self.parent else None,

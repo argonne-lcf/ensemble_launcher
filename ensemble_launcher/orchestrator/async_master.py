@@ -26,6 +26,9 @@ from dataclasses import asdict
 # self.logger = logging.getself.logger(__name__)
 
 class AsyncMaster(Node):
+    
+    type = "AsyncMaster"
+    
     def __init__(self,
                 id:str,
                 config:LauncherConfig,
@@ -146,13 +149,16 @@ class AsyncMaster(Node):
                         parent=None
                     )
         else:
-            #create a master again
+            #create a master again - use work-stealing master if dynamic task updates enabled
+            from .async_workstealing_master import AsyncWorkStealingMaster
+            MasterClass = AsyncWorkStealingMaster if self._config.enable_dynamic_task_updates else AsyncMaster
+            
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
                 self._child_assignment[child_id] = alloc
                 #create a worker
                 children[child_id] = \
-                    AsyncMaster(
+                    MasterClass(
                         child_id,
                         config=self._config,
                         Nodes=alloc["job_resource"],
@@ -250,115 +256,123 @@ class AsyncMaster(Node):
 
         return children
 
+    async def _launch_children(self, children: Dict[str, Node]):
+        """Launch all children processes."""
+        if self._config.child_executor_name == "async_mpi":
+            first_headnode = next(iter(children.values())).nodes.resources[0]
+            worker_equality = all([child.nodes.resources[0] == first_headnode for child in children.values()])
+            if not self._config.sequential_child_launch and worker_equality:
+                ##launch all children in a single shot
+                child_head_nodes = []
+                child_resources = []
+                child_obj_dict = {}
+                
+                for child_name, child_obj in children.items():
+                    head_node = child_obj.nodes.nodes[0]
+                    child_head_nodes.append(head_node)
+                    child_resources.append(NodeResourceCount(ncpus=1))
+                    child_obj_dict[head_node] = child_obj
+                
+                # Build combined dictionary structure
+                common_keys = ["type", "config", "parent", "parent_comm"]
+                first_child = next(iter(child_obj_dict.values()))
+                first_dict = first_child.asdict()
+                
+                # Initialize with common keys from first child
+                final_dict = {key: first_dict[key] for key in common_keys}
+                
+                # Initialize per-host keys as empty dicts
+                for key in first_dict.keys():
+                    if key not in common_keys:
+                        final_dict[key] = {}
+                
+                # Populate per-host values
+                for hostname, child_obj in child_obj_dict.items():
+                    child_dict = child_obj.asdict()
+                    for key, value in child_dict.items():
+                        if key not in common_keys:
+                            final_dict[key][hostname] = value
+                
+                # Create embedded command string
+                json_str = json.dumps(final_dict, default=str)
+                json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                common_keys_str = ','.join(common_keys)
+                load_str_embed = async_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+                load_str_embed = load_str_embed.replace("common_keys_str", f"'{common_keys_str}'")
+                
+                req = JobResource(resources=child_resources, nodes=child_head_nodes)
+                env = os.environ.copy()
+                
+                self.logger.info(f"Launching worker using one shot mpiexec")
+                future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
+                future.add_done_callback(self.create_done_callback("all"))
+                self._children_futures["all"] = future
+            else:
+                ##launch children sequentially one by one
+                for child_idx, (child_name, child_obj) in enumerate(children.items()):
+                    child_nodes = child_obj.nodes
+                    head_node = child_nodes.nodes[0]
+                    
+                    # Serialize child object
+                    child_dict = child_obj.asdict()
+                    json_str = json.dumps(child_dict, default=str)
+                    json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                    
+                    # Create embedded command string for this child (simple version, no per-host logic)
+                    load_str_embed = async_simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+                    
+                    req = JobResource(
+                            resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
+                        )
+                    env = os.environ.copy()
+                    env["EL_CHILDID"] = str(child_idx)
+                    
+                    self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
+                    future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
+                    future.add_done_callback(self.create_done_callback(child_name))
+                    self._children_futures[child_name] = future
+        else:
+            for child_idx, (child_name,child_obj) in enumerate(children.items()):
+                child_nodes = child_obj.nodes.nodes
+                req = JobResource(
+                        resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)], nodes=child_nodes[:1]
+                    )
+                env = os.environ.copy()
+                
+                env["EL_CHILDID"] = str(child_idx)
+
+                future = self._executor.submit(req, child_obj.create_an_event_loop, env = env)
+                future.add_done_callback(self.create_done_callback(child_name))
+                self._children_futures[child_name] = future
+    
+    async def _sync_with_children(self):
+        """Sync with children and send initial node/task updates."""
+        for child_id in self.children:
+            if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
+                self.logger.error(f"Failed to sync heartbeat with child {child_id}")
+                return await self._get_child_exceptions()
+            
+            # Send node update first
+            child_nodes = self._child_assignment[child_id]["job_resource"]
+            node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
+            await self._comm.send_message_to_child(child_id, node_update)
+            self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
+            
+            # Then send task update
+            new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
+            task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+            await self._comm.send_message_to_child(child_id, task_update)
+            self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
+    
     async def run(self):
         async with self._timer("init"):
             children = await self._lazy_init()
         
         async with self._timer("launch_children"):
-            if self._config.child_executor_name == "async_mpi":
-                first_headnode = next(iter(children.values())).nodes.resources[0]
-                worker_equality = all([child.nodes.resources[0] == first_headnode for child in children.values()])
-                if not self._config.sequential_child_launch and worker_equality:
-                    ##launch all children in a single shot
-                    child_head_nodes = []
-                    child_resources = []
-                    child_obj_dict = {}
-                    
-                    for child_name, child_obj in children.items():
-                        head_node = child_obj.nodes.nodes[0]
-                        child_head_nodes.append(head_node)
-                        child_resources.append(NodeResourceCount(ncpus=1))
-                        child_obj_dict[head_node] = child_obj
-                    
-                    # Build combined dictionary structure
-                    common_keys = ["type", "config", "parent", "parent_comm"]
-                    first_child = next(iter(child_obj_dict.values()))
-                    first_dict = first_child.asdict()
-                    
-                    # Initialize with common keys from first child
-                    final_dict = {key: first_dict[key] for key in common_keys}
-                    
-                    # Initialize per-host keys as empty dicts
-                    for key in first_dict.keys():
-                        if key not in common_keys:
-                            final_dict[key] = {}
-                    
-                    # Populate per-host values
-                    for hostname, child_obj in child_obj_dict.items():
-                        child_dict = child_obj.asdict()
-                        for key, value in child_dict.items():
-                            if key not in common_keys:
-                                final_dict[key][hostname] = value
-                    
-                    # Create embedded command string
-                    json_str = json.dumps(final_dict, default=str)
-                    json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-                    common_keys_str = ','.join(common_keys)
-                    load_str_embed = async_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
-                    load_str_embed = load_str_embed.replace("common_keys_str", f"'{common_keys_str}'")
-                    
-                    req = JobResource(resources=child_resources, nodes=child_head_nodes)
-                    env = os.environ.copy()
-                    
-                    self.logger.info(f"Launching worker using one shot mpiexec")
-                    future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
-                    future.add_done_callback(self.create_done_callback("all"))
-                    self._children_futures["all"] = future
-                else:
-                    ##launch children sequentially one by one
-                    for child_idx, (child_name, child_obj) in enumerate(children.items()):
-                        child_nodes = child_obj.nodes
-                        head_node = child_nodes.nodes[0]
-                        
-                        # Serialize child object
-                        child_dict = child_obj.asdict()
-                        json_str = json.dumps(child_dict, default=str)
-                        json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-                        
-                        # Create embedded command string for this child (simple version, no per-host logic)
-                        load_str_embed = async_simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
-                        
-                        req = JobResource(
-                                resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
-                            )
-                        env = os.environ.copy()
-                        env["EL_CHILDID"] = str(child_idx)
-                        
-                        self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
-                        future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
-                        future.add_done_callback(self.create_done_callback(child_name))
-                        self._children_futures[child_name] = future
-            else:
-                for child_idx, (child_name,child_obj) in enumerate(children.items()):
-                    child_nodes = child_obj.nodes.nodes
-                    req = JobResource(
-                            resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)], nodes=child_nodes[:1]
-                        )
-                    env = os.environ.copy()
-                    
-                    env["EL_CHILDID"] = str(child_idx)
-
-                    future = self._executor.submit(req, child_obj.create_an_event_loop, env = env)
-                    future.add_done_callback(self.create_done_callback(child_name))
-                    self._children_futures[child_name] = future
+            await self._launch_children(children)
 
         async with self._timer("sync_with_children"):
-            for child_id in self.children:
-                if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
-                    self.logger.error(f"Failed to sync heartbeat with child {child_id}")
-                    return await self._get_child_exceptions()
-                
-                # Send node update first
-                child_nodes = self._child_assignment[child_id]["job_resource"]
-                node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
-                await self._comm.send_message_to_child(child_id, node_update)
-                self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
-                
-                # Then send task update
-                new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
-                task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
-                await self._comm.send_message_to_child(child_id, task_update)
-                self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
+            await self._sync_with_children()
             
             asyncio.create_task(self.report_status())
             return await self._results() #should return and report
@@ -584,7 +598,7 @@ class AsyncMaster(Node):
     
     def asdict(self,include_tasks:bool = False) -> dict:
         obj_dict = {
-            "type": "AsyncMaster",
+            "type": self.type,
             "node_id": self.node_id,
             "config": self._config.model_dump_json(),
             "parent": asdict(self.parent) if self.parent else None,

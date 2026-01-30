@@ -122,31 +122,13 @@ class TaskScheduler(Scheduler):
             self.scheduler_policy: Policy = policy
         self.sorted_tasks: List[str] = sorted(list(self.tasks.keys()), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
         self.logger.debug(f"Sorted tasks {self.sorted_tasks}")
-    
-    def _buld_task_resource_req(self, task: Task) -> JobResource:
-        req = JobResource(
-                resources=[NodeResourceCount(ncpus=task.ppn,ngpus=task.ngpus_per_process*task.ppn) for i in range(task.nnodes)]
-            )
-        if len(task.cpu_affinity) > 0 or len(task.gpu_affinity) > 0:
-            if task.cpu_affinity and (task.ngpus_per_process > 0 and not task.gpu_affinity):
-                self.logger.warning(f"Task {task.task_id}: Ignoring cpu_affinity as gpu_affinity is not set")
-                return req
-            
-            if task.gpu_affinity and not task.cpu_affinity:
-                self.logger.warning(f"Task {task.task_id}: Ignoring gpu_affinitiy as cpu_affinity is not set")
-                return req
-            
-            req = JobResource(
-                resources=[NodeResourceList(cpus=task.cpu_affinity, gpus=task.gpu_affinity) for node in range(task.nnodes)]
-            )
-        return req
 
     def get_ready_tasks(self) -> Dict[str, JobResource]:
         with self._lock:
             ready_tasks = {}
             for task_id in self.sorted_tasks:
                 task = self.tasks[task_id]
-                req = self._buld_task_resource_req(task)
+                req = task.get_resource_requirements()
                 allocated, resource = self.cluster.allocate(req)
                 if allocated:
                     if task.task_id in self._running_tasks:
