@@ -5,7 +5,7 @@ from .ensemble import TaskFactory, Task
 from .config import SystemConfig, LauncherConfig
 from .helper_functions import get_nodes
 from ensemble_launcher.scheduler.resource import NodeResourceCount, NodeResourceList, JobResource
-from ensemble_launcher.orchestrator import Master, Worker, AsyncMaster, AsyncWorker
+from ensemble_launcher.orchestrator import Master, Worker, AsyncMaster, AsyncWorker, AsyncWorkStealingMaster
 import asyncio
 import copy
 
@@ -128,6 +128,9 @@ class EnsembleLauncher:
                 return AsyncWorker(*launcher_args)
             else:
                 return Worker(*launcher_args)
+        elif self.launcher_config.nlevels == 1 and self.launcher_config.enable_workstealing:
+            logger.info("!!!!!!Using workstealing!!!!!!")
+            return AsyncWorkStealingMaster(*launcher_args)
         else:
             if self.async_orchestrator:
                 return AsyncMaster(*launcher_args)

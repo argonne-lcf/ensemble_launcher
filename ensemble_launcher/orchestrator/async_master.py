@@ -151,7 +151,7 @@ class AsyncMaster(Node):
         else:
             #create a master again - use work-stealing master if dynamic task updates enabled
             from .async_workstealing_master import AsyncWorkStealingMaster
-            MasterClass = AsyncWorkStealingMaster if self._config.enable_dynamic_task_updates else AsyncMaster
+            MasterClass = AsyncWorkStealingMaster if self._config.enable_workstealing else AsyncMaster
             
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
