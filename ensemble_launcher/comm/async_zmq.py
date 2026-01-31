@@ -111,38 +111,57 @@ class AsyncZMQComm(AsyncComm):
         
     async def _monitor_parent_socket(self) -> None:
         """
-        Monitor the parent dealer socket for incoming messages and cache them.
+        Monitor the parent dealer socket for incoming messages and cache them directly to _cache.
         """
+        from .messages import Message
         await self._init_router_cache()
-        # Check ZMQ-specific FIFO cache first for raw data
         parent_id = self._node_info.parent_id
         failures = 0
         while not self._stop_event.is_set():
             try:
                 raw_data = await self.dealer_socket.recv()
-                self._router_cache[parent_id].put_nowait(cloudpickle.loads(raw_data))
-                self.logger.debug(f"{self._node_info.node_id}: Cached raw data from parent.")
+                msg = cloudpickle.loads(raw_data)
+                
+                # Push to _cache if it's a Message object
+                if isinstance(msg, Message):
+                    failures = 0  # Reset on success
+                    self._cache[parent_id].put_nowait(msg)
+                    self.logger.debug(f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}")
+                else:
+                    # Still cache raw data for non-Message types
+                    self._router_cache[parent_id].put_nowait(msg)
+                    self.logger.debug(f"{self._node_info.node_id}: Cached raw data from parent.")
             except Exception as e:
                 failures += 1
                 self.logger.warning(f"{self._node_info.node_id}: Error caching data from parent failed {failures} times: {e}")
-                await asyncio.sleep(0.1)  # Avoid busy waiting
+                await asyncio.sleep(0.01)  # Backoff after repeated failures
 
     async def _monitor_child_sockets(self) -> None:
         """
-        Monitor the child router sockets for incoming messages and cache them.
+        Monitor the child router sockets for incoming messages and cache them directly to _cache.
         """
+        from .messages import Message
         await self._init_router_cache()
         failures = 0
         while not self._stop_event.is_set():
             try:
                 raw_data = await self.router_socket.recv_multipart()
                 sender_id = raw_data[0].decode()  # Convert bytes to string for child_id
-                data = cloudpickle.loads(raw_data[1])  # Unpickle the raw data
-                self._router_cache[sender_id].put_nowait(data)
+                msg = cloudpickle.loads(raw_data[1])  # Unpickle the raw data
+                
+                # Push to _cache if it's a Message object
+                if isinstance(msg, Message):
+                    failures = 0  # Reset on success
+                    self._cache[sender_id].put_nowait(msg)
+                    self.logger.debug(f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}")
+                else:
+                    # Still cache raw data for non-Message types
+                    self._router_cache[sender_id].put_nowait(msg)
+                    self.logger.debug(f"{self._node_info.node_id}: Cached raw data from child {sender_id}.")
             except Exception as e:
                 failures += 1
                 self.logger.warning(f"{self._node_info.node_id}: Error caching data from child failed {failures} times: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)  # Backoff after repeated failures
             
 
     async def _send_to_parent(self, data: Any) -> bool:

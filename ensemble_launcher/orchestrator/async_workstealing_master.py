@@ -5,6 +5,7 @@ from ensemble_launcher.ensemble import Task
 from typing import Optional, List, Dict
 import asyncio
 from .async_master import AsyncMaster
+from ensemble_launcher.scheduler.resource import NodeResourceList, NodeResourceCount
 
 class AsyncWorkStealingMaster(AsyncMaster):
     """
@@ -49,6 +50,17 @@ class AsyncWorkStealingMaster(AsyncMaster):
             
             # Create children without task assignments (resources only)
             assignments, remove_tasks = self._scheduler.assign({}, self.level)  # Pass empty task dict
+
+            ##since this master does a lot of work, overlaoding cpus can cause much higher task request latency
+            ##remove the first cpu from the first node of first child
+            first_child_job_resource = assignments[0]["job_resource"]
+            first_node = first_child_job_resource.resources[0]
+            if isinstance(first_node, NodeResourceList):
+                new_first_node = NodeResourceList(cpus=first_node.cpus[1:],gpus=first_node.gpus)
+            else:
+                new_first_node = NodeResourceCount(ncpus=first_node.cpu_count - 1, ngpus=first_node.gpu_count)
+            first_child_job_resource.resources[0] = new_first_node
+
             if len(remove_tasks) > 0:
                 self.logger.warning(f"Removed tasks due to resource constraints: {remove_tasks}")
             
@@ -179,7 +191,12 @@ class AsyncWorkStealingMaster(AsyncMaster):
             children = await self._lazy_init()
         
         self.logger.info(f"I am workstealing master")
-        
+
+        # Start task request monitor if children are workers
+        if self.level + 1 == self._config.nlevels:
+            asyncio.create_task(self.monitor_task_requests())
+            self.logger.info(f"{self.node_id}: Started task request monitor")
+
         async with self._timer("launch_children"):
             await self._launch_children(children)
 
@@ -187,11 +204,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
             await self._sync_with_children()
             
             asyncio.create_task(self.report_status())
-            
-            # Start task request monitor if children are workers
-            if self.level + 1 == self._config.nlevels:
-                asyncio.create_task(self.monitor_task_requests())
-                self.logger.info(f"{self.node_id}: Started task request monitor")
+
             
             return await self._results()
     

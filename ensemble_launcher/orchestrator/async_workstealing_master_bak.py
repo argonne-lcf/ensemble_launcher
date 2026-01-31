@@ -200,7 +200,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         async with self._timer("sync_with_children"):
             await self._sync_with_children()
             
-            asyncio.create_task(self.report_status())
+            # asyncio.create_task(self.report_status())
             
             # Start task request monitor if enabled and children are workers
             if self._config.enable_dynamic_task_updates and (self.level + 1 == self._config.nlevels):

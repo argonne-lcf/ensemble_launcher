@@ -182,6 +182,7 @@ class AsyncMaster(Node):
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
+        self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}")
         self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), 
                                                 self.nodes, 
                                                 self._config)
@@ -233,6 +234,7 @@ class AsyncMaster(Node):
         kwargs["logger"] = self.logger.getChild('executor')
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         if self._config.child_executor_name == "async_mpi":
+            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
             kwargs["use_ppn"] = self._config.use_mpi_ppn
 
         #create executor
@@ -304,7 +306,18 @@ class AsyncMaster(Node):
                 env = os.environ.copy()
                 
                 self.logger.info(f"Launching worker using one shot mpiexec")
-                future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
+                ##get mpi kwargs
+                if isinstance(first_child.nodes.resources[0],NodeResourceList):
+                    cpus = ":".join(map(str,first_child.nodes.resources[0].cpus))
+                else:
+                    cpus = ":".join(map(str,list(range(first_child.nodes.resources[0].cpu_count))))
+                if self._config.cpu_binding_option == "--cpu-bind":
+                    mpi_kwargs={self._config.cpu_binding_option: f"list:{cpus}"}
+                else:
+                    mpi_kwargs = {}
+                    self.logger.warning(f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning.")
+
+                future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
                 future.add_done_callback(self.create_done_callback("all"))
                 self._children_futures["all"] = future
             else:
@@ -327,8 +340,21 @@ class AsyncMaster(Node):
                     env = os.environ.copy()
                     env["EL_CHILDID"] = str(child_idx)
                     
+                    ##get mpi kwargs
+                    if isinstance(child_obj.nodes.resources[0],NodeResourceList):
+                        cpus = ":".join(map(str,child_obj.nodes.resources[0].cpus))
+                    else:
+                        cpus = ":".join(map(str,list(range(child_obj.nodes.resources[0].cpu_count))))
+                    if self._config.cpu_binding_option == "--cpu-bind":
+                        mpi_kwargs={self._config.cpu_binding_option: f"list:{cpus}"}
+                        self.logger.info(f"Setting cpu affinity to child:{mpi_kwargs}")
+                    else:
+                        mpi_kwargs = {}
+                        self.logger.warning(f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning.")
+
+
                     self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
-                    future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env)
+                    future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
                     future.add_done_callback(self.create_done_callback(child_name))
                     self._children_futures[child_name] = future
         else:

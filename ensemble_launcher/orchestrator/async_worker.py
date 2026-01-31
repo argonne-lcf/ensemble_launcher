@@ -161,6 +161,7 @@ class AsyncWorker(Node):
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
         
+        self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}")
         ##init scheduler
         self._scheduler = AsyncTaskScheduler(self.logger.getChild('scheduler'), self._tasks, self.nodes)
         
@@ -306,6 +307,7 @@ class AsyncWorker(Node):
         kwargs["logger"] = self.logger.getChild('executor')
         kwargs["gpu_selector"] = self._config.gpu_selector
         if self._config.task_executor_name == "async_mpi":
+            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
             kwargs["use_ppn"] = self._config.use_mpi_ppn
             kwargs["return_stdout"] = self._config.return_stdout
         elif self._config.task_executor_name == "async_processpool":

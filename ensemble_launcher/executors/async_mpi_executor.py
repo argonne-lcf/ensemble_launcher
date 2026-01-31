@@ -32,6 +32,7 @@ class AsyncMPIExecutor(Executor):
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
         self.use_ppn = use_ppn
+        self._cpu_binding_option = kwargs.get("cpu_binding_option","--cpu-bind")
         os.makedirs(self.tmp_dir,exist_ok=True)
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
@@ -76,8 +77,12 @@ class AsyncMPIExecutor(Executor):
                 ##TODO: implement host file option
                 self.logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
                 cores = ":".join(map(str, job_resource.resources[0].cpus))
-            launcher_cmd.append("--cpu-bind")
-            launcher_cmd.append(f"list:{cores}")
+            #TODO: Add bind to for openmpi
+            if self._bind_to_core_option == "--cpu-bind":
+                launcher_cmd.append("--cpu-bind")
+                launcher_cmd.append(f"list:{cores}")
+            else:
+                self.logger.warning(f"Unknown bind to core option {self._bind_to_core_option}. Not setting affinity")
         
             if ngpus_per_process > 0:
                 ##defaults to Aurora (Level zero)
