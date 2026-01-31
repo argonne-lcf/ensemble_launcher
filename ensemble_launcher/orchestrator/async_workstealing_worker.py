@@ -32,6 +32,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
         
         super().__init__(id,config,Nodes,tasks,parent,children,parent_comm)
         self._stop_signal_received = asyncio.Event()
+        self._task_request_in_progress = asyncio.Event()
     
     async def _receive_initial_tasks(self):
         """Override to send initial task request instead of waiting for TaskUpdate."""
@@ -63,7 +64,14 @@ class AsyncWorkStealingWorker(AsyncWorker):
         Request tasks from master when local queue is empty.
         Called from task completion callback.
         """
+        # Early check without setting the flag
+        if self._task_request_in_progress.is_set():
+            self.logger.debug(f"Task request is already in progress. Not sending a new one")
+            return
+        
         try:
+            self._task_request_in_progress.set()
+            
             # Calculate how many tasks to request based on available resources
             ntasks = self.nodes.resources[0].cpu_count * len(self.nodes.nodes)
             
@@ -109,4 +117,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
         
         except Exception as e:
             self.logger.error(f"Error requesting tasks from master: {e}", exc_info=True)
+        finally:
+            # Always clear the flag to prevent deadlock
+            self._task_request_in_progress.clear()
     

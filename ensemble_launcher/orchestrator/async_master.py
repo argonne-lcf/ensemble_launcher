@@ -221,7 +221,7 @@ class AsyncMaster(Node):
 
         task_update: TaskUpdate = await self._comm.recv_message_from_parent(TaskUpdate,timeout=5.0)
         if task_update is not None:
-            self.logger.info(f"{self.node_id}: Received task update from parent")
+            self.logger.info(f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}")
             for task in task_update.added_tasks:
                 self._tasks[task.task_id] = task
         

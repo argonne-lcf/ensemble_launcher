@@ -30,6 +30,14 @@ class AsyncMessageRoutingQueue:
             self.logger.debug(f"Created new queue for message type: {msg_type.__name__}")
         await self._queues[msg_type].put(message)
     
+    def put_nowait(self, message: Message):
+        """Put a message into the appropriate type-specific queue"""
+        msg_type = type(message)
+        if msg_type not in self._queues:
+            self._queues[msg_type] = Queue()
+            self.logger.debug(f"Created new queue for message type: {msg_type.__name__}")
+        self._queues[msg_type].put_nowait(message)
+        
     async def get(self, msg_type: Type[Message], timeout: Optional[float] = None) -> Optional[Message]:
         """Get the latest message of a specific type or any type if msg_type is None"""
         
@@ -185,7 +193,7 @@ class AsyncComm(ABC):
                 if msg is not None and self._node_info.parent_id is not None:
                     if isinstance(msg, Message):
                         failures = 0  # Reset on success
-                        await self._cache[self._node_info.parent_id].put(msg)
+                        self._cache[self._node_info.parent_id].put_nowait(msg)
                         self.logger.debug(f"Cached message from parent: {type(msg).__name__}")
             except asyncio.CancelledError:
                 self.logger.info("Parent monitor cancelled.")
@@ -210,7 +218,7 @@ class AsyncComm(ABC):
                 
                 if msg is not None and isinstance(msg, Message):
                     failures = 0  # Reset failure counter on success
-                    await self._cache[child_id].put(msg)
+                    self._cache[child_id].put_nowait(msg)
                     
                     self.logger.debug(f"Cached message from child {child_id}: {type(msg).__name__}")
                     

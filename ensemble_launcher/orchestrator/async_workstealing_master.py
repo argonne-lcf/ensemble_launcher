@@ -178,6 +178,8 @@ class AsyncWorkStealingMaster(AsyncMaster):
         async with self._timer("init"):
             children = await self._lazy_init()
         
+        self.logger.info(f"I am workstealing master")
+        
         async with self._timer("launch_children"):
             await self._launch_children(children)
 
