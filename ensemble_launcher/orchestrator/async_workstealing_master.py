@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from .async_worker import AsyncWorker
 from .node import Node
 from ensemble_launcher.comm.messages import TaskUpdate, Action, ActionType, TaskRequest, ResultBatch
@@ -93,6 +95,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
             try:
                 # Blocking recv - instantly returns when message arrives
                 task_request: TaskRequest = await self._comm.recv_message_from_child(TaskRequest, child_id=child_id, block = True)
+
+                queue_time = (datetime.now() - task_request.timestamp).total_seconds()
+                self.logger.info(f"TaskRequest queue time {queue_time} seconds")
                 
                 if task_request is not None:
                     failures = 0  # Reset failure counter on success

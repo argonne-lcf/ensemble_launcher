@@ -1,6 +1,8 @@
 
 from typing import Optional, Dict
 import asyncio
+import uuid
+from datetime import datetime
 
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
@@ -78,7 +80,9 @@ class AsyncWorkStealingWorker(AsyncWorker):
             self.logger.info(f"{self.node_id}: Requesting {ntasks} tasks from master")
             
             # Send task request
-            task_request = TaskRequest(sender=self.node_id, ntasks=ntasks)
+            message_id = str(uuid.uuid4())
+            task_request = TaskRequest(sender=self.node_id, ntasks=ntasks, message_id=message_id)
+
             await self._comm.send_message_to_parent(task_request)
             
             # Wait for response - either TaskUpdate or Action(STOP), whichever comes first
@@ -107,6 +111,9 @@ class AsyncWorkStealingWorker(AsyncWorker):
                 result = await task
                 if isinstance(result, TaskUpdate):
                     self.logger.info(f"{self.node_id}: Received {len(result.added_tasks)} tasks from master")
+                    queue_time = (datetime.now() - result.timestamp).total_seconds()
+                    self.logger.info(f"TaskUpdate queue time {queue_time} seconds")
+                    self.logger.info
                     if len(result.added_tasks) > 0:
                         self._update_tasks(result)
                     else:

@@ -2,9 +2,11 @@ from typing import Dict
 import time
 import socket
 import random
+from datetime import datetime
 
 from .async_base import AsyncComm
 from .nodeinfo import NodeInfo
+from .messages import TaskRequest, TaskUpdate
 from typing import Any, Optional
 import cloudpickle
 from logging import Logger
@@ -47,6 +49,7 @@ class AsyncZMQComm(AsyncComm):
         self._router_cache = None
 
         self._stop_event = None
+        self.loop = None
         
     async def init_cache(self):
         await super().init_cache()
@@ -104,6 +107,7 @@ class AsyncZMQComm(AsyncComm):
     async def start_monitors(self,**kwargs):
         """Start background tasks to monitor ZMQ sockets."""
         await super().start_monitors(**kwargs)
+        self.loop = asyncio.get_event_loop()
         if self._node_info.parent_id is not None:
             asyncio.create_task(self._monitor_parent_socket())
         if len(self._node_info.children_ids) > 0:
@@ -120,11 +124,18 @@ class AsyncZMQComm(AsyncComm):
         while not self._stop_event.is_set():
             try:
                 raw_data = await self.dealer_socket.recv()
-                msg = cloudpickle.loads(raw_data)
+                msg = await self.loop.run_in_executor(None, cloudpickle.loads, raw_data)
                 
+                network_time = (datetime.now() - msg.timestamp).total_seconds()
+                if isinstance(msg, TaskRequest):
+                    self.logger.info(f"TaskRequest network+deserialization time {network_time} seconds")
+                elif isinstance(msg, TaskUpdate):
+                    self.logger.info(f"TaskUpdate network+deserialization time {network_time} seconds")
+
                 # Push to _cache if it's a Message object
                 if isinstance(msg, Message):
                     failures = 0  # Reset on success
+                    msg.timestamp = datetime.now()
                     self._cache[parent_id].put_nowait(msg)
                     self.logger.debug(f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}")
                 else:
@@ -147,11 +158,18 @@ class AsyncZMQComm(AsyncComm):
             try:
                 raw_data = await self.router_socket.recv_multipart()
                 sender_id = raw_data[0].decode()  # Convert bytes to string for child_id
-                msg = cloudpickle.loads(raw_data[1])  # Unpickle the raw data
+                msg = await self.loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
                 
+                network_time = (datetime.now() - msg.timestamp).total_seconds()
+                if isinstance(msg, TaskRequest):
+                    self.logger.info(f"TaskRequest network+deserialization time {network_time} seconds")
+                elif isinstance(msg, TaskUpdate):
+                    self.logger.info(f"TaskUpdate network+deserialization time {network_time} seconds")
+
                 # Push to _cache if it's a Message object
                 if isinstance(msg, Message):
                     failures = 0  # Reset on success
+                    msg.timestamp = datetime.now()
                     self._cache[sender_id].put_nowait(msg)
                     self.logger.debug(f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}")
                 else:
@@ -170,7 +188,16 @@ class AsyncZMQComm(AsyncComm):
             return False
         
         try:
-            self.dealer_socket.send(cloudpickle.dumps(data))
+            tic = time.perf_counter()
+            data_bytes = cloudpickle.dumps(data)
+            toc = time.perf_counter()
+
+            if isinstance(data, TaskRequest):
+                self.logger.info(f"TaskRequest serialization took {toc-tic} seconds")
+            elif isinstance(data, TaskUpdate):
+                self.logger.info(f"TaskUpdate serialization took {toc-tic} seconds")
+            
+            self.dealer_socket.send(data_bytes)
             self.logger.debug(f"{self._node_info.node_id}: Sent message to parent: {data}")
             return True
         except Exception as e:
@@ -200,7 +227,16 @@ class AsyncZMQComm(AsyncComm):
             raise RuntimeError(f"No connection to child {child_id}")
         
         try:
-            self.router_socket.send_multipart([f"{child_id}".encode(), cloudpickle.dumps(data)])
+            tic = time.perf_counter()
+            data_bytes = cloudpickle.dumps(data)
+            toc = time.perf_counter()
+
+            if isinstance(data, TaskRequest):
+                self.logger.info(f"TaskRequest serialization took {toc-tic} seconds")
+            elif isinstance(data, TaskUpdate):
+                self.logger.info(f"TaskUpdate serialization took {toc-tic} seconds")
+            
+            self.router_socket.send_multipart([f"{child_id}".encode(), data_bytes])
             self.logger.debug(f"{self._node_info.node_id}: Sent message to child {child_id}")
             return True
         except Exception as e:
