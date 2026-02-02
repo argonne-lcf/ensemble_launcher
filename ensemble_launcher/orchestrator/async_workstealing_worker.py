@@ -74,11 +74,12 @@ class AsyncWorkStealingWorker(AsyncWorker):
             
             # Calculate how many tasks to request based on available resources
             ntasks = self.nodes.resources[0].cpu_count * len(self.nodes.nodes)
+            free_resources = self.nodes
             
             self.logger.info(f"{self.node_id}: Requesting {ntasks} tasks from master")
             
             # Send task request
-            task_request = TaskRequest(sender=self.node_id, ntasks=ntasks)
+            task_request = TaskRequest(sender=self.node_id, ntasks=ntasks, free_resources=free_resources)
             await self._comm.send_message_to_parent(task_request)
             
             # Wait for response - either TaskUpdate or Action(STOP), whichever comes first

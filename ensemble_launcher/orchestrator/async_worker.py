@@ -19,6 +19,7 @@ import asyncio
 AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
 import uuid
+import socket
 
 
 class AsyncWorker(Node):
@@ -450,7 +451,9 @@ class AsyncWorker(Node):
     def fromdict(cls, data: dict) -> 'AsyncWorker':
         config = LauncherConfig.model_validate_json(data["config"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
+        print(socket.gethostname(),data["children"])
         children = {child_id: NodeInfo(**child_dict) for child_id, child_dict in data["children"].items()}
+        
 
         if config.comm_name == "async_zmq":
             # ZMQComm might need special handling due to non-picklable attributes

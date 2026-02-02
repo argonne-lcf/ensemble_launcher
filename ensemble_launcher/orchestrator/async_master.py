@@ -23,6 +23,7 @@ from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from .utils import async_load_str, async_simple_load_str
 from dataclasses import asdict
+import socket
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -56,8 +57,7 @@ class AsyncMaster(Node):
         self._children_status: Dict[str, Status] = {}
         self._children_results: Dict[str, Result] = {}
         self._results: Dict[str, List[ResultBatch]] = {}
-        self._running_children: Set[Tuple[str,str]] = set()  # Currently running children
-        self._composite_key_map: Dict[str, str] = {}
+        self._running_children: Set[str] = set()  # Currently running children (child_ids)
 
         self.logger = None
         
@@ -67,7 +67,6 @@ class AsyncMaster(Node):
         #asyncio event
         self._all_children_done_event = asyncio.Event()
         self._stop_reporting_event = asyncio.Event()
-        self._done_children: Set[str] = set()  # Track done instances with composite keys
         self._event_loop = None  # Will be set in run()
 
         #result and aggregate tasks
@@ -134,8 +133,8 @@ class AsyncMaster(Node):
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
-    def _create_children(self, include_tasks: bool = False) -> Dict[str, Node]:
-        assignments,remove_tasks = self._scheduler.assign(self._tasks, self.level)
+    def _create_children(self, tasks: Dict[str, Task], include_tasks: bool = False) -> Dict[str, Node]:
+        assignments,remove_tasks = self._scheduler.assign(tasks, self.level)
         if len(remove_tasks) > 0:
             self.logger.warning(f"Removed tasks due to resource constraints: {remove_tasks}")
         self._child_assignment = {}
@@ -143,16 +142,23 @@ class AsyncMaster(Node):
 
         children = {}
         if self.level + 1 == self._config.nlevels:
+            start_wid = len(self._child_assignment)
             for wid,alloc in assignments.items():
-                child_id = self.node_id+f".w{wid}"
+                child_id = self.node_id+f".w{wid  + start_wid}"
                 self._child_assignment[child_id] = alloc
+                self._child_assignment[child_id]["wid"] = wid
+                # Check if allocation specifies a custom task_executor_name
+                child_config = self._config
+                if "task_executor_name" in alloc:
+                    child_config = self._config.model_copy(update={"task_executor_name": alloc["task_executor_name"]})
+                    self.logger.info(f"{self.node_id}: Child {child_id} using task_executor_name: {alloc['task_executor_name']}")
                 #create a worker
                 children[child_id] = \
                     AsyncWorker(
                         child_id,
-                        config=self._config,
+                        config=child_config,
                         Nodes=alloc["job_resource"],
-                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
+                        tasks={task_id: tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
         else:
@@ -163,13 +169,19 @@ class AsyncMaster(Node):
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
                 self._child_assignment[child_id] = alloc
+                self._child_assignment[child_id]["wid"] = wid
+                # Check if allocation specifies a custom task_executor_name
+                child_config = self._config
+                if "task_executor_name" in alloc:
+                    child_config = self._config.model_copy(update={"task_executor_name": alloc["task_executor_name"]})
+                    self.logger.info(f"{self.node_id}: Child {child_id} using task_executor_name: {alloc['task_executor_name']}")
                 #create a worker
                 children[child_id] = \
                     MasterClass(
                         child_id,
-                        config=self._config,
+                        config=child_config,
                         Nodes=alloc["job_resource"],
-                        tasks={task_id: self._tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
+                        tasks={task_id: tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
         return children
@@ -189,7 +201,7 @@ class AsyncMaster(Node):
         tock = time.perf_counter()
         self.logger.info(f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds")
 
-        self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}")
+        self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}, my hostname: {socket.gethostname()}")
         self._scheduler = AsyncWorkerScheduler(self.logger.getChild('scheduler'), 
                                                 self.nodes, 
                                                 self._config)
@@ -249,7 +261,7 @@ class AsyncMaster(Node):
                                                                      kwargs=kwargs)
 
         ##create children
-        children = self._create_children()
+        children = self._create_children(tasks=self._tasks)
         
         self.logger.info(f"{self.node_id} Created {len(children)} children: {children.keys()}")
 
@@ -311,8 +323,10 @@ class AsyncMaster(Node):
                     child_dict = child_obj.asdict()
                     for key, value in child_dict.items():
                         if key not in common_keys:
+                            self.logger.info(f"{key} not int common keys")
                             final_dict[key][hostname] = value
                 
+                self.logger.info(f"Final dict: {final_dict}")
                 # Create embedded command string
                 json_str = json.dumps(final_dict, default=str)
                 json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
@@ -338,14 +352,11 @@ class AsyncMaster(Node):
                 future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
                 
                 # Generate one UUID for all children in this one-shot launch
-                launch_uuid = str(uuid.uuid4())
                 child_info = []
                 for child_id in children.keys():
-                    composite_key = f"{child_id}_{launch_uuid}"
-                    child_info.append((child_id, composite_key))
-                    self._children_futures[composite_key] = future
-                    self._running_children.add((child_id, composite_key))
-                    self._composite_key_map[composite_key] = child_id
+                    child_info.append(child_id)
+                    self._children_futures[child_id] = future
+                    self._running_children.add(child_id)
                 future.add_done_callback(self.create_done_callback(child_info))
             else:
                 ##launch children in parallel using gather
@@ -371,9 +382,6 @@ class AsyncMaster(Node):
             child_obj: The child Node object
             child_idx: Index of the child for environment variable setting
         """
-        # Generate a unique UUID for this launch
-        launch_uuid = str(uuid.uuid4())
-        composite_key = f"{child_name}_{launch_uuid}"
         
         if self._config.child_executor_name == "async_mpi":
             child_nodes = child_obj.nodes
@@ -407,10 +415,9 @@ class AsyncMaster(Node):
 
             self.logger.info(f"Launching child {child_name} using MPI executor")
             future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
-            future.add_done_callback(self.create_done_callback([(child_name, composite_key)]))
-            self._children_futures[composite_key] = future
-            self._running_children.add((child_name, composite_key))
-            self._composite_key_map[composite_key] = child_name
+            future.add_done_callback(self.create_done_callback([child_name]))
+            self._children_futures[child_name] = future
+            self._running_children.add(child_name)
         else:
             child_nodes = child_obj.nodes.nodes
             req = JobResource(
@@ -420,12 +427,11 @@ class AsyncMaster(Node):
             env["EL_CHILDID"] = str(child_idx)
 
             future = self._executor.submit(req, child_obj.create_an_event_loop, env=env)
-            future.add_done_callback(self.create_done_callback([(child_name, composite_key)]))
-            self._children_futures[composite_key] = future
-            self._running_children.add((child_name, composite_key))
-            self._composite_key_map[composite_key] = child_name
+            future.add_done_callback(self.create_done_callback([child_name]))
+            self._children_futures[child_name] = future
+            self._running_children.add(child_name)
     
-    async def _sync_with_child(self, child_id: str, composite_key: str, 
+    async def _sync_with_child(self, child_id: str,
                                node_update: Optional[NodeUpdate], 
                                task_update: Optional[TaskUpdate]) -> Optional[Result]:
         """
@@ -442,7 +448,7 @@ class AsyncMaster(Node):
         # Sync heartbeat with child
         if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
-            return await self._get_child_exception(child_id, composite_key)
+            return await self._get_child_exception(child_id)
         
         # Send node update first
         if node_update is not None:
@@ -469,8 +475,7 @@ class AsyncMaster(Node):
         """Sync with all children and send initial node/task updates."""
         # Prepare updates for each child
         sync_tasks = []
-        for child_id, composite_key in self._running_children:
-
+        for child_id in self._running_children:
             # Create node update
             node_update = self._build_init_node_update(child_id)
             
@@ -478,7 +483,7 @@ class AsyncMaster(Node):
             task_update = self._build_init_task_update(child_id)
             
             # Add sync task
-            sync_tasks.append(self._sync_with_child(child_id, composite_key, node_update, task_update))
+            sync_tasks.append(self._sync_with_child(child_id, node_update, task_update))
         
         # Sync with all children in parallel
         results = await asyncio.gather(*sync_tasks, return_exceptions=True)
@@ -531,32 +536,32 @@ class AsyncMaster(Node):
         """This function is an entry point for the new process"""
         asyncio.run(self.run())
     
-    def _mark_children_done(self, child_info: List[Tuple[str, str]]):
+    def _mark_children_done(self, child_ids: List[str]):
         """Mark children as done (runs in event loop).
         
         Args:
-            child_info: List of tuples (child_id, composite_key) for completed children
+            child_ids: List of child_ids for completed children
         """
-        for child_id, composite_key in child_info:
-            self._done_children.add(composite_key)
-            self._running_children.discard((child_id, composite_key))
+        for child_id in child_ids:
+            self._running_children.discard(child_id)
+            self._scheduler.free(self._child_assignment[child_id]["wid"])
         if len(self._running_children) == 0:
             self._all_children_done_event.set()
 
-    def create_done_callback(self, child_info: List[Tuple[str, str]]):
+    def create_done_callback(self, child_ids: List[str]):
         """Create callback for when child futures complete.
         
         Args:
-            child_info: List of tuples (child_id, composite_key) for the children
+            child_ids: List of child_ids for the children
         """
         def _done_callback(future: AsyncFuture):
             if self._event_loop is not None:
-                self._event_loop.call_soon_threadsafe(self._mark_children_done, child_info)
+                self._event_loop.call_soon_threadsafe(self._mark_children_done, child_ids)
             else:
                 self.logger.warning("No event loop stored, can't mark child done!")
         return _done_callback
 
-    async def _get_child_exception(self, child_id: str, composite_key: str) -> Optional[Result]:
+    async def _get_child_exception(self, child_id: str) -> Optional[Result]:
         """
         Collect and handle exception from a single child process.
         
@@ -568,7 +573,7 @@ class AsyncMaster(Node):
                     The Result has the child_id as sender and the exception stored as a string
                     in its exception attribute.
         """
-        future = self._children_futures.get(composite_key)
+        future = self._children_futures.get(child_id)
         if future is None:
             self.logger.warning(f"Child {child_id} not found in futures")
             return None
@@ -615,7 +620,7 @@ class AsyncMaster(Node):
         
         # Collect exceptions from all children using gather
         exception_results_list = await asyncio.gather(
-            *[self._get_child_exception(child_id, composite_key) for child_id,composite_key in self._running_children],
+            *[self._get_child_exception(child_id) for child_id in self._running_children],
             return_exceptions=True
         )
         

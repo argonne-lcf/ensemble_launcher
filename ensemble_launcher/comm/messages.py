@@ -126,5 +126,6 @@ class Action(Message):
 @dataclass
 class TaskRequest(Message):
     ntasks: int = 0
+    free_resources: Optional[JobResource] = None
 
 all_messages = [Message, Status, Result, ResultBatch, TaskUpdate, NodeUpdate, HeartBeat, Action, TaskRequest]

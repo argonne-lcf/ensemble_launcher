@@ -42,6 +42,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
         
         # Track worker assignments
         self.workers: Dict[str, JobResource] = {}
+        self._event_loop = asyncio.get_event_loop()
+        self.cluster.set_event_loop(self._event_loop)
 
     def assign(self, 
                tasks: Dict[str, Task], 

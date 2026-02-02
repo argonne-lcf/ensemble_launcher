@@ -28,6 +28,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         self._event_registry: Optional[EventRegistry] = None
         if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry: EventRegistry = get_registry()
+        self.logger.info("Initialized AsyncProcessPool Executor!")
 
     def submit(self,job_resource: JobResource, 
                fn: Union[Callable,str], 

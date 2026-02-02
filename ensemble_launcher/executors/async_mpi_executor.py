@@ -34,6 +34,7 @@ class AsyncMPIExecutor(Executor):
         self.use_ppn = use_ppn
         self._cpu_binding_option = kwargs.get("cpu_binding_option","--cpu-bind")
         os.makedirs(self.tmp_dir,exist_ok=True)
+        self.logger.info("Initialized AsyncMPI Executor!")
 
     def _build_resource_cmd(self, task_id:str, job_resource: JobResource):
         """Function to build the mpi cmd from the job resources"""
@@ -50,21 +51,21 @@ class AsyncMPIExecutor(Executor):
         if self.use_ppn:
             launcher_cmd.append("-ppn")
             launcher_cmd.append(f"{ppn}")
-        if not(len(job_resource.nodes) == 1 and \
-               (job_resource.nodes[0] == socket.gethostname() or job_resource.nodes[0] == socket.gethostname().split(".")[0] )):
-            if nnodes > 512:
-                # Use hostfile for large node counts to avoid command line length limits
-                hostfile_id = str(uuid.uuid4())
-                hostfile_path = os.path.join(self.tmp_dir, f"hostfile_{hostfile_id}.txt")
-                with open(hostfile_path, "w") as f:
-                    for node in job_resource.nodes:
-                        f.write(f"{node}\n")
-                launcher_cmd.append("--hostfile")
-                launcher_cmd.append(hostfile_path)
-                self.logger.info(f"Created hostfile with {nnodes} nodes at {hostfile_path}")
-            else:
-                launcher_cmd.append("--hosts")
-                launcher_cmd.append(f"{','.join(job_resource.nodes)}")
+        # if not(len(job_resource.nodes) == 1 and \
+        #        (job_resource.nodes[0] == socket.gethostname() or job_resource.nodes[0] == socket.gethostname().split(".")[0] )):
+        if nnodes > 512:
+            # Use hostfile for large node counts to avoid command line length limits
+            hostfile_id = str(uuid.uuid4())
+            hostfile_path = os.path.join(self.tmp_dir, f"hostfile_{hostfile_id}.txt")
+            with open(hostfile_path, "w") as f:
+                for node in job_resource.nodes:
+                    f.write(f"{node}\n")
+            launcher_cmd.append("--hostfile")
+            launcher_cmd.append(hostfile_path)
+            self.logger.info(f"Created hostfile with {nnodes} nodes at {hostfile_path}")
+        else:
+            launcher_cmd.append("--hosts")
+            launcher_cmd.append(f"{','.join(job_resource.nodes)}")
 
         ##resource pinning
         if isinstance(job_resource.resources[0],NodeResourceList):
@@ -161,7 +162,7 @@ class AsyncMPIExecutor(Executor):
         return asyncio_task
     
     async def _subprocess_task(self, task_id: str, cmd: List[str], merged_env: Dict[str, Any]):
-        self.logger.debug(f"executing: {' '.join(cmd)}")
+        self.logger.info(f"executing: {' '.join(cmd)}")
         
         # We separate the executable from the arguments
         program = cmd[0]
