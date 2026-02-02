@@ -127,4 +127,4 @@ class Action(Message):
 class TaskRequest(Message):
     ntasks: int = 0
 
-all_messages = [Status, Result, HeartBeat, Message, Action, TaskUpdate, NodeUpdate, TaskRequest]
+all_messages = [Message, Status, Result, ResultBatch, TaskUpdate, NodeUpdate, HeartBeat, Action, TaskRequest]

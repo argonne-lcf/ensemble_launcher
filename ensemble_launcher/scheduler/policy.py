@@ -35,6 +35,27 @@ class WorkerPolicy(ABC):
             level: Current level in the hierarchy (runtime parameter)
         """
         pass
+    
+    @abstractmethod
+    def get_task_assignment(self,
+                           tasks: Dict[str, Task],
+                           worker_assignments: Dict,
+                           ntask: int = None,
+                           **kwargs) -> Tuple[Dict, List]:
+        """
+        Assign tasks to workers.
+        
+        Args:
+            tasks: Dictionary mapping task IDs to Task objects
+            worker_assignments: Dictionary mapping worker IDs to their assignments
+                              {worker_id: {"job_resource": JobResource, "task_ids": [...]}}
+            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
+            **kwargs: Additional arguments for custom policies
+        
+        Returns:
+            Tuple of (updated worker_assignments dict, list of removed task IDs)
+        """
+        pass
 
 class PolicyRegistry:
 
@@ -221,12 +242,65 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
                     "task_ids": [task_id]
                 }
         
-        # Step 6: Assign remaining tasks to workers in a round-robin fashion
-        for i, (task_id, _) in enumerate(sorted_tasks[nworkers:]):
-            worker_id = i % nworkers
-            children_assignments[worker_id]["task_ids"].append(task_id)
+        # Step 6: Assign remaining tasks to workers using get_task_assignment
+        remaining_tasks = {task_id: task for task_id, task in sorted_tasks[nworkers:]}
+        children_assignments, additional_removed = self.get_task_assignment(
+            remaining_tasks, children_assignments, nworkers=nworkers
+        )
+        removed_tasks.extend(additional_removed)
 
         return children_assignments, removed_tasks
+    
+    def get_task_assignment(self,
+                           tasks: Dict[str, Task],
+                           worker_assignments: Dict,
+                           ntask: int = None,
+                           **kwargs) -> Tuple[Dict, List]:
+        """
+        Assign remaining tasks to workers in a round-robin fashion.
+        
+        Args:
+            tasks: Dictionary mapping task IDs to Task objects
+            worker_assignments: Dictionary mapping worker IDs to their assignments
+            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
+            **kwargs: Additional arguments (expects 'nworkers' for round-robin distribution)
+        
+        Returns:
+            Tuple of (updated worker_assignments dict, list of removed task IDs)
+        """
+        nworkers = kwargs.get('nworkers', len(worker_assignments))
+        removed_tasks = []
+        
+        # Sort tasks by decreasing number of nodes for consistent ordering
+        sorted_task_items = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
+        
+        # Track how many tasks each worker has been assigned
+        worker_task_counts = {wid: len(worker_assignments[wid]["task_ids"]) for wid in worker_assignments}
+        
+        # Assign tasks in round-robin fashion
+        for i, (task_id, _) in enumerate(sorted_task_items):
+            worker_id = i % nworkers
+            
+            # Check if worker has reached task limit
+            if ntask is not None and worker_task_counts[worker_id] >= ntask:
+                # Try to find another worker that hasn't reached the limit
+                assigned = False
+                for attempt in range(nworkers):
+                    candidate_worker = (worker_id + attempt) % nworkers
+                    if worker_task_counts[candidate_worker] < ntask:
+                        worker_assignments[candidate_worker]["task_ids"].append(task_id)
+                        worker_task_counts[candidate_worker] += 1
+                        assigned = True
+                        break
+                
+                if not assigned:
+                    # All workers have reached their limit
+                    removed_tasks.append(task_id)
+            else:
+                worker_assignments[worker_id]["task_ids"].append(task_id)
+                worker_task_counts[worker_id] += 1
+        
+        return worker_assignments, removed_tasks
 
 @policy_registry.register("simple_split_worker_policy", type="worker_policy")
 class SimpleSplitWorkerPolicy(WorkerPolicy):
@@ -320,70 +394,64 @@ class SimpleSplitWorkerPolicy(WorkerPolicy):
                     }
                     wid += 1
         
-        # Now assign tasks in round-robin fashion
+        # Assign tasks using get_task_assignment
+        children_assignments, removed_tasks = self.get_task_assignment(
+            tasks, children_assignments, nchildren=nchildren
+        )
+        
+        return children_assignments, removed_tasks
+    
+    def get_task_assignment(self,
+                           tasks: Dict[str, Task],
+                           worker_assignments: Dict,
+                           ntask: int = None,
+                           **kwargs) -> Tuple[Dict, List]:
+        """
+        Assign tasks to workers in round-robin fashion, checking resource constraints.
+        
+        Args:
+            tasks: Dictionary mapping task IDs to Task objects
+            worker_assignments: Dictionary mapping worker IDs to their assignments
+            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
+            **kwargs: Additional arguments (expects 'nchildren' for worker count)
+        
+        Returns:
+            Tuple of (updated worker_assignments dict, list of removed task IDs)
+        """
+        nchildren = kwargs.get('nchildren', len(worker_assignments))
         removed_tasks = []
         current_worker = 0
+        
+        # Track how many tasks each worker has been assigned
+        worker_task_counts = {wid: len(worker_assignments[wid]["task_ids"]) for wid in worker_assignments}
         
         for task_id, task in tasks.items():
             # Check if task fits in current worker
             assigned = False
-            attempts = 0
+            start_worker = current_worker
             
             # Try each worker once in round-robin order
-            while attempts < nchildren:
-                worker_job_resource = children_assignments[current_worker]["job_resource"]
+            for attempts in range(nchildren):
+                worker_id = (start_worker + attempts) % nchildren
+                worker_job_resource = worker_assignments[worker_id]["job_resource"]
+                
+                # Check if worker has reached task limit
+                if ntask is not None and worker_task_counts[worker_id] >= ntask:
+                    # Skip this worker as it has reached its limit
+                    continue
                 
                 # Check if this worker can accommodate the task
-                if self._can_task_fit(task, worker_job_resource):
-                    children_assignments[current_worker]["task_ids"].append(task_id)
+                task_resource = task.get_resource_requirements()
+                if task_resource in worker_job_resource:
+                    worker_assignments[worker_id]["task_ids"].append(task_id)
+                    worker_task_counts[worker_id] += 1
                     assigned = True
-                    current_worker = (current_worker + 1) % nchildren
+                    current_worker = (worker_id + 1) % nchildren
                     break
-                
-                # Try next worker
-                current_worker = (current_worker + 1) % nchildren
-                attempts += 1
             
             if not assigned:
                 removed_tasks.append(task_id)
                 self.logger.warning(f"Task {task_id} does not fit in any worker")
         
-        return children_assignments, removed_tasks
-    
-    def _can_task_fit(self, task: Task, worker_job_resource: JobResource) -> bool:
-        """
-        Check if a task can fit in the given worker's job resource.
-        
-        Args:
-            task: Task to check
-            worker_job_resource: Worker's available resources
-        
-        Returns:
-            True if task can fit, False otherwise
-        """
-        # Skip tasks with CPU or GPU affinity
-        if task.cpu_affinity or task.gpu_affinity:
-            self.logger.warning(f"Task {task.task_id} has CPU/GPU affinity set, skipping assignment")
-            return False
-        
-        # Check if worker has enough nodes
-        if len(worker_job_resource.nodes) < task.nnodes:
-            return False
-        
-        # Calculate resource requirements per node for this task
-        cpus_needed = task.ppn
-        gpus_needed = task.ppn * task.ngpus_per_process
-        
-        # Create a NodeResourceCount requirement to check against each node
-        required_resource = NodeResourceCount(ncpus=cpus_needed, ngpus=gpus_needed)
-        
-        # Check if the first nnodes of the worker can satisfy the task
-        for i in range(task.nnodes):
-            worker_node_resource = worker_job_resource.resources[i]
-            
-            # Use the same containment check as in ClusterResource._can_allocate
-            if required_resource not in worker_node_resource:
-                return False
-        
-        return True
+        return worker_assignments, removed_tasks
     

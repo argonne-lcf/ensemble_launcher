@@ -59,7 +59,7 @@ async def test_async_mpi_master(nlevels=1):
                  )
 
     nodes = [socket.gethostname()]
-    sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local",cpus=list(range(1,13)),ncpus=12))
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
     m = AsyncMaster(

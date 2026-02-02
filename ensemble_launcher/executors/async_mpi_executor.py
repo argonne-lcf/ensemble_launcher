@@ -78,7 +78,7 @@ class AsyncMPIExecutor(Executor):
                 self.logger.warning(f"Can't use same CPUs on all the nodes. Over subscribing cores")
                 cores = ":".join(map(str, job_resource.resources[0].cpus))
             #TODO: Add bind to for openmpi
-            if self._bind_to_core_option == "--cpu-bind":
+            if self._cpu_binding_option == "--cpu-bind":
                 launcher_cmd.append("--cpu-bind")
                 launcher_cmd.append(f"list:{cores}")
             else:

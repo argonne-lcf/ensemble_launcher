@@ -182,6 +182,7 @@ class AsyncComm(ABC):
                 timeout is specified, it will wait up to timeout seconds for a message of the specified type.
         """
         if child_id not in self._cache:
+            self.logger.warning(f"{child_id} not in cache. Current keys {self._cache.keys()}")
             return None
         
         if block is False and timeout is None:

@@ -10,13 +10,14 @@ from ensemble_launcher.comm.messages import Status, Result, TaskUpdate, NodeUpda
 from ensemble_launcher.profiling import get_registry, EventRegistry
 import logging
 from itertools import accumulate
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Set, Tuple
 import os
 import time
 import numpy as np
 import json
 import base64
 import asyncio
+import uuid
 AsyncFuture = asyncio.Future
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
@@ -54,6 +55,9 @@ class AsyncMaster(Node):
         self._child_assignment: Dict[str, Dict] = {}
         self._children_status: Dict[str, Status] = {}
         self._children_results: Dict[str, Result] = {}
+        self._results: Dict[str, List[ResultBatch]] = {}
+        self._running_children: Set[Tuple[str,str]] = set()  # Currently running children
+        self._composite_key_map: Dict[str, str] = {}
 
         self.logger = None
         
@@ -63,9 +67,12 @@ class AsyncMaster(Node):
         #asyncio event
         self._all_children_done_event = asyncio.Event()
         self._stop_reporting_event = asyncio.Event()
-        self._done_children = set()
+        self._done_children: Set[str] = set()  # Track done instances with composite keys
         self._event_loop = None  # Will be set in run()
-        self._lock = None  # Protect _done_children
+
+        #result and aggregate tasks
+        self._result_tasks = []
+        self._aggregate_task = None
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -256,6 +263,17 @@ class AsyncMaster(Node):
 
         await self._comm.start_monitors(children_only = True)
 
+                # Create status reporting task
+        asyncio.create_task(self.report_status())
+        
+        # Create result collection tasks for each child
+        for child_id in self.children:
+            task = asyncio.create_task(self.collect_result_from_child(child_id))
+            self._result_tasks.append(task)
+        
+        # Create task to aggregate and send results
+        self._aggregate_task = asyncio.create_task(self.aggregate_and_send_results(self._result_tasks))
+
         return children
 
     async def _launch_children(self, children: Dict[str, Node]):
@@ -318,77 +336,167 @@ class AsyncMaster(Node):
                     self.logger.warning(f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning.")
 
                 future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
-                future.add_done_callback(self.create_done_callback("all"))
-                self._children_futures["all"] = future
-            else:
-                ##launch children sequentially one by one
-                for child_idx, (child_name, child_obj) in enumerate(children.items()):
-                    child_nodes = child_obj.nodes
-                    head_node = child_nodes.nodes[0]
-                    
-                    # Serialize child object
-                    child_dict = child_obj.asdict()
-                    json_str = json.dumps(child_dict, default=str)
-                    json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-                    
-                    # Create embedded command string for this child (simple version, no per-host logic)
-                    load_str_embed = async_simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
-                    
-                    req = JobResource(
-                            resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
-                        )
-                    env = os.environ.copy()
-                    env["EL_CHILDID"] = str(child_idx)
-                    
-                    ##get mpi kwargs
-                    if isinstance(child_obj.nodes.resources[0],NodeResourceList):
-                        cpus = ":".join(map(str,child_obj.nodes.resources[0].cpus))
-                    else:
-                        cpus = ":".join(map(str,list(range(child_obj.nodes.resources[0].cpu_count))))
-                    if self._config.cpu_binding_option == "--cpu-bind":
-                        mpi_kwargs={self._config.cpu_binding_option: f"list:{cpus}"}
-                        self.logger.info(f"Setting cpu affinity to child:{mpi_kwargs}")
-                    else:
-                        mpi_kwargs = {}
-                        self.logger.warning(f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning.")
-
-
-                    self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
-                    future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
-                    future.add_done_callback(self.create_done_callback(child_name))
-                    self._children_futures[child_name] = future
-        else:
-            for child_idx, (child_name,child_obj) in enumerate(children.items()):
-                child_nodes = child_obj.nodes.nodes
-                req = JobResource(
-                        resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)], nodes=child_nodes[:1]
-                    )
-                env = os.environ.copy()
                 
-                env["EL_CHILDID"] = str(child_idx)
-
-                future = self._executor.submit(req, child_obj.create_an_event_loop, env = env)
-                future.add_done_callback(self.create_done_callback(child_name))
-                self._children_futures[child_name] = future
+                # Generate one UUID for all children in this one-shot launch
+                launch_uuid = str(uuid.uuid4())
+                child_info = []
+                for child_id in children.keys():
+                    composite_key = f"{child_id}_{launch_uuid}"
+                    child_info.append((child_id, composite_key))
+                    self._children_futures[composite_key] = future
+                    self._running_children.add((child_id, composite_key))
+                    self._composite_key_map[composite_key] = child_id
+                future.add_done_callback(self.create_done_callback(child_info))
+            else:
+                ##launch children in parallel using gather
+                launch_tasks = [
+                    self._launch_child(child_name, child_obj, child_idx)
+                    for child_idx, (child_name, child_obj) in enumerate(children.items())
+                ]
+                await asyncio.gather(*launch_tasks)
+        else:
+            ##launch children in parallel using gather
+            launch_tasks = [
+                self._launch_child(child_name, child_obj, child_idx)
+                for child_idx, (child_name, child_obj) in enumerate(children.items())
+            ]
+            await asyncio.gather(*launch_tasks)
     
-    async def _sync_with_children(self):
-        """Sync with children and send initial node/task updates."""
-        for child_id in self.children:
-            if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
-                self.logger.error(f"Failed to sync heartbeat with child {child_id}")
-                return await self._get_child_exceptions()
+    async def _launch_child(self, child_name: str, child_obj: Node, child_idx: int):
+        """
+        Launch a single child process.
+        
+        Args:
+            child_name: The ID of the child to launch
+            child_obj: The child Node object
+            child_idx: Index of the child for environment variable setting
+        """
+        # Generate a unique UUID for this launch
+        launch_uuid = str(uuid.uuid4())
+        composite_key = f"{child_name}_{launch_uuid}"
+        
+        if self._config.child_executor_name == "async_mpi":
+            child_nodes = child_obj.nodes
+            head_node = child_nodes.nodes[0]
             
-            # Send node update first
-            child_nodes = self._child_assignment[child_id]["job_resource"]
-            node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
+            # Serialize child object
+            child_dict = child_obj.asdict()
+            json_str = json.dumps(child_dict, default=str)
+            json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+            
+            # Create embedded command string for this child (simple version, no per-host logic)
+            load_str_embed = async_simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+            
+            req = JobResource(
+                    resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
+                )
+            env = os.environ.copy()
+            env["EL_CHILDID"] = str(child_idx)
+            
+            ##get mpi kwargs
+            if isinstance(child_obj.nodes.resources[0], NodeResourceList):
+                cpus = ":".join(map(str, child_obj.nodes.resources[0].cpus))
+            else:
+                cpus = ":".join(map(str, list(range(child_obj.nodes.resources[0].cpu_count))))
+            if self._config.cpu_binding_option == "--cpu-bind":
+                mpi_kwargs = {self._config.cpu_binding_option: f"list:{cpus}"}
+                self.logger.info(f"Setting cpu affinity to child:{mpi_kwargs}")
+            else:
+                mpi_kwargs = {}
+                self.logger.warning(f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning.")
+
+            self.logger.info(f"Launching child {child_name} using MPI executor")
+            future = self._executor.submit(req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs)
+            future.add_done_callback(self.create_done_callback([(child_name, composite_key)]))
+            self._children_futures[composite_key] = future
+            self._running_children.add((child_name, composite_key))
+            self._composite_key_map[composite_key] = child_name
+        else:
+            child_nodes = child_obj.nodes.nodes
+            req = JobResource(
+                    resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)], nodes=child_nodes[:1]
+                )
+            env = os.environ.copy()
+            env["EL_CHILDID"] = str(child_idx)
+
+            future = self._executor.submit(req, child_obj.create_an_event_loop, env=env)
+            future.add_done_callback(self.create_done_callback([(child_name, composite_key)]))
+            self._children_futures[composite_key] = future
+            self._running_children.add((child_name, composite_key))
+            self._composite_key_map[composite_key] = child_name
+    
+    async def _sync_with_child(self, child_id: str, composite_key: str, 
+                               node_update: Optional[NodeUpdate], 
+                               task_update: Optional[TaskUpdate]) -> Optional[Result]:
+        """
+        Sync with a single child and send initial node/task updates.
+        
+        Args:
+            child_id: The ID of the child to sync with
+            node_update: NodeUpdate message to send to the child
+            task_update: TaskUpdate message to send to the child
+            
+        Returns:
+            None if successful, Result object with exception if failed
+        """
+        # Sync heartbeat with child
+        if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
+            self.logger.error(f"Failed to sync heartbeat with child {child_id}")
+            return await self._get_child_exception(child_id, composite_key)
+        
+        # Send node update first
+        if node_update is not None:
             await self._comm.send_message_to_child(child_id, node_update)
-            self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
-            
-            # Then send task update
-            new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
-            task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+            self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(node_update.nodes.nodes)} nodes")
+        
+        # Then send task update
+        if task_update is not None:
             await self._comm.send_message_to_child(child_id, task_update)
-            self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
+            self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(task_update.added_tasks)} tasks")
+        
+        return None
+    
+    def _build_init_node_update(self,child_id: str):
+        child_nodes = self._child_assignment[child_id]["job_resource"]
+        return NodeUpdate(sender=self.node_id, nodes=child_nodes)
+    
+    def _build_init_task_update(self, child_id: str):
+        # Create task update
+        new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
+        return TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+
+    async def _sync_with_children(self):
+        """Sync with all children and send initial node/task updates."""
+        # Prepare updates for each child
+        sync_tasks = []
+        for child_id, composite_key in self._running_children:
+
+            # Create node update
+            node_update = self._build_init_node_update(child_id)
+            
+            # Create task update
+            task_update = self._build_init_task_update(child_id)
+            
+            # Add sync task
+            sync_tasks.append(self._sync_with_child(child_id, composite_key, node_update, task_update))
+        
+        # Sync with all children in parallel
+        results = await asyncio.gather(*sync_tasks, return_exceptions=True)
+        
+        # Check if any children failed to sync
+        failed_syncs = [result for result in results if result is not None and isinstance(result, Result)]
+        if failed_syncs:
+            self.logger.error(f"{self.node_id}: {len(failed_syncs)} children failed to sync")
+            # Aggregate all exception results
+            aggregated_result = Result(sender=self.node_id, data=failed_syncs)
+            if self.parent:
+                success = await self._comm.send_message_to_parent(aggregated_result)
+                if not success:
+                    self.logger.warning(f"{self.node_id}: Failed to send exception results to parent")
+            await self.stop()
+            return aggregated_result
+        
+        self.logger.info(f"{self.node_id}: Successfully synced with all {len(self.children)} children")
     
     async def run(self):
         async with self._timer("init"):
@@ -399,44 +507,97 @@ class AsyncMaster(Node):
 
         async with self._timer("sync_with_children"):
             await self._sync_with_children()
-            
-            asyncio.create_task(self.report_status())
-            return await self._results() #should return and report
+        
+        # Wait for aggregation to complete
+        await self._aggregate_task
+        
+        # Wait for all children to complete with timeout
+        try:
+            await asyncio.wait_for(self._all_children_done_event.wait(), timeout=30.0)
+            self.logger.info(f"{self.node_id}: All children have completed execution")
+        except asyncio.TimeoutError:
+            self.logger.warning(f"{self.node_id}: Timeout waiting for children to complete")
+        
+        await self.stop()
+        
+        # Return aggregated results
+        result_batch = ResultBatch(sender=self.node_id)
+        for child_results in self._results.values():
+            for rb in child_results:
+                result_batch += rb
+        return result_batch
     
     def create_an_event_loop(self):
         """This function is an entry point for the new process"""
         asyncio.run(self.run())
     
-    def _mark_all_children_done(self):
-        """Mark all children as done (runs in event loop)."""
-        self._done_children = set(self.children.keys())
-        self._all_children_done_event.set()
-    
-    def _mark_child_done(self, child_id: str):
-        """Mark a single child as done (runs in event loop)."""
-        self._done_children.add(child_id)
-        if len(self._done_children) == len(self.children):
+    def _mark_children_done(self, child_info: List[Tuple[str, str]]):
+        """Mark children as done (runs in event loop).
+        
+        Args:
+            child_info: List of tuples (child_id, composite_key) for completed children
+        """
+        for child_id, composite_key in child_info:
+            self._done_children.add(composite_key)
+            self._running_children.discard((child_id, composite_key))
+        if len(self._running_children) == 0:
             self._all_children_done_event.set()
 
-    def create_done_callback(self, child_id: str):
-        if child_id == "all":
-            def _done_callback(future: ConcurrentFuture):
-                if self._event_loop is not None:
-                    self._event_loop.call_soon_threadsafe(self._mark_all_children_done)
-                else:
-                    self.logger.warning("No event loop stored, can't mark children done!")
-            return _done_callback
-        else:
-            def _done_callback(future: AsyncFuture):
-                if self._event_loop is not None:
-                    self._event_loop.call_soon_threadsafe(self._mark_child_done, child_id)
-                else:
-                    self.logger.warning("No event loop stored, can't mark child done!")
-            return _done_callback
+    def create_done_callback(self, child_info: List[Tuple[str, str]]):
+        """Create callback for when child futures complete.
+        
+        Args:
+            child_info: List of tuples (child_id, composite_key) for the children
+        """
+        def _done_callback(future: AsyncFuture):
+            if self._event_loop is not None:
+                self._event_loop.call_soon_threadsafe(self._mark_children_done, child_info)
+            else:
+                self.logger.warning("No event loop stored, can't mark child done!")
+        return _done_callback
 
+    async def _get_child_exception(self, child_id: str, composite_key: str) -> Optional[Result]:
+        """
+        Collect and handle exception from a single child process.
+        
+        Args:
+            child_id: The ID of the child to check for exceptions
+            
+        Returns:
+            Result: A Result object with the exception if the child failed, None otherwise.
+                    The Result has the child_id as sender and the exception stored as a string
+                    in its exception attribute.
+        """
+        future = self._children_futures.get(composite_key)
+        if future is None:
+            self.logger.warning(f"Child {child_id} not found in futures")
+            return None
+        
+        # Stop the child if not done
+        if not future.done():
+            self.logger.info(f"Stopping child {child_id}")
+            future.cancel()
+        
+        # Collect exception without waiting
+        if future.done():
+            try:
+                exception = future.exception()
+                if exception is not None:
+                    self.logger.error(f"Child {child_id} failed with exception: {exception}")
+                    exception_result = Result(sender=child_id, data=[])
+                    exception_result.exception = str(exception)
+                    return exception_result
+                else:
+                    result = future.result()
+                    self.logger.error(f"Child {child_id}: No child exception found! Got {result}")
+            except asyncio.CancelledError:
+                pass
+        
+        return None
+    
     async def _get_child_exceptions(self) -> Result:
         """
-        Collect and handle exceptions from child processes.
+        Collect and handle exceptions from all child processes.
         This method stops all running child processes and collects any exceptions
         that occurred during their execution. It creates Result objects for each
         exception found and optionally sends them to the parent node.
@@ -452,35 +613,19 @@ class AsyncMaster(Node):
             - Logs information about stopped children and found exceptions
         """
         
-        # First, stop all children
-        for child_id, future in self._children_futures.items():
-            if not future.done():
-                self.logger.info(f"Stopping child {child_id}")
-                future.cancel()
-    
-        # Collect exceptions without waiting
-        exceptions = {}
-        for child_id, future in self._children_futures.items():
-            if future.done():
-                try:
-                    exception = future.exception()
-                    if exception is not None:
-                        exceptions[child_id] = exception
-                        self.logger.error(f"Child {child_id} failed with exception: {exception}")
-                    else:
-                        result = future.result()
-                        self.logger.error(f"Child {child_id}: No child exception found! Got {result}")
-                except asyncio.CancelledError:
-                    pass
-
-        self.logger.info(f"{self.node_id}: Stopped children. Found {len(exceptions)} exceptions")
-
-        # Create result objects for each exception
-        exception_results = []
-        for child_id, exception in exceptions.items():
-            exception_result = Result(sender=child_id, data=[])
-            exception_result.exception = str(exception)
-            exception_results.append(exception_result)
+        # Collect exceptions from all children using gather
+        exception_results_list = await asyncio.gather(
+            *[self._get_child_exception(child_id, composite_key) for child_id,composite_key in self._running_children],
+            return_exceptions=True
+        )
+        
+        # Filter out None values and exceptions from gather itself
+        exception_results = [
+            result for result in exception_results_list 
+            if result is not None and isinstance(result, Result)
+        ]
+        
+        self.logger.info(f"{self.node_id}: Stopped children. Found {len(exception_results)} exceptions")
         
         # Create a result with the exception results
         result = Result(sender=self.node_id, data=exception_results)
@@ -493,6 +638,85 @@ class AsyncMaster(Node):
 
         await self.stop()
         return result
+    
+    async def collect_result_from_child(self, child_id: str):
+        """Collect result and final status from a single child."""
+        try:
+            # Wait for result from child
+            result_batch: ResultBatch = await self._comm.recv_message_from_child(ResultBatch, child_id=child_id, block=True)
+
+            if result_batch is not None:
+                self._results[child_id] = [result_batch]
+                self.logger.info(f"{self.node_id}: Received result from {child_id}")
+            else:
+                self.logger.warning(f"{self.node_id}: No result received from {child_id}")
+                self._results[child_id] = []
+            
+            # Collect final status from child
+            # First check if we already have final status
+            if child_id in self._children_status and self._children_status[child_id].tag == "final":
+                self.logger.debug(f"{self.node_id}: Child {child_id} already has final status")
+            else:
+                # Drain status queue to get final status
+                empty_count = 0
+                while empty_count < 2:
+                    status = await self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.01)
+                    if status is not None:
+                        empty_count = 0  # Reset counter on successful recv
+                        self._children_status[child_id] = status
+                        if status.tag == "final":
+                            break
+                    else:
+                        empty_count += 1  # Increment when queue is empty
+                
+                if child_id not in self._children_status or self._children_status[child_id].tag != "final":
+                    self.logger.warning(f"{self.node_id}: Failed to receive final status from {child_id}")
+        except Exception as e:
+            self.logger.error(f"{self.node_id}: Error collecting result from {child_id}: {e}")
+            self._results[child_id] = []
+    
+    async def aggregate_and_send_results(self, result_tasks: List[asyncio.Task]):
+        """Wait for all result collection tasks, aggregate, and send to parent."""
+        # Wait for all result collection tasks to complete
+        await asyncio.gather(*result_tasks, return_exceptions=True)
+        self.logger.info(f"{self.node_id}: All result collection tasks completed")
+        
+        # Aggregate results
+        async with self._timer("aggregate_results"):
+            result_batch = ResultBatch(sender=self.node_id)
+            for child_id, child_results in self._results.items():
+                for rb in child_results:
+                    result_batch += rb
+            self.logger.info(f"{self.node_id}: Aggregated results from {len(self._results)} children")
+        
+        # Send to parent
+        if self.parent:
+            success = await self._comm.send_message_to_parent(result_batch)
+            if not success:
+                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
+            else:
+                self.logger.info(f"{self.node_id}: Successfully sent results to parent")
+        
+        # Report final status to parent
+        async with self._timer("report_to_parent"):
+            if self.parent:
+                final_status = sum(self._children_status.values(), Status())
+                final_status.tag = "final"
+                success = await self._comm.send_message_to_parent(final_status)
+                if not success:
+                    self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
+                else:
+                    self.logger.info(f"{self.node_id}: Successfully reported final status to parent")
+            else:
+                try:
+                    status = sum(self._children_status.values(), Status())
+                    status.tag = "final"
+                    # Write to a json file
+                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                    status.to_file(fname)
+                    self.logger.info(f"{self.node_id}: Successfully reported final status")
+                except Exception as e:
+                    self.logger.warning(f"{self.node_id}: Reporting final status failed with exception {e}")
     
     async def report_status(self):
         while not self._stop_reporting_event.is_set():
@@ -519,92 +743,14 @@ class AsyncMaster(Node):
                 self.logger.info(f"Reporting loop failed with error {e}")
                 await asyncio.sleep(0.1)
     
-    async def _results(self) -> ResultBatch:
-        await self._all_children_done_event.wait()
-        self.logger.info(f"{self.node_id}: All children have completed execution")
-
+    async def stop(self):
         # Stop the reporting loop
         self._stop_reporting_event.set()
         self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
-        async with self._timer("collect_results"):
-            retry_children = set(self.children.keys())
-            result_batch = ResultBatch(sender=self.node_id)
-            max_retries = 10
-            for retry in range(max_retries):
-                for child_id in retry_children.copy():
-                    temp_result_batch: ResultBatch = await self._comm.recv_message_from_child(ResultBatch, child_id=child_id, timeout=1.0)
-                    if temp_result_batch is not None:
-                        result_batch += temp_result_batch
-                        retry_children.remove(child_id)
-                if len(retry_children) == 0:
-                    break
-            if len(retry_children) > 0:
-                self.logger.warning(f"{self.node_id}: Failed to receive results from children {retry_children} after {max_retries} retries")
+        await self._comm.close()        
+        self._executor.shutdown()
 
-        #collect final status from children
-        async with self._timer("collect_status"):
-            remaining_children = set()
-            
-            # Check which children already have final status
-            for child_id in self.children.keys():
-                if child_id in self._children_status and self._children_status[child_id].tag == "final":
-                    self.logger.debug(f"{self.node_id}: Child {child_id} already has final status")
-                else:
-                    remaining_children.add(child_id)
-            
-            # For remaining children, drain their status queues
-            for child_id in remaining_children.copy():
-                empty_count = 0
-                while empty_count < 2:
-                    status = await self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.01)
-                    if status is not None:
-                        empty_count = 0  # Reset counter on successful recv
-                        self._children_status[child_id] = status
-                        if status.tag == "final":
-                            remaining_children.remove(child_id)
-                            break
-                    else:
-                        empty_count += 1  # Increment when queue is empty
-                
-            if len(remaining_children) > 0:
-                self.logger.warning(f"{self.node_id}: Failed to receive final status from children {remaining_children}")
-        
-        self.logger.debug(f"Status from children: {self._children_status}")
-
-        #send final results to parent
-        if self.parent:
-            success = await self._comm.send_message_to_parent(result_batch)
-
-            if not success:
-                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
-            else:
-                self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
-
-        async with self._timer("report_to_parent"):
-            #report it to parent
-            if self.parent:
-                final_status = sum(self._children_status.values(), Status())
-                final_status.tag = "final"
-                success = await self._comm.send_message_to_parent(final_status)
-                if not success:
-                    self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
-                else:
-                    self.logger.info(f"{self.node_id}: Successfully reported final status to parent")
-            else:
-                try:
-                    status = sum(self._children_status.values(), Status())
-                    #write to a json file
-                    fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                    status.to_file(fname)
-                    self.logger.info(f"{self.node_id}: Successfully reported final status")
-                except Exception as e:
-                    self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
-
-        await self.stop()
-        return result_batch
-
-    async def stop(self):
         if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
             # Export to Perfetto format
@@ -619,8 +765,7 @@ class AsyncMaster(Node):
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
             
-        await self._comm.close()        
-        self._executor.shutdown()
+
     
     def asdict(self,include_tasks:bool = False) -> dict:
         obj_dict = {

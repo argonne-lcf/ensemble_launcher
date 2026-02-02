@@ -106,26 +106,24 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         self._stop_task_monitor_event.set()
                         break
                     
-                    # Get child's available resources
-                    child_resources = self._child_assignment[child_id]["job_resource"]
+                    # Use policy to assign tasks to this child
+                    worker_assignment = {0: self._child_assignment[child_id].copy()}
+                    worker_assignment[0]["task_ids"] = []  # Start with empty task list
                     
-                    # Filter tasks that can fit in child's resources
-                    available_tasks = []
-                    for task in self._unassigned_tasks.values():
-                        if len(available_tasks) >= task_request.ntasks:
-                            break  # Got enough tasks
-                        
-                        # Build task resource requirements
-                        task_resource = task.get_resource_requirements()
-                        
-                        # Check if task fits in child's resources
-                        if task_resource in child_resources:
-                            available_tasks.append(task)
+                    # Let policy decide which tasks to assign
+                    updated_assignment, removed_tasks = self._scheduler.policy.get_task_assignment(
+                        tasks=self._unassigned_tasks,
+                        worker_assignments=worker_assignment,
+                        ntask=task_request.ntasks
+                    )
                     
-                    if available_tasks:
-                        # Remove assigned tasks from unassigned pool
-                        for task in available_tasks:
-                            del self._unassigned_tasks[task.task_id]
+                    assigned_task_ids = updated_assignment[0]["task_ids"]
+                    
+                    if assigned_task_ids:
+                        # Get task objects and remove from unassigned pool
+                        available_tasks = [self._unassigned_tasks[task_id] for task_id in assigned_task_ids]
+                        for task_id in assigned_task_ids:
+                            del self._unassigned_tasks[task_id]
                         
                         # Send task update to child
                         task_update = TaskUpdate(sender=self.node_id, added_tasks=available_tasks)
@@ -170,53 +168,22 @@ class AsyncWorkStealingMaster(AsyncMaster):
         
         self.logger.info(f"{self.node_id}: Task request monitor stopped")
     
-    async def _sync_with_children(self):
-        """Override to send empty task updates for work-stealing mode."""
-        from ensemble_launcher.comm.messages import NodeUpdate
-        
-        for child_id in self.children:
-            if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
-                self.logger.error(f"Failed to sync heartbeat with child {child_id}")
-                return await self._get_child_exceptions()
-            
-            # Send node update only - worker will request tasks
-            child_nodes = self._child_assignment[child_id]["job_resource"]
-            node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
-            await self._comm.send_message_to_child(child_id, node_update)
-            self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes (waiting for task request)")
-    
-    async def run(self):
-        """Override to add task request monitoring for work-stealing."""
-        async with self._timer("init"):
-            children = await self._lazy_init()
-        
+    async def _lazy_init(self):
+        children = await super()._lazy_init()
+
         self.logger.info(f"I am workstealing master")
 
         # Start task request monitor if children are workers
         if self.level + 1 == self._config.nlevels:
             asyncio.create_task(self.monitor_task_requests())
             self.logger.info(f"{self.node_id}: Started task request monitor")
-
-        async with self._timer("launch_children"):
-            await self._launch_children(children)
-
-        async with self._timer("sync_with_children"):
-            await self._sync_with_children()
-            
-            asyncio.create_task(self.report_status())
-
-            
-            return await self._results()
-    
-    async def _results(self) -> ResultBatch:
-        """Wrap parent's _results to handle task monitor cleanup."""
-        await self._all_children_done_event.wait()
-        self.logger.info(f"{self.node_id}: All children have completed execution")
-
-        # Stop the reporting loop
-        self._stop_reporting_event.set()
-        self.logger.info(f"{self.node_id}: Stopped reporting loop")
         
+        return children
+    
+    def _build_init_task_update(self, child_id: str):
+        return None
+    
+    async def stop(self):
         # Stop the task monitor loop if it was started
         if self._task_monitor_tasks:
             self._stop_task_monitor_event.set()
@@ -228,5 +195,4 @@ class AsyncWorkStealingMaster(AsyncMaster):
             await asyncio.gather(*self._task_monitor_tasks, return_exceptions=True)
             self.logger.info(f"{self.node_id}: All task monitor tasks stopped")
 
-        # Call parent's result collection logic
-        return await super()._results()
+        return await super().stop()
