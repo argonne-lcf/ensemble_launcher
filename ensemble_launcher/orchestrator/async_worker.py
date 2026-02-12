@@ -168,10 +168,11 @@ class AsyncWorker(Node):
         
         ##Lazy comm creation
         self._create_comm()
-        await self._comm.start_monitors()
 
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
+
+        await self._comm.start_monitors()
 
     def create_done_callback(self, task: Task):
         def done_callback(future):
@@ -213,12 +214,16 @@ class AsyncWorker(Node):
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 if self._config.profile == "perfetto" and self._event_registry is not None:
+                    resource_dict = req.to_dict()
+                    for k,v in resource_dict.items():
+                        resource_dict[k] = v.to_dict()
                     self._event_registry.record_async_begin(
                         name=task.task_id,
                         category="task_execution",
                         node_id=self.node_id,
                         pid=os.getpid(),
-                        async_id=task.task_id
+                        async_id=task.task_id,
+                        job_resource=resource_dict
                     )
                     self._event_registry.record_counter(
                         name="tasks_submitted",

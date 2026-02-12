@@ -71,10 +71,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
             
             if allocated:
                 self.workers[worker_id] = resource
-                allocated_workers[worker_id] = {
-                    "job_resource": resource,
-                    "task_ids": assignment["task_ids"]
-                }
+                allocated_workers[worker_id] = assignment
+                allocated_workers[worker_id]["job_resource"] = resource
             else:
                 self.logger.warning(f"Failed to allocate resources for worker {worker_id}")
         

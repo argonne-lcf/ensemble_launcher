@@ -7,6 +7,7 @@ import asyncio
 from .async_master import AsyncMaster
 from ensemble_launcher.scheduler.resource import NodeResourceList, NodeResourceCount
 from asyncio import Future as AsyncFuture
+import copy
 
 class AsyncWorkStealingMaster(AsyncMaster):
     """
@@ -129,10 +130,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         worker_assignment = {0: self._child_assignment[child_id].copy()}
                         worker_assignment[0]["task_ids"] = []  # Start with empty task list
                         
-                        self.logger.info(f"Worker assignment: {worker_assignment}")
                         # Let policy decide which tasks to assign
                         updated_assignment, removed_tasks = self._scheduler.policy.get_task_assignment(
-                            tasks=self._unassigned_tasks,
+                            tasks=copy.deepcopy(self._unassigned_tasks),
                             worker_assignments=worker_assignment,
                             ntask=task_request.ntasks,
                             free_resources = task_request.free_resources

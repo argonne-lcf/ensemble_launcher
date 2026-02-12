@@ -72,7 +72,8 @@ class AsyncZMQComm(AsyncComm):
         self.router_socket = self.zmq_context.socket(zmq.ROUTER,socket_class=Socket)
         self.router_socket.setsockopt(zmq.IDENTITY,f"{self._node_info.node_id}".encode())
         try:
-            self.router_socket.bind(f"tcp://{self.my_address}")
+            #self.router_socket.bind(f"tcp://{self.my_address}")
+            self.router_socket.bind(f"tcp://*:{self.my_address.split(':')[-1]}")
             self.logger.info(f"{self._node_info.node_id}: Successfully bound to {self.my_address}")
         except zmq.error.ZMQError as e:
             if "Address already in use" in str(e):
@@ -104,10 +105,19 @@ class AsyncZMQComm(AsyncComm):
     async def start_monitors(self,**kwargs):
         """Start background tasks to monitor ZMQ sockets."""
         await super().start_monitors(**kwargs)
-        if self._node_info.parent_id is not None:
-            asyncio.create_task(self._monitor_parent_socket())
-        if len(self._node_info.children_ids) > 0:
-            asyncio.create_task(self._monitor_child_sockets())
+
+        if kwargs.get("parent_only",False):
+            if self._node_info.parent_id is not None:
+                asyncio.create_task(self._monitor_parent_socket())
+        elif kwargs.get("children_only",False):
+            if len(self._node_info.children_ids) > 0:
+                asyncio.create_task(self._monitor_child_sockets())
+        else:
+            if self._node_info.parent_id is not None:
+                asyncio.create_task(self._monitor_parent_socket())
+            if len(self._node_info.children_ids) > 0:
+                asyncio.create_task(self._monitor_child_sockets())
+
         
     async def _monitor_parent_socket(self) -> None:
         """
@@ -153,11 +163,11 @@ class AsyncZMQComm(AsyncComm):
                 if isinstance(msg, Message):
                     failures = 0  # Reset on success
                     self._cache[sender_id].put_nowait(msg)
-                    self.logger.debug(f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}")
+                    self.logger.info(f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}")
                 else:
                     # Still cache raw data for non-Message types
                     self._router_cache[sender_id].put_nowait(msg)
-                    self.logger.debug(f"{self._node_info.node_id}: Cached raw data from child {sender_id}.")
+                    self.logger.info(f"{self._node_info.node_id}: Cached raw data from child {sender_id}.")
             except Exception as e:
                 failures += 1
                 self.logger.warning(f"{self._node_info.node_id}: Error caching data from child failed {failures} times: {e}")

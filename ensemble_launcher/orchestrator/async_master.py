@@ -138,7 +138,8 @@ class AsyncMaster(Node):
         if len(remove_tasks) > 0:
             self.logger.warning(f"Removed tasks due to resource constraints: {remove_tasks}")
         self._child_assignment = {}
-        self.logger.info(f"Children assignment: {self._child_assignment}")
+        for wid in assignments:
+            self.logger.info(f"Children assignment: {assignments[wid].keys()}")
 
         children = {}
         if self.level + 1 == self._config.nlevels:
@@ -168,6 +169,7 @@ class AsyncMaster(Node):
             
             for wid,alloc in assignments.items():
                 child_id = self.node_id+f".m{wid}"
+                self.logger.info(f"{child_id}: {alloc.keys()}")
                 self._child_assignment[child_id] = alloc
                 self._child_assignment[child_id]["wid"] = wid
                 # Check if allocation specifies a custom task_executor_name
@@ -184,6 +186,7 @@ class AsyncMaster(Node):
                         tasks={task_id: tasks[task_id] for task_id in alloc["task_ids"]} if include_tasks else {},
                         parent=None
                     )
+                self.logger.info(f"{wid}: {self._child_assignment[child_id].keys()}")
         return children
 
     async def _lazy_init(self) -> Dict[str, Node]:
@@ -208,15 +211,16 @@ class AsyncMaster(Node):
         
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm() ###This will only create picklable objects
-        ##lazy creation of non-pickable objects
-        await self._comm.start_monitors(parent_only = True)
         
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
 
+        ##lazy creation of non-pickable objects
+        await self._comm.start_monitors(parent_only = True)
+
         async with self._timer("heartbeat_sync"):
             ##heart beat sync with parent
-            if self.parent and not await self._comm.sync_heartbeat_with_parent(timeout=30.0):
+            if self.parent and not await self._comm.sync_heartbeat_with_parent(timeout=60.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
@@ -306,7 +310,10 @@ class AsyncMaster(Node):
                     child_obj_dict[head_node] = child_obj
                 
                 # Build combined dictionary structure
-                common_keys = ["type", "config", "parent", "parent_comm"]
+                common_keys = ["type", "parent", "parent_comm"]
+                if all(["task_executor_name" not in cdict for cdict in self._child_assignment.values()]):
+                    common_keys.append("config")
+                self.logger.info(f"common keys: {common_keys}")
                 first_child = next(iter(child_obj_dict.values()))
                 first_dict = first_child.asdict()
                 
@@ -446,7 +453,7 @@ class AsyncMaster(Node):
             None if successful, Result object with exception if failed
         """
         # Sync heartbeat with child
-        if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=30.0):
+        if not await self._comm.sync_heartbeat_with_child(child_id=child_id, timeout=60.0):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
             return await self._get_child_exception(child_id)
         

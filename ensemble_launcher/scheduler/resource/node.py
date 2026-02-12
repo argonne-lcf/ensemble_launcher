@@ -132,6 +132,9 @@ class NodeResourceCount(NodeResource):
             result.append(NodeResourceCount(ncpus=cpus, ngpus=gpus))
         
         return result
+
+    def to_dict(self):
+        return {"ncpus":self.ncpus,"ngpus":self.ngpus}
     
     @classmethod
     def from_config(self, info: SystemConfig):
@@ -255,6 +258,9 @@ class NodeResourceList(NodeResource):
             cpus = tuple(range(info.ncpus)) if len(info.cpus) == 0 else tuple(info.cpus),
             gpus = tuple(range(info.ngpus)) if len(info.gpus) == 0 else tuple(info.gpus)
         )
+
+    def to_dict(self):
+        return {"cpus":self.cpus,"gpus":self.gpus}
 
 
 @dataclass(eq=True)
