@@ -145,5 +145,11 @@ class EnsembleLauncher:
             results = self._launcher.run()
         return results
     
+    def submit(self, task: Task) -> asyncio.Future:
+        """Submit a task dynamically. Only usable in cluster mode from within the asyncio event loop."""
+        if not self.launcher_config.cluster:
+            raise RuntimeError("submit() is only available when cluster=True in LauncherConfig")
+        return self._launcher.submit(task)
+
     async def run_async(self):
         raise NotImplementedError("non blocking run not implemented yet")

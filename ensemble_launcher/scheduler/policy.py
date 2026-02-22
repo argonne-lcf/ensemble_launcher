@@ -1,12 +1,19 @@
-from ensemble_launcher.ensemble import Task
-from ensemble_launcher.scheduler.resource import NodeResource, JobResource, NodeResourceCount
-from abc import ABC, abstractmethod
-from typing import Dict, Type, Tuple, List
 import logging
+from abc import ABC, abstractmethod
 from itertools import accumulate
+from typing import Dict, List, Tuple, Type
+
 import numpy as np
 
+from ensemble_launcher.ensemble import Task
+from ensemble_launcher.scheduler.resource import (
+    JobResource,
+    NodeResource,
+    NodeResourceCount,
+)
+
 logger = logging.getLogger(__name__)
+
 
 class Policy(ABC):
     @abstractmethod
@@ -17,71 +24,82 @@ class Policy(ABC):
         """
         pass
 
+
 class WorkerPolicy(ABC):
     @abstractmethod
-    def get_worker_assignment(self,
-                            tasks: Dict[str, Task],
-                            nodes: JobResource,
-                            level: int) -> Tuple[Dict, List]:
+    def get_children_resources(
+        self, tasks: Dict[str, Task], nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
         """
-        Returns a tuple of a dictionary and a list:
-        - The first dictionary maps worker IDs to their assigned resources:
-          {worker_id: {"job_resource": JobResource, "task_ids": [...]}}
-        - The second list contains unassigned task IDs.
-        
+        Decide how many child workers to create and what cluster resources each gets.
+
+        Implementations may use ``tasks`` to size the worker layout (e.g. number of
+        nodes per worker based on task requirements) but must NOT assign tasks here.
+
         Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            nodes: JobResource containing available nodes and their resources
-            level: Current level in the hierarchy (runtime parameter)
-        """
-        pass
-    
-    @abstractmethod
-    def get_task_assignment(self,
-                           tasks: Dict[str, Task],
-                           worker_assignments: Dict,
-                           ntask: int = None,
-                           **kwargs) -> Tuple[Dict, List]:
-        """
-        Assign tasks to workers.
-        
-        Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            worker_assignments: Dictionary mapping worker IDs to their assignments
-                              {worker_id: {"job_resource": JobResource, "task_ids": [...]}}
-            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
-            **kwargs: Additional arguments for custom policies
-        
+            tasks: Dictionary mapping task IDs to Task objects.
+            nodes: JobResource containing the available nodes and per-node resources.
+            level: Current hierarchy level (0 = root master).
+
         Returns:
-            Tuple of (updated worker_assignments dict, list of removed task IDs)
+            Dict mapping integer worker IDs to the JobResource allocated to each worker.
+            An empty dict is valid when no workers can be created.
         """
         pass
+
+    @abstractmethod
+    def get_children_tasks(
+        self,
+        tasks: Dict[str, Task],
+        children_resources: Dict[int, JobResource],
+        ntask: int = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[str]], List[str]]:
+        """
+        Distribute tasks across workers given their pre-allocated resources.
+
+        Args:
+            tasks: Dictionary mapping task IDs to Task objects.
+            children_resources: Dict mapping worker IDs to their JobResource
+                (as returned by ``get_children_resources``).
+            ntask: Maximum tasks to assign per worker.  ``None`` means no limit.
+            **kwargs: Additional implementation-specific arguments.
+
+        Returns:
+            Tuple of:
+            - Dict mapping worker IDs to the list of task IDs assigned to them.
+            - List of task IDs that could not be assigned to any worker.
+        """
+        pass
+
 
 class PolicyRegistry:
-
     def __init__(self):
         self.available_policies: Dict[str, Type[Policy]] = {}
         self.available_worker_policies: Dict[str, Type[WorkerPolicy]] = {}
-    
+
     def register(self, policy_name: str, type: str = "policy"):
         """Register a policy class by name.
-        
+
         Args:
             policy_name: Name to register the policy under
             type: Either "policy" or "worker_policy"
         """
+
         def decorator(cls: Type[Policy]):
             if type == "worker_policy":
                 self.available_worker_policies[policy_name] = cls
             else:
                 self.available_policies[policy_name] = cls
             return cls
+
         return decorator
-    
-    def register_policy(self, policy_name: str, policy_class: Type[Policy], 
-                       type: str = "policy"):
+
+    def register_policy(
+        self, policy_name: str, policy_class: Type[Policy], type: str = "policy"
+    ):
         """Programmatically register a policy class.
-        
+
         Args:
             policy_name: Name to register the policy under
             policy_class: The policy class to register
@@ -91,49 +109,61 @@ class PolicyRegistry:
             self.available_worker_policies[policy_name] = policy_class
         else:
             self.available_policies[policy_name] = policy_class
-    
-    def create_policy(self, policy_name: str, policy_args: Tuple = (), policy_kwargs: Dict = {}) -> Policy:
+
+    def create_policy(
+        self, policy_name: str, policy_args: Tuple = (), policy_kwargs: Dict = {}
+    ) -> Policy:
         """Create a policy instance.
-        
+
         Args:
             policy_name: Name of the registered policy
             policy_args: Positional arguments to pass to the policy constructor
             policy_kwargs: Keyword arguments to pass to the policy constructor
-            
+
         Returns:
             Policy instance with default configuration
         """
         if policy_name in self.available_policies:
             return self.available_policies[policy_name](*policy_args, **policy_kwargs)
         elif policy_name in self.available_worker_policies:
-            return self.available_worker_policies[policy_name](*policy_args, **policy_kwargs)
+            return self.available_worker_policies[policy_name](
+                *policy_args, **policy_kwargs
+            )
         else:
-            logger.error(f"{policy_name} not available. Available policy names {list(self.available_policies.keys()) + list(self.available_worker_policies.keys())}")
+            logger.error(
+                f"{policy_name} not available. Available policy names {list(self.available_policies.keys()) + list(self.available_worker_policies.keys())}"
+            )
             raise ValueError(f"Unknown policy: {policy_name}")
 
+
 policy_registry = PolicyRegistry()
+
 
 @policy_registry.register("large_resource_policy")
 class LargeResourcePolicy(Policy):
     """
     A simple policy that always prioritizes a larger task.
     The task that uses gpus is given more priority.
-    
+
     Configuration (class variables):
         cpu_weight: Weight for CPU resources (default: 1.0)
         gpu_weight: Weight for GPU resources (default: 2.0)
-    
+
     To customize, subclass and override:
         class MyPolicy(LargeResourcePolicy):
             cpu_weight = 2.0
             gpu_weight = 5.0
     """
+
     cpu_weight: float = 1.0
     gpu_weight: float = 2.0
 
     def get_score(self, task: Task) -> float:
-        return task.nnodes * task.ppn * (task.ngpus_per_process * self.gpu_weight +
-                                         self.cpu_weight)
+        return (
+            task.nnodes
+            * task.ppn
+            * (task.ngpus_per_process * self.gpu_weight + self.cpu_weight)
+        )
 
 
 @policy_registry.register("greedy_worker_policy", type="worker_policy")
@@ -141,180 +171,148 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
     """
     A worker policy that greedily assigns workers to fit all tasks using bin-packing.
     Tasks are sorted by decreasing node requirements and distributed across workers.
-    
+
     Configuration (class variables):
         nlevels: Total number of hierarchy levels (default: 1, must be >= 1)
-    
+
     To customize, subclass and override:
         class MyGreedyPolicy(GreedyBinPackingWorkerPolicy):
             nlevels = 3
     """
+
     def __init__(self, nlevels: int = None, logger: logging.Logger = None, **kwargs):
         self.logger = logging.getLogger(__name__) if logger is None else logger
         if nlevels is None:
-            raise ValueError("nlevels must be specified for GreedyBinPackingWorkerPolicy")
+            raise ValueError(
+                "nlevels must be specified for GreedyBinPackingWorkerPolicy"
+            )
         self.nlevels = nlevels
-        self.logger.info(f"Initialized GreedyBinPackingWorkerPolicy with nlevels={self.nlevels}")
-    
-    def get_worker_assignment(self,
-                        tasks: Dict[str, Task],
-                        nodes: JobResource,
-                        level: int) -> Tuple[Dict, List]:
+        self.logger.info(
+            f"Initialized GreedyBinPackingWorkerPolicy with nlevels={self.nlevels}"
+        )
+
+    def get_children_resources(
+        self, tasks: Dict[str, Task], nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
         """
-        Assign tasks to workers based on resource requirements.
-        
-        Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            nodes: JobResource containing available nodes and their resources
-            level: Current level in the hierarchy
+        Determine the number of workers and distribute nodes among them.
+
+        Uses task node-requirements (sorted descending) to size each worker's
+        node allocation.  Tasks that require more nodes than are available are
+        simply skipped for sizing purposes — they will be caught as unassignable
+        in ``get_children_tasks``.
         """
         if len(tasks) == 0:
             self.logger.error("Greedy worker policy needs tasks")
-            raise ValueError("Needs Tasks for creating workers") 
-        
-        nlevels = self.nlevels
-        
-        # Extract node names and resources from JobResource
-        node_names = nodes.nodes
-        node_resources = {node_name: resource for node_name, resource in zip(nodes.nodes, nodes.resources)}
-        
-        # Step 1: Sort tasks by decreasing number of nodes required
-        sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
-        
-        # Remove tasks that have num nodes > total nodes of this master
-        removed_tasks = []
-        while sorted_tasks and sorted_tasks[0][1].nnodes > len(node_names):
-            removed_tasks.append((sorted_tasks.pop(0))[0])
-        
-        if len(removed_tasks) > 0:
-            self.logger.warning(f"Can't schedule {','.join(removed_tasks)}!")
+            raise ValueError("Needs Tasks for creating workers")
 
-        # Step 2: Calculate cumulative sum of nodes required for tasks
-        cum_sum_nnodes = list(accumulate(task.nnodes for _, task in sorted_tasks))
-        
-        # Step 3: Determine the max number of workers
-        nworkers_max = 0
-        while nworkers_max < len(cum_sum_nnodes) and cum_sum_nnodes[nworkers_max] <= len(node_names):
-            nworkers_max += 1
-        
-        # Step 4: Do a simple interpolation in the log2 space to determine number of workers at the current level
-        if nlevels > 1:
-            # Create log2 space arrays for interpolation
-            x_vals = np.array([0, nlevels], dtype=float)
+        node_names = nodes.nodes
+        node_resources = {name: res for name, res in zip(nodes.nodes, nodes.resources)}
+
+        # Sort tasks by decreasing node requirement; drop tasks that cannot fit.
+        sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
+        fitting_tasks = [(tid, t) for tid, t in sorted_tasks if t.nnodes <= len(node_names)]
+
+        # Determine the maximum number of workers that fit given cumulative node use.
+        cum_sum = list(accumulate(t.nnodes for _, t in fitting_tasks))
+        nworkers_max = sum(1 for c in cum_sum if c <= len(node_names))
+
+        # Interpolate in log2 space to pick a number of workers for this level.
+        if self.nlevels > 1:
+            x_vals = np.array([0, self.nlevels], dtype=float)
             y_vals = np.array([0, np.log2(max(nworkers_max, 1))], dtype=float)
-            # Interpolate in log2 space
             log2_nworkers = int(np.interp(level + 1, x_vals, y_vals))
-            # Convert back from log2 space
-            nworkers = max(1, min(int(2 ** log2_nworkers), nworkers_max))
+            nworkers = max(1, min(int(2**log2_nworkers), nworkers_max))
         else:
             nworkers = nworkers_max
-        
-        # Step 5: Distribute nodes among workers
-        if len(node_names) == 1:
-            children_assignments = {
-                wid: {
-                "job_resource": JobResource(resources=[node_resources[node_names[0]]], nodes=node_names),
-                "task_ids": [task_id]
-                }
-                for wid, (task_id, _) in enumerate(sorted_tasks[:nworkers])
-            }
-        else:
-            if len(node_names) < nworkers:
-                self.logger.error(f"number of nodes < number of children")
-                raise RuntimeError
-            
-            # Initialize worker node assignments for the first set of tasks
-            nnodes = [task.nnodes for _, task in sorted_tasks[:nworkers]]
-            if sum(nnodes) < len(node_names):
-                nremaining = len(node_names) - sum(nnodes)
-                for i in range(nremaining):
-                    nnodes[i % nworkers] += 1
-            nnodes = list(accumulate(nnodes))
-            
-            children_assignments = {}
-            for wid, (task_id, _) in enumerate(sorted_tasks[:nworkers]):
-                node_indices = range(nnodes[wid]) if wid == 0 else range(nnodes[wid-1], nnodes[wid])
-                worker_nodes = [node_names[i] for i in node_indices]
-                worker_resources = [node_resources[node_names[i]] for i in node_indices]
-                
-                children_assignments[wid] = {
-                    "job_resource": JobResource(resources=worker_resources, nodes=worker_nodes),
-                    "task_ids": [task_id]
-                }
-        
-        # Step 6: Assign remaining tasks to workers using get_task_assignment
-        remaining_tasks = {task_id: task for task_id, task in sorted_tasks[nworkers:]}
-        children_assignments, additional_removed = self.get_task_assignment(
-            remaining_tasks, children_assignments, nworkers=nworkers
-        )
-        removed_tasks.extend(additional_removed)
 
-        return children_assignments, removed_tasks
-    
-    def get_task_assignment(self,
-                           tasks: Dict[str, Task],
-                           worker_assignments: Dict,
-                           ntask: int = None,
-                           **kwargs) -> Tuple[Dict, List]:
+        if nworkers == 0:
+            return {}
+
+        # Single-node case: all workers share the one available node.
+        if len(node_names) == 1:
+            return {
+                wid: JobResource(resources=[node_resources[node_names[0]]], nodes=node_names)
+                for wid in range(nworkers)
+            }
+
+        if len(node_names) < nworkers:
+            self.logger.error("number of nodes < number of children")
+            raise RuntimeError
+
+        # Distribute nodes based on the first nworkers tasks' node requirements.
+        nnodes_per_worker = [t.nnodes for _, t in fitting_tasks[:nworkers]]
+        # Spread any leftover nodes round-robin.
+        remaining = len(node_names) - sum(nnodes_per_worker)
+        for i in range(remaining):
+            nnodes_per_worker[i % nworkers] += 1
+        cum_nodes = list(accumulate(nnodes_per_worker))
+
+        result: Dict[int, JobResource] = {}
+        for wid in range(nworkers):
+            start = cum_nodes[wid - 1] if wid > 0 else 0
+            end = cum_nodes[wid]
+            worker_nodes = node_names[start:end]
+            worker_resources = [node_resources[n] for n in worker_nodes]
+            result[wid] = JobResource(resources=worker_resources, nodes=worker_nodes)
+
+        return result
+
+    def get_children_tasks(
+        self,
+        tasks: Dict[str, Task],
+        children_resources: Dict[int, JobResource],
+        ntask: int = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[str]], List[str]]:
         """
-        Assign remaining tasks to workers in a round-robin fashion.
-        
-        Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            worker_assignments: Dictionary mapping worker IDs to their assignments
-            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
-            **kwargs: Additional arguments (expects 'nworkers' for round-robin distribution)
-        
-        Returns:
-            Tuple of (updated worker_assignments dict, list of removed task IDs)
+        Assign tasks to workers in round-robin order (largest tasks first).
+
+        Tasks that exceed every worker's node count are added to the removed list.
         """
-        nworkers = kwargs.get('nworkers', len(worker_assignments))
-        removed_tasks = []
-        
-        # Sort tasks by decreasing number of nodes for consistent ordering
+        worker_ids = list(children_resources.keys())
+        nworkers = len(worker_ids)
+        task_ids_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        removed_tasks: List[str] = []
+        worker_task_counts = {wid: 0 for wid in worker_ids}
+
         sorted_task_items = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
-        
-        # Track how many tasks each worker has been assigned
-        worker_task_counts = {wid: len(worker_assignments[wid]["task_ids"]) for wid in worker_assignments}
-        
-        # Assign tasks in round-robin fashion
+
         for i, (task_id, _) in enumerate(sorted_task_items):
-            worker_id = i % nworkers
-            
-            # Check if worker has reached task limit
-            if ntask is not None and worker_task_counts[worker_id] >= ntask:
-                # Try to find another worker that hasn't reached the limit
+            preferred = worker_ids[i % nworkers]
+
+            # Check ntask limit on preferred worker, try others in round-robin.
+            if ntask is not None and worker_task_counts[preferred] >= ntask:
                 assigned = False
                 for attempt in range(nworkers):
-                    candidate_worker = (worker_id + attempt) % nworkers
-                    if worker_task_counts[candidate_worker] < ntask:
-                        worker_assignments[candidate_worker]["task_ids"].append(task_id)
-                        worker_task_counts[candidate_worker] += 1
+                    candidate = worker_ids[(i + attempt) % nworkers]
+                    if worker_task_counts[candidate] < ntask:
+                        task_ids_map[candidate].append(task_id)
+                        worker_task_counts[candidate] += 1
                         assigned = True
                         break
-                
                 if not assigned:
-                    # All workers have reached their limit
                     removed_tasks.append(task_id)
             else:
-                worker_assignments[worker_id]["task_ids"].append(task_id)
-                worker_task_counts[worker_id] += 1
-        
-        return worker_assignments, removed_tasks
+                task_ids_map[preferred].append(task_id)
+                worker_task_counts[preferred] += 1
+
+        return task_ids_map, removed_tasks
+
 
 @policy_registry.register("simple_split_worker_policy", type="worker_policy")
 class SimpleSplitWorkerPolicy(WorkerPolicy):
     """
     A worker policy that splits nodes evenly among a specified number of children,
     then assigns tasks in round-robin fashion.
-    
+
     Tasks are assigned to workers in round-robin order, checking if each task fits
     within the worker's resources. Tasks with CPU or GPU affinity set will be skipped
     and added to the removed tasks list.
-    
+
     Configuration (class variables):
         nchildren: Number of child workers (must be > 0)
-    
+
     Note: Not registered by default. To use:
         1. Subclass and set nchildren:
             class Split8Policy(SimpleSplitWorkerPolicy):
@@ -324,134 +322,93 @@ class SimpleSplitWorkerPolicy(WorkerPolicy):
         3. Use it:
             scheduler = AsyncWorkerScheduler(..., policy="split_8")
     """
-    
+
     def __init__(self, nchildren: int = None, logger: logging.Logger = None, **kwargs):
         self.nchildren = nchildren
         if self.nchildren is None or self.nchildren <= 0:
             raise ValueError(f"nchildren must be positive, got {self.nchildren}")
         self.logger = logging.getLogger(__name__) if logger is None else logger
-        self.logger.info(f"Initialized SimpleSplitWorkerPolicy with nchildren={self.nchildren}")
-    
-    def get_worker_assignment(self,
-                        tasks: Dict[str, Task],
-                        nodes: JobResource,
-                        level: int) -> Tuple[Dict, List]:
+        self.logger.info(
+            f"Initialized SimpleSplitWorkerPolicy with nchildren={self.nchildren}"
+        )
+
+    def get_children_resources(
+        self, tasks: Dict[str, Task], nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
         """
-        Split nodes and their resources evenly among the specified number of children,
-        then assign tasks in round-robin fashion.
-        
-        Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            nodes: JobResource containing available nodes and their resources
-            level: Current level in the hierarchy (not used by this policy)
-        
-        Returns:
-            Tuple of (children_assignments dict, list of removed task IDs)
+        Split nodes evenly among ``nchildren`` workers.
+
+        When ``nchildren > nnodes`` each node's resources are subdivided
+        (``nchildren`` must be an exact multiple of the node count).
         """
         nchildren = self.nchildren
         nnodes = len(nodes.nodes)
-        
+        result: Dict[int, JobResource] = {}
+
         if nchildren <= nnodes:
-            # Simple case: distribute whole nodes to children
-            base_nodes_per_child = nnodes // nchildren
+            base = nnodes // nchildren
             remainder = nnodes % nchildren
-            
-            children_assignments = {}
-            start_idx = 0
-            
+            start = 0
             for wid in range(nchildren):
-                count = base_nodes_per_child + (1 if wid < remainder else 0)
-                end_idx = start_idx + count
-                
-                worker_nodes = nodes.nodes[start_idx:end_idx]
-                worker_resources = nodes.resources[start_idx:end_idx]
-                
-                children_assignments[wid] = {
-                    "job_resource": JobResource(resources=worker_resources, nodes=worker_nodes),
-                    "task_ids": []
-                }
-                
-                start_idx = end_idx
+                count = base + (1 if wid < remainder else 0)
+                end = start + count
+                result[wid] = JobResource(
+                    resources=nodes.resources[start:end],
+                    nodes=nodes.nodes[start:end],
+                )
+                start = end
         else:
-            # nchildren > nnodes: need to split nodes at resource level
             if nchildren % nnodes != 0:
-                self.logger.error(f"nchildren ({nchildren}) must be a multiple of number of nodes ({nnodes}) when nchildren > nnodes")
-                raise ValueError(f"nchildren ({nchildren}) must be a multiple of number of nodes ({nnodes})")
-            
-            splits_per_node = nchildren // nnodes
-            
-            # Split each node's resources
-            children_assignments = {}
+                raise ValueError(
+                    f"nchildren ({nchildren}) must be a multiple of nnodes ({nnodes})"
+                )
+            splits = nchildren // nnodes
             wid = 0
-            
             for node_name, node_resource in zip(nodes.nodes, nodes.resources):
-                divided_resources = node_resource.divide(splits_per_node)
-                
-                for resource_part in divided_resources:
-                    children_assignments[wid] = {
-                        "job_resource": JobResource(resources=[resource_part], nodes=[node_name]),
-                        "task_ids": []
-                    }
+                for part in node_resource.divide(splits):
+                    result[wid] = JobResource(resources=[part], nodes=[node_name])
                     wid += 1
-        
-        # Assign tasks using get_task_assignment
-        children_assignments, removed_tasks = self.get_task_assignment(
-            tasks, children_assignments, nchildren=nchildren
-        )
-        
-        return children_assignments, removed_tasks
-    
-    def get_task_assignment(self,
-                           tasks: Dict[str, Task],
-                           worker_assignments: Dict,
-                           ntask: int = None,
-                           **kwargs) -> Tuple[Dict, List]:
+
+        return result
+
+    def get_children_tasks(
+        self,
+        tasks: Dict[str, Task],
+        children_resources: Dict[int, JobResource],
+        ntask: int = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[str]], List[str]]:
         """
-        Assign tasks to workers in round-robin fashion, checking resource constraints.
-        
-        Args:
-            tasks: Dictionary mapping task IDs to Task objects
-            worker_assignments: Dictionary mapping worker IDs to their assignments
-            ntask: Maximum number of tasks to assign to each worker. If None, no limit is applied.
-            **kwargs: Additional arguments (expects 'nchildren' for worker count)
-        
-        Returns:
-            Tuple of (updated worker_assignments dict, list of removed task IDs)
+        Assign tasks to workers in round-robin order, checking resource fit.
+
+        Tasks that do not fit in any worker are added to the removed list.
         """
-        nchildren = kwargs.get('nchildren', len(worker_assignments))
-        removed_tasks = []
-        current_worker = 0
-        
-        # Track how many tasks each worker has been assigned
-        worker_task_counts = {wid: len(worker_assignments[wid]["task_ids"]) for wid in worker_assignments}
-        
+        worker_ids = list(children_resources.keys())
+        nchildren = len(worker_ids)
+        task_ids_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        removed_tasks: List[str] = []
+        worker_task_counts = {wid: 0 for wid in worker_ids}
+        current = 0
+
         for task_id, task in tasks.items():
-            # Check if task fits in current worker
+            task_resource = task.get_resource_requirements()
             assigned = False
-            start_worker = current_worker
-            
-            # Try each worker once in round-robin order
-            for attempts in range(nchildren):
-                worker_id = (start_worker + attempts) % nchildren
-                worker_job_resource = worker_assignments[worker_id]["job_resource"]
-                
-                # Check if worker has reached task limit
-                if ntask is not None and worker_task_counts[worker_id] >= ntask:
-                    # Skip this worker as it has reached its limit
+
+            for attempt in range(nchildren):
+                wid = worker_ids[(current + attempt) % nchildren]
+
+                if ntask is not None and worker_task_counts[wid] >= ntask:
                     continue
-                
-                # Check if this worker can accommodate the task
-                task_resource = task.get_resource_requirements()
-                if task_resource in worker_job_resource:
-                    worker_assignments[worker_id]["task_ids"].append(task_id)
-                    worker_task_counts[worker_id] += 1
+
+                if task_resource in children_resources[wid]:
+                    task_ids_map[wid].append(task_id)
+                    worker_task_counts[wid] += 1
+                    current = (worker_ids.index(wid) + 1) % nchildren
                     assigned = True
-                    current_worker = (worker_id + 1) % nchildren
                     break
-            
+
             if not assigned:
                 removed_tasks.append(task_id)
                 self.logger.warning(f"Task {task_id} does not fit in any worker")
-        
-        return worker_assignments, removed_tasks
-    
+
+        return task_ids_map, removed_tasks

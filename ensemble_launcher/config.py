@@ -31,6 +31,7 @@ class LauncherConfig(BaseModel):
     worker_scheduler_policy: str = "greedy_worker_policy" ##Policy to use for worker scheduler
     enable_workstealing: bool = False ##If True, master will listen for task requests from worker children
     cpu_binding_option: str = "--cpu-bind"
+    cluster: bool = False  # Eager result delivery + submit() API
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

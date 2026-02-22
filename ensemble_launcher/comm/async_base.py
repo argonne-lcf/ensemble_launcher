@@ -128,12 +128,15 @@ class AsyncComm(ABC):
                 continue
             self.logger.info(f"Initializing cache for child_id: {child_id}")
             self._cache[child_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
-        
+
         if self._node_info.parent_id and self._node_info.parent_id not in self._cache:
             self.logger.info(f"Initializing cache for parent_id: {self._node_info.parent_id}")
             self._cache[self._node_info.parent_id] = AsyncMessageRoutingQueue(logger=self.logger, message_types=all_messages)
 
-    async def update_node_info(self,node_info: NodeInfo):
+    async def update_node_info(self, node_info: NodeInfo):
+        removed_children = set(self._node_info.children_ids) - set(node_info.children_ids)
+        for child_id in removed_children:
+            self._cache.pop(child_id, None)
         self._node_info = node_info
         await self.init_cache()
 
