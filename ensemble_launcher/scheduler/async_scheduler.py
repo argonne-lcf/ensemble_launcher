@@ -40,13 +40,24 @@ class AsyncScheduler(Scheduler):
 
 
 class AsyncWorkerScheduler(AsyncScheduler):
+    """Scheduler that manages a pool of child workers: resource allocation, task
+    distribution, lifecycle tracking, and status aggregation."""
+
     def __init__(
         self,
         logger: Logger,
         nodes: JobResource,
         config: LauncherConfig,
         tasks: Optional[Dict[str, Task]] = None,
-    ):
+    ) -> None:
+        """Initialise the worker scheduler.
+
+        Args:
+            logger: Logger instance for this scheduler.
+            nodes: Available cluster resources.
+            config: Launcher configuration (policy name, nchildren, etc.).
+            tasks: Initial task dict; all tasks start in the unassigned pool.
+        """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
 
@@ -107,13 +118,16 @@ class AsyncWorkerScheduler(AsyncScheduler):
 
     @property
     def child_assignments(self) -> Dict[str, WorkerAssignment]:
+        """Mapping of child_id to its WorkerAssignment (resources + task_ids + wid)."""
         return self._child_assignments
 
     @property
     def children_names(self) -> List[str]:
+        """Ordered list of all registered child IDs."""
         return list(self._child_assignments.keys())
 
     def get_child_assignment(self, child_id: str) -> WorkerAssignment:
+        """Return the WorkerAssignment for the given child_id."""
         return self._child_assignments[child_id]
 
     # ------------------------------------------------------------------
@@ -121,6 +135,7 @@ class AsyncWorkerScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
 
     def mark_child_running(self, child_id: str) -> None:
+        """Record that a child process has been submitted to the executor."""
         self._running_children.add(child_id)
 
     def mark_child_done(self, child_id: str) -> None:
@@ -130,22 +145,30 @@ class AsyncWorkerScheduler(AsyncScheduler):
         if child_id in self._child_done_events:
             self._child_done_events[child_id].set()
 
+    async def wait_for_child(self, child_id: str) -> None:
+        """Await the done event for the given child_id."""
+        await self._child_done_events[child_id].wait()
+
     @property
     def all_children_done(self) -> bool:
-        return len(self._running_children) == 0
+        """True when every registered child has set its done event."""
+        return all([event.is_set() for event in self._child_done_events.values()])
 
     # ------------------------------------------------------------------
     # Status bookkeeping
     # ------------------------------------------------------------------
 
     def set_child_status(self, child_id: str, status: "Status") -> None:
+        """Store the most recent Status message received from a child."""
         self._children_status[child_id] = status
 
     def has_final_status(self, child_id: str) -> bool:
+        """Return True if the child's last recorded status has tag='final'."""
         status = self._children_status.get(child_id)
         return status is not None and status.tag == "final"
 
     def aggregate_status(self) -> "Status":
+        """Sum all children statuses into a single aggregated Status object."""
         from ensemble_launcher.comm.messages import Status as _Status
 
         return sum(self._children_status.values(), _Status())
@@ -155,6 +178,7 @@ class AsyncWorkerScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
 
     def get_done_event(self, child_id: str) -> asyncio.Event:
+        """Return the asyncio.Event that is set when the given child finishes."""
         return self._child_done_events[child_id]
 
     # ------------------------------------------------------------------
@@ -353,13 +377,24 @@ class AsyncWorkerScheduler(AsyncScheduler):
 
 
 class AsyncTaskScheduler(AsyncScheduler):
+    """Task-level scheduler used by workers: allocates cluster resources per task
+    and exposes a ready_tasks queue consumed by the worker's execution loop."""
+
     def __init__(
         self,
         logger: Logger,
         tasks: Dict[str, Task],
         nodes: JobResource,
         policy: Union[str, Policy] = "large_resource_policy",
-    ):
+    ) -> None:
+        """Initialise the task scheduler.
+
+        Args:
+            logger: Logger instance.
+            tasks: Initial task dict to schedule.
+            nodes: Available cluster resources for this worker.
+            policy: Policy name or instance used to score/prioritise tasks.
+        """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
@@ -574,10 +609,10 @@ class AsyncTaskScheduler(AsyncScheduler):
 
         self.logger.info("Resource monitoring stopped")
 
-    def _check_all_tasks_done(self):
-        """
-        Check if all tasks are complete and signal completion event.
-        Thread-safe - called from executor callbacks.
+    def _check_all_tasks_done(self) -> None:
+        """Check if all tasks are complete and signal the completion event.
+
+        Thread-safe — called from executor callbacks via call_soon_threadsafe.
         """
         remaining = set(self.tasks.keys()) - (
             self._successful_tasks | self._failed_tasks
@@ -606,6 +641,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         self.logger.debug("Done waiting for task completion!")
 
     def add_task(self, task: Task) -> bool:
+        """Add a task to the priority queue for scheduling. Returns True on success."""
         try:
             if task.nnodes > len(self.cluster.nodes.nodes):
                 raise ValueError(
@@ -621,6 +657,7 @@ class AsyncTaskScheduler(AsyncScheduler):
             return False
 
     def delete_task(self, task: Task) -> bool:
+        """Remove a task from all queues and free its resources. Returns True on success."""
         if task.task_id not in self.tasks:
             self.logger.warning(f"Unknown task: {task.task_id}")
             return False
@@ -680,7 +717,8 @@ class AsyncTaskScheduler(AsyncScheduler):
             self.logger.warning(f"Failed to delete task {task.task_id}: {e}")
             return False
 
-    def free(self, task_id: str, status: TaskStatus):
+    def free(self, task_id: str, status: TaskStatus) -> None:
+        """Deallocate resources for a completed task and record its final status."""
         if task_id in self.tasks:
             if task_id not in self._running_tasks:
                 self.logger.error(f"{task_id} is not running")
@@ -706,7 +744,8 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._check_all_tasks_done()
         return None
 
-    def get_task_assignment(self):
+    def get_task_assignment(self) -> Dict[str, JobResource]:
+        """Return a snapshot of the currently running task_id → resource mapping."""
         return copy.deepcopy(self._running_tasks)
 
     @property
@@ -731,4 +770,5 @@ class AsyncTaskScheduler(AsyncScheduler):
 
     @property
     def remaining_tasks(self) -> Set[str]:
+        """Task IDs that have not yet succeeded or failed."""
         return set(self.tasks.keys()) - (self._successful_tasks | self._failed_tasks)

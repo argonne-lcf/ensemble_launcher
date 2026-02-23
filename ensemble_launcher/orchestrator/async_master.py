@@ -8,7 +8,7 @@ import time
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
 from ensemble_launcher.comm.messages import (
@@ -37,6 +37,13 @@ AsyncFuture = asyncio.Future
 
 
 class AsyncMaster(Node):
+    """Hierarchical master node that manages a layer of child workers or sub-masters.
+
+    Responsible for scheduling tasks onto children, launching child processes,
+    collecting results, and aggregating status up to its parent (or writing to
+    disk if it is the root). Supports both flat and multi-level tree deployments.
+    """
+
     type = "AsyncMaster"
 
     def __init__(
@@ -51,9 +58,9 @@ class AsyncMaster(Node):
     ):
         super().__init__(id, parent=parent, children=children)
         self._init_tasks = tasks
+        self._init_nodes = Nodes
         self._config = config
         self._parent_comm = parent_comm
-        self._nodes = Nodes
 
         ##lazily created in run
         self._executor = None
@@ -91,6 +98,7 @@ class AsyncMaster(Node):
         self._stop_task_update = asyncio.Event()
         self._task_update_task: Optional[asyncio.Task] = None
         self._client_monitor_task: Optional[asyncio.Task] = None
+        self._reporting_task: asyncio.Task = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
 
     @asynccontextmanager
@@ -105,43 +113,47 @@ class AsyncMaster(Node):
             yield
 
     @property
-    def nodes(self):
-        try:
-            return self._scheduler.cluster.nodes
-        except Exception as e:
-            return self._nodes
+    def nodes(self) -> JobResource:
+        """Node resource allocation owned by the scheduler cluster."""
+        return self._scheduler.cluster.nodes
 
     @nodes.setter
-    def nodes(self, value: JobResource):
-        self._nodes = value
-        if (
-            self._scheduler is not None
-            and getattr(self._scheduler, "cluster", None) is not None
-        ):
-            self._scheduler.cluster.update_nodes(value)
+    def nodes(self, value: JobResource) -> None:
+        self._scheduler.cluster.update_nodes(value)
 
     @property
-    def parent_comm(self):
+    def parent_comm(self) -> Optional[AsyncComm]:
+        """Communication channel to the parent node, or None if this is the root."""
         return self._parent_comm
 
     @parent_comm.setter
-    def parent_comm(self, value: AsyncComm):
+    def parent_comm(self, value: AsyncComm) -> None:
         self._parent_comm = value
 
     @property
-    def comm(self):
+    def comm(self) -> Optional[AsyncComm]:
+        """Communication channel for this master (connecting to parent and children)."""
         return self._comm
 
     @property
-    def tasks(self):
+    def tasks(self) -> Dict[str, Task]:
+        """All tasks owned by this master's scheduler."""
         return self._scheduler.tasks
+
+    @property
+    def init_nodes(self) -> JobResource:
+        return self._init_nodes
+
+    @property
+    def init_tasks(self) -> JobResource:
+        return self._init_tasks
 
     # -----------------------------------------------------------------
     #                       Initialization
     # -----------------------------------------------------------------
 
-    def _setup_logger(self):
-
+    def _setup_logger(self) -> None:
+        """Configure the logger for this master, optionally writing to a per-node log file."""
         if self._config.master_logs:
             os.makedirs(os.path.join(os.getcwd(), "logs"), exist_ok=True)
             # Configure file handler for this specific self.self.logger
@@ -160,7 +172,8 @@ class AsyncMaster(Node):
         else:
             self.logger = logging.getLogger(__name__)
 
-    def _create_comm(self):
+    def _create_comm(self) -> None:
+        """Instantiate the communication backend (currently only async_zmq is supported)."""
         if self._config.comm_name == "async_zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
             self._comm = AsyncZMQComm(
@@ -178,7 +191,7 @@ class AsyncMaster(Node):
         """Instantiate the worker scheduler.  Override to change init args."""
         return AsyncWorkerScheduler(
             self.logger.getChild("scheduler"),
-            self.nodes,
+            self._init_nodes,
             self._config,
             tasks=self._init_tasks,
         )
@@ -292,27 +305,14 @@ class AsyncMaster(Node):
                 self._child_result_monitor(child_id)
             )
 
-    async def _teardown_child(self, child_id: str) -> None:
-        """Cancel per-child tasks, remove the child from all bookkeeping, and prune
-        the comm cache so no stale entries remain."""
-        old_task = self._child_result_task.pop(child_id, None)
-        if old_task is not None:
-            old_task.cancel()
-            if old_task in self._result_tasks:
-                self._result_tasks.remove(old_task)
-        old_fwd = self._child_forwarder_task.pop(child_id, None)
-        if old_fwd is not None:
-            old_fwd.cancel()
-        self._scheduler.remove_child(child_id)
-        self.remove_child(child_id)
-        self._child_objs.pop(child_id, None)
-        await self._comm.update_node_info(self.info())
+    def _create_monitor_tasks(self) -> None:
+        """Start long-running asyncio monitor tasks (status reporter, cluster monitors).
 
-    def _create_monitor_tasks(self):
-        # Per-child collect / forwarder tasks are started in _init_child.
-        # The aggregate task is created at the end of _lazy_init once all
-        # children (including any recreated ones) have been registered.
-        asyncio.create_task(self._report_status())
+        Per-child collect/forwarder tasks are started in _init_child.
+        The aggregate task is created at the end of _lazy_init once all
+        children (including any recreated ones) have been registered.
+        """
+        self._reporting_task = asyncio.create_task(self._report_status())
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
@@ -322,18 +322,19 @@ class AsyncMaster(Node):
                     self._parent_task_update_monitor()
                 )
 
-    async def _launch_child(self, child_name: str, child_obj: Node, child_idx: int):
-        """
-        Launch a single child process.
+    async def _launch_child(
+        self, child_name: str, child_obj: Node, child_idx: int
+    ) -> None:
+        """Launch a single child process.
 
         Args:
-            child_name: The ID of the child to launch
-            child_obj: The child Node object
-            child_idx: Index of the child for environment variable setting
+            child_name: The ID of the child to launch.
+            child_obj: The child Node object.
+            child_idx: Index of the child, used to set EL_CHILDID in the environment.
         """
 
         if self._config.child_executor_name == "async_mpi":
-            child_nodes = child_obj.nodes
+            child_nodes = child_obj.init_nodes
             head_node = child_nodes.nodes[0]
 
             # Serialize child object
@@ -351,11 +352,11 @@ class AsyncMaster(Node):
             env["EL_CHILDID"] = str(child_idx)
 
             ##get mpi kwargs
-            if isinstance(child_obj.nodes.resources[0], NodeResourceList):
-                cpus = ":".join(map(str, child_obj.nodes.resources[0].cpus))
+            if isinstance(child_obj.init_nodes.resources[0], NodeResourceList):
+                cpus = ":".join(map(str, child_obj.init_nodes.resources[0].cpus))
             else:
                 cpus = ":".join(
-                    map(str, list(range(child_obj.nodes.resources[0].cpu_count)))
+                    map(str, list(range(child_obj.init_nodes.resources[0].cpu_count)))
                 )
             if self._config.cpu_binding_option == "--cpu-bind":
                 mpi_kwargs = {self._config.cpu_binding_option: f"list:{cpus}"}
@@ -374,9 +375,11 @@ class AsyncMaster(Node):
             self._children_futures[child_name] = future
             self._scheduler.mark_child_running(child_name)
         else:
-            child_nodes = child_obj.nodes.nodes
+            child_nodes = child_obj.init_nodes.nodes
             req = JobResource(
-                resources=[NodeResourceList(cpus=child_obj.nodes.resources[0].cpus)],
+                resources=[
+                    NodeResourceList(cpus=child_obj.init_nodes.resources[0].cpus)
+                ],
                 nodes=child_nodes[:1],
             )
             env = os.environ.copy()
@@ -387,17 +390,17 @@ class AsyncMaster(Node):
             self._children_futures[child_name] = future
             self._scheduler.mark_child_running(child_name)
 
-    async def _launch_children(self, child_names: List[str]):
-        """Launch all children processes."""
+    async def _launch_children(self, child_names: List[str]) -> None:
+        """Submit all named children to the executor."""
         children = {}
         for child_name in child_names:
             children[child_name] = self._child_objs[child_name]
 
         if self._config.child_executor_name == "async_mpi":
-            first_headnode = next(iter(children.values())).nodes.resources[0]
+            first_headnode = next(iter(children.values())).init_nodes.resources[0]
             worker_equality = all(
                 [
-                    child.nodes.resources[0] == first_headnode
+                    child.init_nodes.resources[0] == first_headnode
                     for child in children.values()
                 ]
             )
@@ -408,7 +411,7 @@ class AsyncMaster(Node):
                 child_obj_dict = {}
 
                 for child_name, child_obj in children.items():
-                    head_node = child_obj.nodes.nodes[0]
+                    head_node = child_obj.init_nodes.nodes[0]
                     child_head_nodes.append(head_node)
                     child_resources.append(NodeResourceCount(ncpus=1))
                     child_obj_dict[head_node] = child_obj
@@ -507,6 +510,11 @@ class AsyncMaster(Node):
             await asyncio.gather(*launch_tasks)
 
     async def _lazy_init(self) -> None:
+        """Set up all resources needed before task execution begins.
+
+        In order: logging, event loop capture, comm, parent sync, scheduler,
+        executor, children creation/launch, and monitor task creation.
+        """
         if self._config.profile == "perfetto":
             self._event_registry = get_registry()
             self._event_registry.enable()
@@ -523,9 +531,12 @@ class AsyncMaster(Node):
             f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds"
         )
 
-        self.logger.info(
-            f"My cpu affinity: {os.sched_getaffinity(0)}, my hostname: {socket.gethostname()}"
-        )
+        try:
+            self.logger.info(
+                f"My cpu affinity: {os.sched_getaffinity(0)}, my hostname: {socket.gethostname()}"
+            )
+        except Exception:
+            pass
 
         ##create comm: Need to do this after the setting the children to properly create pipes
         self._create_comm()  ###This will only create picklable objects
@@ -536,14 +547,6 @@ class AsyncMaster(Node):
         # for zmq, setup the sockets
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
-
-        # sync heart beat with parent
-        async with self._timer("heartbeat_sync"):
-            if self.parent and not await self._comm.sync_heartbeat_with_parent(
-                timeout=30.0
-            ):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         # Receive node update from parent if it has a parent
         if self.parent:
@@ -671,17 +674,26 @@ class AsyncMaster(Node):
     # --------------------------------------------------------------------------
 
     async def _sync_with_parent(self) -> None:
+        """Perform initial handshake with the parent: heartbeat, node update, task update."""
+        # sync heart beat with parent
+        async with self._timer("heartbeat_sync"):
+            if self.parent and not await self._comm.sync_heartbeat_with_parent(
+                timeout=30.0
+            ):
+                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+
         node_update: NodeUpdate = await self._comm.recv_message_from_parent(
             NodeUpdate, timeout=10.0
         )
         if node_update is not None:
             self.logger.info(f"{self.node_id}: Received node update from parent")
             if node_update.nodes:
-                self.nodes = node_update.nodes
+                self._init_nodes = node_update.nodes
                 self.logger.info(
-                    f"{self.node_id}: Updated nodes list with {len(self.nodes.nodes)} nodes"
+                    f"{self.node_id}: Updated nodes list with {len(self._init_nodes.nodes)} nodes"
                 )
-                self.logger.debug(f"{self.node_id}: Nodes details: {self.nodes}")
+                self.logger.debug(f"{self.node_id}: Nodes details: {self._init_nodes}")
             else:
                 self.logger.warning(
                     f"{self.node_id}: Received empty node update from parent"
@@ -709,10 +721,12 @@ class AsyncMaster(Node):
     # --------------------------------------------------------------------------
 
     def _build_init_node_update(self, child_id: str) -> NodeUpdate:
+        """Build the initial NodeUpdate message to send to a child at startup."""
         child_nodes = self._scheduler.get_child_assignment(child_id)["job_resource"]
         return NodeUpdate(sender=self.node_id, nodes=child_nodes)
 
     def _build_init_task_update(self, child_id: str) -> TaskUpdate:
+        """Build the initial TaskUpdate message containing all tasks assigned to a child."""
         new_tasks = [
             self._scheduler.tasks[task_id]
             for task_id in self._scheduler.get_child_assignment(child_id)["task_ids"]
@@ -825,6 +839,11 @@ class AsyncMaster(Node):
     async def _launch_and_sync_children(
         self, child_names: List[str]
     ) -> List[Optional[Result]]:
+        """Launch children and perform the initial sync handshake with each.
+
+        Returns a list parallel to child_names where each entry is None on
+        success, or a Result carrying the exception on failure.
+        """
         await self._launch_children(child_names)
         results = await self._sync_with_children(child_names)
         return results
@@ -855,22 +874,27 @@ class AsyncMaster(Node):
     #                               Callbacks
     # --------------------------------------------------------------------------
 
-    def _mark_children_done(self, child_ids: List[str]):
-        """Mark children as done (runs in event loop).
+    def _mark_children_done(self, child_ids: List[str]) -> None:
+        """Mark children as done (runs in event loop via call_soon_threadsafe).
 
         Args:
-            child_ids: List of child_ids for completed children
+            child_ids: List of child_ids for completed children.
         """
         for child_id in child_ids:
             self._scheduler.mark_child_done(child_id)
         if self._scheduler.all_children_done:
             self._all_children_done_event.set()
 
-    def _create_done_callback(self, child_ids: List[str]):
-        """Create callback for when child futures complete.
+    def _create_done_callback(
+        self, child_ids: List[str]
+    ) -> Callable[[ConcurrentFuture], None]:
+        """Create a done-callback that marks children complete when their future resolves.
+
+        The callback is invoked from an executor thread and uses call_soon_threadsafe
+        to safely dispatch _mark_children_done into the event loop.
 
         Args:
-            child_ids: List of child_ids for the children
+            child_ids: Child node IDs associated with the completing future.
         """
 
         def _done_callback(future: AsyncFuture):
@@ -887,7 +911,7 @@ class AsyncMaster(Node):
     #                               Monitors
     # -------------------------------------------------------------------------
 
-    async def _collect_final_result_from_child(self, child_id: str):
+    async def _collect_final_result_from_child(self, child_id: str) -> None:
         """Collect result and final status from a single child."""
         try:
             # Wait for result from child
@@ -935,7 +959,9 @@ class AsyncMaster(Node):
             )
             self._results[child_id] = []
 
-    async def _aggregate_and_send_results(self, result_tasks: List[asyncio.Task]):
+    async def _aggregate_and_send_results(
+        self, result_tasks: List[asyncio.Task]
+    ) -> None:
         """Wait for all result collection tasks, aggregate, and send to parent."""
         # Wait for all result collection tasks to complete
         await asyncio.gather(*result_tasks, return_exceptions=True)
@@ -988,7 +1014,8 @@ class AsyncMaster(Node):
                         f"{self.node_id}: Reporting final status failed with exception {e}"
                     )
 
-    async def _report_status(self):
+    async def _report_status(self) -> None:
+        """Periodically collect status from children, aggregate, and forward to parent."""
         while not self._stop_reporting_event.is_set():
             try:
                 for child_id in self.children:
@@ -1018,7 +1045,7 @@ class AsyncMaster(Node):
                 self.logger.info(f"Reporting loop failed with error {e}")
                 await asyncio.sleep(0.1)
 
-    async def _client_request_monitor(self):
+    async def _client_request_monitor(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this master."""
         while not self._all_children_done_event.is_set():
             item = await self._comm.recv_client_message(timeout=0.1)
@@ -1030,15 +1057,15 @@ class AsyncMaster(Node):
                     self._route_task(task)
                     self._client_task_map[task.task_id] = client_id
 
-    async def _forward_result(self, result: Result):
-        """Route a result to its client if dynamically submitted, otherwise to parent."""
+    async def _forward_result(self, result: Result) -> None:
+        """Route a result to its originating client if dynamically submitted, otherwise to parent."""
         if result.task_id in self._client_task_map:
             client_id = self._client_task_map.pop(result.task_id)
             await self._comm.send_message_to_child(client_id, result)
         elif self.parent:
             await self._comm.send_message_to_parent(result)
 
-    async def _child_result_monitor(self, child_id: str):
+    async def _child_result_monitor(self, child_id: str) -> None:
         """Receive Result messages from child and forward to client or parent."""
         child_done = self._scheduler.get_done_event(child_id)
         while not child_done.is_set():
@@ -1054,8 +1081,8 @@ class AsyncMaster(Node):
                 break
             await self._forward_result(result)
 
-    async def _parent_task_update_monitor(self):
-        """Non-root master only: receive TaskUpdate from parent and forward tasks to children via _route_task()."""
+    async def _parent_task_update_monitor(self) -> None:
+        """Non-root master only: receive TaskUpdates from parent and route tasks to children."""
         while not self._stop_task_update.is_set():
             try:
                 task_update = await self._comm.recv_message_from_parent(
@@ -1074,26 +1101,35 @@ class AsyncMaster(Node):
     #                               Teardown
     # -------------------------------------------------------------------------
 
-    async def stop(self):
-        if self._task_update_task:
-            self._stop_task_update.set()
-            self._task_update_task.cancel()
-            try:
-                await self._task_update_task
-            except asyncio.CancelledError:
-                pass
+    async def _teardown_child(self, child_id: str) -> None:
+        """Cancel per-child tasks, remove the child from all bookkeeping, and prune
+        the comm cache so no stale entries remain."""
+        ##Cancel the future and wait for scheduler to mark it done
+        child_fut = self._children_futures.get(child_id, None)
+        if child_fut is None:
+            raise RuntimeError(f"{child_id} Child future doesn't exist!")
+        if not child_fut.done():
+            child_fut.cancel()
+        await self._scheduler.wait_for_child(child_id)
 
-        if self._child_forwarder_task:
-            await asyncio.gather(
-                *self._child_forwarder_task.values(), return_exceptions=True
-            )
+        old_task = self._child_result_task.pop(child_id, None)
+        if old_task is not None:
+            old_task.cancel()
+            if old_task in self._result_tasks:
+                self._result_tasks.remove(old_task)
+        old_fwd = self._child_forwarder_task.pop(child_id, None)
+        if old_fwd is not None:
+            old_fwd.cancel()
+        self._scheduler.remove_child(child_id)
+        self.remove_child(child_id)
+        self._child_objs.pop(child_id, None)
+        await self._comm.update_node_info(self.info())
 
-        if self._client_monitor_task and not self._client_monitor_task.done():
-            self._client_monitor_task.cancel()
-            try:
-                await self._client_monitor_task
-            except asyncio.CancelledError:
-                pass
+    async def stop(self) -> None:
+        """Gracefully shut down all children, monitors, comm, and executor."""
+        # Tear down children and wait for them to be done
+        for child_name in self._scheduler.children_names:
+            await self._teardown_child(child_name)
 
         # Wait for all children to complete with timeout
         try:
@@ -1103,10 +1139,34 @@ class AsyncMaster(Node):
             self.logger.warning(
                 f"{self.node_id}: Timeout waiting for children to complete"
             )
-        # Stop the reporting loop
+
+        # stop global monitors
         self._stop_reporting_event.set()
+        self._reporting_task.cancel()
+        try:
+            await self._reporting_task
+        except Exception:
+            pass
         self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
+        if self._client_monitor_task and not self._client_monitor_task.done():
+            self._client_monitor_task.cancel()
+            try:
+                await self._client_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("Stopped client monitor task")
+
+        if self._task_update_task:
+            self._stop_task_update.set()
+            self._task_update_task.cancel()
+            try:
+                await self._task_update_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("Stopped parent task update monitor")
+
+        # stop comm and executor
         await self._comm.close()
         self._executor.shutdown()
 
@@ -1130,12 +1190,17 @@ class AsyncMaster(Node):
     #                               Entry point
     # -------------------------------------------------------------------------
 
-    async def run(self):
+    async def _wait_for_finish(self) -> None:
+        """Wait for all work to complete. Overridable by subclasses."""
+        await self._aggregate_task
+
+    async def run(self) -> ResultBatch:
+        """Main entry point: initialise, wait for all work to finish, stop, return results."""
         async with self._timer("init"):
             await self._lazy_init()
 
         # Wait for aggregation to complete
-        await self._aggregate_task
+        await self._wait_for_finish()
 
         await self.stop()
 
@@ -1146,8 +1211,8 @@ class AsyncMaster(Node):
                 result_batch += rb
         return result_batch
 
-    def create_an_event_loop(self):
-        """This function is an entry point for the new process"""
+    def create_an_event_loop(self) -> None:
+        """Entry point for a new child process: run the async event loop."""
         asyncio.run(self.run())
 
     # -------------------------------------------------------------------------
@@ -1155,6 +1220,7 @@ class AsyncMaster(Node):
     # -------------------------------------------------------------------------
 
     def asdict(self, include_tasks: bool = False) -> dict:
+        """Serialise this master to a JSON-compatible dict for cross-process transfer."""
         obj_dict = {
             "type": self.type,
             "node_id": self.node_id,
@@ -1175,6 +1241,7 @@ class AsyncMaster(Node):
 
     @classmethod
     def fromdict(cls, data: dict) -> "AsyncMaster":
+        """Reconstruct an AsyncMaster from a serialised dict (inverse of asdict)."""
         config = LauncherConfig.model_validate_json(data["config"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         children = {

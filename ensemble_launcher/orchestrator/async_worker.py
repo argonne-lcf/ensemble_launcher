@@ -7,7 +7,7 @@ import time
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 from ensemble_launcher.comm import (
     Action,
@@ -38,7 +38,12 @@ AsyncFuture = asyncio.Future
 
 
 class AsyncWorker(Node):
-    """Synchronous worker implementation - all operations in main loop"""
+    """Leaf-level worker node that executes tasks using a local executor.
+
+    Receives its resource allocation and task assignments from a parent master,
+    runs tasks through an AsyncTaskScheduler, and returns results and final
+    status back to the parent when all work is complete.
+    """
 
     type = "AsyncWorker"
 
@@ -54,9 +59,9 @@ class AsyncWorker(Node):
     ):
         super().__init__(id, parent=parent, children=children)
         self._config = config
-        self._tasks: Dict[str, Task] = tasks
+        self._init_tasks: Dict[str, Task] = tasks if tasks is not None else {}
+        self._init_nodes = Nodes
         self._parent_comm = parent_comm
-        self._nodes = Nodes
 
         ##lazy init in run function
         self._comm = None
@@ -74,8 +79,9 @@ class AsyncWorker(Node):
         self._stop_reporting = asyncio.Event()
 
         self._submission_task = None
+        self._reporting_task = None
 
-        self._futures: Dict[str, Union[AsyncFuture, ConcurrentFuture]] = {}
+        self._task_futures: Dict[str, Union[AsyncFuture, ConcurrentFuture]] = {}
         self._event_loop = None
 
         # Cluster mode state
@@ -96,31 +102,47 @@ class AsyncWorker(Node):
             yield
 
     @property
-    def nodes(self):
-        try:
-            return self._scheduler.cluster.nodes
-        except Exception as e:
-            return self._nodes
+    def nodes(self) -> JobResource:
+        """Node resource allocation owned by the scheduler cluster."""
+        return self._scheduler.cluster.nodes
 
     @nodes.setter
-    def nodes(self, value: JobResource):
-        self._nodes = value
-        if self._scheduler is not None:
-            self._scheduler.cluster.update_nodes(value)
+    def nodes(self, value: JobResource) -> None:
+        self._scheduler.cluster.update_nodes(value)
 
     @property
-    def parent_comm(self):
+    def parent_comm(self) -> Optional[AsyncComm]:
+        """Communication channel to the parent node."""
         return self._parent_comm
 
     @parent_comm.setter
-    def parent_comm(self, value: AsyncComm):
+    def parent_comm(self, value: AsyncComm) -> None:
         self._parent_comm = value
 
     @property
-    def comm(self):
+    def comm(self) -> Optional[AsyncComm]:
+        """Communication channel for this worker."""
         return self._comm
 
-    def _setup_logger(self):
+    @property
+    def tasks(self) -> Dict[str, Task]:
+        """All tasks owned by this worker's scheduler."""
+        return self._scheduler.tasks
+
+    @property
+    def init_nodes(self) -> JobResource:
+        return self._init_nodes
+
+    @property
+    def init_tasks(self) -> JobResource:
+        return self._init_tasks
+
+    # -----------------------------------------------------------------
+    #                       Initialization
+    # -----------------------------------------------------------------
+
+    def _setup_logger(self) -> None:
+        """Configure the logger, optionally writing to a per-worker log file."""
         if self._config.worker_logs:
             os.makedirs(os.path.join(os.getcwd(), "logs"), exist_ok=True)
             file_handler = logging.FileHandler(
@@ -139,40 +161,8 @@ class AsyncWorker(Node):
         else:
             self.logger = logging.getLogger(__name__)
 
-    def get_status(self):
-        """Gets the status of all the tasks and resources in terms of counts"""
-        return Status(
-            nrunning_tasks=len(self._scheduler.running_tasks),
-            nfailed_tasks=len(self._scheduler.failed_tasks),
-            nsuccessful_tasks=len(self._scheduler.successful_tasks),
-            nfree_cores=self._scheduler.cluster.free_cpus,
-            nfree_gpus=self._scheduler.cluster.free_gpus,
-        )
-
-    def _update_tasks(
-        self, taskupdate: TaskUpdate
-    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        ##Add the tasks to scheduler
-        add_status = {}
-        del_status = {}
-        for new_task in taskupdate.added_tasks:
-            self.logger.debug(f"Adding new task {new_task}")
-            add_status[new_task.task_id] = self._scheduler.add_task(new_task)
-            if not add_status[new_task.task_id]:
-                self.logger.error(f"Failed to add new task {new_task.task_id}")
-            else:
-                self.logger.debug(f"Added new task {new_task.task_id}")
-
-        ##delete tasks if needed
-        for task in taskupdate.deleted_tasks:
-            if task.task_id in self._scheduler._running_tasks:
-                self._executor.stop(task_id=self._executor_task_ids[task.task_id])
-                self._futures[task.task_id].cancel()
-            del_status[task.task_id] = self._scheduler.delete_task(task)
-
-        return (add_status, del_status)
-
-    def _create_comm(self):
+    def _create_comm(self) -> None:
+        """Instantiate the communication backend (currently only async_zmq is supported)."""
         if self._config.comm_name == "async_zmq":
             self.logger.info(f"{self.node_id}: Starting comm init")
             self._comm = AsyncZMQComm(
@@ -186,7 +176,28 @@ class AsyncWorker(Node):
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
-    async def _lazy_init(self):
+    def _create_monitor_tasks(self) -> None:
+        """Start the submission, reporting, and cluster monitor asyncio tasks."""
+        ##start submission loop
+        self._submission_task = asyncio.create_task(self._submit_ready_tasks())
+
+        ##start reporting loop
+        self._reporting_task = asyncio.create_task(self.report_status())
+
+        if self._config.cluster and self.parent:
+            self._task_update_task = asyncio.create_task(self._task_update_monitor())
+
+        if self._config.cluster:
+            self._client_handler_task = asyncio.create_task(
+                self._client_request_handler()
+            )
+
+    async def _lazy_init(self) -> None:
+        """Set up all resources needed before task execution begins.
+
+        In order: logging, event loop capture, comm, parent sync (heartbeat +
+        node/task updates), scheduler, executor, and monitor task creation.
+        """
         if self._config.profile == "perfetto":
             self._event_registry = get_registry()
             self._event_registry.enable()
@@ -200,27 +211,124 @@ class AsyncWorker(Node):
             f"{self.node_id}: Logger setup time: {tock - tick:.4f} seconds"
         )
 
-        self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}")
-        ##init scheduler
-        self._scheduler = AsyncTaskScheduler(
-            self.logger.getChild("scheduler"), self._tasks, self.nodes
-        )
+        try:
+            self.logger.info(f"My cpu affinity: {os.sched_getaffinity(0)}")
+        except Exception:
+            pass
 
-        ##Lazy comm creation
+        # Lazy comm creation
         self._create_comm()
+
+        # start parent endpoint monitors
+        await self._comm.start_monitors()
 
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
 
-        await self._comm.start_monitors()
+        # Syncronize with parent
+        await self._sync_with_parent()
 
-    def create_done_callback(self, task: Task):
-        def done_callback(future):
+        # Init scheduler
+        self._scheduler = AsyncTaskScheduler(
+            self.logger.getChild("scheduler"), self._init_tasks, self._init_nodes
+        )
+
+        # Validate that nodes are initialized
+        if not self.nodes:
+            self.logger.error(f"{self.node_id}: Nodes not initialized!")
+            raise RuntimeError(
+                f"{self.node_id}: Nodes must be initialized before execution"
+            )
+
+        self._scheduler.start_monitoring()  # start the scheduler monitoring
+
+        self.logger.info(f"Running {list(self.tasks.keys())} tasks")
+        self.logger.debug(f"Sorted tasks size {self._scheduler._sorted_tasks.qsize()}")
+
+        ##lazy executor creation
+        assert self._config.task_executor_name in executor_registry.async_executors, (
+            f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+        )
+
+        kwargs = {}
+        kwargs["logger"] = self.logger.getChild("executor")
+        kwargs["gpu_selector"] = self._config.gpu_selector
+        kwargs["max_workers"] = self.nodes.resources[0].cpu_count
+        if self._config.task_executor_name == "async_mpi":
+            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
+            kwargs["use_ppn"] = self._config.use_mpi_ppn
+            kwargs["return_stdout"] = self._config.return_stdout
+        self._executor: Union[
+            AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor
+        ] = executor_registry.create_executor(
+            self._config.task_executor_name, kwargs=kwargs
+        )
+
+        # Start global monitor tasks
+        self._create_monitor_tasks()
+
+    # --------------------------------------------------------------------------
+    #                               Parent Synchronization
+    # --------------------------------------------------------------------------
+
+    async def _receive_initial_tasks(self) -> None:
+        """Receive initial task assignment from parent into _init_tasks. Overridable by subclasses."""
+        task_update: TaskUpdate = await self._comm.recv_message_from_parent(
+            TaskUpdate, timeout=5.0
+        )
+        if task_update is not None:
+            self.logger.info(
+                f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
+            )
+            for task in task_update.added_tasks:
+                self._init_tasks[task.task_id] = task
+
+    async def _sync_with_parent(self) -> None:
+        """Perform initial handshake with the parent: heartbeat, node update, task update."""
+        # sync heart beat with parent
+        async with self._timer("heartbeat_sync"):
+            if self.parent and not await self._comm.sync_heartbeat_with_parent(
+                timeout=30.0
+            ):
+                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+
+        node_update: NodeUpdate = await self._comm.recv_message_from_parent(
+            NodeUpdate, timeout=10.0
+        )
+        if node_update is not None:
+            self.logger.info(f"{self.node_id}: Received node update from parent")
+            if node_update.nodes:
+                self._init_nodes = node_update.nodes
+                self.logger.info(
+                    f"{self.node_id}: Updated nodes list with {len(self._init_nodes.nodes)} nodes"
+                )
+                self.logger.debug(f"{self.node_id}: Nodes details: {self._init_nodes}")
+            else:
+                self.logger.warning(
+                    f"{self.node_id}: Received empty node update from parent"
+                )
+        else:
+            self.logger.warning(
+                f"{self.node_id}: No node update received from parent at start"
+            )
+
+        await self._receive_initial_tasks()
+
+    # --------------------------------------------------------------------------
+    #                               Callbacks
+    # --------------------------------------------------------------------------
+
+    def create_done_callback(self, task: Task) -> Callable[[ConcurrentFuture], None]:
+        """Return a done-callback that dispatches _task_callback into the event loop."""
+
+        def done_callback(future: ConcurrentFuture) -> None:
             self._event_loop.call_soon_threadsafe(self._task_callback, task, future)
 
         return done_callback
 
-    def _task_callback(self, task: Task, future):
+    def _task_callback(self, task: Task, future: ConcurrentFuture) -> None:
+        """Process a completed task future: record status, free resources, forward result."""
         task_id = task.task_id
         if self._config.profile == "perfetto" and self._event_registry is not None:
             self._event_registry.record_async_end(
@@ -230,7 +338,7 @@ class AsyncWorker(Node):
                 pid=os.getpid(),
                 async_id=task.task_id,
             )
-        if task_id in self._tasks:
+        if task_id in self.tasks:
             exception = future.exception()
             task.end_time = time.time()
             if exception is None:
@@ -256,10 +364,54 @@ class AsyncWorker(Node):
                     asyncio.create_task(
                         self._comm.send_message_to_child(client_id, task_result)
                     )
+                    asyncio.create_task(
+                        self._comm.send_message_to_child(client_id, task_result)
+                    )
                 elif self.parent:
                     asyncio.create_task(self._comm.send_message_to_parent(task_result))
 
-    async def _client_request_handler(self):
+    # -------------------------------------------------------------------------
+    #                               Monitors
+    # -------------------------------------------------------------------------
+
+    def get_status(self) -> Status:
+        """Return a Status snapshot of running/failed/successful tasks and free resources."""
+        return Status(
+            nrunning_tasks=len(self._scheduler.running_tasks),
+            nfailed_tasks=len(self._scheduler.failed_tasks),
+            nsuccessful_tasks=len(self._scheduler.successful_tasks),
+            nfree_cores=self._scheduler.cluster.free_cpus,
+            nfree_gpus=self._scheduler.cluster.free_gpus,
+        )
+
+    def _update_tasks(
+        self, taskupdate: TaskUpdate
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Apply a TaskUpdate: add new tasks to the scheduler and cancel/delete removed ones.
+
+        Returns (add_status, del_status) dicts mapping task_id -> success bool.
+        """
+        ##Add the tasks to scheduler
+        add_status = {}
+        del_status = {}
+        for new_task in taskupdate.added_tasks:
+            self.logger.debug(f"Adding new task {new_task}")
+            add_status[new_task.task_id] = self._scheduler.add_task(new_task)
+            if not add_status[new_task.task_id]:
+                self.logger.error(f"Failed to add new task {new_task.task_id}")
+            else:
+                self.logger.debug(f"Added new task {new_task.task_id}")
+
+        ##delete tasks if needed
+        for task in taskupdate.deleted_tasks:
+            if task.task_id in self._scheduler._running_tasks:
+                self._executor.stop(task_id=self._executor_task_ids[task.task_id])
+                self._task_futures[task.task_id].cancel()
+            del_status[task.task_id] = self._scheduler.delete_task(task)
+
+        return (add_status, del_status)
+
+    async def _client_request_handler(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this worker."""
         while not self._stop_task_update.is_set():
             item = await self._comm.recv_client_message(timeout=0.1)
@@ -271,7 +423,7 @@ class AsyncWorker(Node):
                     self._client_task_map[task.task_id] = client_id
                 self._update_tasks(msg)
 
-    async def _task_update_monitor(self):
+    async def _task_update_monitor(self) -> None:
         """Receive TaskUpdate messages from parent and incorporate new tasks."""
         while not self._stop_task_update.is_set():
             try:
@@ -286,14 +438,15 @@ class AsyncWorker(Node):
                 self.logger.error(f"Task update monitor error: {e}")
                 await asyncio.sleep(0.1)
 
-    async def _submit_ready_tasks(self):
+    async def _submit_ready_tasks(self) -> None:
+        """Consume the scheduler's ready_tasks queue and submit each task to the executor."""
         self.logger.info("Starting task submission loop")
 
         while not self._stop_submission.is_set():
             try:
                 task_id, req = await self._scheduler.ready_tasks.get()
 
-                task = self._tasks[task_id]
+                task = self.tasks[task_id]
                 self.logger.debug(
                     f"Submitting task {task_id}: {task.executable} with resources {req.resources} {task.env}"
                 )
@@ -325,7 +478,7 @@ class AsyncWorker(Node):
                     env=task.env,
                 )
                 future.add_done_callback(self.create_done_callback(task))
-                self._futures[task_id] = future
+                self._task_futures[task_id] = future
                 task.status = TaskStatus.RUNNING
             except asyncio.CancelledError:
                 self.logger.info("Submission loop cancelled")
@@ -334,20 +487,8 @@ class AsyncWorker(Node):
                 self.logger.error(f"Error in task submission loop: {e}", exc_info=True)
                 raise e
 
-    async def _receive_initial_tasks(self):
-        """Receive initial task assignment. Can be overridden by subclasses."""
-        task_update: TaskUpdate = await self._comm.recv_message_from_parent(
-            TaskUpdate, timeout=10.0
-        )
-        if task_update is not None:
-            self.logger.info(f"{self.node_id}: Received task update from parent")
-            self._update_tasks(task_update)
-        else:
-            self.logger.warning(
-                f"{self.node_id}: No task update received from parent at start"
-            )
-
-    async def report_status(self):
+    async def report_status(self) -> None:
+        """Periodically send a Status snapshot to the parent at the configured interval."""
         while not self._stop_reporting.is_set():
             try:
                 status = self.get_status()
@@ -371,181 +512,83 @@ class AsyncWorker(Node):
                 self.logger.info(f"Reporting loop failed with error {e}")
                 await asyncio.sleep(0.1)
 
-    async def _wait_for_stop_condition(self):
-        """Wait for completion condition. Can be overridden by subclasses."""
+    async def _wait_for_stop_condition(self) -> None:
+        """Wait for all tasks to finish (non-cluster) or a STOP action from parent (cluster)."""
         if self._config.cluster:
             self.logger.info("Cluster mode enabled - waiting for stop message")
             await self._comm.recv_message_from_parent(Action, block=True)
         else:
             await self._scheduler.wait_for_completion()
 
-    async def run(self) -> Result:
-        async with self._timer("init"):
-            ##lazy init
-            await self._lazy_init()
+    # -------------------------------------------------------------------------
+    #                               Teardown
+    # -------------------------------------------------------------------------
 
-        async with self._timer("heartbeat_sync"):
-            # sync with parent
-            if self.parent and not await self._comm.sync_heartbeat_with_parent(
-                timeout=30.0
-            ):
-                self.logger.error(f"{self.node_id}: Failed to connect to parent")
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            else:
-                self.logger.info(f"{self.node_id}: Connected to parent")
-
-        # Receive node update from parent
-        node_update: NodeUpdate = await self._comm.recv_message_from_parent(
-            NodeUpdate, timeout=10.0
-        )
-        if node_update is not None:
-            self.logger.info(f"{self.node_id}: Received node update from parent")
-            self.nodes = node_update.nodes
-            self.logger.debug(f"{self.node_id}: Nodes details: {self.nodes}")
-        else:
-            self.logger.warning(
-                f"{self.node_id}: No node update received from parent at start"
-            )
-
-        # Validate that nodes are initialized
-        if not self.nodes:
-            self.logger.error(f"{self.node_id}: Nodes not initialized!")
-            raise RuntimeError(
-                f"{self.node_id}: Nodes must be initialized before execution"
-            )
-
-        await self._receive_initial_tasks()
-
-        self.logger.info(f"Running {list(self._tasks.keys())} tasks")
-        self.logger.debug(f"Sorted tasks sizeL {self._scheduler._sorted_tasks.qsize()}")
-
-        ##lazy executor creation
-        assert self._config.task_executor_name in executor_registry.async_executors, (
-            f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
-        )
-
-        kwargs = {}
-        kwargs["logger"] = self.logger.getChild("executor")
-        kwargs["gpu_selector"] = self._config.gpu_selector
-        kwargs["max_workers"] = self.nodes.resources[0].cpu_count
-        if self._config.task_executor_name == "async_mpi":
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
-            kwargs["return_stdout"] = self._config.return_stdout
-        self._executor: Union[
-            AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor
-        ] = executor_registry.create_executor(
-            self._config.task_executor_name, kwargs=kwargs
-        )
-
-        self._scheduler.start_monitoring()  # start the schduler monitoring
-
-        ##start submission loop
-        self._submission_task = asyncio.create_task(self._submit_ready_tasks())
-
-        ##start reporting loop
-        self._reporting_task = asyncio.create_task(self.report_status())
-
-        if self._config.cluster and self.parent:
-            self._task_update_task = asyncio.create_task(self._task_update_monitor())
-
-        if self._config.cluster:
-            self._client_handler_task = asyncio.create_task(
-                self._client_request_handler()
-            )
-
-        self.logger.info("Started waiting for stop condition")
-        await self._wait_for_stop_condition()
-
-        ##stop scheduler monitoring first
-        await self._scheduler.stop_monitoring()
-
-        ##stop submission and reporting tasks
+    async def _stop_monitor_tasks(self) -> None:
+        """Signal and await cancellation of all monitor asyncio tasks."""
         self._stop_submission.set()
         self._stop_reporting.set()
-
-        if self._submission_task:
-            self._submission_task.cancel()
-            try:
-                await self._submission_task
-            except asyncio.CancelledError:
-                self.logger.debug("Submission task cancelled")
-        self.logger.info("Stopped submission loop!")
-
-        if self._reporting_task:
-            self._reporting_task.cancel()
-            try:
-                await self._reporting_task
-            except asyncio.CancelledError:
-                self.logger.debug("Reporting task cancelled")
-
-        self.logger.info("Stopped reporting loop!")
-
         self._stop_task_update.set()
-        if self._task_update_task:
-            self._task_update_task.cancel()
-            try:
-                await self._task_update_task
-            except asyncio.CancelledError:
-                pass
+        for task in [
+            self._submission_task,
+            self._reporting_task,
+            self._task_update_task,
+            self._client_handler_task,
+        ]:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-        if self._client_handler_task and not self._client_handler_task.done():
-            self._client_handler_task.cancel()
-            try:
-                await self._client_handler_task
-            except asyncio.CancelledError:
-                pass
+    async def _send_final_results_and_status(self) -> ResultBatch:
+        """Collect all task results, send them to the parent, then send the final status."""
+        result_batch = ResultBatch(sender=self.node_id)
+        for task_id, task in self.tasks.items():
+            if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
+                task_result = Result(
+                    task_id=task_id,
+                    data=self.tasks[task_id].result,
+                    exception=str(self.tasks[task_id].exception),
+                )
+                result_batch.add_result(task_result)
+            else:
+                self.logger.warning(f"Task {task_id} status {task.status}")
 
-        async with self._timer("result_collection"):
-            all_results = await self._results()
+        success = await self._comm.send_message_to_parent(result_batch)
+        if self.parent:
+            if success:
+                self.logger.info(
+                    f"{self.node_id}: Successfully sent the results to parent"
+                )
+            else:
+                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
 
         async with self._timer("final_status"):
             ##also send the final status
             final_status = self.get_status()
             final_status.tag = "final"
             success = await self._comm.send_message_to_parent(final_status)
-            if success:
-                self.logger.info(f"{self.node_id}: Sent final status to parent")
-            else:
-                self.logger.warning(
-                    f"{self.node_id}: Failed to send final status to parent"
-                )
-                fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                self.logger.info(f"{final_status}")
-                final_status.to_file(fname)
+            if self.parent:
+                if success:
+                    self.logger.info(f"{self.node_id}: Sent final status to parent")
+                else:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send final status to parent"
+                    )
+                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                    self.logger.info(f"{final_status}")
+                    final_status.to_file(fname)
 
-        await self.stop()
-
-        self.logger.info(f"{self.node_id} stopped")
-        return all_results
-
-    async def _results(self) -> ResultBatch:
-        result_batch = ResultBatch(sender=self.node_id)
-        for task_id, task in self._tasks.items():
-            if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
-                task_result = Result(
-                    task_id=task_id,
-                    data=self._tasks[task_id].result,
-                    exception=str(self._tasks[task_id].exception),
-                )
-                result_batch.add_result(task_result)
-            else:
-                self.logger.warning(f"Task {task_id} status {task.status}")
-
-        status = await self._comm.send_message_to_parent(result_batch)
-        if self.parent:
-            if status:
-                self.logger.info(
-                    f"{self.node_id}: Successfully sent the results to parent"
-                )
-            else:
-                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
         return result_batch
 
-    def create_an_event_loop(self):
-        """This fuction is the entry point for a new process"""
-        asyncio.run(self.run())
+    async def stop(self) -> None:
+        """Stop the scheduler, cancel all monitor tasks, close comm and executor."""
+        ##stop scheduler monitoring first
+        await self._scheduler.stop_monitoring()
+        await self._stop_monitor_tasks()
 
-    async def stop(self):
         if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
             # Export to Perfetto format
@@ -565,7 +608,39 @@ class AsyncWorker(Node):
         await self._comm.close()
         self._executor.shutdown()
 
+        return
+
+    # -------------------------------------------------------------------------
+    #                               Entry point
+    # -------------------------------------------------------------------------
+
+    async def run(self) -> ResultBatch:
+        """Main entry point: initialise, execute tasks, collect results, stop."""
+        async with self._timer("init"):
+            ##lazy init
+            await self._lazy_init()
+
+        self.logger.info("Started waiting for stop condition")
+        await self._wait_for_stop_condition()
+
+        async with self._timer("result_collection"):
+            all_results = await self._send_final_results_and_status()
+
+        await self.stop()
+
+        self.logger.info(f"{self.node_id} stopped")
+        return all_results
+
+    def create_an_event_loop(self) -> None:
+        """Entry point for a new child process: run the async event loop."""
+        asyncio.run(self.run())
+
+    # -------------------------------------------------------------------------
+    #                       Serialization and Deserialization
+    # -------------------------------------------------------------------------
+
     def asdict(self, include_tasks: bool = False) -> dict:
+        """Serialise this worker to a JSON-compatible dict for cross-process transfer."""
         obj_dict = {
             "type": self.type,
             "node_id": self.node_id,
@@ -586,6 +661,7 @@ class AsyncWorker(Node):
 
     @classmethod
     def fromdict(cls, data: dict) -> "AsyncWorker":
+        """Reconstruct an AsyncWorker from a serialised dict (inverse of asdict)."""
         config = LauncherConfig.model_validate_json(data["config"])
         parent = NodeInfo(**data["parent"]) if data["parent"] else None
         print(socket.gethostname(), data["children"])

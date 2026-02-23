@@ -1,6 +1,6 @@
 import asyncio
 from asyncio import Future as AsyncFuture
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from ensemble_launcher.comm.messages import (
     Action,
@@ -8,7 +8,6 @@ from ensemble_launcher.comm.messages import (
     TaskRequest,
     TaskUpdate,
 )
-from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
 
 from .async_master import AsyncMaster
@@ -16,11 +15,11 @@ from .node import Node
 
 
 class AsyncWorkStealingMaster(AsyncMaster):
-    """
-    Work-stealing variant of AsyncMaster that enables dynamic task distribution.
+    """Work-stealing variant of AsyncMaster that enables dynamic task distribution.
 
-    This master keeps tasks unassigned initially and distributes them on-demand
-    when workers request more work, enabling better load balancing.
+    Tasks are kept in the scheduler's unassigned pool at startup and dispatched
+    on-demand when workers send TaskRequests, enabling better load balancing
+    across heterogeneous or slow-starting workers.
 
     The full task dict and unassigned task pool are owned by the scheduler
     (scheduler.tasks, scheduler.unassigned_task_ids), seeded at creation time.
@@ -37,17 +36,23 @@ class AsyncWorkStealingMaster(AsyncMaster):
         parent=None,
         children=None,
         parent_comm=None,
-    ):
+    ) -> None:
+        """Initialise work-stealing specific state on top of AsyncMaster."""
         super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
 
         self._task_monitor_tasks: List[asyncio.Task] = []
         self._stop_task_monitor_event = asyncio.Event()
+        self._monitor_task_requests_task: Optional[asyncio.Task] = None
+        self._all_work_done_event = asyncio.Event()
+        self._relaunch_attempts = 0
+        self._max_relaunch_attempts = 2
 
     # ------------------------------------------------------------------
     # Child class selection
     # ------------------------------------------------------------------
 
-    def _get_child_class(self) -> "type":
+    def _get_child_class(self) -> type:
+        """Return AsyncWorkStealingWorker for leaf level, otherwise delegate to base."""
         if self.level + 1 == self._config.nlevels:
             from .async_workstealing_worker import AsyncWorkStealingWorker
 
@@ -64,10 +69,11 @@ class AsyncWorkStealingMaster(AsyncMaster):
         partial: bool = False,
         nodes: Optional[JobResource] = None,
     ) -> Dict[str, Node]:
-        """Allocate resources for children without assigning tasks.
+        """Allocate resources for children without assigning tasks upfront.
 
         Tasks remain in the scheduler's unassigned pool and are dispatched
-        on-demand when workers issue TaskRequests.
+        on-demand when workers issue TaskRequests. include_tasks is accepted
+        for API compatibility but is intentionally ignored.
         """
         existing_ids = set(self._scheduler.children_names) if partial else set()
 
@@ -81,15 +87,21 @@ class AsyncWorkStealingMaster(AsyncMaster):
         target_ids = set(self._scheduler.child_assignments.keys()) - existing_ids
         return self._instantiate_children(include_tasks, target_ids)
 
-    def _build_init_task_update(self, child_id: str):
+    def _build_init_task_update(self, child_id: str) -> None:
+        """No initial task update is sent in work-stealing mode; tasks arrive on demand."""
         return None
 
     # ------------------------------------------------------------------
     # Dynamic task monitoring
     # ------------------------------------------------------------------
 
-    async def _monitor_single_child_task_requests(self, child_id: str):
-        """Dedicated monitor for task requests from a single child."""
+    async def _monitor_single_child_task_requests(self, child_id: str) -> None:
+        """Serve task requests from a single child until the stop event is set.
+
+        Blocks on each TaskRequest, assigns tasks from the unassigned pool via
+        the scheduler, and replies with a TaskUpdate or a STOP Action if the
+        pool is empty.
+        """
         self.logger.debug(
             f"{self.node_id}: Started monitoring task requests from child {child_id}"
         )
@@ -149,8 +161,8 @@ class AsyncWorkStealingMaster(AsyncMaster):
             f"{self.node_id}: Stopped monitoring task requests from child {child_id}"
         )
 
-    async def monitor_task_requests(self):
-        """Monitor for task requests from all children — one dedicated task per child."""
+    async def monitor_task_requests(self) -> None:
+        """Spawn one _monitor_single_child_task_requests coroutine per child and await all."""
         if len(self.children) == 0:
             self.logger.debug(
                 f"{self.node_id}: No children to monitor for task requests"
@@ -176,7 +188,8 @@ class AsyncWorkStealingMaster(AsyncMaster):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def _lazy_init(self):
+    async def _lazy_init(self) -> None:
+        """Extend base lazy init: start the task-request monitor at the leaf level."""
         await super()._lazy_init()
 
         self.logger.info(f"I am workstealing master")
@@ -185,15 +198,39 @@ class AsyncWorkStealingMaster(AsyncMaster):
             self.logger.info(
                 f"{self.node_id}: Work-stealing mode — {len(self._scheduler.unassigned_task_ids)} tasks in unassigned pool"
             )
-            asyncio.create_task(self.monitor_task_requests())
+            self._monitor_task_requests_task = asyncio.create_task(self.monitor_task_requests())
             self.logger.info(f"{self.node_id}: Started task request monitor")
 
-    def _mark_and_launch(self, child_ids: List[str]):
-        """Mark children done and potentially launch new ones if tasks remain."""
-        super()._mark_children_done(child_ids)
+    def _mark_and_launch(self, child_ids: List[str]) -> None:
+        """Mark children done; relaunch with remaining tasks or signal all-work-done.
 
-    async def _relaunch_children(self):
-        """Asynchronously create, launch, and sync new children for remaining tasks."""
+        Called via call_soon_threadsafe from done callbacks. If all children
+        are done but unassigned tasks remain, relaunches up to
+        _max_relaunch_attempts times before giving up and setting the done event.
+        """
+        super()._mark_children_done(child_ids)
+        if not self._scheduler.all_children_done:
+            return
+        if self._scheduler.unassigned_task_ids:
+            if self._relaunch_attempts < self._max_relaunch_attempts:
+                self._relaunch_attempts += 1
+                self.logger.warning(
+                    f"{self.node_id}: Relaunching children for remaining "
+                    f"{len(self._scheduler.unassigned_task_ids)} tasks "
+                    f"(attempt {self._relaunch_attempts}/{self._max_relaunch_attempts})"
+                )
+                asyncio.create_task(self._relaunch_children())
+            else:
+                self.logger.error(
+                    f"{self.node_id}: Max relaunch attempts reached, "
+                    f"{len(self._scheduler.unassigned_task_ids)} tasks will not be executed"
+                )
+                self._all_work_done_event.set()
+        else:
+            self._all_work_done_event.set()
+
+    async def _relaunch_children(self) -> None:
+        """Create, launch, and sync a fresh set of children for the remaining unassigned tasks."""
         try:
             children = self._create_children()
             self.logger.info(
@@ -236,7 +273,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         except Exception as e:
             self.logger.error(f"{self.node_id}: Error during relaunch: {e}")
 
-    def _create_done_callback(self, child_ids: List[str]):
+    def _create_done_callback(self, child_ids: List[str]) -> Callable[[AsyncFuture], None]:
         def _done_callback(future: AsyncFuture):
             if self._event_loop is not None:
                 self._event_loop.call_soon_threadsafe(self._mark_and_launch, child_ids)
@@ -245,7 +282,13 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
         return _done_callback
 
-    async def stop(self):
+    async def _wait_for_finish(self) -> None:
+        """Done when all children are done and no unassigned tasks remain (with retries)."""
+        await self._all_work_done_event.wait()
+        await self._aggregate_task
+
+    async def stop(self) -> None:
+        """Cancel all task-monitor coroutines then delegate to the base stop."""
         if self._task_monitor_tasks:
             self._stop_task_monitor_event.set()
             self.logger.info(f"{self.node_id}: Signaled task monitor tasks to stop")
@@ -253,5 +296,12 @@ class AsyncWorkStealingMaster(AsyncMaster):
                 task.cancel()
             await asyncio.gather(*self._task_monitor_tasks, return_exceptions=True)
             self.logger.info(f"{self.node_id}: All task monitor tasks stopped")
+
+        if self._monitor_task_requests_task and not self._monitor_task_requests_task.done():
+            self._monitor_task_requests_task.cancel()
+            try:
+                await self._monitor_task_requests_task
+            except asyncio.CancelledError:
+                pass
 
         return await super().stop()

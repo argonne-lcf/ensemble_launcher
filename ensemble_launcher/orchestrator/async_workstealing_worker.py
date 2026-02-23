@@ -1,72 +1,87 @@
-
-from typing import Optional, Dict
 import asyncio
+from typing import Dict, Optional
 
+from ensemble_launcher.comm import AsyncComm, NodeInfo
+from ensemble_launcher.comm.messages import Action, ActionType, TaskRequest, TaskUpdate
+from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
-from ensemble_launcher.config import LauncherConfig
-from ensemble_launcher.comm import NodeInfo, AsyncComm
-from ensemble_launcher.comm.messages import TaskRequest, TaskUpdate, Action, ActionType
 
 from .async_worker import AsyncWorker
 
+
 class AsyncWorkStealingWorker(AsyncWorker):
+    """Work-stealing variant of AsyncWorker that dynamically requests tasks from master.
+
+    Tasks are not assigned upfront; instead the worker requests a batch whenever
+    its local queue drains. The worker stays alive until it receives a STOP action
+    from the master rather than stopping when its initial task list is empty.
     """
-    Work-stealing variant of AsyncWorker that dynamically requests tasks from master.
-    
-    When this worker's task queue is empty, it requests more tasks from the master.
-    Instead of completing when all tasks are done, it waits for a STOP signal from master.
-    """
-    
+
     type = "AsyncWorkStealingWorker"
-    
-    def __init__(self,
-                id:str,
-                config:LauncherConfig,
-                Nodes: Optional[JobResource] = None,
-                tasks: Optional[Dict[str, Task]] = None,
-                parent: Optional[NodeInfo] = None,
-                children: Optional[Dict[str, NodeInfo]] = None,
-                parent_comm: Optional[AsyncComm] = None
-                ):
-        
-        super().__init__(id,config,Nodes,tasks,parent,children,parent_comm)
+
+    def __init__(
+        self,
+        id: str,
+        config: LauncherConfig,
+        Nodes: Optional[JobResource] = None,
+        tasks: Optional[Dict[str, Task]] = None,
+        parent: Optional[NodeInfo] = None,
+        children: Optional[Dict[str, NodeInfo]] = None,
+        parent_comm: Optional[AsyncComm] = None,
+    ) -> None:
+        """Initialise work-stealing specific state on top of AsyncWorker."""
+        super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
         self._stop_signal_received = asyncio.Event()
         self._task_request_in_progress = asyncio.Event()
-    
-    async def _receive_initial_tasks(self):
-        """Override to send initial task request instead of waiting for TaskUpdate."""
+
+    # ------------------------------------------------------------------
+    # Initialisation overrides
+    # ------------------------------------------------------------------
+
+    async def _receive_initial_tasks(self) -> None:
+        """No-op: tasks are requested dynamically after full init, not during parent sync."""
+        pass
+
+    async def _lazy_init(self) -> None:
+        """Extend base init: fire the initial task request after the scheduler is ready."""
+        await super()._lazy_init()
         self.logger.info(f"{self.node_id}: Sending initial task request")
-        await self._request_tasks_from_master()
-    
-    async def _wait_for_stop_condition(self):
-        """Override to wait for STOP signal from master instead of task completion."""
+        asyncio.create_task(self._request_tasks_from_master())
+
+    # ------------------------------------------------------------------
+    # Stop condition
+    # ------------------------------------------------------------------
+
+    async def _wait_for_stop_condition(self) -> None:
+        """Wait for a STOP action from the master rather than local task exhaustion."""
         self.logger.info("Waiting for STOP signal from master")
         await self._stop_signal_received.wait()
         self.logger.info("Received STOP signal")
-    
-    def _task_callback(self, task: Task, future):
-        """Override to check if we need more tasks after each task completion."""
-        # Call parent callback to handle normal task completion
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
+    def _task_callback(self, task: Task, future) -> None:
+        """After each task completes, request more tasks if the local queue is now empty."""
         super()._task_callback(task, future)
-        
-        # Check if we need to request more tasks
+
         if self._scheduler._sorted_tasks.empty() and not self._stop_signal_received.is_set():
-            self.logger.debug(f"{self.node_id}: Task queue empty after {task.task_id} completion, triggering task request")
-            # Schedule task request in event loop
-            self._event_loop.call_soon_threadsafe(
-                asyncio.create_task,
-                self._request_tasks_from_master()
+            self.logger.debug(
+                f"{self.node_id}: Task queue empty after {task.task_id} completion, requesting more"
             )
-    
-    async def _request_tasks_from_master(self):
-        """
-        Request tasks from master when local queue is empty.
-        Called from task completion callback.
+            asyncio.create_task(self._request_tasks_from_master())
+
+    async def _request_tasks_from_master(self) -> None:
+        """Send a TaskRequest to the master and process the response (TaskUpdate or STOP).
+
+        A guard flag prevents concurrent requests. On receiving a TaskUpdate the
+        tasks are forwarded to the scheduler; on STOP the stop event is set.
         """
         # Early check without setting the flag
         if self._task_request_in_progress.is_set():
-            self.logger.debug(f"Task request is already in progress. Not sending a new one")
+            self.logger.debug("Task request is already in progress. Not sending a new one")
             return
         
         try:
