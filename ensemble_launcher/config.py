@@ -47,6 +47,7 @@ class LauncherConfig(BaseModel):
     )
     cpu_binding_option: str = "--cpu-bind"
     cluster: bool = False  # Eager result delivery + submit() API
+    checkpoint_dir: Optional[str] = None  # Directory for checkpoints; None disables checkpointing
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

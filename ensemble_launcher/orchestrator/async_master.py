@@ -9,6 +9,7 @@ from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, List, Optional, Union
 
+from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
     AsyncComm,
     AsyncCommState,
@@ -98,6 +99,8 @@ class AsyncMaster(Node):
         self._child_forwarder_task: Dict[
             str, asyncio.Task
         ] = {}  # child_id -> result monitor task
+
+        self._checkpointer: Optional[Checkpointer] = None
 
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
@@ -672,6 +675,18 @@ class AsyncMaster(Node):
         self._aggregate_task = asyncio.create_task(
             self._aggregate_and_send_results(self._result_tasks)
         )
+
+        # Checkpoint scheduler + comm state once everything is initialised.
+        if self._config.checkpoint_dir:
+            self._checkpointer = Checkpointer(
+                self.node_id, self._config.checkpoint_dir, self.logger
+            )
+            await self._checkpointer.write_checkpoint(
+                scheduler_state=self._scheduler.get_state(self.node_id),
+                comm_state=self._comm.get_state(),
+            )
+            self.logger.info(f"{self.node_id}: Init checkpoint written")
+
         return None
 
     # --------------------------------------------------------------------------

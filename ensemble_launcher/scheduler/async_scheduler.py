@@ -21,7 +21,7 @@ from .resource import (
     NodeResourceList,
 )
 from .scheduler import Scheduler
-from .state import WorkerAssignment
+from .state import SchedulerState, WorkerAssignment
 
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
@@ -249,6 +249,29 @@ class AsyncWorkerScheduler(AsyncScheduler):
         self._child_to_tasks.pop(child_id, None)
         self.free(child_id)  # no-op if already freed by mark_child_done
 
+    def get_state(self, node_id: str) -> SchedulerState:
+        """Snapshot current state for checkpointing.
+
+        Captures child assignment bookkeeping (resources + task IDs) so the
+        master can rebuild its tree after a restart.  Tasks that were
+        in-flight (assigned to running children) are preserved in
+        ``children_task_ids`` so they can be redistributed on recovery.
+        """
+        children_task_ids: Dict[str, List[str]] = {
+            cid: list(asgn["task_ids"])
+            for cid, asgn in self._child_assignments.items()
+        }
+        children_resources: Dict[str, JobResource] = {
+            cid: asgn["job_resource"]
+            for cid, asgn in self._child_assignments.items()
+        }
+        return SchedulerState(
+            node_id=node_id,
+            nodes=self.cluster.nodes,
+            children_task_ids=children_task_ids,
+            children_resources=children_resources,
+        )
+
     def assign(
         self,
         level: int,
@@ -431,6 +454,29 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._event_registry: Optional[EventRegistry] = None
         if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
+
+    def get_state(self, node_id: str) -> SchedulerState:
+        """Snapshot current state for checkpointing.
+
+        Running tasks are folded back into ``pending_tasks`` because their
+        executor futures will not survive a restart; they must be re-queued.
+        """
+        successful = self.successful_tasks      # Set[str]
+        failed = self.failed_tasks              # Set[str]
+        running = set(self._running_tasks.keys())
+        all_ids = set(self.tasks.keys())
+
+        # Running tasks must be retried on recovery, so include them in pending.
+        pending = (all_ids - successful - failed) | running
+
+        return SchedulerState(
+            node_id=node_id,
+            nodes=self.cluster.nodes,
+            pending_tasks=pending,
+            running_tasks=set(),     # nothing is running post-recovery
+            completed_tasks=successful,
+            failed_tasks=failed,
+        )
 
     def _find_min_resource_req(self) -> JobResource:
         """

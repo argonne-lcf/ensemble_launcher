@@ -78,6 +78,20 @@ class NodeResource(ABC):
         """Divide this resource into n approximately equal parts."""
         pass
 
+    @abstractmethod
+    def serialize(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dict that includes a ``type`` discriminator."""
+        pass
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResource':
+        """Reconstruct a concrete ``NodeResource`` from a dict produced by ``serialize``."""
+        type_map: Dict[str, type] = {"count": NodeResourceCount, "list": NodeResourceList}
+        kind = d.get("type")
+        if kind not in type_map:
+            raise ValueError(f"Unknown NodeResource type '{kind}'")
+        return type_map[kind].deserialize(d)
+
 
 @dataclass(frozen=True, eq=True)
 class NodeResourceCount(NodeResource):
@@ -135,7 +149,14 @@ class NodeResourceCount(NodeResource):
 
     def to_dict(self):
         return {"ncpus":self.ncpus,"ngpus":self.ngpus}
-    
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"type": "count", "ncpus": self.ncpus, "ngpus": self.ngpus}
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResourceCount':
+        return cls(ncpus=d["ncpus"], ngpus=d["ngpus"])
+
     @classmethod
     def from_config(self, info: SystemConfig):
         """creates a node resource list from a dict"""
@@ -262,6 +283,13 @@ class NodeResourceList(NodeResource):
     def to_dict(self):
         return {"cpus":self.cpus,"gpus":self.gpus}
 
+    def serialize(self) -> Dict[str, Any]:
+        return {"type": "list", "cpus": list(self.cpus), "gpus": list(self.gpus)}
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResourceList':
+        return cls(cpus=tuple(d["cpus"]), gpus=tuple(d["gpus"]))
+
 
 @dataclass(eq=True)
 class JobResource:
@@ -354,3 +382,16 @@ class JobResource:
                 return False
         
         return True
+
+    def serialize(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dict including type-discriminated resources."""
+        return {
+            "resources": [r.serialize() for r in self.resources],
+            "nodes": list(self.nodes),
+        }
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'JobResource':
+        """Reconstruct a ``JobResource`` from a dict produced by ``serialize``."""
+        resources = [NodeResource.deserialize(r) for r in d["resources"]]
+        return cls(resources=resources, nodes=d.get("nodes", []))

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from typing_extensions import TypedDict
 
 from .resource import JobResource
@@ -24,12 +24,16 @@ class SchedulerState(BaseModel):
     AsyncTaskScheduler (task status sets).  Either set of fields may be
     left at its default (empty) value when only one scheduler type needs
     to be captured.
+
+    The ``nodes`` and ``children_resources`` fields hold ``JobResource``
+    dataclass instances.  Custom serialisers/validators ensure they
+    round-trip cleanly through ``model_dump_json`` / ``model_validate_json``.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     node_id: str
-    nodes: JobResource
+    nodes: Optional[JobResource] = None
 
     # ------------------------------------------------------------------ #
     # Task status sets (AsyncTaskScheduler)                               #
@@ -53,3 +57,34 @@ class SchedulerState(BaseModel):
     # child_id -> extra keyword args forwarded from policy
     # (e.g. {"task_executor_name": "mpi"})
     children_kwargs: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    # ------------------------------------------------------------------ #
+    # Custom serialisers / validators for JobResource fields              #
+    # ------------------------------------------------------------------ #
+
+    @field_serializer("nodes")
+    def _serialize_nodes(self, v: Optional[JobResource]) -> Optional[Dict[str, Any]]:
+        return v.serialize() if v is not None else None
+
+    @field_validator("nodes", mode="before")
+    @classmethod
+    def _validate_nodes(cls, v: Any) -> Optional[JobResource]:
+        if isinstance(v, dict):
+            return JobResource.deserialize(v)
+        return v
+
+    @field_serializer("children_resources")
+    def _serialize_children_resources(
+        self, v: Dict[str, JobResource]
+    ) -> Dict[str, Any]:
+        return {k: jr.serialize() for k, jr in v.items()}
+
+    @field_validator("children_resources", mode="before")
+    @classmethod
+    def _validate_children_resources(cls, v: Any) -> Dict[str, JobResource]:
+        if isinstance(v, dict):
+            return {
+                k: JobResource.deserialize(val) if isinstance(val, dict) else val
+                for k, val in v.items()
+            }
+        return v
