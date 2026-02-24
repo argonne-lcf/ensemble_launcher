@@ -17,6 +17,7 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
   - [Advanced Configuration](#advanced-configuration)
   - [Resource Pinning](#resource-pinning)
 - [Execution Modes](#execution-modes)
+- [Cluster Mode](#cluster-mode)
 - [Examples](#examples)
 - [Performance Tuning](#performance-tuning)
 - [API Reference](#api-reference)
@@ -36,6 +37,7 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 - **Real-time Monitoring**: Track task execution with configurable status updates
 - **Fault Tolerance**: Graceful handling of task failures with detailed error reporting
 - **Python & Shell Support**: Execute Python callables or shell commands seamlessly
+- **Cluster Mode**: Run the orchestrator as a long-lived background service and submit tasks dynamically from any client process
 
 ---
 
@@ -127,65 +129,72 @@ python3 launcher_script.py
 
 Ensemble Launcher provides a command-line interface for quick execution without writing launcher scripts.
 
-### Basic Usage
+### Commands
 
-After installation, use the `el` command:
-
-```bash
-el config.json
-```
-
-Alternatively, run as a Python module:
-
-```bash
-python -m ensemble_launcher.cli config.json
-```
-
-### CLI Options
+The CLI has two subcommands: `start` and `stop`.
 
 ```bash
 el --help
+el start --help
+el stop --help
 ```
 
-**Available Options:**
+#### `el start` — launch an ensemble
 
-- `--ensemble-file` (required): Path to the ensemble configuration JSON file
-- `--system-config-file` (optional): Path to the system configuration JSON file
-- `--launcher-config-file` (optional): Path to the launcher configuration JSON file
-- `--nodes-str` (optional): Comma-separated list of compute nodes (e.g., "node-001,node-002,node-003")
-- `--pin-resources / --no-pin-resources`: Enable/disable CPU/GPU resource pinning (default: enabled)
-- `--async-orchestrator / --no-async-orchestrator`: Use event-driven orchestrator (default: disabled, only works with ZMQ)
+Starts the ensemble. In normal mode it blocks until all tasks finish and writes `results.json`. In cluster mode (when `launcher.json` contains `"cluster": true`) it starts the orchestrator in the background and returns immediately.
+
+```bash
+el start ENSEMBLE_FILE [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--system-config-file` | Path to system configuration JSON |
+| `--launcher-config-file` | Path to launcher configuration JSON |
+| `--nodes-str` | Comma-separated compute nodes, e.g. `"node-001,node-002"` |
+| `--pin-resources / --no-pin-resources` | CPU/GPU resource pinning (default: enabled) |
+| `--async-orchestrator / --no-async-orchestrator` | Event-driven orchestrator (default: enabled) |
+
+#### `el stop` — stop a running cluster
+
+Sends `SIGTERM` to a cluster-mode orchestrator started with `el start`, triggering graceful shutdown.
+
+```bash
+el stop
+```
+
+The PID of the background process is stored in `.el_launcher.pid` in the working directory.
 
 ### Examples
 
-**Simple execution with default settings:**
+**Normal blocking execution:**
 ```bash
-el my_ensemble.json
+el start my_ensemble.json
 ```
 
 **With custom configurations:**
 ```bash
-el my_ensemble.json \
+el start my_ensemble.json \
     --system-config-file system.json \
     --launcher-config-file launcher.json
 ```
 
 **Specify compute nodes:**
 ```bash
-el my_ensemble.json \
+el start my_ensemble.json \
     --nodes-str "node-001,node-002,node-003,node-004"
 ```
 
-**Use async orchestrator with ZMQ:**
+**Start a cluster-mode orchestrator in the background:**
 ```bash
-el my_ensemble.json \
-    --async-orchestrator
-```
+el start my_ensemble.json --launcher-config-file cluster_launcher.json
+# Returns immediately; orchestrator is running in the background
 
-**Disable resource pinning:**
-```bash
-el my_ensemble.json \
-    --no-pin-resources
+# ... submit tasks from Python (see Cluster Mode section) ...
+
+el stop   # gracefully shut down
 ```
 
 ### Configuration Files
@@ -431,6 +440,113 @@ if __name__ == "__main__":
 
 ---
 
+## Cluster Mode
+
+Cluster mode turns the orchestrator into a long-lived background service. Clients can connect at any time to submit tasks and receive results — without restarting the orchestrator between runs.
+
+### How it works
+
+1. The orchestrator starts in the background and writes a **comm checkpoint** to `checkpoint_dir` recording its ZMQ address.
+2. Any number of `ClusterClient` instances read that checkpoint to discover the address and connect.
+3. Clients submit tasks and receive results via `concurrent.futures.Future`.
+4. The orchestrator shuts down gracefully on `SIGTERM` (sent by `el stop` or `EnsembleLauncher.stop()`).
+
+### Via the CLI
+
+**`launcher_cluster.json`:**
+```json
+{
+    "task_executor_name": "async_processpool",
+    "comm_name": "async_zmq",
+    "nlevels": 1,
+    "cluster": true,
+    "checkpoint_dir": "/scratch/my_job/ckpt"
+}
+```
+
+```bash
+# Start the orchestrator in the background
+el start my_ensemble.json --launcher-config-file launcher_cluster.json
+
+# Submit tasks from Python (see below)
+
+# Graceful shutdown
+el stop
+```
+
+### Via the Python API
+
+**Start / stop:**
+```python
+from ensemble_launcher import EnsembleLauncher
+from ensemble_launcher.config import LauncherConfig, SystemConfig
+
+el = EnsembleLauncher(
+    ensemble_file={},          # tasks will be submitted by clients
+    system_config=SystemConfig(name="local", ncpus=8),
+    launcher_config=LauncherConfig(
+        cluster=True,
+        checkpoint_dir="/scratch/my_job/ckpt",
+    ),
+    Nodes=["node-001", "node-002"],
+)
+
+el.start()   # non-blocking; spawns orchestrator in a separate process
+# ...
+el.stop()    # sends SIGTERM, waits for graceful exit, force-kills if needed
+```
+
+**Context manager:**
+```python
+with EnsembleLauncher(...) as el:
+    # orchestrator is running
+    ...
+# stop() called automatically on exit
+```
+
+### Submitting tasks with `ClusterClient`
+
+```python
+import time
+from ensemble_launcher.orchestrator import ClusterClient
+from ensemble_launcher.ensemble import Task
+
+# Wait for the orchestrator to write its checkpoint, then connect.
+# node_id="global" (default) resolves to the root master automatically.
+with ClusterClient(checkpoint_dir="/scratch/my_job/ckpt") as client:
+    futures = {}
+    for i in range(10):
+        task = Task(task_id=f"task-{i}", nnodes=1, ppn=1,
+                    executable=my_fn, args=(i,))
+        futures[task.task_id] = client.submit(task)
+
+    results = {tid: fut.result(timeout=60) for tid, fut in futures.items()}
+```
+
+**Connecting to a specific node:**
+```python
+# Connect to a specific worker (useful for targeted task routing)
+client = ClusterClient(
+    checkpoint_dir="/scratch/my_job/ckpt",
+    node_id="main.w0",   # scheduler naming: main, main.w0, main.m0.w1, ...
+)
+```
+
+### Node ID naming convention
+
+Orchestrator nodes follow the scheduler naming scheme:
+
+| Node ID | Role |
+|---|---|
+| `main` | Global master (root) |
+| `main.w0`, `main.w1` | Workers of the global master |
+| `main.m0`, `main.m1` | Sub-masters (nlevels=2) |
+| `main.m0.w0` | Worker under sub-master 0 |
+
+`node_id="global"` always resolves to the root master (shortest name in the checkpoint directory).
+
+---
+
 ## Examples
 
 See the [`examples`](examples/) directory for complete workflow samples:
@@ -508,7 +624,7 @@ EnsembleLauncher(
     launcher_config: Optional[LauncherConfig] = None,
     Nodes: Optional[List[str]] = None,
     pin_resources: bool = True,
-    async_orchestrator: bool = False
+    async_orchestrator: bool = True
 )
 ```
 
@@ -521,7 +637,31 @@ EnsembleLauncher(
 - `async_orchestrator`: Use event-driven orchestrator (only for ZMQ backend)
 
 **Methods:**
-- `run()`: Execute ensemble and return results
+- `run()`: Execute ensemble synchronously and return results (raises `RuntimeError` in cluster mode)
+- `start()`: Start the orchestrator in a background process (cluster mode)
+- `stop()`: Send SIGTERM to the background process; force-kill after 30 s if needed
+- `__enter__` / `__exit__`: Context manager — calls `start()` on entry, `stop()` on exit
+
+### ClusterClient
+
+```python
+ClusterClient(
+    checkpoint_dir: str,
+    node_id: str = "global",
+    client_id: Optional[str] = None,
+)
+```
+
+**Parameters:**
+- `checkpoint_dir`: Directory containing orchestrator checkpoint files
+- `node_id`: Node to connect to. `"global"` (default) resolves to the root master; pass a specific scheduler name such as `"main.w0"` to connect to a particular node
+- `client_id`: Optional identity string; auto-generated if omitted
+
+**Methods:**
+- `start()`: Connect transport and start receive thread
+- `teardown()`: Disconnect and stop receive thread
+- `submit(task)`: Send a `Task` and return a `concurrent.futures.Future`
+- `__enter__` / `__exit__`: Context manager — calls `start()` on entry, `teardown()` on exit
 
 ### SystemConfig
 
