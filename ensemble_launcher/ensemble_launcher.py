@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import logging
+import multiprocessing
 import sys
 from typing import Dict, List, Optional, Union
 
@@ -119,6 +120,7 @@ class EnsembleLauncher:
         logger.info(f"LauncherConfig: {self.launcher_config}")
 
         self._launcher = self._create_launcher()
+        self._launcher_process: Optional[multiprocessing.Process] = None
 
     def _generate_tasks(self) -> Dict[str, Task]:
         if isinstance(self.ensemble_file, str):
@@ -175,13 +177,24 @@ class EnsembleLauncher:
             # results = self._launcher.run()
         return results
 
-    def submit(self, task: Task) -> asyncio.Future:
-        """Submit a task dynamically. Only usable in cluster mode from within the asyncio event loop."""
-        if not self.launcher_config.cluster:
-            raise RuntimeError(
-                "submit() is only available when cluster=True in LauncherConfig"
-            )
-        return self._launcher.submit(task)
+    def start(self):
+        """Start the launcher in a separate process."""
+        self._launcher_process = multiprocessing.Process(target=self.run)
+        self._launcher_process.start()
 
-    async def run_async(self):
-        raise NotImplementedError("non blocking run not implemented yet")
+    def stop(self):
+        """Terminate the launcher process, waiting for it to exit and force-killing if needed."""
+        if self._launcher_process is not None:
+            self._launcher_process.terminate()
+            self._launcher_process.join(timeout=30)
+            if self._launcher_process.is_alive():
+                self._launcher_process.kill()
+                self._launcher_process.join()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+        return False

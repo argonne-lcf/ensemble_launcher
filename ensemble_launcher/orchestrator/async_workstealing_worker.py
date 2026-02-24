@@ -32,7 +32,6 @@ class AsyncWorkStealingWorker(AsyncWorker):
     ) -> None:
         """Initialise work-stealing specific state on top of AsyncWorker."""
         super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
-        self._stop_signal_received = asyncio.Event()
         self._task_request_in_progress = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -55,9 +54,16 @@ class AsyncWorkStealingWorker(AsyncWorker):
 
     async def _wait_for_stop_condition(self) -> None:
         """Wait for a STOP action from the master rather than local task exhaustion."""
-        self.logger.info("Waiting for STOP signal from master")
-        await self._stop_signal_received.wait()
-        self.logger.info("Received STOP signal")
+        if self._config.cluster:
+            self.logger.info("Cluster mode enabled - listening for stop message")
+            while not self._stop_signal_received.is_set():
+                msg = await self._comm.recv_message_from_parent(Action, block=True)
+                if msg.type == ActionType.STOP:
+                    self._stop_signal_received.set()
+        else:
+            self.logger.info("Waiting for stop event to be set")
+            await self._stop_signal_received.wait()
+            self.logger.info("Received STOP signal")
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -67,7 +73,10 @@ class AsyncWorkStealingWorker(AsyncWorker):
         """After each task completes, request more tasks if the local queue is now empty."""
         super()._task_callback(task, future)
 
-        if self._scheduler._sorted_tasks.empty() and not self._stop_signal_received.is_set():
+        if (
+            self._scheduler._sorted_tasks.empty()
+            and not self._stop_signal_received.is_set()
+        ):
             self.logger.debug(
                 f"{self.node_id}: Task queue empty after {task.task_id} completion, requesting more"
             )
@@ -81,35 +90,40 @@ class AsyncWorkStealingWorker(AsyncWorker):
         """
         # Early check without setting the flag
         if self._task_request_in_progress.is_set():
-            self.logger.debug("Task request is already in progress. Not sending a new one")
+            self.logger.debug(
+                "Task request is already in progress. Not sending a new one"
+            )
             return
-        
+
         try:
             self._task_request_in_progress.set()
-            
+
             # Calculate how many tasks to request based on available resources
             ntasks = self.nodes.resources[0].cpu_count * len(self.nodes.nodes)
             free_resources = self.nodes
-            
+
             self.logger.info(f"{self.node_id}: Requesting {ntasks} tasks from master")
-            
+
             # Send task request
-            task_request = TaskRequest(sender=self.node_id, ntasks=ntasks, free_resources=free_resources)
+            task_request = TaskRequest(
+                sender=self.node_id, ntasks=ntasks, free_resources=free_resources
+            )
             await self._comm.send_message_to_parent(task_request)
-            
+
             # Wait for response - either TaskUpdate or Action(STOP), whichever comes first
             task_update_task = asyncio.create_task(
-                self._comm.recv_message_from_parent(TaskUpdate, timeout=None, block = True)
+                self._comm.recv_message_from_parent(
+                    TaskUpdate, timeout=None, block=True
+                )
             )
             action_task = asyncio.create_task(
-                self._comm.recv_message_from_parent(Action, timeout=None, block = True)
+                self._comm.recv_message_from_parent(Action, timeout=None, block=True)
             )
-            
+
             done, pending = await asyncio.wait(
-                [task_update_task, action_task],
-                return_when=asyncio.FIRST_COMPLETED
+                [task_update_task, action_task], return_when=asyncio.FIRST_COMPLETED
             )
-            
+
             # Cancel pending tasks
             for task in pending:
                 task.cancel()
@@ -117,23 +131,26 @@ class AsyncWorkStealingWorker(AsyncWorker):
                     await task
                 except asyncio.CancelledError:
                     pass
-            
+
             # Check which task completed
             for task in done:
                 result = await task
                 if isinstance(result, TaskUpdate):
-                    self.logger.info(f"{self.node_id}: Received {len(result.added_tasks)} tasks from master")
+                    self.logger.info(
+                        f"{self.node_id}: Received {len(result.added_tasks)} tasks from master"
+                    )
                     if len(result.added_tasks) > 0:
                         self._update_tasks(result)
                     else:
                         self.logger.debug(f"{self.node_id}: Received empty task update")
                 elif isinstance(result, Action) and result.type == ActionType.STOP:
-                    self.logger.info(f"{self.node_id}: Received STOP signal from master")
+                    self.logger.info(
+                        f"{self.node_id}: Received STOP signal from master"
+                    )
                     self._stop_signal_received.set()
-        
+
         except Exception as e:
             self.logger.error(f"Error requesting tasks from master: {e}", exc_info=True)
         finally:
             # Always clear the flag to prevent deadlock
             self._task_request_in_progress.clear()
-    

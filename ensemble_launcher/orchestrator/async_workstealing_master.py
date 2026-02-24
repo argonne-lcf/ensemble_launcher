@@ -198,7 +198,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
             self.logger.info(
                 f"{self.node_id}: Work-stealing mode — {len(self._scheduler.unassigned_task_ids)} tasks in unassigned pool"
             )
-            self._monitor_task_requests_task = asyncio.create_task(self.monitor_task_requests())
+            self._monitor_task_requests_task = asyncio.create_task(
+                self.monitor_task_requests()
+            )
             self.logger.info(f"{self.node_id}: Started task request monitor")
 
     def _mark_and_launch(self, child_ids: List[str]) -> None:
@@ -273,7 +275,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
         except Exception as e:
             self.logger.error(f"{self.node_id}: Error during relaunch: {e}")
 
-    def _create_done_callback(self, child_ids: List[str]) -> Callable[[AsyncFuture], None]:
+    def _create_done_callback(
+        self, child_ids: List[str]
+    ) -> Callable[[AsyncFuture], None]:
         def _done_callback(future: AsyncFuture):
             if self._event_loop is not None:
                 self._event_loop.call_soon_threadsafe(self._mark_and_launch, child_ids)
@@ -284,8 +288,28 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
     async def _wait_for_finish(self) -> None:
         """Done when all children are done and no unassigned tasks remain (with retries)."""
-        await self._all_work_done_event.wait()
-        await self._aggregate_task
+        if self._config.cluster:
+            self.logger.info("Cluster mode - listening for stop message from parent")
+            if self.parent is not None:
+                while not self._stop_signal_received.is_set():
+                    msg = await self._comm.recv_message_from_parent(Action, block=True)
+                    if msg.type == ActionType.STOP:
+                        for child_id in self.children:
+                            await self._comm.send_message_to_child(
+                                child_id, Action(type=ActionType.STOP)
+                            )
+                        await self._aggregate_task
+                        self._stop_signal_received.set()
+            else:
+                await self._stop_signal_received.wait()
+                for child_id in self.children:
+                    await self._comm.send_message_to_child(
+                        child_id, Action(type=ActionType.STOP)
+                    )
+                    await self._aggregate_task
+        else:
+            await self._all_work_done_event.wait()
+            await self._aggregate_task
 
     async def stop(self) -> None:
         """Cancel all task-monitor coroutines then delegate to the base stop."""
@@ -297,7 +321,10 @@ class AsyncWorkStealingMaster(AsyncMaster):
             await asyncio.gather(*self._task_monitor_tasks, return_exceptions=True)
             self.logger.info(f"{self.node_id}: All task monitor tasks stopped")
 
-        if self._monitor_task_requests_task and not self._monitor_task_requests_task.done():
+        if (
+            self._monitor_task_requests_task
+            and not self._monitor_task_requests_task.done()
+        ):
             self._monitor_task_requests_task.cancel()
             try:
                 await self._monitor_task_requests_task

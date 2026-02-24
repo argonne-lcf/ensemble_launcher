@@ -100,8 +100,8 @@ class AsyncZMQComm(AsyncComm):
             zmq.IDENTITY, f"{self._node_info.node_id}".encode()
         )
         try:
-            # self.router_socket.bind(f"tcp://{self.my_address}")
-            self.router_socket.bind(f"tcp://*:{self.my_address.split(':')[-1]}")
+            self.router_socket.bind(f"tcp://{self.my_address}")
+            # self.router_socket.bind(f"tcp://*:{self.my_address.split(':')[-1]}")
             self.logger.info(
                 f"{self._node_info.node_id}: Successfully bound to {self.my_address}"
             )
@@ -161,10 +161,7 @@ class AsyncZMQComm(AsyncComm):
                 asyncio.create_task(self._monitor_parent_socket())
                 self._parent_monitor_started = True
         elif kwargs.get("children_only", False):
-            if (
-                len(self._node_info.children_ids) > 0
-                and not self._child_monitor_started
-            ):
+            if not self._child_monitor_started:
                 asyncio.create_task(self._monitor_child_sockets())
                 self._child_monitor_started = True
         else:
@@ -174,10 +171,7 @@ class AsyncZMQComm(AsyncComm):
             ):
                 asyncio.create_task(self._monitor_parent_socket())
                 self._parent_monitor_started = True
-            if (
-                len(self._node_info.children_ids) > 0
-                and not self._child_monitor_started
-            ):
+            if not self._child_monitor_started:
                 asyncio.create_task(self._monitor_child_sockets())
                 self._child_monitor_started = True
 

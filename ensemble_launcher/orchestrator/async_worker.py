@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import socket
 import time
 from concurrent.futures import Future as ConcurrentFuture
@@ -11,6 +12,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
     Action,
+    ActionType,
     AsyncComm,
     AsyncCommState,
     AsyncZMQComm,
@@ -93,6 +95,9 @@ class AsyncWorker(Node):
         self._task_update_task = None
         self._client_handler_task: Optional[asyncio.Task] = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
+
+        # Cluster mode / workstealing mode
+        self._stop_signal_received = asyncio.Event()
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -207,6 +212,9 @@ class AsyncWorker(Node):
             self._event_registry.enable()
 
         self._event_loop = asyncio.get_running_loop()
+        self._event_loop.add_signal_handler(
+            signal.SIGTERM, self._stop_signal_received.set
+        )
         # lazy logger creation
         tick = time.perf_counter()
         self._setup_logger()
@@ -429,7 +437,7 @@ class AsyncWorker(Node):
     async def _client_request_handler(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this worker."""
         while not self._stop_task_update.is_set():
-            item = await self._comm.recv_client_message(timeout=0.1)
+            item = await self._comm.recv_client_message()
             if item is None:
                 continue
             client_id, msg = item
@@ -531,7 +539,13 @@ class AsyncWorker(Node):
         """Wait for all tasks to finish (non-cluster) or a STOP action from parent (cluster)."""
         if self._config.cluster:
             self.logger.info("Cluster mode enabled - waiting for stop message")
-            await self._comm.recv_message_from_parent(Action, block=True)
+            if self.parent is not None:
+                while not self._stop_signal_received.is_set():
+                    msg = await self._comm.recv_message_from_parent(Action, block=True)
+                    if msg.type == ActionType.STOP:
+                        self._stop_signal_received.set()
+            else:
+                await self._stop_signal_received.wait()
         else:
             await self._scheduler.wait_for_completion()
 

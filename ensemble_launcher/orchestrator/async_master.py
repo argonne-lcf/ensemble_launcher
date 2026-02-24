@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import socket
 import time
 from concurrent.futures import Future as ConcurrentFuture
@@ -18,6 +19,8 @@ from ensemble_launcher.comm import (
     NodeInfo,
 )
 from ensemble_launcher.comm.messages import (
+    Action,
+    ActionType,
     NodeUpdate,
     Result,
     ResultBatch,
@@ -108,6 +111,7 @@ class AsyncMaster(Node):
         self._client_monitor_task: Optional[asyncio.Task] = None
         self._reporting_task: asyncio.Task = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
+        self._stop_signal_received = asyncio.Event()
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -429,7 +433,7 @@ class AsyncMaster(Node):
                 if all(
                     [
                         "task_executor_name" not in cdict
-                        for cdict in self._child_assignment.values()
+                        for cdict in self._scheduler.child_assignments.values()
                     ]
                 ):
                     common_keys.append("config")
@@ -472,11 +476,14 @@ class AsyncMaster(Node):
 
                 self.logger.info("Launching worker using one shot mpiexec")
                 ##get mpi kwargs
-                if isinstance(first_child.nodes.resources[0], NodeResourceList):
-                    cpus = ":".join(map(str, first_child.nodes.resources[0].cpus))
+                if isinstance(first_child.init_nodes.resources[0], NodeResourceList):
+                    cpus = ":".join(map(str, first_child.init_nodes.resources[0].cpus))
                 else:
                     cpus = ":".join(
-                        map(str, list(range(first_child.nodes.resources[0].cpu_count)))
+                        map(
+                            str,
+                            list(range(first_child.init_nodes.resources[0].cpu_count)),
+                        )
                     )
                 if self._config.cpu_binding_option == "--cpu-bind":
                     mpi_kwargs = {self._config.cpu_binding_option: f"list:{cpus}"}
@@ -530,6 +537,9 @@ class AsyncMaster(Node):
 
         # Store event loop for thread-safe event signaling from callbacks
         self._event_loop = asyncio.get_event_loop()
+        self._event_loop.add_signal_handler(
+            signal.SIGTERM, self._stop_signal_received.set
+        )
 
         # create logger
         tick = time.perf_counter()
@@ -1068,7 +1078,7 @@ class AsyncMaster(Node):
     async def _client_request_monitor(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this master."""
         while not self._all_children_done_event.is_set():
-            item = await self._comm.recv_client_message(timeout=0.1)
+            item = await self._comm.recv_client_message()
             if item is None:
                 continue
             client_id, msg = item
@@ -1212,7 +1222,27 @@ class AsyncMaster(Node):
 
     async def _wait_for_finish(self) -> None:
         """Wait for all work to complete. Overridable by subclasses."""
-        await self._aggregate_task
+        if self._config.cluster:
+            self.logger.info("Cluster mode - listening for stop message from parent")
+            if self.parent is not None:
+                while not self._stop_signal_received.is_set():
+                    msg = await self._comm.recv_message_from_parent(Action, block=True)
+                    if msg.type == ActionType.STOP:
+                        for child_id in self.children:
+                            await self._comm.send_message_to_child(
+                                child_id, Action(type=ActionType.STOP)
+                            )
+                        await self._aggregate_task
+                        self._stop_signal_received.set()
+            else:
+                await self._stop_signal_received.wait()
+                for child_id in self.children:
+                    await self._comm.send_message_to_child(
+                        child_id, Action(type=ActionType.STOP)
+                    )
+                    await self._aggregate_task
+        else:
+            await self._aggregate_task
 
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, wait for all work to finish, stop, return results."""
