@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import cloudpickle
 
-from .async_base import AsyncComm
+from .async_base import AsyncComm, AsyncCommState
 from .nodeinfo import NodeInfo
 
 try:
@@ -21,6 +21,12 @@ except ImportError:
     ZMQ_AVAILABLE = False
 
 # logger = logging.getLogger(__name__)
+
+
+class AsyncZMQCommState(AsyncCommState):
+    node_info: NodeInfo
+    my_address: str
+    parent_address: Optional[str] = None
 
 
 class AsyncZMQComm(AsyncComm):
@@ -381,22 +387,23 @@ class AsyncZMQComm(AsyncComm):
             )
 
     def pickable_copy(self) -> "AsyncZMQComm":
-        ret = AsyncZMQComm(
-            None, node_info=self._node_info, parent_address=self.parent_address
-        )
-        ret.my_address = self.my_address
-        return ret
+        state = self.get_state()
+        state = AsyncZMQCommState.deserialize(state.serialize())
+        return AsyncZMQComm.set_state(state)
 
-    def asdict(self):
-        base_dict = {}
-        base_dict["node_info"] = asdict(self._node_info) if self._node_info else None
-        base_dict["parent_address"] = self.parent_address
-        base_dict["my_address"] = self.my_address
-        return base_dict
+    def get_state(self) -> AsyncZMQCommState:
+        return AsyncZMQCommState(
+            node_info=self._node_info,
+            my_address=self.my_address,
+            parent_address=self.parent_address,
+        )
 
     @classmethod
-    def fromdict(cls, data: Dict[str, Any]) -> "AsyncZMQComm":
-        node_info = NodeInfo(**data["node_info"]) if data.get("node_info") else None
-        comm = cls(None, node_info=node_info, parent_address=data.get("parent_address"))
-        comm.my_address = data.get("my_address")
-        return comm
+    def set_state(self, state: AsyncZMQCommState) -> "AsyncZMQComm":
+        ret = AsyncZMQComm(
+            logger=None,
+            node_info=state.node_info,
+            parent_address=state.parent_address,
+        )
+        ret.my_address = state.my_address
+        return ret

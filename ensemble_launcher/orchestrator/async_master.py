@@ -7,10 +7,15 @@ import socket
 import time
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from typing import Callable, Dict, List, Optional, Union
 
-from ensemble_launcher.comm import AsyncComm, AsyncZMQComm, NodeInfo
+from ensemble_launcher.comm import (
+    AsyncComm,
+    AsyncCommState,
+    AsyncZMQComm,
+    AsyncZMQCommState,
+    NodeInfo,
+)
 from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Result,
@@ -1225,11 +1230,13 @@ class AsyncMaster(Node):
             "type": self.type,
             "node_id": self.node_id,
             "config": self._config.model_dump_json(),
-            "parent": asdict(self.parent) if self.parent else None,
+            "parent": self.parent.serialize() if self.parent else None,
             "children": {
-                child_id: asdict(child) for child_id, child in self.children.items()
+                child_id: child.serialize() for child_id, child in self.children.items()
             },
-            "parent_comm": self.parent_comm.asdict() if self.parent_comm else None,
+            "parent_comm": self.parent_comm.get_state().serialize()
+            if self.parent_comm is not None
+            else None,
         }
 
         if include_tasks:
@@ -1243,16 +1250,18 @@ class AsyncMaster(Node):
     def fromdict(cls, data: dict) -> "AsyncMaster":
         """Reconstruct an AsyncMaster from a serialised dict (inverse of asdict)."""
         config = LauncherConfig.model_validate_json(data["config"])
-        parent = NodeInfo(**data["parent"]) if data["parent"] else None
+        parent = NodeInfo.deserialize(data["parent"]) if data["parent"] else None
         children = {
-            child_id: NodeInfo(**child_dict)
-            for child_id, child_dict in data["children"].items()
+            child_id: NodeInfo.deserialize(child_json)
+            for child_id, child_json in data["children"].items()
         }
 
         if config.comm_name == "async_zmq":
             # AsyncZMQComm might need special handling due to non-picklable attributes
             parent_comm = (
-                AsyncZMQComm.fromdict(data["parent_comm"])
+                AsyncZMQComm.set_state(
+                    AsyncZMQCommState.deserialize(data["parent_comm"])
+                )
                 if data["parent_comm"]
                 else None
             )
