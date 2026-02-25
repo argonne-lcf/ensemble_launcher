@@ -30,7 +30,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.profiling import EventRegistry, get_registry
-from ensemble_launcher.scheduler import AsyncWorkerScheduler
+from ensemble_launcher.scheduler import AsyncChildrenScheduler
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -93,7 +93,7 @@ class AsyncMaster(Node):
         self._event_loop = None  # Will be set in run()
 
         # result and aggregate tasks
-        self._result_tasks = []
+        self._result_batch_tasks = []
         self._aggregate_task = None
         self._child_result_task: Dict[
             str, asyncio.Task
@@ -202,9 +202,9 @@ class AsyncMaster(Node):
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
-    def _create_scheduler(self) -> AsyncWorkerScheduler:
+    def _create_scheduler(self) -> AsyncChildrenScheduler:
         """Instantiate the worker scheduler.  Override to change init args."""
-        return AsyncWorkerScheduler(
+        return AsyncChildrenScheduler(
             self.logger.getChild("scheduler"),
             self._init_nodes,
             self._config,
@@ -312,8 +312,10 @@ class AsyncMaster(Node):
         # Extend the comm's node-info so its cache gains an entry for this child.
         await self._comm.update_node_info(self.info())
         # Per-child collect task (waits for the child's final ResultBatch).
-        task = asyncio.create_task(self._collect_final_result_from_child(child_id))
-        self._result_tasks.append(task)
+        task = asyncio.create_task(
+            self._collect_final_result_batch_from_child(child_id)
+        )
+        self._result_batch_tasks.append(task)
         self._child_result_task[child_id] = task
         # Per-child status monitor (continuously drains Status messages).
         self._child_status_task[child_id] = asyncio.create_task(
@@ -690,7 +692,7 @@ class AsyncMaster(Node):
 
         # Create aggregate task once, after all children (including recreated ones) are registered.
         self._aggregate_task = asyncio.create_task(
-            self._aggregate_and_send_results(self._result_tasks)
+            self._aggregate_and_send_result_batch(self._result_batch_tasks)
         )
 
         # Checkpoint scheduler + comm state once everything is initialised.
@@ -948,7 +950,7 @@ class AsyncMaster(Node):
     #                               Monitors
     # -------------------------------------------------------------------------
 
-    async def _collect_final_result_from_child(self, child_id: str) -> None:
+    async def _collect_final_result_batch_from_child(self, child_id: str) -> None:
         """Collect result and final status from a single child."""
         try:
             # Wait for result from child
@@ -971,7 +973,7 @@ class AsyncMaster(Node):
             )
             self._results[child_id] = []
 
-    async def _aggregate_and_send_results(
+    async def _aggregate_and_send_result_batch(
         self, result_tasks: List[asyncio.Task]
     ) -> None:
         """Wait for all result collection tasks, aggregate, and send to parent."""
@@ -1144,8 +1146,8 @@ class AsyncMaster(Node):
         old_task = self._child_result_task.pop(child_id, None)
         if old_task is not None:
             old_task.cancel()
-            if old_task in self._result_tasks:
-                self._result_tasks.remove(old_task)
+            if old_task in self._result_batch_tasks:
+                self._result_batch_tasks.remove(old_task)
         old_status = self._child_status_task.pop(child_id, None)
         if old_status is not None:
             old_status.cancel()
@@ -1158,7 +1160,18 @@ class AsyncMaster(Node):
         await self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
-        """Gracefully shut down all children, monitors, comm, and executor."""
+        """Gracefully shut down the master in a fixed teardown order.
+
+        1. Tear down each child — cancels the child's future, waits for the
+           scheduler to mark it done, and cancels its per-child result/status
+           monitor tasks.
+        2. Wait (up to 30 s) for ``_all_children_done_event`` to confirm every
+           child process has exited.
+        3. Stop global monitor tasks: status reporter, cluster client monitor
+           (if cluster mode), and parent task-update monitor (if non-root).
+        4. Close the comm layer and shut down the executor.
+        5. Export Perfetto profiling traces if profiling was enabled.
+        """
         # Tear down children and wait for them to be done
         for child_name in self._scheduler.children_names:
             await self._teardown_child(child_name)
@@ -1223,7 +1236,24 @@ class AsyncMaster(Node):
     # -------------------------------------------------------------------------
 
     async def _wait_for_finish(self) -> None:
-        """Wait for all work to complete. Overridable by subclasses."""
+        """Wait for all work to complete, then trigger result aggregation.
+
+        Behaviour depends on deployment mode:
+
+        Non-cluster:
+            Directly awaits ``_aggregate_task``, which resolves once every
+            child has returned its final ResultBatch.
+
+        Cluster mode — non-root master:
+            Loops receiving Action messages from the parent.  On receipt of a
+            STOP action, forwards it to every child, then awaits
+            ``_aggregate_task`` before marking itself done.
+
+        Cluster mode — root master:
+            Waits for ``_stop_signal_received`` to be set (e.g. via SIGTERM or
+            an explicit stop call), then broadcasts STOP to every child and
+            awaits ``_aggregate_task``.
+        """
         if self._config.cluster:
             self.logger.info("Cluster mode - listening for stop message from parent")
             if self.parent is not None:

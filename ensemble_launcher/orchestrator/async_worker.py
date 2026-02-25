@@ -536,7 +536,25 @@ class AsyncWorker(Node):
                 await asyncio.sleep(0.1)
 
     async def _wait_for_stop_condition(self) -> None:
-        """Wait for all tasks to finish (non-cluster) or a STOP action from parent (cluster)."""
+        """Wait for the condition that ends this worker's execution loop.
+
+        Behaviour depends on deployment mode:
+
+        Non-cluster:
+            Calls ``scheduler.wait_for_completion()``, which blocks until every
+            task assigned to this worker has either succeeded or failed.  The
+            worker shuts down as soon as its local task pool is exhausted.
+
+        Cluster mode — non-root worker:
+            Loops receiving Action messages from the parent master.  On receipt
+            of a STOP action, sets ``_stop_signal_received`` and exits.  The
+            worker stays alive indefinitely until the master decides to stop it,
+            allowing new tasks to be submitted at any time.
+
+        Cluster mode — root worker:
+            Awaits ``_stop_signal_received`` directly (set externally, e.g. via
+            SIGTERM or a programmatic stop call).
+        """
         if self._config.cluster:
             self.logger.info("Cluster mode enabled - waiting for stop message")
             if self.parent is not None:
@@ -554,7 +572,12 @@ class AsyncWorker(Node):
     # -------------------------------------------------------------------------
 
     async def _stop_monitor_tasks(self) -> None:
-        """Signal and await cancellation of all monitor asyncio tasks."""
+        """Signal stop events then cancel and await each monitor asyncio task.
+
+        Sets the stop events for the submission loop, status reporter, and
+        parent task-update listener before cancelling the corresponding tasks,
+        ensuring each coroutine exits cleanly via ``CancelledError``.
+        """
         self._stop_submission.set()
         self._stop_reporting.set()
         self._stop_task_update.set()
@@ -572,7 +595,15 @@ class AsyncWorker(Node):
                     pass
 
     async def _send_final_results_and_status(self) -> ResultBatch:
-        """Collect all task results, send them to the parent, then send the final status."""
+        """Package completed task results, send them to the parent, then send the final status.
+
+        Iterates over all tasks owned by this worker, collects results for
+        those that succeeded or failed, and sends a ``ResultBatch`` to the
+        parent.  Immediately afterwards sends a ``Status`` message tagged
+        ``"final"`` so the parent knows this worker is finished.  If the
+        status send fails the status is also written to a local JSON file as
+        a fallback.
+        """
         result_batch = ResultBatch(sender=self.node_id)
         for task_id, task in self.tasks.items():
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
@@ -613,7 +644,19 @@ class AsyncWorker(Node):
         return result_batch
 
     async def stop(self) -> None:
-        """Stop the scheduler, cancel all monitor tasks, close comm and executor."""
+        """Gracefully shut down the worker in a fixed teardown order.
+
+        1. Stop the scheduler's resource monitor so no new tasks are dispatched
+           to the executor.
+        2. Cancel all monitor asyncio tasks: submission loop, status reporter,
+           parent task-update listener, and cluster client handler.
+        3. Export Perfetto profiling traces if profiling was enabled.
+        4. Close the comm layer and shut down the executor.
+
+        Note: results and final status are sent to the parent inside
+        ``run()`` (via ``_send_final_results_and_status``) before ``stop()``
+        is called, so this method does not perform any result forwarding.
+        """
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()
         await self._stop_monitor_tasks()

@@ -287,7 +287,25 @@ class AsyncWorkStealingMaster(AsyncMaster):
         return _done_callback
 
     async def _wait_for_finish(self) -> None:
-        """Done when all children are done and no unassigned tasks remain (with retries)."""
+        """Wait for all work to complete, accounting for dynamically stolen tasks.
+
+        Behaviour depends on deployment mode:
+
+        Non-cluster:
+            Waits for ``_all_work_done_event``, which is set only once every
+            task has been assigned to a child and every child's result has been
+            collected (including any tasks that were stolen and redistributed
+            at runtime).  Then awaits ``_aggregate_task`` to finalise results.
+
+        Cluster mode — non-root master:
+            Loops receiving Action messages from the parent.  On receipt of a
+            STOP action, forwards it to every child, then awaits
+            ``_aggregate_task`` before marking itself done.
+
+        Cluster mode — root master:
+            Waits for ``_stop_signal_received`` to be set, then broadcasts
+            STOP to every child and awaits ``_aggregate_task``.
+        """
         if self._config.cluster:
             self.logger.info("Cluster mode - listening for stop message from parent")
             if self.parent is not None:
@@ -312,7 +330,15 @@ class AsyncWorkStealingMaster(AsyncMaster):
             await self._aggregate_task
 
     async def stop(self) -> None:
-        """Cancel all task-monitor coroutines then delegate to the base stop."""
+        """Extend the base master stop with work-stealing-specific cleanup.
+
+        1. Signal and cancel all per-child task-monitor coroutines
+           (``_task_monitor_tasks``) that watch for steal-able tasks.
+        2. Cancel the ``_monitor_task_requests_task`` that listens for steal
+           requests from children.
+        3. Delegate to ``AsyncMaster.stop()`` for the standard teardown
+           sequence (child teardown, monitors, comm, executor).
+        """
         if self._task_monitor_tasks:
             self._stop_task_monitor_event.set()
             self.logger.info(f"{self.node_id}: Signaled task monitor tasks to stop")

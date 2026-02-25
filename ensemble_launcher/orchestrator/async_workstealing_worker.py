@@ -53,7 +53,26 @@ class AsyncWorkStealingWorker(AsyncWorker):
     # ------------------------------------------------------------------
 
     async def _wait_for_stop_condition(self) -> None:
-        """Wait for a STOP action from the master rather than local task exhaustion."""
+        """Wait for an explicit STOP signal rather than local task exhaustion.
+
+        Unlike the base ``AsyncWorker``, this worker never exits simply because
+        its local task queue is empty.  The master may steal tasks from other
+        workers and push them here at any time, so the worker must stay alive
+        until told otherwise.
+
+        Behaviour depends on deployment mode:
+
+        Non-cluster:
+            Awaits ``_stop_signal_received``, which is set when the master sends
+            a STOP Action over the comm channel (handled in the parent-message
+            monitor).  Local task exhaustion alone does not trigger shutdown.
+
+        Cluster mode:
+            Loops receiving Action messages from the parent master.  On receipt
+            of a STOP action, sets ``_stop_signal_received`` and exits.
+            Behaviour is the same regardless of whether this is a root or
+            non-root worker since work-stealing workers always have a master.
+        """
         if self._config.cluster:
             self.logger.info("Cluster mode enabled - listening for stop message")
             while not self._stop_signal_received.is_set():

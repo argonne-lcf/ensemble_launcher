@@ -17,7 +17,7 @@ from .resource import (
     NodeResourceCount,
 )
 from .scheduler import Scheduler
-from .state import SchedulerState, WorkerAssignment
+from .state import ChildrenAssignment, SchedulerState
 
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
@@ -35,7 +35,7 @@ class AsyncScheduler(Scheduler):
         super().__init__(logger=logger, cluster_resource=cluster_resource)
 
 
-class AsyncWorkerScheduler(AsyncScheduler):
+class AsyncChildrenScheduler(AsyncScheduler):
     """Scheduler that manages a pool of child workers: resource allocation, task
     distribution, lifecycle tracking, and status aggregation."""
 
@@ -77,10 +77,11 @@ class AsyncWorkerScheduler(AsyncScheduler):
         self.cluster.set_event_loop(self._event_loop)
 
         # Child bookkeeping
-        self._child_assignments: Dict[str, WorkerAssignment] = {}
+        self._child_assignments: Dict[str, ChildrenAssignment] = {}
         self._children_status: Dict[str, "Status"] = {}  # child_id -> Status
         self._child_done_events: Dict[str, asyncio.Event] = {}  # child_id -> done event
         self._running_children: Set[str] = set()  # child_ids currently running
+        self._dead_children: Set[str] = set()  # child_ids dead before finishing work
         self._child_to_tasks: Dict[
             str, List[str]
         ] = {}  # child_id -> dynamically assigned task_ids
@@ -117,8 +118,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
 
     @property
-    def child_assignments(self) -> Dict[str, WorkerAssignment]:
-        """Mapping of child_id to its WorkerAssignment (resources + task_ids + wid)."""
+    def child_assignments(self) -> Dict[str, ChildrenAssignment]:
+        """Mapping of child_id to its ChildrenAssignment (resources + task_ids + wid)."""
         return self._child_assignments
 
     @property
@@ -126,8 +127,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
         """Ordered list of all registered child IDs."""
         return list(self._child_assignments.keys())
 
-    def get_child_assignment(self, child_id: str) -> WorkerAssignment:
-        """Return the WorkerAssignment for the given child_id."""
+    def get_child_assignment(self, child_id: str) -> ChildrenAssignment:
+        """Return the ChildrenAssignment for the given child_id."""
         return self._child_assignments[child_id]
 
     # ------------------------------------------------------------------
@@ -137,6 +138,14 @@ class AsyncWorkerScheduler(AsyncScheduler):
     def mark_child_running(self, child_id: str) -> None:
         """Record that a child process has been submitted to the executor."""
         self._running_children.add(child_id)
+        if child_id in self._dead_children:
+            self._dead_children.discard(child_id)
+
+    def mark_child_dead(self, child_id: str) -> None:
+        """Record the child is dead"""
+        self._running_children.discard(child_id)
+        self._dead_children.add(child_id)
+        self.free(child_id)
 
     def mark_child_done(self, child_id: str) -> None:
         """Discard from running set, free cluster resources, and set done event."""
@@ -323,7 +332,7 @@ class AsyncWorkerScheduler(AsyncScheduler):
             if allocated:
                 child_id = node_id + f"{child_suffix}{wid}"
                 self.workers[child_id] = resource
-                alloc: WorkerAssignment = {
+                alloc: ChildrenAssignment = {
                     "job_resource": resource,
                     "task_ids": [],
                     "wid": wid,

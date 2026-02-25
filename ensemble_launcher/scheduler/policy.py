@@ -14,7 +14,7 @@ from ensemble_launcher.scheduler.resource import (
 
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
-    from ensemble_launcher.scheduler.state import WorkerAssignment
+    from ensemble_launcher.scheduler.state import ChildrenAssignment
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class ChildrenPolicy(ABC):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
-        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:
@@ -272,7 +272,7 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
-        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:
@@ -331,7 +331,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         2. Register it:
             policy_registry.register_policy("split_8", Split8Policy, type="children_policy")
         3. Use it:
-            scheduler = AsyncWorkerScheduler(..., policy="split_8")
+            scheduler = AsyncChildrenScheduler(..., policy="split_8")
     """
 
     def __init__(self, nchildren: int = None, logger: logging.Logger = None, **kwargs):
@@ -387,7 +387,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
-        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:

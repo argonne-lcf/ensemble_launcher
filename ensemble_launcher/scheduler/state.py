@@ -8,8 +8,8 @@ from typing_extensions import TypedDict
 from .resource import JobResource
 
 
-class WorkerAssignment(TypedDict):
-    """Per-child assignment stored in AsyncWorkerScheduler._child_assignments."""
+class ChildrenAssignment(TypedDict):
+    """Per-child assignment stored in AsyncChildrenScheduler._child_assignments."""
 
     job_resource: JobResource
     task_ids: List[str]
@@ -20,7 +20,7 @@ class SchedulerState(BaseModel):
     """
     Snapshot of scheduler state for fault tolerance and checkpointing.
 
-    Covers both AsyncWorkerScheduler (worker_* fields) and
+    Covers both AsyncChildrenScheduler (worker_* fields) and
     AsyncTaskScheduler (task status sets).  Either set of fields may be
     left at its default (empty) value when only one scheduler type needs
     to be captured.
@@ -45,7 +45,7 @@ class SchedulerState(BaseModel):
     failed_tasks: Set[str] = Field(default_factory=set)
 
     # ------------------------------------------------------------------ #
-    # Children bookkeeping (AsyncWorkerScheduler)                           #
+    # Children bookkeeping (AsyncChildrenScheduler)                           #
     # ------------------------------------------------------------------ #
 
     # child_id -> task ids assigned to that child
