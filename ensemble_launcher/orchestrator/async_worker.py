@@ -99,6 +99,10 @@ class AsyncWorker(Node):
         # Cluster mode / workstealing mode
         self._stop_signal_received = asyncio.Event()
 
+        # Parent fault detection
+        self._consecutive_parent_failures: int = 0
+        self._parent_dead_event: asyncio.Event = asyncio.Event()
+
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
@@ -252,6 +256,9 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Nodes must be initialized before execution"
             )
 
+        # Restore from checkpoint if one exists for this node
+        await self._restore_checkpoint()
+
         self._scheduler.start_monitoring()  # start the scheduler monitoring
 
         self.logger.info(f"Running {list(self.tasks.keys())} tasks")
@@ -280,15 +287,56 @@ class AsyncWorker(Node):
         self._create_monitor_tasks()
 
         # Checkpoint scheduler + comm state once everything is initialised.
-        if self._config.checkpoint_dir:
-            self._checkpointer = Checkpointer(
-                self.node_id, self._config.checkpoint_dir, self.logger
-            )
-            await self._checkpointer.write_checkpoint(
-                scheduler_state=self._scheduler.get_state(self.node_id),
-                comm_state=self._comm.get_state(),
-            )
+        if self._checkpointer is not None:
+            await self._write_checkpoint()
             self.logger.info(f"{self.node_id}: Init checkpoint written")
+
+    # --------------------------------------------------------------------------
+    #                               Checkpointing
+    # --------------------------------------------------------------------------
+
+    async def _restore_checkpoint(self) -> bool:
+        """Create checkpointer and restore scheduler state from a prior checkpoint.
+
+        Returns True if scheduler state was successfully restored.
+        """
+        if not self._config.checkpoint_dir:
+            return False
+        self._checkpointer = Checkpointer(
+            self.node_id, self._config.checkpoint_dir, self.logger
+        )
+        if not self._checkpointer.checkpoint_exists():
+            return False
+        ckpt = await self._checkpointer.read_checkpoint()
+        results = await self._checkpointer.read_results()
+        if ckpt is None:
+            return False
+        scheduler_state, _comm_state, _tasks = ckpt
+        if scheduler_state is None:
+            return False
+        self._scheduler.set_state(scheduler_state, results or {})
+        self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
+        return True
+
+    async def _write_checkpoint(self) -> None:
+        """Write scheduler state, comm state, and completed results to checkpoint."""
+        if self._checkpointer is None:
+            return
+        await self._checkpointer.write_checkpoint(
+            scheduler_state=self._scheduler.get_state(self.node_id),
+            comm_state=self._comm.get_state(),
+        )
+        completed_results = {
+            task_id: Result(
+                task_id=task_id,
+                data=task.result,
+                exception=str(task.exception),
+            )
+            for task_id, task in self.tasks.items()
+            if task.status in (TaskStatus.SUCCESS, TaskStatus.FAILED)
+        }
+        if completed_results:
+            await self._checkpointer.write_results(completed_results)
 
     # --------------------------------------------------------------------------
     #                               Parent Synchronization
@@ -516,10 +564,31 @@ class AsyncWorker(Node):
             try:
                 status = self.get_status()
                 if self.parent:
-                    await self._comm.send_message_to_parent(status)
+                    success = await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
+                    if success:
+                        self._consecutive_parent_failures = 0
+                    else:
+                        self._consecutive_parent_failures += 1
+                        self.logger.warning(
+                            f"{self.node_id}: Failed to send status to parent "
+                            f"({self._consecutive_parent_failures}/{self._config.max_parent_send_failures})"
+                        )
+                        if (
+                            self._consecutive_parent_failures
+                            >= self._config.max_parent_send_failures
+                        ):
+                            self.logger.error(
+                                f"{self.node_id}: Parent unreachable — self-terminating"
+                            )
+                            self._parent_dead_event.set()
                 else:
                     self.logger.info(status)
+
+                # Periodic checkpoint: scheduler state, comm state, and completed results.
+                if self._checkpointer is not None:
+                    asyncio.create_task(self._write_checkpoint())
+
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
                     await asyncio.wait_for(
@@ -538,34 +607,60 @@ class AsyncWorker(Node):
     async def _wait_for_stop_condition(self) -> None:
         """Wait for the condition that ends this worker's execution loop.
 
-        Behaviour depends on deployment mode:
+        Races three conditions with asyncio.FIRST_COMPLETED:
+        1. Mode-specific work/stop signal (task completion or external stop).
+        2. Parent dead locally — consecutive send failures exceeded threshold.
+        3. STOP action received from parent (non-root only).
 
-        Non-cluster:
-            Calls ``scheduler.wait_for_completion()``, which blocks until every
-            task assigned to this worker has either succeeded or failed.  The
-            worker shuts down as soon as its local task pool is exhausted.
-
-        Cluster mode — non-root worker:
-            Loops receiving Action messages from the parent master.  On receipt
-            of a STOP action, sets ``_stop_signal_received`` and exits.  The
-            worker stays alive indefinitely until the master decides to stop it,
-            allowing new tasks to be submitted at any time.
-
-        Cluster mode — root worker:
-            Awaits ``_stop_signal_received`` directly (set externally, e.g. via
-            SIGTERM or a programmatic stop call).
+        In non-cluster mode with a parent, work completion (task pool exhausted)
+        acts as condition 1. In cluster mode (root), the external stop signal is
+        condition 1. In cluster mode (non-root), only conditions 2 and 3 apply.
         """
+        stop_tasks: Dict[str, asyncio.Task] = {}
+
+        # Condition 1: mode-specific work/stop signal
         if self._config.cluster:
-            self.logger.info("Cluster mode enabled - waiting for stop message")
             if self.parent is not None:
-                while not self._stop_signal_received.is_set():
-                    msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg.type == ActionType.STOP:
-                        self._stop_signal_received.set()
+                # Cluster non-root: no separate work-done condition — parent_stop handles it
+                pass
             else:
-                await self._stop_signal_received.wait()
+                # Root worker: external stop signal
+                stop_tasks["stop_signal"] = asyncio.create_task(
+                    self._stop_signal_received.wait()
+                )
         else:
-            await self._scheduler.wait_for_completion()
+            # Non-cluster non-root: task completion
+            stop_tasks["work_done"] = asyncio.create_task(
+                self._scheduler.wait_for_completion()
+            )
+
+        # Condition 2: parent detected dead locally
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        # Condition 3: STOP action received from parent (non-root only)
+        if self.parent is not None:
+
+            async def _recv_stop_from_parent():
+                while True:
+                    msg = await self._comm.recv_message_from_parent(Action, block=True)
+                    if msg is not None and msg.type == ActionType.STOP:
+                        return
+
+            stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
+
+        if not stop_tasks:
+            # Should not happen, but guard against empty wait
+            return
+
+        done, pending = await asyncio.wait(
+            set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # -------------------------------------------------------------------------
     #                               Teardown
@@ -657,6 +752,11 @@ class AsyncWorker(Node):
         ``run()`` (via ``_send_final_results_and_status``) before ``stop()``
         is called, so this method does not perform any result forwarding.
         """
+
+        if self._checkpointer:
+            await self._write_checkpoint()
+            self.logger.info(f"{self.node_id}: Final checkpoint written")
+
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()
         await self._stop_monitor_tasks()

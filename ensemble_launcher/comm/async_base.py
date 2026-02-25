@@ -269,7 +269,6 @@ class AsyncComm(ABC):
         return await self._send_to_child(child_id=child_id, data=msg)
 
     async def send_message_to_parent(self, msg: Message) -> bool:
-        """Send a message to the parent node."""
         return await self._send_to_parent(data=msg)
 
     async def recv_message_from_parent(

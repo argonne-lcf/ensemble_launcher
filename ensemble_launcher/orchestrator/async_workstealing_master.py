@@ -1,6 +1,6 @@
 import asyncio
 from asyncio import Future as AsyncFuture
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from ensemble_launcher.comm.messages import (
     Action,
@@ -185,6 +185,38 @@ class AsyncWorkStealingMaster(AsyncMaster):
         self.logger.info(f"{self.node_id}: Task request monitor stopped")
 
     # ------------------------------------------------------------------
+    # Fault tolerance overrides
+    # ------------------------------------------------------------------
+
+    async def _recover_dead_child(self, child_id: str) -> List[str]:
+        """Recover a dead child: cancel its task-request monitor, call super, start monitors for new children."""
+        # Cancel the task-request monitor for the dead child
+        dead_monitors = [
+            t for t in self._task_monitor_tasks
+            if t.get_name() == f"task_monitor_{child_id}"
+        ]
+        for t in dead_monitors:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._task_monitor_tasks = [t for t in self._task_monitor_tasks if not t.done()]
+
+        # Base class tears down, relaunches, and returns new child IDs
+        new_child_ids = await super()._recover_dead_child(child_id)
+
+        # Start task-request monitors for the new children
+        for cid in new_child_ids:
+            task = asyncio.create_task(
+                self._monitor_single_child_task_requests(cid),
+                name=f"task_monitor_{cid}",
+            )
+            self._task_monitor_tasks.append(task)
+
+        return new_child_ids
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -289,45 +321,51 @@ class AsyncWorkStealingMaster(AsyncMaster):
     async def _wait_for_finish(self) -> None:
         """Wait for all work to complete, accounting for dynamically stolen tasks.
 
-        Behaviour depends on deployment mode:
+        Races three conditions with asyncio.FIRST_COMPLETED:
+        1. Work done — _all_work_done_event (set once all tasks assigned and collected).
+        2. Parent dead locally — consecutive send failures exceeded threshold.
+        3. STOP action received from parent (non-root only) / external signal (root).
 
-        Non-cluster:
-            Waits for ``_all_work_done_event``, which is set only once every
-            task has been assigned to a child and every child's result has been
-            collected (including any tasks that were stolen and redistributed
-            at runtime).  Then awaits ``_aggregate_task`` to finalise results.
-
-        Cluster mode — non-root master:
-            Loops receiving Action messages from the parent.  On receipt of a
-            STOP action, forwards it to every child, then awaits
-            ``_aggregate_task`` before marking itself done.
-
-        Cluster mode — root master:
-            Waits for ``_stop_signal_received`` to be set, then broadcasts
-            STOP to every child and awaits ``_aggregate_task``.
+        On any non-work-done exit, forwards Action(STOP) to all children before
+        proceeding, cascading the shutdown down the subtree.
         """
-        if self._config.cluster:
-            self.logger.info("Cluster mode - listening for stop message from parent")
-            if self.parent is not None:
-                while not self._stop_signal_received.is_set():
+        stop_tasks: Dict[str, asyncio.Task] = {}
+
+        stop_tasks["work_done"] = asyncio.create_task(self._all_work_done_event.wait())
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        if self.parent is not None:
+            async def _recv_stop_from_parent():
+                while True:
                     msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg.type == ActionType.STOP:
-                        for child_id in self.children:
-                            await self._comm.send_message_to_child(
-                                child_id, Action(type=ActionType.STOP)
-                            )
-                        await self._aggregate_task
-                        self._stop_signal_received.set()
-            else:
-                await self._stop_signal_received.wait()
-                for child_id in self.children:
-                    await self._comm.send_message_to_child(
-                        child_id, Action(type=ActionType.STOP)
-                    )
-                    await self._aggregate_task
+                    if msg is not None and msg.type == ActionType.STOP:
+                        return
+            stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
         else:
-            await self._all_work_done_event.wait()
-            await self._aggregate_task
+            stop_tasks["stop_signal"] = asyncio.create_task(self._stop_signal_received.wait())
+
+        done, pending = await asyncio.wait(
+            set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Propagate stop to children if work didn't finish naturally
+        if not self._all_work_done_event.is_set():
+            self.logger.info(f"{self.node_id}: Propagating STOP to children")
+            for child_id in list(self.children.keys()):
+                try:
+                    await self._comm.send_message_to_child(
+                        child_id, Action(sender=self.node_id, type=ActionType.STOP)
+                    )
+                except Exception:
+                    pass
+
+        await self._aggregate_task
 
     async def stop(self) -> None:
         """Extend the base master stop with work-stealing-specific cleanup.

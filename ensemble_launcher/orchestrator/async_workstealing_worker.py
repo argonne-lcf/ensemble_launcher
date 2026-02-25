@@ -53,36 +53,50 @@ class AsyncWorkStealingWorker(AsyncWorker):
     # ------------------------------------------------------------------
 
     async def _wait_for_stop_condition(self) -> None:
-        """Wait for an explicit STOP signal rather than local task exhaustion.
+        """Wait for the condition that ends this work-stealing worker's execution loop.
 
-        Unlike the base ``AsyncWorker``, this worker never exits simply because
-        its local task queue is empty.  The master may steal tasks from other
-        workers and push them here at any time, so the worker must stay alive
-        until told otherwise.
+        Unlike the base AsyncWorker, this worker has no upfront task pool — tasks
+        arrive on-demand via TaskRequests.  There is therefore no task-completion
+        condition; the worker stays alive until externally stopped.
 
-        Behaviour depends on deployment mode:
-
-        Non-cluster:
-            Awaits ``_stop_signal_received``, which is set when the master sends
-            a STOP Action over the comm channel (handled in the parent-message
-            monitor).  Local task exhaustion alone does not trigger shutdown.
-
-        Cluster mode:
-            Loops receiving Action messages from the parent master.  On receipt
-            of a STOP action, sets ``_stop_signal_received`` and exits.
-            Behaviour is the same regardless of whether this is a root or
-            non-root worker since work-stealing workers always have a master.
+        Races two conditions with asyncio.FIRST_COMPLETED:
+        1. STOP action received from parent (non-root) / external signal (root).
+        2. Parent dead locally — consecutive send failures exceeded threshold.
         """
-        if self._config.cluster:
-            self.logger.info("Cluster mode enabled - listening for stop message")
-            while not self._stop_signal_received.is_set():
-                msg = await self._comm.recv_message_from_parent(Action, block=True)
-                if msg.type == ActionType.STOP:
-                    self._stop_signal_received.set()
+        stop_tasks: Dict[str, asyncio.Task] = {}
+
+        # Condition 1: Stop event set either explicitly or received from parent
+        if self.parent is None:
+            # Root worker: external stop signal
+            stop_tasks["stop_signal"] = asyncio.create_task(
+                self._stop_signal_received.wait()
+            )
         else:
-            self.logger.info("Waiting for stop event to be set")
-            await self._stop_signal_received.wait()
-            self.logger.info("Received STOP signal")
+
+            async def _recv_stop_from_parent():
+                while True:
+                    msg = await self._comm.recv_message_from_parent(Action, block=True)
+                    if msg is not None and msg.type == ActionType.STOP:
+                        return
+
+            stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
+
+        # Condition 2: parent detected dead locally
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        if not stop_tasks:
+            # Should not happen, but guard against empty wait
+            return
+
+        done, pending = await asyncio.wait(
+            set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -162,11 +176,6 @@ class AsyncWorkStealingWorker(AsyncWorker):
                         self._update_tasks(result)
                     else:
                         self.logger.debug(f"{self.node_id}: Received empty task update")
-                elif isinstance(result, Action) and result.type == ActionType.STOP:
-                    self.logger.info(
-                        f"{self.node_id}: Received STOP signal from master"
-                    )
-                    self._stop_signal_received.set()
 
         except Exception as e:
             self.logger.error(f"Error requesting tasks from master: {e}", exc_info=True)

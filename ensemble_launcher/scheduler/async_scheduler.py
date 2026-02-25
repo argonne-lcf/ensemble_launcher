@@ -20,7 +20,7 @@ from .scheduler import Scheduler
 from .state import ChildrenAssignment, SchedulerState
 
 if TYPE_CHECKING:
-    from ensemble_launcher.comm.messages import Status
+    from ensemble_launcher.comm.messages import Result, Status
 
 # self.logger = logging.getself.logger(__name__)
 
@@ -146,6 +146,18 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._running_children.discard(child_id)
         self._dead_children.add(child_id)
         self.free(child_id)
+
+    def is_child_dead(self, child_id: str) -> bool:
+        """Return True if child_id has already been declared dead."""
+        return child_id in self._dead_children
+
+    def get_children_status_timestamps(self) -> Dict[str, "datetime"]:
+        """Return a dict of child_id -> last status timestamp for all children with a recorded status."""
+        return {
+            child_id: status.timestamp
+            for child_id, status in self._children_status.items()
+            if status is not None and status.timestamp is not None
+        }
 
     def mark_child_done(self, child_id: str) -> None:
         """Discard from running set, free cluster resources, and set done event."""
@@ -277,6 +289,46 @@ class AsyncChildrenScheduler(AsyncScheduler):
             nodes=self.cluster.nodes,
             children_task_ids=children_task_ids,
             children_resources=children_resources,
+            child_id_to_wid=dict(self._child_id_to_wid),
+            wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
+        )
+
+    def set_state(self, state: SchedulerState) -> None:
+        """Restore scheduler from a checkpointed SchedulerState.
+
+        Repopulates child assignments, resource allocations, and wid mappings
+        so that the master can re-instantiate child Node objects with the same
+        task layout as before the crash, without re-running the scheduling policy.
+
+        Must be called after scheduler creation but before _create_children().
+        """
+        for child_id, task_ids in state.children_task_ids.items():
+            resource = state.children_resources.get(child_id)
+            wid = state.child_id_to_wid.get(child_id, len(self._child_assignments))
+            assignment: ChildrenAssignment = {
+                "job_resource": resource,
+                "task_ids": list(task_ids),
+                "wid": wid,
+            }
+            self.register_child(child_id, assignment)
+            if resource is not None:
+                allocated, res = self.cluster.allocate(resource)
+                if allocated:
+                    self.workers[child_id] = res
+            self._child_id_to_wid[child_id] = wid
+            self._wid_to_child_id[wid] = child_id
+
+        # All tasks that were assigned to children leave the unassigned pool
+        assigned = {
+            task_id
+            for task_ids in state.children_task_ids.values()
+            for task_id in task_ids
+        }
+        self._unassigned_tasks -= assigned
+
+        self.logger.info(
+            f"set_state: restored {len(state.children_task_ids)} children, "
+            f"{len(assigned)} tasks assigned, {len(self._unassigned_tasks)} unassigned"
         )
 
     def assign(
@@ -502,6 +554,68 @@ class AsyncTaskScheduler(AsyncScheduler):
             completed_tasks=successful,
             failed_tasks=failed,
         )
+
+    def set_state(
+        self,
+        state: "SchedulerState",
+        results: Optional[Dict[str, "Result"]] = None,
+    ) -> None:
+        """Restore scheduler from a checkpointed SchedulerState.
+
+        Marks completed/failed tasks, rebuilds the priority queue with only
+        truly-pending tasks, and optionally restores result data on Task objects
+        so the final ResultBatch includes pre-completed work.
+
+        Args:
+            state: SchedulerState snapshot from a previous run.
+            results: Optional dict of checkpointed Result objects keyed by task_id.
+                     If provided, task.result and task.exception are restored for
+                     completed/failed tasks (needed for final ResultBatch).
+        """
+        # 1. Populate internal status sets
+        self._successful_tasks = set(state.completed_tasks)
+        self._failed_tasks = set(state.failed_tasks)
+
+        # 2. Update Task object statuses and optionally restore result data
+        for task_id in state.completed_tasks:
+            if task_id in self.tasks:
+                self.tasks[task_id].status = TaskStatus.SUCCESS
+                if results and task_id in results:
+                    self.tasks[task_id].result = results[task_id].data
+                    self.tasks[task_id].exception = results[task_id].exception
+        for task_id in state.failed_tasks:
+            if task_id in self.tasks:
+                self.tasks[task_id].status = TaskStatus.FAILED
+                if results and task_id in results:
+                    self.tasks[task_id].result = results[task_id].data
+                    self.tasks[task_id].exception = results[task_id].exception
+
+        # 3. Rebuild priority queue with only pending tasks
+        pending = (
+            set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
+        )
+        # Drain existing queue (all tasks were added at __init__ time)
+        while not self._sorted_tasks.empty():
+            try:
+                self._sorted_tasks.get_nowait()
+            except Exception:
+                break
+        for task_id in pending:
+            self._sorted_tasks.put_nowait(
+                (
+                    1.0 / self.scheduler_policy.get_score(self.tasks[task_id]),
+                    task_id,
+                )
+            )
+
+        restored = len(state.completed_tasks) + len(state.failed_tasks)
+        self.logger.info(
+            f"set_state: {restored} tasks restored from checkpoint, "
+            f"{len(pending)} tasks pending execution"
+        )
+
+        # Signal completion immediately if no tasks remain
+        self._check_all_tasks_done()
 
     def _find_min_resource_req(self) -> JobResource:
         """

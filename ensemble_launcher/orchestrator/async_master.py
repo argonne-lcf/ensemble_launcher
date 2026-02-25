@@ -8,6 +8,7 @@ import socket
 import time
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
@@ -115,6 +116,10 @@ class AsyncMaster(Node):
         self._reporting_task: asyncio.Task = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
         self._stop_signal_received = asyncio.Event()
+
+        # Parent fault detection
+        self._consecutive_parent_failures: int = 0
+        self._parent_dead_event: asyncio.Event = asyncio.Event()
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -593,6 +598,9 @@ class AsyncMaster(Node):
             f"{self.node_id}: Have {len(self.tasks)} tasks after update from parent"
         )
 
+        # Restore from checkpoint if one exists for this node
+        ckpt_restored = await self._restore_checkpoint()
+
         # Check executor validity
         assert self._config.child_executor_name in executor_registry.async_executors, (
             f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
@@ -611,11 +619,19 @@ class AsyncMaster(Node):
         )
         self.logger.info(f"Created {self._config.child_executor_name} executor")
 
-        # Create children and initialise each one (tree registration + per-child tasks).
-        children = self._create_children()
-        self.logger.info(
-            f"{self.node_id}: Created {len(children)} children: {list(children.keys())}"
-        )
+        # Create children: use restored assignment topology if available, else run policy.
+        if ckpt_restored:
+            children = self._instantiate_children(
+                False, set(self._scheduler.children_names)
+            )
+            self.logger.info(
+                f"{self.node_id}: Recreated {len(children)} children from checkpoint: {list(children.keys())}"
+            )
+        else:
+            children = self._create_children()
+            self.logger.info(
+                f"{self.node_id}: Created {len(children)} children: {list(children.keys())}"
+            )
         for child_id, child in children.items():
             await self._init_child(child_id, child)
 
@@ -696,17 +712,49 @@ class AsyncMaster(Node):
         )
 
         # Checkpoint scheduler + comm state once everything is initialised.
-        if self._config.checkpoint_dir:
-            self._checkpointer = Checkpointer(
-                self.node_id, self._config.checkpoint_dir, self.logger
-            )
-            await self._checkpointer.write_checkpoint(
-                scheduler_state=self._scheduler.get_state(self.node_id),
-                comm_state=self._comm.get_state(),
-            )
+        if self._checkpointer is not None:
+            await self._write_checkpoint()
             self.logger.info(f"{self.node_id}: Init checkpoint written")
 
         return None
+
+    # --------------------------------------------------------------------------
+    #                               Checkpointing
+    # --------------------------------------------------------------------------
+
+    async def _restore_checkpoint(self) -> bool:
+        """Create checkpointer and restore scheduler state from a prior checkpoint.
+
+        Returns True if child assignment topology was successfully restored.
+        """
+        if not self._config.checkpoint_dir:
+            return False
+        self._checkpointer = Checkpointer(
+            self.node_id, self._config.checkpoint_dir, self.logger
+        )
+        if not self._checkpointer.checkpoint_exists():
+            return False
+        ckpt = await self._checkpointer.read_checkpoint()
+        if ckpt is None:
+            return False
+        ckpt_sched_state, _, _ = ckpt
+        if ckpt_sched_state is None or not ckpt_sched_state.children_task_ids:
+            return False
+        self._scheduler.set_state(ckpt_sched_state)
+        self.logger.info(
+            f"{self.node_id}: Scheduler state restored from checkpoint "
+            f"({len(ckpt_sched_state.children_task_ids)} children)"
+        )
+        return True
+
+    async def _write_checkpoint(self) -> None:
+        """Write scheduler state and comm state to checkpoint."""
+        if self._checkpointer is None:
+            return
+        await self._checkpointer.write_checkpoint(
+            scheduler_state=self._scheduler.get_state(self.node_id),
+            comm_state=self._comm.get_state(),
+        )
 
     # --------------------------------------------------------------------------
     #                               Parent Synchronization
@@ -1029,15 +1077,56 @@ class AsyncMaster(Node):
                     )
 
     async def _report_status(self) -> None:
-        """Periodically aggregate child status and forward to parent."""
+        """Periodically aggregate child status and forward to parent.
+
+        Also checks each child's last status timestamp against the dead-child
+        threshold (dead_child_factor * report_interval). Any child whose status
+        has not been updated within that window is treated as dead and scheduled
+        for recovery.
+        """
+        threshold = self._config.dead_child_factor * self._config.report_interval
         while not self._stop_reporting_event.is_set():
             try:
                 status = self._scheduler.aggregate_status()
                 if self.parent:
-                    await self._comm.send_message_to_parent(status)
+                    success = await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
+                    if success:
+                        self._consecutive_parent_failures = 0
+                    else:
+                        self._consecutive_parent_failures += 1
+                        self.logger.warning(
+                            f"{self.node_id}: Failed to send status to parent "
+                            f"({self._consecutive_parent_failures}/{self._config.max_parent_send_failures})"
+                        )
+                        if (
+                            self._consecutive_parent_failures
+                            >= self._config.max_parent_send_failures
+                        ):
+                            self.logger.error(
+                                f"{self.node_id}: Parent unreachable — self-terminating"
+                            )
+                            self._parent_dead_event.set()
                 else:
                     self.logger.info(status)
+
+                # Dead-child detection: check each child's status timestamp.
+                now = datetime.now()
+                child_timestamps = self._scheduler.get_children_status_timestamps()
+                for child_id, ts in child_timestamps.items():
+                    if self._scheduler.is_child_dead(child_id):
+                        continue
+                    age = (now - ts).total_seconds()
+                    if age > threshold:
+                        self.logger.warning(
+                            f"{self.node_id}: Child {child_id} appears dead "
+                            f"(status age {age:.1f}s > threshold {threshold:.1f}s)"
+                        )
+                        asyncio.create_task(self._recover_dead_child(child_id))
+
+                # Periodic checkpoint: scheduler state, comm state, and collected results.
+                if self._checkpointer is not None:
+                    asyncio.create_task(self._write_checkpoint())
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
                     await asyncio.wait_for(
@@ -1112,6 +1201,40 @@ class AsyncMaster(Node):
         except asyncio.CancelledError:
             pass
 
+    async def _recover_dead_child(self, child_id: str) -> List[str]:
+        """Tear down a dead child and relaunch on the same resources.
+
+        Returns the list of new child IDs created (for subclasses to extend).
+        """
+        self.logger.info(f"{self.node_id}: Recovering dead child {child_id}")
+        self._scheduler.mark_child_dead(child_id)  # prevents duplicate recovery
+
+        # Capture both assignment and child object BEFORE teardown removes them
+        assignment = self._scheduler.get_child_assignment(child_id)
+        child_obj = self._child_objs[child_id]
+
+        await self._teardown_child(child_id)
+
+        self._scheduler.register_child(child_id, assignment)
+
+        if not self._scheduler.unassigned_task_ids:
+            self.logger.info(
+                f"{self.node_id}: No tasks remain after {child_id} teardown"
+            )
+            return []
+
+        await self._init_child(child_id, child_obj)
+        results = await self._launch_and_sync_children([child_id])
+        result = results[0]
+        if result is not None:
+            self.logger.error(
+                f"{self.node_id}: Failed to relaunch child {child_id}: {result}"
+            )
+            await self._teardown_child(child_id)
+            return []
+
+        return [child_id]
+
     async def _parent_task_update_monitor(self) -> None:
         """Non-root master only: receive TaskUpdates from parent and route tasks to children."""
         while not self._stop_task_update.is_set():
@@ -1185,6 +1308,11 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Timeout waiting for children to complete"
             )
 
+        # write a final checkpoint
+        if self._checkpointer is not None:
+            await self._write_checkpoint()
+            self.logger.info(f"{self.node_id}: Final checkpoint written")
+
         # stop global monitors
         self._stop_reporting_event.set()
         self._reporting_task.cancel()
@@ -1238,43 +1366,62 @@ class AsyncMaster(Node):
     async def _wait_for_finish(self) -> None:
         """Wait for all work to complete, then trigger result aggregation.
 
-        Behaviour depends on deployment mode:
+        Races three conditions with asyncio.FIRST_COMPLETED:
+        1. Work done — all children have returned their final ResultBatch.
+        2. Parent dead locally — consecutive send failures exceeded threshold.
+        3. STOP action received from parent (non-root only) / external signal (root).
 
-        Non-cluster:
-            Directly awaits ``_aggregate_task``, which resolves once every
-            child has returned its final ResultBatch.
-
-        Cluster mode — non-root master:
-            Loops receiving Action messages from the parent.  On receipt of a
-            STOP action, forwards it to every child, then awaits
-            ``_aggregate_task`` before marking itself done.
-
-        Cluster mode — root master:
-            Waits for ``_stop_signal_received`` to be set (e.g. via SIGTERM or
-            an explicit stop call), then broadcasts STOP to every child and
-            awaits ``_aggregate_task``.
+        On any non-work-done exit, forwards Action(STOP) to all children before
+        proceeding, cascading the shutdown down the subtree.
         """
-        if self._config.cluster:
-            self.logger.info("Cluster mode - listening for stop message from parent")
-            if self.parent is not None:
-                while not self._stop_signal_received.is_set():
+        stop_tasks: Dict[str, asyncio.Task] = {}
+
+        # Condition 1: all local work done
+        stop_tasks["work_done"] = asyncio.create_task(
+            self._all_children_done_event.wait()
+        )
+
+        # Condition 2: parent detected dead locally
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        # Condition 3: STOP action received from parent (non-root only)
+        if self.parent is not None:
+
+            async def _recv_stop_from_parent():
+                while True:
                     msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg.type == ActionType.STOP:
-                        for child_id in self.children:
-                            await self._comm.send_message_to_child(
-                                child_id, Action(type=ActionType.STOP)
-                            )
-                        await self._aggregate_task
-                        self._stop_signal_received.set()
-            else:
-                await self._stop_signal_received.wait()
-                for child_id in self.children:
-                    await self._comm.send_message_to_child(
-                        child_id, Action(type=ActionType.STOP)
-                    )
-                    await self._aggregate_task
+                    if msg is not None and msg.type == ActionType.STOP:
+                        return
+
+            stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
         else:
-            await self._aggregate_task
+            # Root node: external signal (SIGTERM or programmatic)
+            stop_tasks["stop_signal"] = asyncio.create_task(
+                self._stop_signal_received.wait()
+            )
+
+        done, pending = await asyncio.wait(
+            set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Propagate stop to children if work didn't finish naturally
+        if not self._all_children_done_event.is_set():
+            self.logger.info(f"{self.node_id}: Propagating STOP to children")
+            for child_id in list(self.children.keys()):
+                try:
+                    await self._comm.send_message_to_child(
+                        child_id, Action(sender=self.node_id, type=ActionType.STOP)
+                    )
+                except Exception:
+                    pass
+
+        await self._aggregate_task
 
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, wait for all work to finish, stop, return results."""

@@ -58,6 +58,10 @@ class SchedulerState(BaseModel):
     # (e.g. {"task_executor_name": "mpi"})
     children_kwargs: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
+    # Bidirectional wid <-> child_id maps (AsyncChildrenScheduler only)
+    child_id_to_wid: Dict[str, int] = Field(default_factory=dict)
+    wid_to_child_id: Dict[int, str] = Field(default_factory=dict)
+
     # ------------------------------------------------------------------ #
     # Custom serialisers / validators for JobResource fields              #
     # ------------------------------------------------------------------ #
