@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from itertools import accumulate
-from typing import Dict, List, Tuple, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 
@@ -11,6 +11,10 @@ from ensemble_launcher.scheduler.resource import (
     NodeResource,
     NodeResourceCount,
 )
+
+if TYPE_CHECKING:
+    from ensemble_launcher.comm.messages import Status
+    from ensemble_launcher.scheduler.state import WorkerAssignment
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,8 @@ class ChildrenPolicy(ABC):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
+        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:
         """
@@ -60,14 +66,17 @@ class ChildrenPolicy(ABC):
 
         Args:
             tasks: Dictionary mapping task IDs to Task objects.
-            children_resources: Dict mapping worker IDs to their JobResource
+            children_resources: Dict mapping wid (int) to their JobResource
                 (as returned by ``get_children_resources``).
             ntask: Maximum tasks to assign per worker.  ``None`` means no limit.
+            child_assignments: Full assignment state per wid, including
+                already-assigned task_ids and resource info.
+            child_status: Most recent Status message per wid.
             **kwargs: Additional implementation-specific arguments.
 
         Returns:
             Tuple of:
-            - Dict mapping worker IDs to the list of task IDs assigned to them.
+            - Dict mapping wid (int) to the list of task IDs assigned to them.
             - List of task IDs that could not be assigned to any worker.
         """
         pass
@@ -263,6 +272,8 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
+        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:
         """
@@ -376,6 +387,8 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         tasks: Dict[str, Task],
         children_resources: Dict[int, JobResource],
         ntask: int = None,
+        child_assignments: Optional[Dict[int, "WorkerAssignment"]] = None,
+        child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], List[str]]:
         """

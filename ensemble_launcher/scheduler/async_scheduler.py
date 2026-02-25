@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import os
-import uuid
 from asyncio import PriorityQueue, Queue
 from collections import Counter
 from logging import Logger
@@ -11,14 +10,11 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
-from .policy import Policy, ChildrenPolicy, policy_registry
+from .policy import ChildrenPolicy, Policy, policy_registry
 from .resource import (
     AsyncLocalClusterResource,
     JobResource,
-    LocalClusterResource,
-    NodeResource,
     NodeResourceCount,
-    NodeResourceList,
 )
 from .scheduler import Scheduler
 from .state import SchedulerState, WorkerAssignment
@@ -92,6 +88,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
         # Pool of task IDs not yet assigned to any child.
         # Seeded at init from tasks; assign_task_ids() drains it as tasks are placed.
         self._unassigned_tasks: Set[str] = set(self.tasks.keys())
+        self._child_id_to_wid: Dict[str, int] = {}
+        self._wid_to_child_id: Dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Child registration / reset
@@ -111,6 +109,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
         self._running_children = set()
         self._child_to_tasks = {}
         self._task_to_child = {}
+        self._child_id_to_wid = {}
+        self._wid_to_child_id = {}
 
     # ------------------------------------------------------------------
     # Assignment accessors
@@ -258,12 +258,10 @@ class AsyncWorkerScheduler(AsyncScheduler):
         ``children_task_ids`` so they can be redistributed on recovery.
         """
         children_task_ids: Dict[str, List[str]] = {
-            cid: list(asgn["task_ids"])
-            for cid, asgn in self._child_assignments.items()
+            cid: list(asgn["task_ids"]) for cid, asgn in self._child_assignments.items()
         }
         children_resources: Dict[str, JobResource] = {
-            cid: asgn["job_resource"]
-            for cid, asgn in self._child_assignments.items()
+            cid: asgn["job_resource"] for cid, asgn in self._child_assignments.items()
         }
         return SchedulerState(
             node_id=node_id,
@@ -331,6 +329,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
                     "wid": wid,
                 }
                 self.register_child(child_id, alloc)
+                self._child_id_to_wid[child_id] = wid
+                self._wid_to_child_id[wid] = child_id
             else:
                 self.logger.warning(f"Failed to allocate resources for worker {wid}")
 
@@ -352,7 +352,7 @@ class AsyncWorkerScheduler(AsyncScheduler):
         if not self._child_assignments or not task_ids:
             return {}
 
-        # Build per-wid resource view and reverse mapping, optionally restricted.
+        # Restrict to requested child_ids if provided.
         target_assignments = (
             {
                 cid: self._child_assignments[cid]
@@ -362,16 +362,32 @@ class AsyncWorkerScheduler(AsyncScheduler):
             if child_ids is not None
             else self._child_assignments
         )
-        children_resources: Dict[int, JobResource] = {}
-        wid_to_child: Dict[int, str] = {}
-        for child_id, assignment in target_assignments.items():
-            wid = assignment["wid"]
-            children_resources[wid] = assignment["job_resource"]
-            wid_to_child[wid] = child_id
+        # Build wid-keyed children_resources using the pre-built maps from assign_resources.
+        children_resources: Dict[int, JobResource] = {
+            self._child_id_to_wid[cid]: assignment["job_resource"]
+            for cid, assignment in target_assignments.items()
+            if cid in self._child_id_to_wid
+        }
+
+        # Convert child_assignments and child_status to wid-keyed for the policy.
+        wid_assignments = {
+            self._child_id_to_wid[cid]: assignment
+            for cid, assignment in target_assignments.items()
+            if cid in self._child_id_to_wid
+        }
+        wid_status = {
+            self._child_id_to_wid[cid]: status
+            for cid, status in self._children_status.items()
+            if cid in self._child_id_to_wid
+        }
 
         task_objs = {tid: self.tasks[tid] for tid in task_ids if tid in self.tasks}
         task_ids_map, removed_tasks = self.policy.get_children_tasks(
-            tasks=task_objs, children_resources=children_resources, ntask=ntask
+            tasks=task_objs,
+            children_resources=children_resources,
+            ntask=ntask,
+            child_assignments=wid_assignments,
+            child_status=wid_status,
         )
 
         if removed_tasks:
@@ -381,7 +397,7 @@ class AsyncWorkerScheduler(AsyncScheduler):
 
         child_assignments: Dict[str, List[str]] = {}
         for wid, assigned_ids in task_ids_map.items():
-            child_id = wid_to_child[wid]
+            child_id = self._wid_to_child_id[wid]
             self._child_assignments[child_id]["task_ids"].extend(assigned_ids)
             for tid in assigned_ids:
                 self._unassigned_tasks.discard(tid)
@@ -461,8 +477,8 @@ class AsyncTaskScheduler(AsyncScheduler):
         Running tasks are folded back into ``pending_tasks`` because their
         executor futures will not survive a restart; they must be re-queued.
         """
-        successful = self.successful_tasks      # Set[str]
-        failed = self.failed_tasks              # Set[str]
+        successful = self.successful_tasks  # Set[str]
+        failed = self.failed_tasks  # Set[str]
         running = set(self._running_tasks.keys())
         all_ids = set(self.tasks.keys())
 
@@ -473,7 +489,7 @@ class AsyncTaskScheduler(AsyncScheduler):
             node_id=node_id,
             nodes=self.cluster.nodes,
             pending_tasks=pending,
-            running_tasks=set(),     # nothing is running post-recovery
+            running_tasks=set(),  # nothing is running post-recovery
             completed_tasks=successful,
             failed_tasks=failed,
         )
