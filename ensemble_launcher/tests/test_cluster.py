@@ -109,7 +109,7 @@ async def test_async_master_cluster(
             checkpoint_dir=os.path.join(os.getcwd(), "ckpt"),
             cpu_binding_option="",
             return_stdout=True,
-            worker_scheduler_policy="simple_split_worker_policy",
+            children_scheduler_policy="simple_split_children_policy",
             nchildren=1,
             nlevels=2,
         ),

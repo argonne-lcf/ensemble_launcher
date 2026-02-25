@@ -43,8 +43,8 @@ class WorkerScheduler(Scheduler):
         self._lock = threading.RLock()
         self._config = config
         # Initialize policy - uses the registered state instance
-        from .policy import WorkerPolicy
-        self.policy: WorkerPolicy = policy_registry.create_policy(self._config.worker_scheduler_policy, 
+        from .policy import ChildrenPolicy
+        self.policy: ChildrenPolicy = policy_registry.create_policy(self._config.children_scheduler_policy,
                                                                   policy_kwargs={"nchildren": self._config.nchildren, 
                                                                                 "nlevels":self._config.nlevels,
                                                                                 "logger": logger.getChild('policy')})

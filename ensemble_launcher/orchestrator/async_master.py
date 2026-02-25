@@ -13,7 +13,6 @@ from typing import Callable, Dict, List, Optional, Union
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
     AsyncComm,
-    AsyncCommState,
     AsyncZMQComm,
     AsyncZMQCommState,
     NodeInfo,

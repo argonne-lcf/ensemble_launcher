@@ -11,7 +11,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
-from .policy import Policy, WorkerPolicy, policy_registry
+from .policy import Policy, ChildrenPolicy, policy_registry
 from .resource import (
     AsyncLocalClusterResource,
     JobResource,
@@ -63,8 +63,8 @@ class AsyncWorkerScheduler(AsyncScheduler):
 
         self._config = config
         # Initialize policy - uses the registered state instance
-        self.policy: WorkerPolicy = policy_registry.create_policy(
-            self._config.worker_scheduler_policy,
+        self.policy: ChildrenPolicy = policy_registry.create_policy(
+            self._config.children_scheduler_policy,
             policy_kwargs={
                 "nchildren": self._config.nchildren,
                 "nlevels": self._config.nlevels,

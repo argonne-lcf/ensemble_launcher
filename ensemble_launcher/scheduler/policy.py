@@ -25,7 +25,7 @@ class Policy(ABC):
         pass
 
 
-class WorkerPolicy(ABC):
+class ChildrenPolicy(ABC):
     @abstractmethod
     def get_children_resources(
         self, tasks: Dict[str, Task], nodes: JobResource, level: int
@@ -76,19 +76,19 @@ class WorkerPolicy(ABC):
 class PolicyRegistry:
     def __init__(self):
         self.available_policies: Dict[str, Type[Policy]] = {}
-        self.available_worker_policies: Dict[str, Type[WorkerPolicy]] = {}
+        self.available_children_policies: Dict[str, Type[ChildrenPolicy]] = {}
 
     def register(self, policy_name: str, type: str = "policy"):
         """Register a policy class by name.
 
         Args:
             policy_name: Name to register the policy under
-            type: Either "policy" or "worker_policy"
+            type: Either "policy" or "children_policy"
         """
 
         def decorator(cls: Type[Policy]):
-            if type == "worker_policy":
-                self.available_worker_policies[policy_name] = cls
+            if type == "children_policy":
+                self.available_children_policies[policy_name] = cls
             else:
                 self.available_policies[policy_name] = cls
             return cls
@@ -103,10 +103,10 @@ class PolicyRegistry:
         Args:
             policy_name: Name to register the policy under
             policy_class: The policy class to register
-            type: Either "policy" for task scoring policies or "worker_policy" for worker assignment policies
+            type: Either "policy" for task scoring policies or "children_policy" for children assignment policies
         """
-        if type == "worker_policy":
-            self.available_worker_policies[policy_name] = policy_class
+        if type == "children_policy":
+            self.available_children_policies[policy_name] = policy_class
         else:
             self.available_policies[policy_name] = policy_class
 
@@ -125,13 +125,13 @@ class PolicyRegistry:
         """
         if policy_name in self.available_policies:
             return self.available_policies[policy_name](*policy_args, **policy_kwargs)
-        elif policy_name in self.available_worker_policies:
-            return self.available_worker_policies[policy_name](
+        elif policy_name in self.available_children_policies:
+            return self.available_children_policies[policy_name](
                 *policy_args, **policy_kwargs
             )
         else:
             logger.error(
-                f"{policy_name} not available. Available policy names {list(self.available_policies.keys()) + list(self.available_worker_policies.keys())}"
+                f"{policy_name} not available. Available policy names {list(self.available_policies.keys()) + list(self.available_children_policies.keys())}"
             )
             raise ValueError(f"Unknown policy: {policy_name}")
 
@@ -166,17 +166,17 @@ class LargeResourcePolicy(Policy):
         )
 
 
-@policy_registry.register("greedy_worker_policy", type="worker_policy")
-class GreedyBinPackingWorkerPolicy(WorkerPolicy):
+@policy_registry.register("greedy_children_policy", type="children_policy")
+class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
     """
-    A worker policy that greedily assigns workers to fit all tasks using bin-packing.
+    A children policy that greedily assigns workers to fit all tasks using bin-packing.
     Tasks are sorted by decreasing node requirements and distributed across workers.
 
     Configuration (class variables):
         nlevels: Total number of hierarchy levels (default: 1, must be >= 1)
 
     To customize, subclass and override:
-        class MyGreedyPolicy(GreedyBinPackingWorkerPolicy):
+        class MyGreedyPolicy(GreedyBinPackingChildrenPolicy):
             nlevels = 3
     """
 
@@ -184,11 +184,11 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
         self.logger = logging.getLogger(__name__) if logger is None else logger
         if nlevels is None:
             raise ValueError(
-                "nlevels must be specified for GreedyBinPackingWorkerPolicy"
+                "nlevels must be specified for GreedyBinPackingChildrenPolicy"
             )
         self.nlevels = nlevels
         self.logger.info(
-            f"Initialized GreedyBinPackingWorkerPolicy with nlevels={self.nlevels}"
+            f"Initialized GreedyBinPackingChildrenPolicy with nlevels={self.nlevels}"
         )
 
     def get_children_resources(
@@ -300,10 +300,10 @@ class GreedyBinPackingWorkerPolicy(WorkerPolicy):
         return task_ids_map, removed_tasks
 
 
-@policy_registry.register("simple_split_worker_policy", type="worker_policy")
-class SimpleSplitWorkerPolicy(WorkerPolicy):
+@policy_registry.register("simple_split_children_policy", type="children_policy")
+class SimpleSplitChildrenPolicy(ChildrenPolicy):
     """
-    A worker policy that splits nodes evenly among a specified number of children,
+    A children policy that splits nodes evenly among a specified number of children,
     then assigns tasks in round-robin fashion.
 
     Tasks are assigned to workers in round-robin order, checking if each task fits
@@ -315,10 +315,10 @@ class SimpleSplitWorkerPolicy(WorkerPolicy):
 
     Note: Not registered by default. To use:
         1. Subclass and set nchildren:
-            class Split8Policy(SimpleSplitWorkerPolicy):
+            class Split8Policy(SimpleSplitChildrenPolicy):
                 nchildren = 8
         2. Register it:
-            policy_registry.register_policy("split_8", Split8Policy, type="worker_policy")
+            policy_registry.register_policy("split_8", Split8Policy, type="children_policy")
         3. Use it:
             scheduler = AsyncWorkerScheduler(..., policy="split_8")
     """
@@ -329,7 +329,7 @@ class SimpleSplitWorkerPolicy(WorkerPolicy):
             raise ValueError(f"nchildren must be positive, got {self.nchildren}")
         self.logger = logging.getLogger(__name__) if logger is None else logger
         self.logger.info(
-            f"Initialized SimpleSplitWorkerPolicy with nchildren={self.nchildren}"
+            f"Initialized SimpleSplitChildrenPolicy with nchildren={self.nchildren}"
         )
 
     def get_children_resources(
