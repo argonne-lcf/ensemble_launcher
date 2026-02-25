@@ -103,6 +103,10 @@ class AsyncMaster(Node):
             str, asyncio.Task
         ] = {}  # child_id -> result monitor task
 
+        self._child_status_task: Dict[
+            str, asyncio.Task
+        ] = {}  # child_id -> status monitor task
+
         self._checkpointer: Optional[Checkpointer] = None
 
         # Cluster mode state
@@ -312,6 +316,10 @@ class AsyncMaster(Node):
         task = asyncio.create_task(self._collect_final_result_from_child(child_id))
         self._result_tasks.append(task)
         self._child_result_task[child_id] = task
+        # Per-child status monitor (continuously drains Status messages).
+        self._child_status_task[child_id] = asyncio.create_task(
+            self._child_status_monitor(child_id)
+        )
         if self._config.cluster:
             self._child_forwarder_task[child_id] = asyncio.create_task(
                 self._child_result_monitor(child_id)
@@ -957,32 +965,7 @@ class AsyncMaster(Node):
                     f"{self.node_id}: No result received from {child_id}"
                 )
                 self._results[child_id] = []
-
-            # Collect final status from child
-            # First check if we already have final status
-            if self._scheduler.has_final_status(child_id):
-                self.logger.debug(
-                    f"{self.node_id}: Child {child_id} already has final status"
-                )
-            else:
-                # Drain status queue to get final status
-                empty_count = 0
-                while empty_count < 2:
-                    status = await self._comm.recv_message_from_child(
-                        Status, child_id=child_id, timeout=0.01
-                    )
-                    if status is not None:
-                        empty_count = 0  # Reset counter on successful recv
-                        self._scheduler.set_child_status(child_id, status)
-                        if status.tag == "final":
-                            break
-                    else:
-                        empty_count += 1  # Increment when queue is empty
-
-                if not self._scheduler.has_final_status(child_id):
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to receive final status from {child_id}"
-                    )
+            # Final status is collected by the per-child status monitor.
         except Exception as e:
             self.logger.error(
                 f"{self.node_id}: Error collecting result from {child_id}: {e}"
@@ -1045,15 +1028,9 @@ class AsyncMaster(Node):
                     )
 
     async def _report_status(self) -> None:
-        """Periodically collect status from children, aggregate, and forward to parent."""
+        """Periodically aggregate child status and forward to parent."""
         while not self._stop_reporting_event.is_set():
             try:
-                for child_id in self.children:
-                    status = await self._comm.recv_message_from_child(
-                        Status, child_id=child_id
-                    )
-                    if status is not None:
-                        self._scheduler.set_child_status(child_id, status)
                 status = self._scheduler.aggregate_status()
                 if self.parent:
                     await self._comm.send_message_to_parent(status)
@@ -1111,6 +1088,29 @@ class AsyncMaster(Node):
                 break
             await self._forward_result(result)
 
+    async def _child_status_monitor(self, child_id: str) -> None:
+        """Continuously collect status messages from a single child and update scheduler."""
+        child_done = self._scheduler.get_done_event(child_id)
+        try:
+            while not child_done.is_set():
+                status = await self._comm.recv_message_from_child(
+                    Status, child_id=child_id, block=True
+                )
+                if status is not None:
+                    self._scheduler.set_child_status(child_id, status)
+                    if status.tag == "final":
+                        return
+            # Drain any remaining status messages after child process exits
+            while True:
+                status = await self._comm.recv_message_from_child(
+                    Status, child_id=child_id
+                )
+                if status is None:
+                    break
+                self._scheduler.set_child_status(child_id, status)
+        except asyncio.CancelledError:
+            pass
+
     async def _parent_task_update_monitor(self) -> None:
         """Non-root master only: receive TaskUpdates from parent and route tasks to children."""
         while not self._stop_task_update.is_set():
@@ -1147,6 +1147,9 @@ class AsyncMaster(Node):
             old_task.cancel()
             if old_task in self._result_tasks:
                 self._result_tasks.remove(old_task)
+        old_status = self._child_status_task.pop(child_id, None)
+        if old_status is not None:
+            old_status.cancel()
         old_fwd = self._child_forwarder_task.pop(child_id, None)
         if old_fwd is not None:
             old_fwd.cancel()
