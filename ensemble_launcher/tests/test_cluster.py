@@ -19,7 +19,7 @@ from ensemble_launcher.scheduler.resource import (
 
 
 @pytest.mark.asyncio
-async def test_async_master_cluster(
+async def test_async_worker_cluster(
     task_executor="async_processpool", ntasks_per_core=1, exec=echo
 ):
     ##create tasks

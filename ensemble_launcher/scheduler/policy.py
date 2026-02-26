@@ -220,7 +220,9 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
 
         # Sort tasks by decreasing node requirement; drop tasks that cannot fit.
         sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
-        fitting_tasks = [(tid, t) for tid, t in sorted_tasks if t.nnodes <= len(node_names)]
+        fitting_tasks = [
+            (tid, t) for tid, t in sorted_tasks if t.nnodes <= len(node_names)
+        ]
 
         # Determine the maximum number of workers that fit given cumulative node use.
         cum_sum = list(accumulate(t.nnodes for _, t in fitting_tasks))
@@ -241,7 +243,9 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         # Single-node case: all workers share the one available node.
         if len(node_names) == 1:
             return {
-                wid: JobResource(resources=[node_resources[node_names[0]]], nodes=node_names)
+                wid: JobResource(
+                    resources=[node_resources[node_names[0]]], nodes=node_names
+                )
                 for wid in range(nworkers)
             }
 
@@ -287,7 +291,9 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         removed_tasks: List[str] = []
         worker_task_counts = {wid: 0 for wid in worker_ids}
 
-        sorted_task_items = sorted(tasks.items(), key=lambda x: x[1].nnodes, reverse=True)
+        sorted_task_items = sorted(
+            tasks.items(), key=lambda x: x[1].nnodes, reverse=True
+        )
 
         for i, (task_id, _) in enumerate(sorted_task_items):
             preferred = worker_ids[i % nworkers]
@@ -401,7 +407,12 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         task_ids_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
         removed_tasks: List[str] = []
         worker_task_counts = {wid: 0 for wid in worker_ids}
-        current = 0
+        current = worker_ids.index(
+            min(
+                worker_ids,
+                key=lambda worker_id: len(child_assignments[worker_id]["task_ids"]),
+            )
+        )
 
         for task_id, task in tasks.items():
             task_resource = task.get_resource_requirements()

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 import signal
 import socket
@@ -14,9 +13,9 @@ from ensemble_launcher.comm import (
     Action,
     ActionType,
     AsyncComm,
-    AsyncCommState,
     AsyncZMQComm,
     AsyncZMQCommState,
+    HeartBeat,
     NodeInfo,
     NodeUpdate,
     Result,
@@ -32,6 +31,7 @@ from ensemble_launcher.executors import (
     AsyncThreadPoolExecutor,
     executor_registry,
 )
+from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.resource import JobResource
@@ -89,6 +89,9 @@ class AsyncWorker(Node):
         self._event_loop = None
 
         self._checkpointer: Optional[Checkpointer] = None
+        # Cached checkpoint data — populated early in _lazy_init() before sockets are set up.
+        self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
+        self._ckpt_results: Optional[dict] = None  # {task_id: Result}
 
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
@@ -100,7 +103,7 @@ class AsyncWorker(Node):
         self._stop_signal_received = asyncio.Event()
 
         # Parent fault detection
-        self._consecutive_parent_failures: int = 0
+        self._last_parent_ack_time: float = time.time()
         self._parent_dead_event: asyncio.Event = asyncio.Event()
 
     @asynccontextmanager
@@ -156,23 +159,12 @@ class AsyncWorker(Node):
 
     def _setup_logger(self) -> None:
         """Configure the logger, optionally writing to a per-worker log file."""
-        if self._config.worker_logs:
-            os.makedirs(os.path.join(os.getcwd(), "logs"), exist_ok=True)
-            file_handler = logging.FileHandler(
-                os.path.join(os.getcwd(), f"logs/worker-{self.node_id}.log")
-            )
-            file_handler.setLevel(self._config.log_level)
-
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
-            file_handler.setFormatter(formatter)
-
-            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-            self.logger.addHandler(file_handler)
-            self.logger.setLevel(self._config.log_level)
-        else:
-            self.logger = logging.getLogger(__name__)
+        log_dir = (
+            os.path.join(os.getcwd(), "logs") if self._config.worker_logs else None
+        )
+        self.logger = setup_logger(
+            __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
+        )
 
     def _create_comm(self) -> None:
         """Instantiate the communication backend (currently only async_zmq is supported)."""
@@ -232,8 +224,15 @@ class AsyncWorker(Node):
         except Exception:
             pass
 
+        # Read checkpoint data early so both comm state and scheduler state
+        # can be restored from the cached data at the appropriate points below.
+        await self._read_checkpoint_data()
+
         # Lazy comm creation
         self._create_comm()
+
+        # Restore saved comm state before binding so parent can reconnect.
+        self._restore_comm_state()
 
         # start parent endpoint monitors
         await self._comm.start_monitors()
@@ -256,8 +255,8 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Nodes must be initialized before execution"
             )
 
-        # Restore from checkpoint if one exists for this node
-        await self._restore_checkpoint()
+        # Restore scheduler state from cached checkpoint data (comm already restored).
+        self._restore_scheduler_checkpoint()
 
         self._scheduler.start_monitoring()  # start the scheduler monitoring
 
@@ -295,26 +294,54 @@ class AsyncWorker(Node):
     #                               Checkpointing
     # --------------------------------------------------------------------------
 
-    async def _restore_checkpoint(self) -> bool:
-        """Create checkpointer and restore scheduler state from a prior checkpoint.
+    async def _read_checkpoint_data(self) -> None:
+        """Create checkpointer (if configured) and eagerly read the full checkpoint.
 
-        Returns True if scheduler state was successfully restored.
+        Called immediately after logger setup — before comm is created and
+        before any sockets are bound — so that both comm state and scheduler
+        state are available in ``self._ckpt_data`` when needed.
         """
         if not self._config.checkpoint_dir:
-            return False
+            return
         self._checkpointer = Checkpointer(
             self.node_id, self._config.checkpoint_dir, self.logger
         )
         if not self._checkpointer.checkpoint_exists():
+            return
+        self._ckpt_data = await self._checkpointer.read_checkpoint()
+        self._ckpt_results = await self._checkpointer.read_results()
+
+    def _restore_comm_state(self) -> None:
+        """Restore comm from cached checkpoint data using the comm's set_state.
+
+        Must be called after _create_comm() and before setup_zmq_sockets() so
+        the node re-binds to its previous address.
+        """
+        if self._ckpt_data is None:
+            return
+        _, comm_state, _ = self._ckpt_data
+        if comm_state is None:
+            return
+        comm_logger = self._comm.logger
+        self._comm = type(self._comm).set_state(comm_state)
+        self._comm.logger = comm_logger
+        self.logger.info(
+            f"{self.node_id}: Comm state restored from checkpoint"
+            f" (address: {self._comm.my_address})"
+        )
+
+    def _restore_scheduler_checkpoint(self) -> bool:
+        """Restore scheduler state from cached checkpoint data.
+
+        Called after scheduler creation. Returns True if scheduler state was
+        successfully restored.
+        """
+        if self._ckpt_data is None:
             return False
-        ckpt = await self._checkpointer.read_checkpoint()
-        results = await self._checkpointer.read_results()
-        if ckpt is None:
-            return False
-        scheduler_state, _comm_state, _tasks = ckpt
+        scheduler_state, _, _ = self._ckpt_data
         if scheduler_state is None:
             return False
-        self._scheduler.set_state(scheduler_state, results or {})
+        self._scheduler.set_state(scheduler_state, self._ckpt_results or {})
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
 
@@ -362,6 +389,7 @@ class AsyncWorker(Node):
                 timeout=30.0
             ):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+            self._last_parent_ack_time = time.time()
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         node_update: NodeUpdate = await self._comm.recv_message_from_parent(
@@ -564,22 +592,23 @@ class AsyncWorker(Node):
             try:
                 status = self.get_status()
                 if self.parent:
-                    success = await self._comm.send_message_to_parent(status)
+                    await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
-                    if success:
-                        self._consecutive_parent_failures = 0
+                    # Check for HeartBeat ACK from parent (sent by parent on Status receipt)
+                    threshold = (
+                        self._config.dead_node_factor
+                        * self._config.report_interval
+                        / 2.0
+                    )
+                    ack = await self._comm.recv_message_from_parent(HeartBeat)
+                    if ack is not None:
+                        self._last_parent_ack_time = time.time()
                     else:
-                        self._consecutive_parent_failures += 1
-                        self.logger.warning(
-                            f"{self.node_id}: Failed to send status to parent "
-                            f"({self._consecutive_parent_failures}/{self._config.max_parent_send_failures})"
-                        )
-                        if (
-                            self._consecutive_parent_failures
-                            >= self._config.max_parent_send_failures
-                        ):
+                        age = time.time() - self._last_parent_ack_time
+                        if age > threshold:
                             self.logger.error(
-                                f"{self.node_id}: Parent unreachable — self-terminating"
+                                f"{self.node_id}: No heartbeat from parent for {age:.1f}s "
+                                f"(threshold {threshold:.1f}s) — self-terminating"
                             )
                             self._parent_dead_event.set()
                 else:

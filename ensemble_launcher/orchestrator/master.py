@@ -10,6 +10,7 @@ from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action,
 from ensemble_launcher.profiling import get_registry, EventRegistry
 import copy
 import logging
+from ensemble_launcher.logging import setup_logger
 from itertools import accumulate
 from typing import Optional, List, Dict, Any
 import os
@@ -93,20 +94,8 @@ class Master(Node):
         return self._comm
     
     def _setup_logger(self):
-
-        if self._config.master_logs:
-            os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
-            # Configure file handler for this specific self.self.logger
-            file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/master-{self.node_id}.log'))
-            file_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            # Create instance self.self.logger and add handler
-            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-            self.logger.addHandler(file_handler)
-            self.logger.setLevel(logging.INFO)
-        else:
-            self.logger = logging.getLogger(__name__)
+        log_dir = os.path.join(os.getcwd(), "logs") if self._config.master_logs else None
+        self.logger = setup_logger(__name__, self.node_id, log_dir=log_dir, level=self._config.log_level)
 
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":

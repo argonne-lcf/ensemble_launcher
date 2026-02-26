@@ -1,4 +1,5 @@
 import abc
+import logging
 import os
 import threading
 import uuid
@@ -11,6 +12,7 @@ from ensemble_launcher.checkpointing import CommCheckpointData
 from ensemble_launcher.checkpointing.checkpointer import _get_comm_state_class
 from ensemble_launcher.comm.messages import Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
+from ensemble_launcher.logging import setup_logger
 
 # ---------------------------------------------------------------------------
 # Transport abstraction
@@ -47,7 +49,6 @@ class _ZMQTransport(_ClientTransport):
         self._socket = self._context.socket(zmq.DEALER)
         self._socket.setsockopt(zmq.IDENTITY, identity)
         self._socket.connect(f"tcp://{address}")
-        print(f"Connected to {address}")
 
     def send(self, data: bytes) -> None:
         self._socket.send(data)
@@ -127,6 +128,8 @@ class ClusterClient:
         checkpoint_dir: str,
         node_id: str = "global",
         client_id: Optional[str] = None,
+        log_dir: str = "logs",
+        log_level: int = logging.INFO,
     ):
         """
         Args:
@@ -137,14 +140,23 @@ class ClusterClient:
                             ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
                             that node.
             client_id:      Optional client identity string; auto-generated if omitted.
+            log_dir:        Directory for log files.  When provided a file
+                            ``{log_dir}/{client_id}.log`` is created.  When
+                            ``None`` (default) logging goes to the root handler.
+            log_level:      Logging level (default ``logging.INFO``).
         """
         self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
+        self.logger = setup_logger(
+            __name__, self._client_id, log_dir=log_dir, level=log_level
+        )
         self._pending: Dict[str, ConcurrentFuture] = {}
         self._lock = threading.Lock()
         self._recv_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._node_id = None
 
         resolved_id = _resolve_node_id(checkpoint_dir, node_id)
+        self._node_id = resolved_id
         comm_path = os.path.join(checkpoint_dir, f"{resolved_id}_comm.json")
         if not os.path.exists(comm_path):
             raise FileNotFoundError(
@@ -167,10 +179,10 @@ class ClusterClient:
     def start(self):
         """Connect to the node and start the result-receive thread."""
         self._transport.connect(self._node_address, self._client_id.encode())
-        print("Connected")
+        self.logger.info(f"Connected to {self._node_id} at {self._node_address}")
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
-        print("started recv thread")
+        self.logger.info("Started recv thread")
 
     def teardown(self):
         """Shut down the transport and receive thread."""

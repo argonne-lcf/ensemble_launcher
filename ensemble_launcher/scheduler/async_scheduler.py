@@ -140,24 +140,23 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._running_children.add(child_id)
         if child_id in self._dead_children:
             self._dead_children.discard(child_id)
+            self._child_done_events[child_id].clear()
 
     def mark_child_dead(self, child_id: str) -> None:
-        """Record the child is dead"""
+        """Record the child is dead and unblock any wait_for_child() waiters."""
         self._running_children.discard(child_id)
         self._dead_children.add(child_id)
         self.free(child_id)
+        # Unblock _teardown_child's wait_for_child() so recovery can proceed.
+        if child_id in self._child_done_events:
+            self._child_done_events[child_id].set()
+
+    def is_child_done(self, child_id: str):
+        return self._child_done_events[child_id].is_set()
 
     def is_child_dead(self, child_id: str) -> bool:
         """Return True if child_id has already been declared dead."""
         return child_id in self._dead_children
-
-    def get_children_status_timestamps(self) -> Dict[str, "datetime"]:
-        """Return a dict of child_id -> last status timestamp for all children with a recorded status."""
-        return {
-            child_id: status.timestamp
-            for child_id, status in self._children_status.items()
-            if status is not None and status.timestamp is not None
-        }
 
     def mark_child_done(self, child_id: str) -> None:
         """Discard from running set, free cluster resources, and set done event."""
@@ -172,8 +171,12 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
     @property
     def all_children_done(self) -> bool:
-        """True when every registered child has set its done event."""
-        return all([event.is_set() for event in self._child_done_events.values()])
+        """True when every non-dead registered child has set its done event."""
+        return all(
+            event.is_set()
+            for child_id, event in self._child_done_events.items()
+            if child_id not in self._dead_children
+        )
 
     # ------------------------------------------------------------------
     # Status bookkeeping
@@ -591,9 +594,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                     self.tasks[task_id].exception = results[task_id].exception
 
         # 3. Rebuild priority queue with only pending tasks
-        pending = (
-            set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
-        )
+        pending = set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
         # Drain existing queue (all tasks were added at __init__ time)
         while not self._sorted_tasks.empty():
             try:

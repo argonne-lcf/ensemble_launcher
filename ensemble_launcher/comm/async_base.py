@@ -69,7 +69,7 @@ class AsyncMessageRoutingQueue:
             return None
 
         try:
-            self.logger.info(
+            self.logger.debug(
                 f"Waiting for message of type {msg_type.__name__} with timeout {timeout}"
             )
             msg = await asyncio.wait_for(self._queues[msg_type].get(), timeout=timeout)

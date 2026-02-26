@@ -11,6 +11,7 @@ from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate, Node
 from ensemble_launcher.executors import executor_registry, Executor
 from ensemble_launcher.profiling import get_registry, EventRegistry
 import logging
+from ensemble_launcher.logging import setup_logger
 import cloudpickle
 import socket
 import json
@@ -86,18 +87,8 @@ class Worker(Node):
         return self._comm
     
     def _setup_logger(self):
-        if self._config.worker_logs:
-            os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/worker-{self.node_id}.log'))
-            file_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-
-            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-            self.logger.addHandler(file_handler)
-            self.logger.setLevel(logging.INFO)
-        else:
-            self.logger = logging.getLogger(__name__)
+        log_dir = os.path.join(os.getcwd(), "logs") if self._config.worker_logs else None
+        self.logger = setup_logger(__name__, self.node_id, log_dir=log_dir, level=self._config.log_level)
     
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":

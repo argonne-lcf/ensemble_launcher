@@ -14,12 +14,8 @@ import logging
 import importlib.util
 
 logger = logging.getLogger(__name__)
-# Configure logging with stdout handler
 if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.NullHandler())
 
 
 def load_external_policies():

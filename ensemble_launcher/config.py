@@ -47,9 +47,16 @@ class LauncherConfig(BaseModel):
     )
     cpu_binding_option: str = "--cpu-bind"
     cluster: bool = False  # Eager result delivery + submit() API
-    checkpoint_dir: Optional[str] = None  # Directory for checkpoints; None disables checkpointing
-    dead_child_factor: float = 3.0  # Child is declared dead if status age > dead_child_factor * report_interval
-    max_parent_send_failures: int = 3  # Consecutive send failures before declaring parent dead
+    checkpoint_dir: Optional[str] = (
+        None  # Directory for checkpoints; None disables checkpointing
+    )
+    dead_node_factor: float = (
+        3.0  # Liveness threshold multiplier: a node (child or parent) is declared dead
+    )
+    # if no heartbeat ACK is received for dead_node_factor * report_interval seconds.
+    # Master uses this to detect dead children (via stale status timestamps).
+    # if no heartbeat ACK is received for dead_node_factor * report_interval seconds / 2.0.
+    # Workers and sub-masters use this to detect a dead parent (via missing HeartBeat ACKs).
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

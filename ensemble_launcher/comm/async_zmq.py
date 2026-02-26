@@ -69,10 +69,10 @@ class AsyncZMQComm(AsyncComm):
         removed_children = set(self._node_info.children_ids) - set(
             node_info.children_ids
         )
-        await super().update_node_info(node_info)
         if self._router_cache is not None:
             for child_id in removed_children:
                 self._router_cache.pop(child_id, None)
+        await super().update_node_info(node_info)
 
     async def init_cache(self):
         await super().init_cache()

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import socket
 import time
 from logging import Logger
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
@@ -57,6 +58,8 @@ class CheckpointData(BaseModel):
     has_scheduler: bool = False
     has_comm: bool = False
     has_tasks: bool = False
+    pid: int = os.getpid()
+    hostname: str = socket.gethostname()
 
 
 class CommCheckpointData(BaseModel):
@@ -166,7 +169,13 @@ class Checkpointer:
         self.node_id = node_id
         self.checkpoint_dir = checkpoint_dir
         self.logger = logger
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        try:
+            os.makedirs(checkpoint_dir)
+        except FileExistsError:
+            if not os.path.isdir(checkpoint_dir):
+                raise RuntimeError(
+                    f"Checkpoint path {checkpoint_dir!r} exists but is not a directory"
+                )
 
     # ------------------------------------------------------------------
     # File paths
@@ -274,7 +283,13 @@ class Checkpointer:
 
     def _read_components_sync(
         self,
-    ) -> Optional[Tuple[Optional[SchedulerState], Optional[AsyncCommState], Optional[Dict[str, "Task"]]]]:
+    ) -> Optional[
+        Tuple[
+            Optional[SchedulerState],
+            Optional[AsyncCommState],
+            Optional[Dict[str, "Task"]],
+        ]
+    ]:
         """Read all available components; return None if no metadata exists."""
         raw_meta = self._read_json(self.meta_path)
         if raw_meta is None:
@@ -338,7 +353,13 @@ class Checkpointer:
 
     async def read_checkpoint(
         self,
-    ) -> Optional[Tuple[Optional[SchedulerState], Optional[AsyncCommState], Optional[Dict[str, "Task"]]]]:
+    ) -> Optional[
+        Tuple[
+            Optional[SchedulerState],
+            Optional[AsyncCommState],
+            Optional[Dict[str, "Task"]],
+        ]
+    ]:
         """Non-blocking read of all checkpoint components from disk.
 
         Returns:
@@ -349,9 +370,7 @@ class Checkpointer:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, self._read_components_sync)
         if result is None:
-            self.logger.debug(
-                f"[Checkpointer] No checkpoint found for {self.node_id}"
-            )
+            self.logger.debug(f"[Checkpointer] No checkpoint found for {self.node_id}")
             return None
 
         scheduler_state, comm_state, tasks = result
