@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import socket
 import time
+import uuid
 
 import pytest
 from utils import echo, echo_stdout
@@ -35,6 +36,7 @@ async def test_async_worker_cluster(
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4)}")
     w = AsyncWorker(
         "test",
         LauncherConfig(
@@ -45,7 +47,7 @@ async def test_async_worker_cluster(
             use_mpi_ppn=False,
             log_level=logging.INFO,
             cluster=True,
-            checkpoint_dir=os.path.join(os.getcwd(), "ckpt"),
+            checkpoint_dir=ckpt_dir,
             cpu_binding_option="",
             return_stdout=True,
         ),
@@ -55,9 +57,7 @@ async def test_async_worker_cluster(
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
     time.sleep(2.0)
-    client = ClusterClient(
-        node_id="test", checkpoint_dir=os.path.join(os.getcwd(), "ckpt")
-    )
+    client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}
     for task_id, task in tasks.items():
@@ -95,6 +95,7 @@ async def test_async_master_cluster(
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4)}")
     w = AsyncMaster(
         "test",
         LauncherConfig(
@@ -106,7 +107,7 @@ async def test_async_master_cluster(
             use_mpi_ppn=False,
             log_level=logging.INFO,
             cluster=True,
-            checkpoint_dir=os.path.join(os.getcwd(), "ckpt"),
+            checkpoint_dir=ckpt_dir,
             cpu_binding_option="",
             return_stdout=True,
             children_scheduler_policy="simple_split_children_policy",
@@ -119,9 +120,7 @@ async def test_async_master_cluster(
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
     time.sleep(2.0)
-    client = ClusterClient(
-        node_id="test", checkpoint_dir=os.path.join(os.getcwd(), "ckpt")
-    )
+    client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}
     for task_id, task in tasks.items():

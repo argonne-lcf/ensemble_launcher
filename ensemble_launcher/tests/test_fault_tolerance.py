@@ -33,9 +33,7 @@ def _make_tasks(n: int):
 
 
 def test_el_fault_tolerance():
-    ckpt_dir = os.path.join(
-        os.getcwd(), f"ckpt_el_fault_tolerance_{str(uuid.uuid4()).split('-')[0]}"
-    )
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
     os.makedirs(ckpt_dir, exist_ok=True)
     tasks = _make_tasks(120)
 

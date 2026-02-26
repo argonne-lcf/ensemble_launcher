@@ -1151,6 +1151,8 @@ class AsyncMaster(Node):
                     )
                     for task_id in self._scheduler.unassigned_task_ids
                 ]
+            else:
+                failed_results = []
             result_batch = ResultBatch(sender=self.node_id, data=failed_results)
             for child_id, child_results in self._results.items():
                 for rb in child_results:
