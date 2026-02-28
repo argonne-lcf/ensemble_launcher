@@ -53,9 +53,11 @@ def test_el_run():
 # Cluster mode — start() + ClusterClient
 # ---------------------------------------------------------------------------
 
+import uuid
+
 
 def test_el_cluster_mode():
-    ckpt_dir = os.path.join(os.getcwd(), "ckpt_el_cluster")
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
     tasks = _make_tasks(8)
 
     el = EnsembleLauncher(
@@ -66,7 +68,7 @@ def test_el_cluster_mode():
             comm_name="async_zmq",
             nlevels=0,
             return_stdout=True,
-            worker_logs=False,
+            worker_logs=True,
             cpu_binding_option="",
             use_mpi_ppn=False,
             cluster=True,
@@ -91,8 +93,8 @@ def test_el_cluster_mode():
 
 
 if __name__ == "__main__":
-    print("test_el_run")
-    test_el_run()
+    # print("test_el_run")
+    # test_el_run()
     print("test_el_cluster_mode")
     test_el_cluster_mode()
     print("All tests passed")

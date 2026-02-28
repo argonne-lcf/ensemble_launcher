@@ -170,7 +170,7 @@ class Checkpointer:
         self.checkpoint_dir = checkpoint_dir
         self.logger = logger
         try:
-            os.makedirs(checkpoint_dir)
+            os.makedirs(checkpoint_dir, exist_ok=True)
         except FileExistsError:
             if not os.path.isdir(checkpoint_dir):
                 raise RuntimeError(
@@ -251,12 +251,14 @@ class Checkpointer:
         has_tasks = meta.has_tasks if meta else False
 
         if scheduler_state is not None:
+            self.logger.info(f"Writing scheduler state to {self.scheduler_path}")
             self._write_json_atomic(
                 self.scheduler_path, scheduler_state.model_dump_json()
             )
             has_scheduler = True
 
         if comm_state is not None:
+            self.logger.info(f"Writing comm state {self.comm_path}")
             comm_data = CommCheckpointData(
                 comm_state_type=type(comm_state).__name__,
                 comm_state_json=comm_state.serialize(),

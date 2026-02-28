@@ -36,7 +36,7 @@ async def test_async_worker_cluster(
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4)}")
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
     w = AsyncWorker(
         "test",
         LauncherConfig(

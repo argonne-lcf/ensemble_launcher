@@ -733,11 +733,6 @@ class AsyncMaster(Node):
             self._aggregate_and_send_result_batch(self._result_batch_tasks)
         )
 
-        # Checkpoint scheduler + comm state once everything is initialised.
-        if self._checkpointer is not None:
-            await self._write_checkpoint()
-            self.logger.info(f"{self.node_id}: Init checkpoint written")
-
         return None
 
     # --------------------------------------------------------------------------

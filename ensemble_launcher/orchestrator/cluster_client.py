@@ -4,7 +4,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import Future as ConcurrentFuture
-from typing import Dict, Optional, Type
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import cloudpickle
 
@@ -191,14 +191,113 @@ class ClusterClient:
             self._recv_thread.join(timeout=5.0)
         self._transport.close()
 
-    def submit(self, task: Task) -> ConcurrentFuture:
-        """Send a task to the node. Returns a Future resolved on completion."""
-        fut: ConcurrentFuture = ConcurrentFuture()
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _to_task(
+        self,
+        task_or_callable: Union[Task, Callable, str],
+        args: Tuple = (),
+        kwargs: Dict = {},
+        nnodes: int = 1,
+        ppn: int = 1,
+        ngpus_per_process: int = 0,
+    ) -> Task:
+        """Wrap a callable or shell string in a Task with the given resource spec."""
+        if isinstance(task_or_callable, Task):
+            return task_or_callable
+        if callable(task_or_callable) or isinstance(task_or_callable, str):
+            return Task(
+                task_id=str(uuid.uuid4()),
+                nnodes=nnodes,
+                ppn=ppn,
+                ngpus_per_process=ngpus_per_process,
+                executable=task_or_callable,
+                args=args,
+                kwargs=kwargs,
+            )
+        raise TypeError(
+            f"submit() expects a Task, callable, or str; got {type(task_or_callable)}"
+        )
+
+    def _send_batch(self, tasks: List[Task]) -> List[ConcurrentFuture]:
+        """Register futures for *tasks* and send them in a single TaskUpdate."""
+        futures: List[ConcurrentFuture] = []
         with self._lock:
-            self._pending[task.task_id] = fut
-        task_update = TaskUpdate(sender=self._client_id, added_tasks=[task])
+            for task in tasks:
+                fut: ConcurrentFuture = ConcurrentFuture()
+                self._pending[task.task_id] = fut
+                futures.append(fut)
+        task_update = TaskUpdate(sender=self._client_id, added_tasks=tasks)
         self._transport.send(cloudpickle.dumps(task_update))
-        return fut
+        return futures
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        task: Union[Task, Callable, str],
+        *args,
+        nnodes: int = 1,
+        ppn: int = 1,
+        ngpus_per_process: int = 0,
+        **kwargs,
+    ) -> ConcurrentFuture:
+        """Send a task to the node. Returns a Future resolved on completion.
+
+        *task* may be:
+        - a :class:`Task` (used as-is; resource args and *args*/*kwargs* are ignored),
+        - a callable — wrapped in a Task with the given resource spec,
+        - a shell command string — wrapped in a Task with the given resource spec.
+
+        Args:
+            task: Task object, callable, or shell command string.
+            *args: Positional arguments forwarded to the callable.
+            nnodes: Number of nodes to request (ignored when *task* is a Task).
+            ppn: Processes per node (ignored when *task* is a Task).
+            ngpus_per_process: GPUs per process (ignored when *task* is a Task).
+            **kwargs: Keyword arguments forwarded to the callable.
+        """
+        return self._send_batch(
+            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)]
+        )[0]
+
+    def map(
+        self,
+        fn: Union[Callable, str],
+        iterable: Iterable,
+        nnodes: int = 1,
+        ppn: int = 1,
+        ngpus_per_process: int = 0,
+        **kwargs,
+    ) -> List[ConcurrentFuture]:
+        """Submit *fn* applied to each element of *iterable* in a single batch.
+
+        All tasks are sent in one :class:`TaskUpdate` message.  Returns a list
+        of :class:`~concurrent.futures.Future` objects in the same order as
+        *iterable*.
+
+        Args:
+            fn: Callable or shell command string to apply to each item.
+            iterable: Items to map over; each becomes the sole positional arg.
+            nnodes: Number of nodes per task.
+            ppn: Processes per node per task.
+            ngpus_per_process: GPUs per process per task.
+            **kwargs: Keyword arguments forwarded to *fn* for every call.
+
+        Example::
+
+            futs = client.map(my_func, [1, 2, 3], ppn=4)
+            results = [f.result() for f in futs]
+        """
+        tasks = [
+            self._to_task(fn, (item,), kwargs, nnodes, ppn, ngpus_per_process)
+            for item in iterable
+        ]
+        return self._send_batch(tasks)
 
     def __enter__(self) -> "ClusterClient":
         self.start()

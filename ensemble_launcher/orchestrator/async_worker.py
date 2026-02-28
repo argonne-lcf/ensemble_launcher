@@ -285,11 +285,6 @@ class AsyncWorker(Node):
         # Start global monitor tasks
         self._create_monitor_tasks()
 
-        # Checkpoint scheduler + comm state once everything is initialised.
-        if self._checkpointer is not None:
-            await self._write_checkpoint()
-            self.logger.info(f"{self.node_id}: Init checkpoint written")
-
     # --------------------------------------------------------------------------
     #                               Checkpointing
     # --------------------------------------------------------------------------
@@ -304,7 +299,9 @@ class AsyncWorker(Node):
         if not self._config.checkpoint_dir:
             return
         self._checkpointer = Checkpointer(
-            self.node_id, self._config.checkpoint_dir, self.logger
+            self.node_id,
+            self._config.checkpoint_dir,
+            self.logger.getChild("checkpointer"),
         )
         if not self._checkpointer.checkpoint_exists():
             return
