@@ -294,7 +294,14 @@ class ClusterClient:
             results = [f.result() for f in futs]
         """
         tasks = [
-            self._to_task(fn, (item,), kwargs, nnodes, ppn, ngpus_per_process)
+            self._to_task(
+                fn,
+                item if isinstance(item, tuple) else (item,),
+                kwargs,
+                nnodes,
+                ppn,
+                ngpus_per_process,
+            )
             for item in iterable
         ]
         return self._send_batch(tasks)

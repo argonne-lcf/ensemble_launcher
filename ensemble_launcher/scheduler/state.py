@@ -14,6 +14,8 @@ class ChildrenAssignment(TypedDict):
     job_resource: JobResource
     task_ids: List[str]
     wid: int
+    task_executor_name: str
+    child_class: str
 
 
 class SchedulerState(BaseModel):

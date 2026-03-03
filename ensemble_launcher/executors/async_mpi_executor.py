@@ -5,6 +5,7 @@ import socket
 import stat
 import subprocess
 import uuid
+from asyncio import Future as AsyncFuture
 from asyncio import Task
 from concurrent.futures import Executor
 from typing import Any, Callable, Dict, List, Tuple, Union
@@ -180,7 +181,7 @@ class AsyncMPIExecutor(Executor):
         mpi_args: Tuple = (),
         mpi_kwargs: Dict[str, Any] = {},
         serial_launch: bool = False,
-    ) -> Task:
+    ) -> AsyncFuture:
         # task is a str command
         task_id = str(uuid.uuid4())
 

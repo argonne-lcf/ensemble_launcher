@@ -1,5 +1,7 @@
+import asyncio
 import os
 import uuid
+from asyncio import Future as AsyncFuture
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -45,8 +47,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         task_args: Tuple = (),
         task_kwargs: Dict = {},
         env: Dict[str, Any] = {},
-    ):
-
+    ) -> AsyncFuture:
         if len(job_resource.nodes) > 1:
             raise ValueError(
                 "MultiProcessingExecutor can only execute single node tasks"
@@ -78,7 +79,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
             self.logger.warning(f"Can only excute either a str or a callable")
             return None
 
-        return future
+        return asyncio.wrap_future(future)
 
 
 @executor_registry.register("async_threadpool", type="async")
@@ -98,8 +99,7 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
         task_args: Tuple = (),
         task_kwargs: Dict = {},
         env: Dict[str, Any] = None,
-    ):
-
+    ) -> AsyncFuture:
         if env is None:
             env = {}
 
@@ -166,4 +166,4 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
         else:
             raise TypeError(f"Task must be str or callable, got {type(fn)}")
 
-        return future
+        return asyncio.wrap_future(future)

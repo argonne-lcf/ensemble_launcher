@@ -70,7 +70,11 @@ class AsyncWorker(Node):
         ##lazy init in run function
         self._comm = None
         ##lazy init in run function
-        self._executor = None
+        self._executor: Dict[
+            str,
+            Union[AsyncProcessPoolExecutor, AsyncMPIExecutor, AsyncThreadPoolExecutor],
+        ] = None
+        self._default_executor_name: str = None
 
         self._scheduler = None
 
@@ -85,7 +89,8 @@ class AsyncWorker(Node):
         self._submission_task = None
         self._reporting_task = None
 
-        self._task_futures: Dict[str, Union[AsyncFuture, ConcurrentFuture]] = {}
+        self._task_futures: Dict[str, AsyncFuture] = {}
+        self._task_id_to_executor: Dict[str, str] = {}
         self._event_loop = None
 
         self._checkpointer: Optional[Checkpointer] = None
@@ -264,9 +269,21 @@ class AsyncWorker(Node):
         self.logger.debug(f"Sorted tasks size {self._scheduler._sorted_tasks.qsize()}")
 
         ##lazy executor creation
-        assert self._config.task_executor_name in executor_registry.async_executors, (
-            f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
-        )
+        if isinstance(self._config.task_executor_name, list):
+            assert all(
+                [
+                    executor_name in executor_registry.async_executors
+                    for executor_name in self._config.task_executor_name
+                ]
+            ), (
+                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+            )
+        else:
+            assert (
+                self._config.task_executor_name in executor_registry.async_executors
+            ), (
+                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+            )
 
         kwargs = {}
         kwargs["logger"] = self.logger.getChild("executor")
@@ -276,10 +293,23 @@ class AsyncWorker(Node):
             kwargs["cpu_binding_option"] = self._config.cpu_binding_option
             kwargs["use_ppn"] = self._config.use_mpi_ppn
             kwargs["return_stdout"] = self._config.return_stdout
-        self._executor: Union[
-            AsyncProcessPoolExecutor, AsyncThreadPoolExecutor, AsyncMPIExecutor
-        ] = executor_registry.create_executor(
-            self._config.task_executor_name, kwargs=kwargs
+        if isinstance(self._config.task_executor_name, list):
+            self._executor = {}
+            for exec_name in self._config.task_executor_name:
+                self._executor[exec_name] = executor_registry.create_executor(
+                    exec_name, kwargs=kwargs
+                )
+            self._default_executor_name = self._config.task_executor_name[0]
+        else:
+            self._executor = {
+                self._config.task_executor_name: executor_registry.create_executor(
+                    self._config.task_executor_name, kwargs=kwargs
+                )
+            }
+            self._default_executor_name = self._config.task_executor_name
+
+        self.logger.info(
+            f"Created {self._config.task_executor_name} executors (Default = {self._default_executor_name})"
         )
 
         # Start global monitor tasks
@@ -415,15 +445,15 @@ class AsyncWorker(Node):
     #                               Callbacks
     # --------------------------------------------------------------------------
 
-    def create_done_callback(self, task: Task) -> Callable[[ConcurrentFuture], None]:
+    def create_done_callback(self, task: Task) -> Callable[[AsyncFuture], None]:
         """Return a done-callback that dispatches _task_callback into the event loop."""
 
-        def done_callback(future: ConcurrentFuture) -> None:
+        def done_callback(future: AsyncFuture) -> None:
             self._event_loop.call_soon_threadsafe(self._task_callback, task, future)
 
         return done_callback
 
-    def _task_callback(self, task: Task, future: ConcurrentFuture) -> None:
+    def _task_callback(self, task: Task, future: AsyncFuture) -> None:
         """Process a completed task future: record status, free resources, forward result."""
         task_id = task.task_id
         if self._config.profile == "perfetto" and self._event_registry is not None:
@@ -501,7 +531,10 @@ class AsyncWorker(Node):
         ##delete tasks if needed
         for task in taskupdate.deleted_tasks:
             if task.task_id in self._scheduler._running_tasks:
-                self._executor.stop(task_id=self._executor_task_ids[task.task_id])
+                executor_name = self._task_id_to_executor[task.task_id]
+                self._executor[executor_name].stop(
+                    task_id=self._executor_task_ids[task.task_id]
+                )
                 self._task_futures[task.task_id].cancel()
             del_status[task.task_id] = self._scheduler.delete_task(task)
 
@@ -566,16 +599,44 @@ class AsyncWorker(Node):
                         pid=os.getpid(),
                         node_id=self.node_id,
                     )
-                future = self._executor.submit(
-                    req,
-                    task.executable,
-                    task_args=task.args,
-                    task_kwargs=task.kwargs,
-                    env=task.env,
-                )
+
+                set_exception = False
+                if task.executor_name is not None:
+                    if task.executor_name in self._executor:
+                        future = self._executor[task.executor_name].submit(
+                            req,
+                            task.executable,
+                            task_args=task.args,
+                            task_kwargs=task.kwargs,
+                            env=task.env,
+                        )
+                        self._task_id_to_executor[task_id] = task.executor_name
+                    else:
+                        self.logger.warning(
+                            f"Failed to submit {task_id}. {self.node_id} doesn't have {task.executor_name} executor"
+                        )
+                        future = self._event_loop.create_future()
+                        set_exception = True
+
+                else:
+                    default_executor = self._executor[self._default_executor_name]
+                    future = default_executor.submit(
+                        req,
+                        task.executable,
+                        task_args=task.args,
+                        task_kwargs=task.kwargs,
+                        env=task.env,
+                    )
+                    self._task_id_to_executor[task_id] = self._default_executor_name
                 future.add_done_callback(self.create_done_callback(task))
                 self._task_futures[task_id] = future
                 task.status = TaskStatus.RUNNING
+                if set_exception:
+                    future.set_exception(
+                        Exception(
+                            f"Failed due to unavailability of {task.executor_name} at {self.node_id}"
+                        )
+                    )
             except asyncio.CancelledError:
                 self.logger.info("Submission loop cancelled")
                 break
@@ -804,7 +865,8 @@ class AsyncWorker(Node):
                 json.dump(stats, f, indent=2)
 
         await self._comm.close()
-        self._executor.shutdown()
+        for executor in self._executor.values():
+            executor.shutdown()
 
         return
 

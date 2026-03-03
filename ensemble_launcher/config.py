@@ -20,7 +20,7 @@ class LauncherConfig(BaseModel):
     """Configuration for launcher"""
 
     child_executor_name: str = "async_processpool"
-    task_executor_name: str = "async_processpool"
+    task_executor_name: Union[str, List[str]] = "async_processpool"
     comm_name: Literal["async_zmq"] = "async_zmq"
     report_interval: float = 10.0
     nlevels: int = 1

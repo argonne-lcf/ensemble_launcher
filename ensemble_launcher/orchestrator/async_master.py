@@ -31,7 +31,7 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
-from ensemble_launcher.scheduler import AsyncChildrenScheduler
+from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -213,15 +213,35 @@ class AsyncMaster(Node):
             tasks=self._init_tasks,
         )
 
-    def _get_child_class(self) -> type:
+    def _get_child_class(
+        self, child_assignment: Optional[ChildrenAssignment] = None
+    ) -> type:
         """Return the Node class to use for children at the next level."""
-        if self.level + 1 == self._config.nlevels:
-            return AsyncWorker
-        from .async_workstealing_master import AsyncWorkStealingMaster
+        if (
+            child_assignment is not None
+            and child_assignment.get("child_class", None) is not None
+        ):
+            child_class = child_assignment["child_class"]
+            if child_class.lower() == "asyncworker":
+                return AsyncWorker
+            elif child_class.lower() == "asyncmaster":
+                return AsyncMaster
+            elif child_class.lower() == "asyncworkstealingmaster":
+                from .async_workstealing_master import AsyncWorkStealingMaster
 
-        return (
-            AsyncWorkStealingMaster if self._config.enable_workstealing else AsyncMaster
-        )
+                return AsyncWorkStealingMaster
+            else:
+                raise RuntimeError(f"Unknown child_class {child_class}")
+        else:
+            if self.level + 1 == self._config.nlevels:
+                return AsyncWorker
+            from .async_workstealing_master import AsyncWorkStealingMaster
+
+            return (
+                AsyncWorkStealingMaster
+                if self._config.enable_workstealing
+                else AsyncMaster
+            )
 
     def _instantiate_children(
         self,
@@ -934,6 +954,8 @@ class AsyncMaster(Node):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
             return await self._get_child_exception(child_id)
 
+        self._last_child_ack_time[child_id] = time.time()
+
         # Send node update first
         if node_update is not None:
             await self._comm.send_message_to_child(child_id, node_update)
@@ -1033,7 +1055,8 @@ class AsyncMaster(Node):
             child_ids: List of child_ids for completed children.
         """
         for child_id in child_ids:
-            self._scheduler.mark_child_done(child_id)
+            if not self._scheduler.is_child_done(child_id):
+                self._scheduler.mark_child_done(child_id)
         if self._scheduler.all_children_done:
             self._all_children_done_event.set()
 
@@ -1077,7 +1100,20 @@ class AsyncMaster(Node):
                     )
                     return
             # Distinguish a clean exit from an unexpected crash.
-            crashed = future.cancelled()
+            # Following are the scenarios when a child is considered crashed
+            # 1. Child is already marked dead by the report_status() loop
+            # 2. Future is cancelled but the result has not arrived yet
+            #       -> should happen only when _teardown_child is called before the wait_for_finish is resolved
+            # 3. Future is not cancelled but an exception was returned
+            crashed = self._scheduler.is_child_dead(child_id) or (
+                future.cancelled()
+                and all(
+                    [
+                        not self._scheduler.is_child_done(child_id)
+                        for child_id in child_ids
+                    ]
+                )
+            )
             if crashed:
                 self.logger.info(f"{child_ids} crashed")
             if not crashed:
@@ -1114,6 +1150,8 @@ class AsyncMaster(Node):
             if result_batch is not None:
                 self._results[child_id] = [result_batch]
                 self.logger.info(f"{self.node_id}: Received result from {child_id}")
+                if not self._scheduler.is_child_done(child_id):
+                    self._scheduler.mark_child_done(child_id)
             else:
                 self.logger.warning(
                     f"{self.node_id}: No result received from {child_id}"
@@ -1229,9 +1267,9 @@ class AsyncMaster(Node):
                 # Dead-child detection: check each child's last ACK time.
                 now = time.time()
                 for child_id, last_ack in list(self._last_child_ack_time.items()):
-                    if (
+                    if child_id in self._children_recovering or (
                         self._scheduler.is_child_done(child_id)
-                        and child_id in self._children_recovering
+                        and not self._scheduler.is_child_dead(child_id)
                     ):
                         continue
                     age = now - last_ack
@@ -1427,34 +1465,16 @@ class AsyncMaster(Node):
     async def stop(self) -> None:
         """Gracefully shut down the master in a fixed teardown order.
 
-        1. Tear down each child — cancels the child's future, waits for the
+        1. Stop global monitor tasks: status reporter, cluster client monitor
+           (if cluster mode), and parent task-update monitor (if non-root).
+        2. Tear down each child — cancels the child's future, waits for the
            scheduler to mark it done, and cancels its per-child result/status
            monitor tasks.
-        2. Wait (up to 30 s) for ``_all_children_done_event`` to confirm every
+        3. Wait (up to 30 s) for ``_all_children_done_event`` to confirm every
            child process has exited.
-        3. Stop global monitor tasks: status reporter, cluster client monitor
-           (if cluster mode), and parent task-update monitor (if non-root).
         4. Close the comm layer and shut down the executor.
         5. Export Perfetto profiling traces if profiling was enabled.
         """
-        # Tear down children and wait for them to be done
-        for child_name in self._scheduler.children_names:
-            await self._teardown_child(child_name)
-
-        # Wait for all children to complete with timeout
-        try:
-            await asyncio.wait_for(self._all_children_done_event.wait(), timeout=30.0)
-            self.logger.info(f"{self.node_id}: All children have completed execution")
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                f"{self.node_id}: Timeout waiting for children to complete"
-            )
-
-        # write a final checkpoint
-        if self._checkpointer is not None:
-            await self._write_checkpoint()
-            self.logger.info(f"{self.node_id}: Final checkpoint written")
-
         # stop global monitors
         self._stop_reporting_event.set()
         self._reporting_task.cancel()
@@ -1480,6 +1500,24 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
             self.logger.info("Stopped parent task update monitor")
+
+        # Tear down children and wait for them to be done
+        for child_name in self._scheduler.children_names:
+            await self._teardown_child(child_name)
+
+        # Wait for all children to complete with timeout
+        try:
+            await asyncio.wait_for(self._all_children_done_event.wait(), timeout=30.0)
+            self.logger.info(f"{self.node_id}: All children have completed execution")
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"{self.node_id}: Timeout waiting for children to complete"
+            )
+
+        # write a final checkpoint
+        if self._checkpointer is not None:
+            await self._write_checkpoint()
+            self.logger.info(f"{self.node_id}: Final checkpoint written")
 
         # stop comm and executor
         await self._comm.close()
