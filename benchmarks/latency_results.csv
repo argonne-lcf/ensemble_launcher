@@ -1,0 +1,3 @@
+timestamp,git_commit,nnodes,nlevels,nchildren,n_repeats,mean_ms,std_ms
+2026-03-06T23:05:37,2c4fd63,2,1,2,100,3.341,1.044
+2026-03-06T23:05:37,2c4fd63,2,2,2,100,4.556,1.381
