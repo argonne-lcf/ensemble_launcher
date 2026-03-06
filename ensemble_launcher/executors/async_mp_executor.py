@@ -47,6 +47,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         task_args: Tuple = (),
         task_kwargs: Dict = {},
         env: Dict[str, Any] = {},
+        **kwargs,
     ) -> AsyncFuture:
         if len(job_resource.nodes) > 1:
             raise ValueError(
@@ -99,6 +100,7 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
         task_args: Tuple = (),
         task_kwargs: Dict = {},
         env: Dict[str, Any] = None,
+        **kwargs,
     ) -> AsyncFuture:
         if env is None:
             env = {}

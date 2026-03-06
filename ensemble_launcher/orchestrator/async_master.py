@@ -18,12 +18,12 @@ from ensemble_launcher.comm import (
     NodeInfo,
 )
 from ensemble_launcher.comm.messages import (
-    Action,
-    ActionType,
     NodeUpdate,
     Result,
     ResultBatch,
     Status,
+    Stop,
+    StopType,
     TaskUpdate,
 )
 from ensemble_launcher.config import LauncherConfig
@@ -94,9 +94,8 @@ class AsyncMaster(Node):
         self._event_loop = None  # Will be set in run()
 
         # result and aggregate tasks
-        self._result_batch_tasks = []
         self._aggregate_task = None
-        self._child_result_task: Dict[
+        self._child_result_batch_task: Dict[
             str, asyncio.Task
         ] = {}  # child_id -> collect task
         self._child_forwarder_task: Dict[
@@ -338,8 +337,7 @@ class AsyncMaster(Node):
         task = asyncio.create_task(
             self._collect_final_result_batch_from_child(child_id)
         )
-        self._result_batch_tasks.append(task)
-        self._child_result_task[child_id] = task
+        self._child_result_batch_task[child_id] = task
         # Per-child status monitor (continuously drains Status messages).
         self._child_status_task[child_id] = asyncio.create_task(
             self._child_status_monitor(child_id)
@@ -750,7 +748,9 @@ class AsyncMaster(Node):
 
         # Create aggregate task once, after all children (including recreated ones) are registered.
         self._aggregate_task = asyncio.create_task(
-            self._aggregate_and_send_result_batch(self._result_batch_tasks)
+            self._aggregate_and_send_result_batch(
+                list(self._child_result_batch_task.values())
+            )
         )
 
         return None
@@ -1011,38 +1011,38 @@ class AsyncMaster(Node):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    def _route_task(self, task: Task) -> Optional[str]:
-        """Route a task to the best child via scheduler policy. Returns chosen child_id."""
-        self._scheduler.add_task(task)
-        child_assignments = self._scheduler.assign_task_ids({task.task_id})
+    def _route_tasks(self, tasks: List[Task]) -> List[Optional[str]]:
+        """Route a list of tasks to the best child via scheduler policy. Returns chosen child_id."""
+        for task in tasks:
+            self._scheduler.add_task(task)
+        child_assignments, task_to_child, unassigned_tasks = (
+            self._scheduler.assign_task_ids({task.task_id for task in tasks})
+        )
 
-        if not child_assignments:
-            raise RuntimeError(
-                f"Policy could not assign task {task.task_id} to any worker"
-            )
-
-        best_child = None
-        for child_id, child_tasks in child_assignments.items():
-            if task.task_id in child_tasks:
-                best_child = child_id
-
-        if best_child is not None:
+        for child_id, added_tasks in child_assignments.items():
+            if len(added_tasks) == 0:
+                continue
             asyncio.create_task(
                 self._comm.send_message_to_child(
-                    best_child, TaskUpdate(sender=self.node_id, added_tasks=[task])
+                    child_id,
+                    TaskUpdate(
+                        sender=self.node_id,
+                        added_tasks=[self.tasks[task_id] for task_id in added_tasks],
+                    ),
                 )
             )
-            self.logger.info(f"Routing task to {best_child}")
-        else:
-            self.logger.warning("Can't route task to any child")
+            self.logger.info(f"Routing {len(added_tasks)} Tasks to {child_id}")
+
+        for task_id in unassigned_tasks:
+            self.logger.warning(f"Can't route task {task_id} to any child")
             result = Result(
                 sender=self.node_id,
-                task_id=task.task_id,
+                task_id=task_id,
                 success=False,
                 exception=f"Routing failed at {self.node_id}",
             )
             asyncio.create_task(self._forward_result(result))
-        return best_child
+        return [task_to_child.get(task.task_id, None) for task in tasks]
 
     # --------------------------------------------------------------------------
     #                               Callbacks
@@ -1194,17 +1194,21 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Aggregated results from {len(self._results)} children"
             )
 
-        # Send to parent
-        if self.parent:
+        # Send to parent (skip if parent is dead)
+        if self.parent and not self._parent_dead_event.is_set():
             success = await self._comm.send_message_to_parent(result_batch)
             if not success:
                 self.logger.warning(f"{self.node_id}: Failed to send results to parent")
             else:
                 self.logger.info(f"{self.node_id}: Successfully sent results to parent")
+        elif self.parent:
+            self.logger.warning(
+                f"{self.node_id}: Parent is dead, skipping result send"
+            )
 
-        # Report final status to parent
+        # Report final status to parent (or write to file if root / parent dead)
         async with self._timer("report_to_parent"):
-            if self.parent:
+            if self.parent and not self._parent_dead_event.is_set():
                 final_status = self._scheduler.aggregate_status()
                 final_status.tag = "final"
                 success = await self._comm.send_message_to_parent(final_status)
@@ -1220,7 +1224,6 @@ class AsyncMaster(Node):
                 try:
                     status = self._scheduler.aggregate_status()
                     status.tag = "final"
-                    # Write to a json file
                     fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
                     status.to_file(fname)
                     self.logger.info(
@@ -1310,8 +1313,8 @@ class AsyncMaster(Node):
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
                 self.logger.info("Received TaskUpdate from client")
+                self._route_tasks(msg.added_tasks)
                 for task in msg.added_tasks:
-                    self._route_task(task)
                     self._client_task_map[task.task_id] = client_id
 
     async def _forward_result(self, result: Result) -> None:
@@ -1417,8 +1420,7 @@ class AsyncMaster(Node):
                     TaskUpdate, block=True
                 )
                 if task_update is not None:
-                    for task in task_update.added_tasks:
-                        self._route_task(task)
+                    self._route_tasks(task_update.added_tasks)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1444,11 +1446,9 @@ class AsyncMaster(Node):
                 self.logger.warning(f"Cancelling {child_id} future was unsuccessful")
         await self._scheduler.wait_for_child(child_id)
 
-        old_task = self._child_result_task.pop(child_id, None)
+        old_task = self._child_result_batch_task.pop(child_id, None)
         if old_task is not None:
             old_task.cancel()
-            if old_task in self._result_batch_tasks:
-                self._result_batch_tasks.remove(old_task)
         old_status = self._child_status_task.pop(child_id, None)
         if old_status is not None:
             old_status.cancel()
@@ -1546,39 +1546,37 @@ class AsyncMaster(Node):
     async def _wait_for_finish(self) -> None:
         """Wait for all work to complete, then trigger result aggregation.
 
-        Races three conditions with asyncio.FIRST_COMPLETED:
+        Races conditions with asyncio.FIRST_COMPLETED:
         1. Work done — all children have returned their final ResultBatch.
         2. Parent dead locally — consecutive send failures exceeded threshold.
-        3. STOP action received from parent (non-root only) / external signal (root).
+        3. SIGTERM on this process.
+        4. Stop(TERMINATE/KILL) received from parent (non-root only).
 
-        On any non-work-done exit, forwards Action(STOP) to all children before
-        proceeding, cascading the shutdown down the subtree.
+        On parent-dead exit, forwards Stop(KILL) to all children. On any other
+        non-work-done exit, forwards Stop(TERMINATE) cascading the shutdown down
+        the subtree. In both cases skips sending results/status to the dead parent.
         """
-        stop_tasks: Dict[str, asyncio.Task] = {}
+        import sys
 
-        # Condition 1: all local work done
+        stop_tasks: Dict[str, asyncio.Task] = {}
+        received_stop_type: List[Optional[StopType]] = [None]
+
         stop_tasks["work_done"] = asyncio.create_task(
             self._all_children_done_event.wait()
         )
-
-        # Condition 2: parent detected dead locally
         stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+        stop_tasks["stop_signal"] = asyncio.create_task(
+            self._stop_signal_received.wait()
+        )
 
-        # Condition 3: STOP action received from parent (non-root only)
         if self.parent is not None:
 
             async def _recv_stop_from_parent():
-                while True:
-                    msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg is not None and msg.type == ActionType.STOP:
-                        return
+                msg = await self._comm.recv_message_from_parent(Stop, block=True)
+                if msg is not None:
+                    received_stop_type[0] = msg.type
 
             stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
-        else:
-            # Root node: external signal (SIGTERM or programmatic)
-            stop_tasks["stop_signal"] = asyncio.create_task(
-                self._stop_signal_received.wait()
-            )
 
         done, pending = await asyncio.wait(
             set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
@@ -1590,18 +1588,46 @@ class AsyncMaster(Node):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Propagate stop to children if work didn't finish naturally
+        # Propagate stop to children if work didn't finish naturally.
+        # Parent dead → KILL children. Received stop from parent → mirror its type.
+        # Any other reason (SIGTERM etc.) → TERMINATE cleanly.
         if not self._all_children_done_event.is_set():
-            self.logger.info(f"{self.node_id}: Propagating STOP to children")
+            if self._parent_dead_event.is_set():
+                stop_type = StopType.KILL
+            elif received_stop_type[0] is not None:
+                stop_type = received_stop_type[0]
+            else:
+                stop_type = StopType.TERMINATE
+            self.logger.info(
+                f"{self.node_id}: Propagating {stop_type.value} to children"
+            )
             for child_id in list(self.children.keys()):
                 try:
                     await self._comm.send_message_to_child(
-                        child_id, Action(sender=self.node_id, type=ActionType.STOP)
+                        child_id, Stop(sender=self.node_id, type=stop_type)
                     )
                 except Exception:
                     pass
 
-        await self._aggregate_task
+        # If we KILLed children they won't send results — cancel all result tasks.
+        if not self._all_children_done_event.is_set() and stop_type == StopType.KILL:
+            for t in list(self._child_result_batch_task.values()):
+                t.cancel()
+            await asyncio.gather(
+                *self._child_result_batch_task.values(),
+                return_exceptions=True,
+            )
+            self._aggregate_task.cancel()
+            try:
+                await self._aggregate_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            await self._aggregate_task
+
+        # Force-exit after propagating if we received a KILL from our parent.
+        if received_stop_type[0] == StopType.KILL:
+            sys.exit(1)
 
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, wait for all work to finish, stop, return results."""

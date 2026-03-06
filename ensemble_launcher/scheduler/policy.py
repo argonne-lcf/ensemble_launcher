@@ -60,7 +60,7 @@ class ChildrenPolicy(ABC):
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[str]], List[str]]:
+    ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
         Distribute tasks across workers given their pre-allocated resources.
 
@@ -77,6 +77,7 @@ class ChildrenPolicy(ABC):
         Returns:
             Tuple of:
             - Dict mapping wid (int) to the list of task IDs assigned to them.
+            - Dict mapping task id to the wid (int) it is assigned to
             - List of task IDs that could not be assigned to any worker.
         """
         pass
@@ -279,7 +280,7 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[str]], List[str]]:
+    ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
         Assign tasks to workers in round-robin order (largest tasks first).
 
@@ -287,7 +288,8 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         """
         worker_ids = list(children_resources.keys())
         nworkers = len(worker_ids)
-        task_ids_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        wid_to_task_id_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        task_id_to_wid_map: Dict[str, int] = {}
         removed_tasks: List[str] = []
         worker_task_counts = {wid: 0 for wid in worker_ids}
 
@@ -304,17 +306,19 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
                 for attempt in range(nworkers):
                     candidate = worker_ids[(i + attempt) % nworkers]
                     if worker_task_counts[candidate] < ntask:
-                        task_ids_map[candidate].append(task_id)
+                        wid_to_task_id_map[candidate].append(task_id)
+                        task_id_to_wid_map[task_id] = candidate
                         worker_task_counts[candidate] += 1
                         assigned = True
                         break
                 if not assigned:
                     removed_tasks.append(task_id)
             else:
-                task_ids_map[preferred].append(task_id)
+                wid_to_task_id_map[preferred].append(task_id)
+                task_id_to_wid_map[task_id] = preferred
                 worker_task_counts[preferred] += 1
 
-        return task_ids_map, removed_tasks
+        return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
 
 
 @policy_registry.register("simple_split_children_policy", type="children_policy")
@@ -396,7 +400,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[str]], List[str]]:
+    ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
         Assign tasks to workers in round-robin order, checking resource fit.
 
@@ -404,7 +408,8 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         """
         worker_ids = list(children_resources.keys())
         nchildren = len(worker_ids)
-        task_ids_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        wid_to_task_id_map: Dict[int, List[str]] = {wid: [] for wid in worker_ids}
+        task_id_to_wid_map: Dict[str, int] = {}
         removed_tasks: List[str] = []
         worker_task_counts = {wid: 0 for wid in worker_ids}
         current = worker_ids.index(
@@ -425,7 +430,8 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
                     continue
 
                 if task_resource in children_resources[wid]:
-                    task_ids_map[wid].append(task_id)
+                    wid_to_task_id_map[wid].append(task_id)
+                    task_id_to_wid_map[task_id] = wid
                     worker_task_counts[wid] += 1
                     current = (worker_ids.index(wid) + 1) % nchildren
                     assigned = True
@@ -435,4 +441,4 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
                 removed_tasks.append(task_id)
                 self.logger.warning(f"Task {task_id} does not fit in any worker")
 
-        return task_ids_map, removed_tasks
+        return wid_to_task_id_map, task_id_to_wid_map, removed_tasks

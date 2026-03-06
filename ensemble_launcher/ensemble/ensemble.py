@@ -55,24 +55,43 @@ class Task(BaseModel):
             ]
         )
         if len(self.cpu_affinity) > 0 or len(self.gpu_affinity) > 0:
-            if self.cpu_affinity and (
-                self.ngpus_per_process > 0 and not self.gpu_affinity
-            ):
-                # Ignore cpu_affinity if gpu_affinity is not set
-                return req
+            ncpus = self.ppn * self.nnodes
+            ngpus = ncpus * self.ngpus_per_process
+            if ncpus >= 1 and ngpus >= 1:
+                if self.cpu_affinity and (
+                    self.ngpus_per_process > 0 and not self.gpu_affinity
+                ):
+                    # Ignore cpu_affinity if gpu_affinity is not set
+                    return req
 
-            if self.gpu_affinity and not self.cpu_affinity:
-                # Ignore gpu_affinity if cpu_affinity is not set
-                return req
+                if self.gpu_affinity and not self.cpu_affinity:
+                    # Ignore gpu_affinity if cpu_affinity is not set
+                    return req
 
-            req = JobResource(
-                resources=[
-                    NodeResourceList(
-                        cpus=tuple(self.cpu_affinity), gpus=tuple(self.gpu_affinity)
+                req = JobResource(
+                    resources=[
+                        NodeResourceList(
+                            cpus=tuple(self.cpu_affinity), gpus=tuple(self.gpu_affinity)
+                        )
+                        for node in range(self.nnodes)
+                    ]
+                )
+            elif ncpus >= 1 and ngpus == 0:
+                if len(self.cpu_affinity) == self.ppn:
+                    req = JobResource(
+                        resources=[
+                            NodeResourceList(
+                                cpus=tuple(self.cpu_affinity),
+                            )
+                            for node in range(self.nnodes)
+                        ]
                     )
-                    for node in range(self.nnodes)
-                ]
-            )
+                else:
+                    # This is a multi threading case where we might need more physical core per process
+                    pass
+            else:
+                pass
+
         return req
 
 

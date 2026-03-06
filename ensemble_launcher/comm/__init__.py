@@ -2,14 +2,14 @@ from .async_base import AsyncComm, AsyncCommState
 from .async_zmq import AsyncZMQComm, AsyncZMQCommState
 from .base import Comm
 from .messages import (
-    Action,
-    ActionType,
     HeartBeat,
     Message,
     NodeUpdate,
     Result,
     ResultBatch,
     Status,
+    Stop,
+    StopType,
     TaskRequest,
     TaskUpdate,
 )
@@ -22,14 +22,14 @@ __all__ = [
     "AsyncCommState",
     "AsyncZMQComm",
     "Comm",
-    "Action",
-    "ActionType",
     "HeartBeat",
     "Message",
     "NodeUpdate",
     "Result",
     "ResultBatch",
     "Status",
+    "Stop",
+    "StopType",
     "TaskRequest",
     "TaskUpdate",
     "MPComm",

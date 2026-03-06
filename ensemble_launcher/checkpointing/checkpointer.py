@@ -168,15 +168,16 @@ class Checkpointer:
     ) -> None:
         self.node_id = node_id
         self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_sub_dir = os.path.join(checkpoint_dir, *self.node_id.split("."))
         self.logger = logger
         try:
-            os.makedirs(checkpoint_dir, exist_ok=True)
+            os.makedirs(self.checkpoint_sub_dir, exist_ok=True)
             self.logger.info(f"Writing scheduler state to {self.scheduler_path}")
             self.logger.info(f"Writing comm state {self.comm_path}")
         except FileExistsError:
-            if not os.path.isdir(checkpoint_dir):
+            if not os.path.isdir(self.checkpoint_sub_dir):
                 raise RuntimeError(
-                    f"Checkpoint path {checkpoint_dir!r} exists but is not a directory"
+                    f"Checkpoint path {self.checkpoint_sub_dir!r} exists but is not a directory"
                 )
 
     # ------------------------------------------------------------------
@@ -185,23 +186,23 @@ class Checkpointer:
 
     @property
     def meta_path(self) -> str:
-        return os.path.join(self.checkpoint_dir, f"{self.node_id}_meta.json")
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_meta.json")
 
     @property
     def scheduler_path(self) -> str:
-        return os.path.join(self.checkpoint_dir, f"{self.node_id}_scheduler.json")
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_scheduler.json")
 
     @property
     def comm_path(self) -> str:
-        return os.path.join(self.checkpoint_dir, f"{self.node_id}_comm.json")
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_comm.json")
 
     @property
     def tasks_path(self) -> str:
-        return os.path.join(self.checkpoint_dir, f"{self.node_id}_tasks.json")
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_tasks.json")
 
     @property
     def results_path(self) -> str:
-        return os.path.join(self.checkpoint_dir, f"{self.node_id}_results.json")
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_results.json")
 
     # ------------------------------------------------------------------
     # Synchronous I/O helpers (dispatched to a thread via run_in_executor)
@@ -209,12 +210,15 @@ class Checkpointer:
 
     def _write_json_atomic(self, path: str, json_str: str) -> None:
         """Atomically write *json_str* to *path* via a sibling ``.tmp`` file."""
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(json_str)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(json_str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception as e:
+            self.logger.warning(f"Writing {path} failed with error {e}")
 
     def _read_json(self, path: str) -> Optional[str]:
         """Return the raw JSON string at *path*, or ``None`` if absent."""

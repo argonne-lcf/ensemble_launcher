@@ -2,7 +2,7 @@ import asyncio
 from typing import Dict, Optional
 
 from ensemble_launcher.comm import AsyncComm, NodeInfo
-from ensemble_launcher.comm.messages import Action, ActionType, TaskRequest, TaskUpdate
+from ensemble_launcher.comm.messages import Stop, StopType, TaskRequest, TaskUpdate
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
@@ -59,34 +59,32 @@ class AsyncWorkStealingWorker(AsyncWorker):
         arrive on-demand via TaskRequests.  There is therefore no task-completion
         condition; the worker stays alive until externally stopped.
 
-        Races two conditions with asyncio.FIRST_COMPLETED:
-        1. STOP action received from parent (non-root) / external signal (root).
+        Races conditions with asyncio.FIRST_COMPLETED:
+        1. SIGTERM on this process.
         2. Parent dead locally — consecutive send failures exceeded threshold.
+        3. Stop(TERMINATE/KILL) received from parent (non-root only).
         """
+        import sys
+
         stop_tasks: Dict[str, asyncio.Task] = {}
 
-        # Condition 1: Stop event set either explicitly or received from parent
-        if self.parent is None:
-            # Root worker: external stop signal
-            stop_tasks["stop_signal"] = asyncio.create_task(
-                self._stop_signal_received.wait()
-            )
-        else:
+        stop_tasks["stop_signal"] = asyncio.create_task(
+            self._stop_signal_received.wait()
+        )
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        if self.parent is not None:
 
             async def _recv_stop_from_parent():
                 while True:
-                    msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg is not None and msg.type == ActionType.STOP:
-                        return
+                    msg = await self._comm.recv_message_from_parent(Stop, block=True)
+                    if msg is not None:
+                        if msg.type == StopType.KILL:
+                            sys.exit(1)
+                        elif msg.type == StopType.TERMINATE:
+                            return
 
             stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
-
-        # Condition 2: parent detected dead locally
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
-
-        if not stop_tasks:
-            # Should not happen, but guard against empty wait
-            return
 
         done, pending = await asyncio.wait(
             set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
@@ -97,6 +95,9 @@ class AsyncWorkStealingWorker(AsyncWorker):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+        if self._parent_dead_event.is_set():
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -143,14 +144,14 @@ class AsyncWorkStealingWorker(AsyncWorker):
             )
             await self._comm.send_message_to_parent(task_request)
 
-            # Wait for response - either TaskUpdate or Action(STOP), whichever comes first
+            # Wait for response - either TaskUpdate or Stop, whichever comes first
             task_update_task = asyncio.create_task(
                 self._comm.recv_message_from_parent(
                     TaskUpdate, timeout=None, block=True
                 )
             )
             action_task = asyncio.create_task(
-                self._comm.recv_message_from_parent(Action, timeout=None, block=True)
+                self._comm.recv_message_from_parent(Stop, timeout=None, block=True)
             )
 
             done, pending = await asyncio.wait(

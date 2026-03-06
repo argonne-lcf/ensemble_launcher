@@ -3,15 +3,12 @@ import copy
 import json
 import logging
 import multiprocessing
-import sys
 from typing import Dict, List, Optional, Union
 
 from ensemble_launcher.orchestrator import (
     AsyncMaster,
     AsyncWorker,
     AsyncWorkStealingMaster,
-    Master,
-    Worker,
 )
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -155,7 +152,7 @@ class EnsembleLauncher:
             if self.async_orchestrator:
                 return AsyncWorker(*launcher_args)
             else:
-                return Worker(*launcher_args)
+                raise ValueError("Sync worker is no longer supported")
         elif (
             self.launcher_config.nlevels == 1
             and self.launcher_config.enable_workstealing
@@ -166,7 +163,7 @@ class EnsembleLauncher:
             if self.async_orchestrator:
                 return AsyncMaster(*launcher_args)
             else:
-                return Master(*launcher_args)
+                raise ValueError("Sync Master version is no longer supported")
 
     def run(self):
         """Simply blocks untils all the tasks are done"""

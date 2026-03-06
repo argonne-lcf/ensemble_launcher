@@ -21,7 +21,7 @@ def _make_tasks(n: int):
             nnodes=1,
             ppn=1,
             executable=echo_sleep,
-            args=(f"task-{i}", 3.0),
+            args=(f"task-{i}", 5.0),
         )
         for i in range(n)
     }
@@ -70,7 +70,7 @@ def test_el_fault_tolerance():
         # Kill main.m0 node
         import json
 
-        fname = os.path.join(ckpt_dir, "main.m0_meta.json")
+        fname = os.path.join(ckpt_dir, "main", "m0", "main.m0_meta.json")
         with open(fname, "r") as f:
             meta_data = json.load(f)
             pid = meta_data.get("pid", None)

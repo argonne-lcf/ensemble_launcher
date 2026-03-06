@@ -10,8 +10,6 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
-    Action,
-    ActionType,
     AsyncComm,
     AsyncZMQComm,
     AsyncZMQCommState,
@@ -21,6 +19,8 @@ from ensemble_launcher.comm import (
     Result,
     ResultBatch,
     Status,
+    Stop,
+    StopType,
     TaskUpdate,
 )
 from ensemble_launcher.config import LauncherConfig
@@ -694,50 +694,36 @@ class AsyncWorker(Node):
     async def _wait_for_stop_condition(self) -> None:
         """Wait for the condition that ends this worker's execution loop.
 
-        Races three conditions with asyncio.FIRST_COMPLETED:
-        1. Mode-specific work/stop signal (task completion or external stop).
+        Races conditions with asyncio.FIRST_COMPLETED:
+        1. SIGTERM on the process.
         2. Parent dead locally — consecutive send failures exceeded threshold.
-        3. STOP action received from parent (non-root only).
-
-        In non-cluster mode with a parent, work completion (task pool exhausted)
-        acts as condition 1. In cluster mode (root), the external stop signal is
-        condition 1. In cluster mode (non-root), only conditions 2 and 3 apply.
+        3. Work done (non-cluster mode only) — task pool exhausted.
+        4. Stop(TERMINATE/KILL) received from parent (non-root only).
         """
+        import sys
+
         stop_tasks: Dict[str, asyncio.Task] = {}
 
-        # Condition 1: mode-specific work/stop signal
-        if self._config.cluster:
-            if self.parent is not None:
-                # Cluster non-root: no separate work-done condition — parent_stop handles it
-                pass
-            else:
-                # Root worker: external stop signal
-                stop_tasks["stop_signal"] = asyncio.create_task(
-                    self._stop_signal_received.wait()
-                )
-        else:
-            # Non-cluster non-root: task completion
+        stop_tasks["stop_signal"] = asyncio.create_task(
+            self._stop_signal_received.wait()
+        )
+        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+
+        if not self._config.cluster:
             stop_tasks["work_done"] = asyncio.create_task(
                 self._scheduler.wait_for_completion()
             )
 
-        # Condition 2: parent detected dead locally
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
-
-        # Condition 3: STOP action received from parent (non-root only)
         if self.parent is not None:
 
             async def _recv_stop_from_parent():
-                while True:
-                    msg = await self._comm.recv_message_from_parent(Action, block=True)
-                    if msg is not None and msg.type == ActionType.STOP:
-                        return
+                msg = await self._comm.recv_message_from_parent(Stop, block=True)
+                if msg.type == StopType.KILL:
+                    sys.exit(1)
+                elif msg.type == StopType.TERMINATE:
+                    return
 
             stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
-
-        if not stop_tasks:
-            # Should not happen, but guard against empty wait
-            return
 
         done, pending = await asyncio.wait(
             set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
@@ -748,6 +734,9 @@ class AsyncWorker(Node):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+        if self._parent_dead_event.is_set():
+            sys.exit(1)
 
     # -------------------------------------------------------------------------
     #                               Teardown
@@ -884,7 +873,8 @@ class AsyncWorker(Node):
         await self._wait_for_stop_condition()
 
         async with self._timer("result_collection"):
-            all_results = await self._send_final_results_and_status()
+            if not self._parent_dead_event.is_set():
+                all_results = await self._send_final_results_and_status()
 
         await self.stop()
 

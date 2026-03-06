@@ -8,7 +8,6 @@ from utils import echo, echo_stdout
 from ensemble_launcher.config import LauncherConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncWorkStealingMaster as AsyncMaster
-from ensemble_launcher.orchestrator import Worker
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,

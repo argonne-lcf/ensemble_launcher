@@ -8,10 +8,9 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
 
 
-class ActionType(enum.Enum):
-    START = "start"
-    WAIT = "wait"
-    STOP = "stop"
+class StopType(enum.Enum):
+    TERMINATE = "terminate"
+    KILL = "kill"
 
 
 ##Base message class
@@ -141,8 +140,8 @@ class HeartBeat(Message):
 
 
 @dataclass
-class Action(Message):
-    type: Optional[ActionType] = None
+class Stop(Message):
+    type: Optional[StopType] = None
 
 
 @dataclass
@@ -159,6 +158,6 @@ all_messages = [
     TaskUpdate,
     NodeUpdate,
     HeartBeat,
-    Action,
+    Stop,
     TaskRequest,
 ]

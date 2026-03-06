@@ -87,17 +87,15 @@ def _resolve_node_id(checkpoint_dir: str, node_id: str) -> str:
     (the global master always has the shortest name, e.g. ``"main"``).
     Any other value is returned unchanged.
     """
-    if node_id != "global":
+    if node_id not in ["global", "local"]:
         return node_id
-
-    candidates = [
-        fname[: -len("_comm.json")]
-        for fname in os.listdir(checkpoint_dir)
-        if fname.endswith("_comm.json")
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"No comm checkpoints found in '{checkpoint_dir}'")
-    return min(candidates, key=len)
+    else:
+        if node_id == "global":
+            return os.listdir(checkpoint_dir)[0]
+        elif node_id == "local":
+            raise NotImplementedError("local connection is not implemented")
+        else:
+            raise ValueError(f"Unknown node_id {node_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +155,9 @@ class ClusterClient:
 
         resolved_id = _resolve_node_id(checkpoint_dir, node_id)
         self._node_id = resolved_id
-        comm_path = os.path.join(checkpoint_dir, f"{resolved_id}_comm.json")
+        comm_path = os.path.join(
+            checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_comm.json"
+        )
         if not os.path.exists(comm_path):
             raise FileNotFoundError(
                 f"No comm checkpoint found for node '{resolved_id}' in '{checkpoint_dir}'"

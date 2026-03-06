@@ -220,10 +220,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
             for child_id, assignment in self._child_assignments.items()
         }
 
-    def record_dynamic_assignment(self, task_id: str, child_id: str) -> None:
-        """Record that task_id was dynamically routed to child_id."""
-        self._child_to_tasks[child_id].append(task_id)
-        self._task_to_child[task_id] = child_id
+    def get_task_to_child(self, task_id: str) -> Optional[str]:
+        """Return the child id to which task is assigned"""
+        return self._task_to_child.get(task_id, None)
 
     def get_child_task_ids(self, child_id: str) -> List[str]:
         """Return the task IDs assigned to a child."""
@@ -294,6 +293,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             children_resources=children_resources,
             child_id_to_wid=dict(self._child_id_to_wid),
             wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
+            task_to_child=self._task_to_child,
         )
 
     def set_state(self, state: SchedulerState) -> None:
@@ -321,6 +321,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
             self._child_id_to_wid[child_id] = wid
             self._wid_to_child_id[wid] = child_id
 
+        # also set the task_id to wid
+        self._task_to_child.update(state.task_to_child)
+
         # All tasks that were assigned to children leave the unassigned pool
         assigned = {
             task_id
@@ -340,10 +343,13 @@ class AsyncChildrenScheduler(AsyncScheduler):
         node_id: str,
         reset: bool = True,
         nodes: Optional[JobResource] = None,
-    ) -> Dict[str, List[str]]:
+    ) -> Tuple[Dict[str, List[str]], Dict[str, str], List[str]]:
         """Convenience wrapper: assign_resources then assign_task_ids.
 
-        Returns child_id -> assigned task_ids mapping.
+        Returns
+        - dict mapping child_id -> list of task_ids assigned in this call
+        - dict mapping of task_id -> child id (str)
+        - list of unassigned tasks in this call.
         """
         self.assign_resources(level, node_id, reset=reset, nodes=nodes)
         return self.assign_task_ids(self._unassigned_tasks)
@@ -403,7 +409,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         task_ids: Set[str],
         ntask: Optional[int] = None,
         child_ids: Optional[List[str]] = None,
-    ) -> Dict[str, List[str]]:
+    ) -> Tuple[Dict[str, List[str]], Dict[str, str], List[str]]:
         """
         Distribute the given task_ids to registered children via the policy.
 
@@ -411,10 +417,13 @@ class AsyncChildrenScheduler(AsyncScheduler):
         child's task_ids list, and removes successfully placed tasks from the
         unassigned pool.
 
-        Returns a dict mapping child_id -> list of task_ids assigned in this call.
+        Returns a Tuple or
+        - dict mapping child_id -> list of task_ids assigned in this call
+        - dict mapping of task_id -> child id (str)
+        - list of unassigned tasks in this call.
         """
         if not self._child_assignments or not task_ids:
-            return {}
+            return {}, {}, []
 
         # Restrict to requested child_ids if provided.
         target_assignments = (
@@ -446,12 +455,14 @@ class AsyncChildrenScheduler(AsyncScheduler):
         }
 
         task_objs = {tid: self.tasks[tid] for tid in task_ids if tid in self.tasks}
-        task_ids_map, removed_tasks = self.policy.get_children_tasks(
-            tasks=task_objs,
-            children_resources=children_resources,
-            ntask=ntask,
-            child_assignments=wid_assignments,
-            child_status=wid_status,
+        wid_to_task_id_map, task_id_to_wid_map, removed_tasks = (
+            self.policy.get_children_tasks(
+                tasks=task_objs,
+                children_resources=children_resources,
+                ntask=ntask,
+                child_assignments=wid_assignments,
+                child_status=wid_status,
+            )
         )
 
         if removed_tasks:
@@ -460,14 +471,20 @@ class AsyncChildrenScheduler(AsyncScheduler):
             )
 
         child_assignments: Dict[str, List[str]] = {}
-        for wid, assigned_ids in task_ids_map.items():
+        for wid, assigned_ids in wid_to_task_id_map.items():
             child_id = self._wid_to_child_id[wid]
             self._child_assignments[child_id]["task_ids"].extend(assigned_ids)
             for tid in assigned_ids:
                 self._unassigned_tasks.discard(tid)
             child_assignments[child_id] = assigned_ids
 
-        return child_assignments
+        task_to_child: Dict[str, str] = {}
+        for task_id, wid in task_id_to_wid_map.items():
+            task_to_child[task_id] = self._wid_to_child_id[wid]
+
+        self._task_to_child.update(task_to_child)
+
+        return child_assignments, task_to_child, removed_tasks
 
     def free(self, child_id: str) -> bool:
         """Deallocate cluster resources for a child. No-op if already freed."""

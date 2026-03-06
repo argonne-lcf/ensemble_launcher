@@ -64,6 +64,9 @@ class SchedulerState(BaseModel):
     child_id_to_wid: Dict[str, int] = Field(default_factory=dict)
     wid_to_child_id: Dict[int, str] = Field(default_factory=dict)
 
+    # A map of task_id -> child_id
+    task_to_child: Dict[str, str] = Field(default_factory=dict)
+
     # ------------------------------------------------------------------ #
     # Custom serialisers / validators for JobResource fields              #
     # ------------------------------------------------------------------ #
