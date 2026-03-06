@@ -1,10 +1,16 @@
 import socket
+import time
 
+from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, SystemConfig
-from ensemble_launcher.mcp import Server
+from ensemble_launcher.mcp import Interface
 from sim_script import sim
 
-mcp = Server(
+CHECKPOINT_DIR = "/tmp/mcp_el_ckpt"
+
+# --- Start the EnsembleLauncher cluster before creating the interface ---
+el = EnsembleLauncher(
+    ensemble_file={},
     system_config=SystemConfig(name="local", ncpus=4, cpus=list(range(4))),
     launcher_config=LauncherConfig(
         task_executor_name="async_processpool",
@@ -15,9 +21,15 @@ mcp = Server(
         cpu_binding_option="",
         use_mpi_ppn=False,
         cluster=True,
+        checkpoint_dir=CHECKPOINT_DIR,
     ),
     Nodes=[socket.gethostname()],
 )
+el.start()
+time.sleep(2.0)  # wait for cluster to be ready
+
+# --- Create the MCP interface, pointing it at the running cluster ---
+mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
 
 
 # Single-call cluster tool — one task per MCP invocation
@@ -35,4 +47,7 @@ def run_sim_ensemble(Temperature: float, Pressure: float) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        el.stop()

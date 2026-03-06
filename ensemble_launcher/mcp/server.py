@@ -1,5 +1,4 @@
 import inspect
-import os
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -13,20 +12,28 @@ from ..ensemble import Task
 from ..orchestrator import ClusterClient
 
 
-class Server:
+class Interface:
     def __init__(
         self,
-        name: str = "MCP server to execute ensemble tasks",
-        system_config: Optional[SystemConfig] = None,
-        launcher_config: Optional[LauncherConfig] = None,
-        Nodes: Optional[List[str]] = None,
+        name: str = "MCP interface for ensemble tasks",
+        checkpoint_dir: Optional[str] = None,
+        node_id: str = "global",
         **kwargs,
     ):
+        """
+        Args:
+            name:           Name passed to FastMCP.
+            checkpoint_dir: Checkpoint directory of a running EnsembleLauncher
+                            cluster. The Interface will create and manage its own
+                            ClusterClient pointing at this cluster.
+                            Start the EnsembleLauncher externally before calling
+                            interface.run().
+            node_id:        Node to connect to (default ``"global"``).
+            **kwargs:       Forwarded to FastMCP.
+        """
         self._mcp = FastMCP(name=name, **kwargs)
-        self._system_config = system_config
-        self._launcher_config = launcher_config
-        self._Nodes = Nodes
-        self._el: Optional[EnsembleLauncher] = None
+        self._checkpoint_dir = checkpoint_dir
+        self._node_id = node_id
         self._client: Optional[ClusterClient] = None
 
     @property
@@ -183,8 +190,8 @@ class Server:
             def cluster_wrapper(*args, **kwargs):
                 if self._client is None:
                     raise RuntimeError(
-                        "Cluster is not running. Ensure server.run() was called "
-                        "with system_config, launcher_config, and Nodes set."
+                        "No active ClusterClient. Ensure the EnsembleLauncher cluster "
+                        "is running and interface.run() has been called."
                     )
                 task = Task(
                     task_id=str(uuid.uuid4()),
@@ -213,45 +220,15 @@ class Server:
             return _register(fn)
         return _register
 
-    def _start_cluster(self):
-        """Start EnsembleLauncher in cluster mode and connect ClusterClient."""
-        if self._system_config is None or self._launcher_config is None or self._Nodes is None:
-            raise RuntimeError(
-                "system_config, launcher_config, and Nodes must be provided to use cluster tools."
-            )
-        if not self._launcher_config.cluster:
-            raise RuntimeError("launcher_config.cluster must be True for cluster mode.")
-
-        checkpoint_dir = self._launcher_config.checkpoint_dir
-        if checkpoint_dir is None:
-            checkpoint_dir = os.path.join(os.getcwd(), f"ckpt_{uuid.uuid4()}")
-            self._launcher_config = self._launcher_config.model_copy(
-                update={"checkpoint_dir": checkpoint_dir}
-            )
-
-        self._el = EnsembleLauncher(
-            ensemble_file={},
-            system_config=self._system_config,
-            launcher_config=self._launcher_config,
-            Nodes=self._Nodes,
-        )
-        self._el.start()
-        time.sleep(2.0)
-        self._client = ClusterClient(checkpoint_dir=checkpoint_dir, node_id="global")
-        self._client.start()
-
-    def _stop_cluster(self):
-        if self._client is not None:
-            self._client.teardown()
-            self._client = None
-        if self._el is not None:
-            self._el.stop()
-            self._el = None
-
     def run(self, transport: Literal["sse", "stdio", "streamable-http"] = "stdio"):
-        if self._system_config is not None and self._launcher_config is not None:
-            self._start_cluster()
+        if self._checkpoint_dir is not None:
+            self._client = ClusterClient(
+                checkpoint_dir=self._checkpoint_dir, node_id=self._node_id
+            )
+            self._client.start()
         try:
             self._mcp.run(transport=transport)
         finally:
-            self._stop_cluster()
+            if self._client is not None:
+                self._client.teardown()
+                self._client = None
