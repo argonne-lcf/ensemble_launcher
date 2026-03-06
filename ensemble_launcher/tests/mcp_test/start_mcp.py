@@ -1,3 +1,4 @@
+import argparse
 import socket
 import time
 
@@ -28,8 +29,21 @@ el = EnsembleLauncher(
 el.start()
 time.sleep(2.0)  # wait for cluster to be ready
 
+# --- Parse transport args ---
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--transport",
+    choices=["stdio", "sse", "streamable-http"],
+    default="stdio",
+)
+parser.add_argument("--port", type=int, default=9276)
+args = parser.parse_args()
+
 # --- Create the MCP interface, pointing it at the running cluster ---
-mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
+mcp = Interface(
+    checkpoint_dir=CHECKPOINT_DIR,
+    **({"port": args.port} if args.transport == "streamable-http" else {}),
+)
 
 
 # Single-call cluster tool — one task per MCP invocation
@@ -48,6 +62,6 @@ def run_sim_ensemble(Temperature: float, Pressure: float) -> str:
 
 if __name__ == "__main__":
     try:
-        mcp.run()
+        mcp.run(transport=args.transport)
     finally:
         el.stop()
