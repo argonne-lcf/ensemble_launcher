@@ -8,7 +8,7 @@ import time
 import pytest
 
 from ensemble_launcher.config import LauncherConfig, SystemConfig
-from ensemble_launcher.ensemble import Task
+from ensemble_launcher.ensemble import AsyncTask, Task
 from ensemble_launcher.orchestrator import AsyncWorker
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -115,12 +115,62 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
     ), f"{[result for task_id, result in results.items()]}"
 
 
-if __name__ == "__main__":
-    print("Testing Async Worker with ProcessPool Executor for 1 task per core")
-    asyncio.run(test_async_worker(task_executor="async_processpool"))
-    print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")
-    asyncio.run(
-        test_async_worker(task_executor="async_processpool", ntasks_per_core=10)
+async def async_echo(task_id: str) -> str:
+    await asyncio.sleep(0)
+    return f"Hello from task {task_id}"
+
+
+@pytest.mark.asyncio
+async def test_async_task_worker():
+    tasks = {
+        f"task-{i}": AsyncTask(
+            task_id=f"task-{i}",
+            nnodes=1,
+            ppn=1,
+            executable=async_echo,
+            args=(f"task-{i}",),
+        )
+        for i in range(12)
+    }
+
+    nodes = [socket.gethostname()]
+    sys_info = NodeResourceList.from_config(
+        SystemConfig(name="local", ncpus=12, cpus=list(range(1, 13)))
     )
-    print("Testing Async Worker with MPI Executor")
-    asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
+
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name="async_processpool",
+            comm_name="async_zmq",
+            worker_logs=True,
+            report_interval=100.0,
+            use_mpi_ppn=False,
+            log_level=logging.INFO,
+        ),
+        job_resource,
+        tasks,
+    )
+
+    res = await w.run()
+    results = {r.task_id: r.data for r in res.data}
+
+    assert len(results) == len(tasks)
+    for task_id in tasks:
+        assert results[task_id] == f"Hello from task {task_id}", (
+            f"{results[task_id]} != Hello from task {task_id}"
+        )
+
+
+if __name__ == "__main__":
+    # print("Testing Async Worker with ProcessPool Executor for 1 task per core")
+    # asyncio.run(test_async_worker(task_executor="async_processpool"))
+    # print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")
+    # asyncio.run(
+    #     test_async_worker(task_executor="async_processpool", ntasks_per_core=10)
+    # )
+    # print("Testing Async Worker with MPI Executor")
+    # asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
+    print("Testing Async Worker with AsyncTask")
+    asyncio.run(test_async_task_worker())

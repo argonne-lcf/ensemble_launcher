@@ -1,3 +1,4 @@
+import asyncio
 import enum
 import json
 import os
@@ -93,6 +94,57 @@ class Task(BaseModel):
                 pass
 
         return req
+
+
+class _AsyncWrapper:
+    """Picklable sync wrapper around an ``async def`` callable.
+
+    A nested closure (e.g. defined inside ``model_post_init``) cannot be
+    pickled by the standard ``pickle`` module used by ``ProcessPoolExecutor``.
+    A top-level class instance is picklable as long as the wrapped function is
+    also picklable (i.e. defined at module level).
+    """
+
+    __slots__ = ("_fn", "_loop")
+
+    def __init__(
+        self, fn: Callable, loop: Optional[Any] = None
+    ) -> None:
+        self._fn = fn
+        self._loop = loop
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._loop is not None:
+            return self._loop.run_until_complete(self._fn(*args, **kwargs))
+        return asyncio.run(self._fn(*args, **kwargs))
+
+
+class AsyncTask(Task):
+    """A Task whose executable is an ``async def`` callable.
+
+    After initialisation ``executable`` is transparently replaced with a sync
+    wrapper so the task works with ``AsyncProcessPoolExecutor`` without any
+    changes to the worker.
+
+    If ``loop`` is set the wrapper calls ``loop.run_until_complete``; otherwise
+    it uses ``asyncio.run``.
+
+    Usage::
+
+        async def my_sim(x: float) -> float:
+            await asyncio.sleep(0)
+            return x ** 2
+
+        task = AsyncTask(task_id="t0", nnodes=1, ppn=1,
+                         executable=my_sim, args=(3.0,))
+
+        el = EnsembleLauncher(ensemble_file={"t0": task}, ...)
+    """
+
+    loop: Optional[Any] = None
+
+    def model_post_init(self, _: Any) -> None:
+        object.__setattr__(self, "executable", _AsyncWrapper(self.executable, self.loop))
 
 
 class TaskFactory:

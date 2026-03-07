@@ -6,7 +6,7 @@ import socket
 import time
 import uuid
 
-from utils import compute_density
+from utils import async_compute_density, compute_density
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, SystemConfig
@@ -47,6 +47,10 @@ def start_mcp():
 
     # Batch ensemble tool — accepts lists, one task per list element
     mcp.ensemble_tool(compute_density, nnodes=1, ppn=1)
+
+    # Async variants — interface auto-detects async def and uses AsyncTask
+    mcp.tool(async_compute_density, nnodes=1, ppn=1)
+    mcp.ensemble_tool(async_compute_density, nnodes=1, ppn=1)
 
     logger.info("Done registering tools")
 
