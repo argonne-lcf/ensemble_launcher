@@ -400,42 +400,93 @@ if __name__ == '__main__':
 
 ## MCP
 
-Transform @mcp.tool into ensemble tool that can perform an ensemble of tool executions using a single AI tool call
+`ensemble_launcher.mcp.Interface` wraps [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and exposes two decorators:
+
+- **`@interface.tool`** — submits a single task to the EnsembleLauncher cluster per MCP call.
+- **`@interface.ensemble_tool`** — accepts lists of arguments and runs one task per element (ensemble in a single call).
+
+The cluster lifecycle is decoupled from the MCP server: start `EnsembleLauncher` separately, then point `Interface` at its checkpoint directory.
+
+### Minimal example (`start_mcp.py`)
 
 ```python
-from ensemble_launcher.mcp import Server
-from sim_script import sim
+import socket
+import time
+import uuid
+import os
 
-mcp = Server(port=9276)
+from ensemble_launcher import EnsembleLauncher
+from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.mcp import Interface
+from my_module import my_sim   # your simulation function
 
-tool = mcp.ensemble_tool(sim)
-"""
-or
 
-@mcp.ensemble_tool
-def sim(a:float,b:float)->str:
-    return "Done sim"
+CHECKPOINT_DIR = f"{os.getcwd()}/mcp_{uuid.uuid4()}"
 
-or 
+# 1. Start the EnsembleLauncher cluster (non-blocking)
+el = EnsembleLauncher(
+    ensemble_file={},
+    system_config=SystemConfig(name="local", ncpus=4, cpus=list(range(4))),
+    launcher_config=LauncherConfig(
+        task_executor_name="async_processpool",
+        comm_name="async_zmq",
+        nlevels=0,
+        cluster=True,
+        checkpoint_dir=CHECKPOINT_DIR,
+    ),
+    Nodes=[socket.gethostname()],
+)
+el.start()
+time.sleep(2.0)   # wait for cluster to be ready
 
-from ensemble_launcher.config import LaucherConfig, SystemConfig
-@mcp.ensemble_tool(launcher_config = LauncherConfig(...), system_config = SystemConfig(...))
-def sim(a: float, b:floar)->str:
-    return "Done sim"
-"""
+# 2. Create the MCP interface, pointing at the running cluster
+mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
 
-if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+# 3. Register tools
+mcp.tool(my_sim, nnodes=1, ppn=1)           # single-call tool
+mcp.ensemble_tool(my_sim, nnodes=1, ppn=1)  # batch ensemble tool
+
+# 4. Serve (stdio by default; also supports "sse" and "streamable-http")
+mcp.run()
 ```
 
-We also provide some tooling for port forwarding between compute and login nodes. In the client script do the following
+Decorator style is also supported:
+
+```python
+@mcp.tool(nnodes=1, ppn=4)
+def my_sim(a: float, b: float) -> str:
+    ...
+
+@mcp.ensemble_tool(nnodes=1, ppn=4)
+def my_sim(a: float, b: float) -> str:
+    ...
+```
+
+### Running via stdio (default)
+
+Configure your MCP client (e.g. Claude Desktop) to launch the server:
+
+```json
+{
+    "mcpServers": {
+        "my_sim": {
+            "command": "python3",
+            "args": ["start_mcp.py"]
+        }
+    }
+}
+```
+
+### Port-forwarding helper (HPC login → compute node)
+
+When the MCP server runs on a compute node and the client runs on a login node, use the built-in SSH tunnel helpers:
 
 ```python
 from ensemble_launcher.mcp import start_tunnel, stop_tunnel
-if __name__ == "__main__":
-    ret = start_tunnel("<User name>","<Job head node host name>",9276,9276)
-    asyncio.run(main())
-    stop_tunnel(*ret)
+
+ret = start_tunnel("<username>", "<head-node-hostname>", local_port=9276, remote_port=9276)
+# ... run your async client ...
+stop_tunnel(*ret)
 ```
 
 ---
