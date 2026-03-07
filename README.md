@@ -405,6 +405,8 @@ if __name__ == '__main__':
 - **`@interface.tool`** — submits a single task to the EnsembleLauncher cluster per MCP call.
 - **`@interface.ensemble_tool`** — accepts lists of arguments and runs one task per element (ensemble in a single call).
 
+Both decorators automatically detect whether the registered function is an `async def` and create an `AsyncTask` instead of a plain `Task`, with no extra configuration required.
+
 The cluster lifecycle is decoupled from the MCP server: start `EnsembleLauncher` separately, then point `Interface` at its checkpoint directory.
 
 ### Minimal example (`start_mcp.py`)
@@ -442,7 +444,7 @@ time.sleep(2.0)   # wait for cluster to be ready
 # 2. Create the MCP interface, pointing at the running cluster
 mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
 
-# 3. Register tools
+# 3. Register tools — works with both def and async def
 mcp.tool(my_sim, nnodes=1, ppn=1)           # single-call tool
 mcp.ensemble_tool(my_sim, nnodes=1, ppn=1)  # batch ensemble tool
 
