@@ -12,3 +12,11 @@ def echo_stdout(task_id: str):
 def echo_sleep(task_id: str, sleep_time: float = 0.0):
     time.sleep(sleep_time)
     return f"Hello from task {task_id}"
+
+
+def compute_density(Temperature: float, Pressure: float) -> float:
+    """
+    Computes density of Air from the temperature (K) and pressure (Pa) from ideal gas law
+    """
+    R_specific = 8.314 / 28.96e-3
+    return Pressure / R_specific / Temperature

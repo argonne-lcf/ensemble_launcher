@@ -265,6 +265,10 @@ class ClusterClient:
             [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)]
         )[0]
 
+    def submit_batch(self, tasks: List[Task]):
+        """Submit a batch of tasks to the cluster"""
+        return self._send_batch(tasks)
+
     def map(
         self,
         fn: Union[Callable, str],
@@ -327,6 +331,7 @@ class ClusterClient:
             if fut is None or fut.done():
                 continue
             if msg.success:
+                self.logger.info(f"Got result from task {msg.task_id}")
                 fut.set_result(msg.data)
             else:
                 fut.set_exception(Exception(msg.exception or "Task failed"))
