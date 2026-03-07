@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 
+import pytest
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from utils import compute_density
@@ -37,7 +38,7 @@ async def call_ensemble_tools():
             return result
 
 
-if __name__ == "__main__":
+def test_mcp():
     try:
         result = asyncio.run(call_tools())
         ensemble_result = asyncio.run(call_ensemble_tools())
@@ -56,3 +57,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Test failed: {e}")
         raise
+
+
+if __name__ == "__main__":
+    test_mcp()
