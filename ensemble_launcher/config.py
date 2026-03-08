@@ -28,7 +28,7 @@ class LauncherConfig(BaseModel):
     worker_logs: bool = False
     master_logs: bool = False
     nchildren: Optional[int] = (
-        None  ##Setting this will fix the number of children at each level
+        1  ##Setting this will fix the number of children at each level
     )
     sequential_child_launch: bool = (
         False  ##If True, launch children one by one even for MPI executor
@@ -40,7 +40,7 @@ class LauncherConfig(BaseModel):
     log_level: int = logging.INFO
     use_mpi_ppn: bool = True  ##If True, use -ppn flag when launching MPI jobs
     children_scheduler_policy: str = (
-        "greedy_children_policy"  ##Policy to use for children scheduler
+        "simple_split_children_policy"  ##Policy to use for children scheduler
     )
     enable_workstealing: bool = (
         False  ##If True, master will listen for task requests from worker children
