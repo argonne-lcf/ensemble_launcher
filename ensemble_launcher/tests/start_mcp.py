@@ -52,6 +52,22 @@ def start_mcp():
     mcp.tool(async_compute_density, nnodes=1, ppn=1)
     mcp.ensemble_tool(async_compute_density, nnodes=1, ppn=1)
 
+    # String command tools — return value is stdout; cluster must have return_stdout=True
+    mcp.tool(
+        "python3 py_echo.py {task_id}",
+        name="py_echo",
+        description="Echo a task ID via shell command. Prints 'Hello from task <task_id>' to stdout.",
+        nnodes=1,
+        ppn=1,
+    )
+    mcp.ensemble_tool(
+        "python3 py_echo.py {task_id}",
+        name="py_echo",
+        description="Echo multiple task IDs via shell command. Prints 'Hello from task <task_id>' to stdout.",
+        nnodes=1,
+        ppn=1,
+    )
+
     logger.info("Done registering tools")
 
     mcp.run()

@@ -112,5 +112,53 @@ def test_mcp_async():
         raise
 
 
+async def call_string_tool(task_id: str):
+    server_params = StdioServerParameters(
+        command="python3", args=["start_mcp.py"], env=os.environ.copy()
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("py_echo", arguments={"task_id": task_id})
+            return result
+
+
+async def call_string_ensemble_tool(task_ids: list):
+    server_params = StdioServerParameters(
+        command="python3", args=["start_mcp.py"], env=os.environ.copy()
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "ensemble_py_echo", arguments={"task_id": task_ids}
+            )
+            return result
+
+
+def test_mcp_string():
+    try:
+        task_id = "hello"
+        result = asyncio.run(call_string_tool(task_id))
+        stdout = result.content[0].text
+        assert f"Hello from task task-{task_id}" in stdout, (
+            f"Unexpected output: {stdout!r}"
+        )
+
+        task_ids = ["a", "b", "c"]
+        ensemble_result = asyncio.run(call_string_ensemble_tool(task_ids))
+        outputs = ensemble_result.structuredContent["result"]
+        assert len(outputs) == len(task_ids)
+        for tid, out in zip(task_ids, outputs):
+            assert f"Hello from task task-{tid}" in out, f"Unexpected output: {out!r}"
+
+        print("All string tool tests passed")
+
+    except Exception as e:
+        print(f"String tool test failed: {e}")
+        raise
+
+
 if __name__ == "__main__":
-    test_mcp()
+    # test_mcp()
+    test_mcp_string()
