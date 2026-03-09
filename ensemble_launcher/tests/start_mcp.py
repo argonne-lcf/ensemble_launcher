@@ -11,7 +11,7 @@ from utils import async_compute_density, compute_density
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, SystemConfig
 from ensemble_launcher.logging import setup_logger
-from ensemble_launcher.mcp import Interface
+from ensemble_launcher.mcp import ELFastMCP
 
 
 def start_mcp():
@@ -40,7 +40,7 @@ def start_mcp():
     logger.info("Done starting el")
 
     # --- Create the MCP interface, pointing it at the running cluster ---
-    mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
+    mcp = ELFastMCP(checkpoint_dir=CHECKPOINT_DIR)
 
     # Single-call cluster tool — one task per MCP invocation
     mcp.tool(compute_density, nnodes=1, ppn=1)

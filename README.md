@@ -400,14 +400,14 @@ if __name__ == '__main__':
 
 ## MCP
 
-`ensemble_launcher.mcp.Interface` wraps [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and exposes two decorators:
+`ensemble_launcher.mcp.ELFastMCP` is a subclass of [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and exposes two decorators:
 
-- **`@interface.tool`** — submits a single task to the EnsembleLauncher cluster per MCP call.
-- **`@interface.ensemble_tool`** — accepts lists of arguments and runs one task per element (ensemble in a single call).
+- **`@mcp.tool`** — submits a single task to the EnsembleLauncher cluster per MCP call.
+- **`@mcp.ensemble_tool`** — accepts lists of arguments and runs one task per element (ensemble in a single call).
 
 Both decorators automatically detect whether the registered function is an `async def` and create an `AsyncTask` instead of a plain `Task`, with no extra configuration required.
 
-The cluster lifecycle is decoupled from the MCP server: start `EnsembleLauncher` separately, then point `Interface` at its checkpoint directory.
+The cluster lifecycle is decoupled from the MCP server: start `EnsembleLauncher` separately, then point `ELFastMCP` at its checkpoint directory.
 
 ### Minimal example (`start_mcp.py`)
 
@@ -419,7 +419,7 @@ import os
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, SystemConfig
-from ensemble_launcher.mcp import Interface
+from ensemble_launcher.mcp import ELFastMCP
 from my_module import my_sim   # your simulation function
 
 
@@ -442,7 +442,7 @@ el.start()
 time.sleep(2.0)   # wait for cluster to be ready
 
 # 2. Create the MCP interface, pointing at the running cluster
-mcp = Interface(checkpoint_dir=CHECKPOINT_DIR)
+mcp = ELFastMCP(checkpoint_dir=CHECKPOINT_DIR)
 
 # 3. Register tools — works with both def and async def
 mcp.tool(my_sim, nnodes=1, ppn=1)           # single-call tool

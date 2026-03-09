@@ -26,7 +26,7 @@ def _parse_template_params(cmd_template: str) -> List[str]:
     return params
 
 
-class Interface:
+class ELFastMCP(FastMCP):
     def __init__(
         self,
         name: str = "MCP interface for ensemble tasks",
@@ -45,15 +45,11 @@ class Interface:
             node_id:        Node to connect to (default ``"global"``).
             **kwargs:       Forwarded to FastMCP.
         """
-        self._mcp = FastMCP(name=name, **kwargs)
+        super().__init__(name=name, **kwargs)
         self._checkpoint_dir = checkpoint_dir
         self._node_id = node_id
         self._client: Optional[ClusterClient] = None
         self.logger = setup_logger("mcp_interface", log_dir=f"{os.getcwd()}/logs")
-
-    @property
-    def mcp(self):
-        return self._mcp
 
     def ensemble_tool(
         self,
@@ -164,7 +160,7 @@ class Interface:
                     f"{doc_string}",
                 ]
             )
-            return self._mcp.add_tool(ensemble_wrapper)
+            return self.add_tool(ensemble_wrapper)
 
         def _register_str(cmd_template: str):
             if not name:
@@ -227,7 +223,7 @@ class Interface:
                     description,
                 ]
             )
-            return self._mcp.add_tool(ensemble_wrapper)
+            return self.add_tool(ensemble_wrapper)
 
         if fn is not None and isinstance(fn, str):
             return _register_str(fn)
@@ -314,7 +310,7 @@ class Interface:
                     f"{doc_string}",
                 ]
             )
-            return self._mcp.add_tool(cluster_wrapper)
+            return self.add_tool(cluster_wrapper)
 
         def _register_str(cmd_template: str):
             if not name:
@@ -373,7 +369,7 @@ class Interface:
                     description,
                 ]
             )
-            return self._mcp.add_tool(cluster_wrapper)
+            return self.add_tool(cluster_wrapper)
 
         if fn is not None and isinstance(fn, str):
             return _register_str(fn)
@@ -394,7 +390,7 @@ class Interface:
             )
             self._client.start()
         try:
-            self._mcp.run(transport=transport)
+            super().run(transport=transport)
         finally:
             if self._client is not None:
                 self._client.teardown()
