@@ -150,6 +150,7 @@ class ELFastMCP(FastMCP):
 
             ensemble_wrapper.__name__ = tool_name
             ensemble_wrapper.__signature__ = new_sig
+            ensemble_wrapper.__globals__.update(target_fn.__globals__)
             ensemble_wrapper.__doc__ = "\n".join(
                 [
                     f"[Ensemble Tool] Runs '{target_fn.__name__}' on a range of input parameters.",
@@ -164,9 +165,13 @@ class ELFastMCP(FastMCP):
 
         def _register_str(cmd_template: str):
             if not name:
-                raise ValueError("name is required when registering a string command template")
+                raise ValueError(
+                    "name is required when registering a string command template"
+                )
             if not description:
-                raise ValueError("description is required when registering a string command template")
+                raise ValueError(
+                    "description is required when registering a string command template"
+                )
 
             warnings.warn(
                 f"String command tool '{name}': return value is always a str captured from stdout. "
@@ -179,7 +184,9 @@ class ELFastMCP(FastMCP):
             params = _parse_template_params(cmd_template)
             new_sig = inspect.Signature(
                 parameters=[
-                    inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=List[Any])
+                    inspect.Parameter(
+                        p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=List[Any]
+                    )
                     for p in params
                 ],
                 return_annotation=List[str],
@@ -302,6 +309,7 @@ class ELFastMCP(FastMCP):
 
             cluster_wrapper.__name__ = tool_name
             cluster_wrapper.__signature__ = sig
+            cluster_wrapper.__globals__.update(target_fn.__globals__)
             cluster_wrapper.__doc__ = "\n".join(
                 [
                     f"[Cluster Tool] Runs '{target_fn.__name__}' as a cluster task.",
@@ -314,9 +322,13 @@ class ELFastMCP(FastMCP):
 
         def _register_str(cmd_template: str):
             if not name:
-                raise ValueError("name is required when registering a string command template")
+                raise ValueError(
+                    "name is required when registering a string command template"
+                )
             if not description:
-                raise ValueError("description is required when registering a string command template")
+                raise ValueError(
+                    "description is required when registering a string command template"
+                )
 
             warnings.warn(
                 f"String command tool '{name}': return value is always a str captured from stdout. "
@@ -329,7 +341,9 @@ class ELFastMCP(FastMCP):
             params = _parse_template_params(cmd_template)
             sig = inspect.Signature(
                 parameters=[
-                    inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Any)
+                    inspect.Parameter(
+                        p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Any
+                    )
                     for p in params
                 ],
                 return_annotation=str,
@@ -383,12 +397,15 @@ class ELFastMCP(FastMCP):
 
         return _register
 
-    def run(self, transport: Literal["sse", "stdio", "streamable-http"] = "stdio"):
+    def init_client(self):
         if self._checkpoint_dir is not None:
             self._client = ClusterClient(
                 checkpoint_dir=self._checkpoint_dir, node_id=self._node_id
             )
             self._client.start()
+
+    def run(self, transport: Literal["sse", "stdio", "streamable-http"] = "stdio"):
+        self.init_client()
         try:
             super().run(transport=transport)
         finally:
