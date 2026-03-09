@@ -289,10 +289,11 @@ class AsyncWorker(Node):
         kwargs["logger"] = self.logger.getChild("executor")
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
+        kwargs["return_stdout"] = self._config.return_stdout
         if self._config.task_executor_name == "async_mpi":
             kwargs["cpu_binding_option"] = self._config.cpu_binding_option
             kwargs["use_ppn"] = self._config.use_mpi_ppn
-            kwargs["return_stdout"] = self._config.return_stdout
+
         if isinstance(self._config.task_executor_name, list):
             self._executor = {}
             for exec_name in self._config.task_executor_name:

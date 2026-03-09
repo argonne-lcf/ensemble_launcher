@@ -29,9 +29,14 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
     def __init__(
         self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", **kwargs
     ):
-        super().__init__(**kwargs)
         self.logger = logger
         self._gpu_selector = gpu_selector
+        self._return_stdout = False
+        if "return_stdout" in kwargs:
+            self._return_stdout = kwargs["return_stdout"]
+            del kwargs["return_stdout"]
+
+        super().__init__(**kwargs)
 
         super().submit(dummy_task)
 
@@ -75,7 +80,9 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
                 run_callable_with_affinity, *(fn, task_args, task_kwargs, cpu_id, env)
             )
         elif isinstance(fn, str):
-            future = super().submit(run_cmd, *(fn, task_args, task_kwargs, cpu_id, env))
+            future = super().submit(
+                run_cmd, *(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout)
+            )
         else:
             self.logger.warning(f"Can only excute either a str or a callable")
             return None
@@ -88,9 +95,13 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
     def __init__(
         self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", **kwargs
     ):
-        super().__init__(**kwargs)
         self.logger = logger
         self._gpu_selector = gpu_selector
+        self._return_stdout = False
+        if "return_stdout" in kwargs:
+            self._return_stdout = kwargs["return_stdout"]
+            del kwargs["return_stdout"]
+        super().__init__(**kwargs)
         self.logger.info("Initialized threadpool executor")
 
     def submit(
