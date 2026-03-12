@@ -16,7 +16,7 @@ from ensemble_launcher.scheduler.resource import (
     NodeResourceList,
 )
 
-from .config import LauncherConfig, SystemConfig
+from .config import LauncherConfig, PolicyConfig, SystemConfig
 from .ensemble import Task, TaskFactory
 from .helper_functions import get_nodes
 
@@ -108,7 +108,7 @@ class EnsembleLauncher:
                 child_executor_name=child_executor_name,
                 task_executor_name=task_executor_name,
                 comm_name=comm_name,
-                nlevels=nlevels,
+                policy_config=PolicyConfig(nlevels=nlevels),
                 return_stdout=True,
                 master_logs=True,
                 worker_logs=True,
@@ -148,13 +148,13 @@ class EnsembleLauncher:
         )
         launcher_args = ("main", self.launcher_config, nodes, self._tasks)
 
-        if self.launcher_config.nlevels == 0:
+        if self.launcher_config.policy_config.nlevels == 0:
             if self.async_orchestrator:
                 return AsyncWorker(*launcher_args)
             else:
                 raise ValueError("Sync worker is no longer supported")
         elif (
-            self.launcher_config.nlevels == 1
+            self.launcher_config.policy_config.nlevels == 1
             and self.launcher_config.enable_workstealing
         ):
             logger.info("!!!!!!Using workstealing!!!!!!")

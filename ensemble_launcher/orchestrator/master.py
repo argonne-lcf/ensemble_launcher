@@ -118,7 +118,7 @@ class Master(Node):
         self.logger.info(f"Children assignment: {self._child_assignment}")
 
         children = {}
-        if self.level + 1 == self._config.nlevels:
+        if self.level + 1 == self._config.policy_config.nlevels:
             for wid, alloc in assignments.items():
                 child_id = self.node_id+f".w{wid}"
                 self._child_assignment[child_id] = alloc

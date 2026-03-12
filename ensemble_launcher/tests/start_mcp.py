@@ -9,7 +9,7 @@ import uuid
 from utils import async_compute_density, compute_density
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.mcp import ELFastMCP
 
@@ -25,7 +25,7 @@ def start_mcp():
         launcher_config=LauncherConfig(
             task_executor_name="async_processpool",
             comm_name="async_zmq",
-            nlevels=0,
+            policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
             worker_logs=True,
             cpu_binding_option="",

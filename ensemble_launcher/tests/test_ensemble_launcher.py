@@ -6,7 +6,7 @@ import pytest
 from utils import echo
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
 
@@ -33,7 +33,7 @@ def test_el_run():
         launcher_config=LauncherConfig(
             task_executor_name="async_processpool",
             comm_name="async_zmq",
-            nlevels=0,
+            policy_config=PolicyConfig(nlevels=0),
             return_stdout=False,
             worker_logs=False,
             cpu_binding_option="",
@@ -66,7 +66,7 @@ def test_el_cluster_mode():
         launcher_config=LauncherConfig(
             task_executor_name="async_processpool",
             comm_name="async_zmq",
-            nlevels=0,
+            policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
             worker_logs=True,
             cpu_binding_option="",

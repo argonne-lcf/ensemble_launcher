@@ -46,7 +46,7 @@ class WorkerScheduler(Scheduler):
         from .policy import ChildrenPolicy
         self.policy: ChildrenPolicy = policy_registry.create_policy(self._config.children_scheduler_policy,
                                                                   policy_kwargs={"nchildren": self._config.nchildren, 
-                                                                                "nlevels":self._config.nlevels,
+                                                                                "nlevels":self._config.policy_config.nlevels,
                                                                                 "logger": logger.getChild('policy')})
     
     def assign(self, tasks: Dict[str, Task], level: int) -> Tuple[Dict[str, Dict], List[str]]:

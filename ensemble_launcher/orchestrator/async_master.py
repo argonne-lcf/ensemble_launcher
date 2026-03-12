@@ -210,6 +210,7 @@ class AsyncMaster(Node):
             self._init_nodes,
             self._config,
             tasks=self._init_tasks,
+            node_id=self.node_id,
         )
 
     def _get_child_class(
@@ -232,7 +233,7 @@ class AsyncMaster(Node):
             else:
                 raise RuntimeError(f"Unknown child_class {child_class}")
         else:
-            if self.level + 1 == self._config.nlevels:
+            if self.level + 1 == self._config.policy_config.nlevels:
                 return AsyncWorker
             from .async_workstealing_master import AsyncWorkStealingMaster
 
@@ -310,7 +311,7 @@ class AsyncMaster(Node):
             self.level, self.node_id, reset=not partial, nodes=nodes
         )
 
-        if not partial:
+        if not partial and not self._config.overload_orchestrator_core:
             self._apply_resource_headroom()
 
         # Phase 2: distribute tasks from the unassigned pool to registered children.
@@ -1119,11 +1120,13 @@ class AsyncMaster(Node):
             if not crashed:
                 try:
                     crashed = future.exception() is not None
-                    self.logger.info(
-                        f"{child_ids} crashed with exception {future.exception()}"
-                    )
+                    if crashed:
+                        self.logger.warning(
+                            f"{child_ids} crashed with exception {future.exception()}"
+                        )
                 except Exception as e:
                     crashed = True
+                    self.logger.warning(f"{child_ids} crashed with exception {e}")
             if crashed:
                 self._event_loop.call_soon_threadsafe(
                     self._mark_children_crashed, child_ids
@@ -1172,6 +1175,53 @@ class AsyncMaster(Node):
         await asyncio.gather(*result_tasks, return_exceptions=True)
         self.logger.info(f"{self.node_id}: All result collection tasks completed")
 
+        # Cancel the reporting task
+        self._stop_reporting_event.set()
+        self._reporting_task.cancel()
+        try:
+            await self._reporting_task
+        except Exception:
+            pass
+
+        self.logger.info(f"{self.node_id}: Stopped reporting loop")
+
+        # Report final status to parent (or write to file if root / parent dead)
+        async with self._timer("report_to_parent"):
+            if self.parent and not self._parent_dead_event.is_set():
+                final_status = self._scheduler.aggregate_status()
+                final_status.tag = "final"
+                success = await self._comm.send_message_to_parent(final_status)
+                if not success:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send final status to parent"
+                    )
+                else:
+                    self.logger.info(
+                        f"{self.node_id}: Successfully reported final status to parent"
+                    )
+                    ack = await self._comm.recv_message_from_parent(
+                        HeartBeat, timeout=5.0
+                    )
+                    if ack is None:
+                        self.logger.warning(
+                            "Did not receive ack for final status from parent in 5sec"
+                        )
+                    else:
+                        self.logger.info("Received ack from parent for final status")
+            else:
+                try:
+                    status = self._scheduler.aggregate_status()
+                    status.tag = "final"
+                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                    status.to_file(fname)
+                    self.logger.info(
+                        f"{self.node_id}: Successfully dumped final status to {fname}"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"{self.node_id}: Reporting final status failed with exception {e}"
+                    )
+
         # Aggregate results
         async with self._timer("aggregate_results"):
             if len(self._scheduler.unassigned_task_ids) > 0:
@@ -1202,37 +1252,7 @@ class AsyncMaster(Node):
             else:
                 self.logger.info(f"{self.node_id}: Successfully sent results to parent")
         elif self.parent:
-            self.logger.warning(
-                f"{self.node_id}: Parent is dead, skipping result send"
-            )
-
-        # Report final status to parent (or write to file if root / parent dead)
-        async with self._timer("report_to_parent"):
-            if self.parent and not self._parent_dead_event.is_set():
-                final_status = self._scheduler.aggregate_status()
-                final_status.tag = "final"
-                success = await self._comm.send_message_to_parent(final_status)
-                if not success:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
-                else:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully reported final status to parent"
-                    )
-            else:
-                try:
-                    status = self._scheduler.aggregate_status()
-                    status.tag = "final"
-                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                    status.to_file(fname)
-                    self.logger.info(
-                        f"{self.node_id}: Successfully reported final status"
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"{self.node_id}: Reporting final status failed with exception {e}"
-                    )
+            self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
 
     async def _report_status(self) -> None:
         """Periodically aggregate child status and forward to parent.
@@ -1475,14 +1495,6 @@ class AsyncMaster(Node):
         4. Close the comm layer and shut down the executor.
         5. Export Perfetto profiling traces if profiling was enabled.
         """
-        # stop global monitors
-        self._stop_reporting_event.set()
-        self._reporting_task.cancel()
-        try:
-            await self._reporting_task
-        except Exception:
-            pass
-        self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
         if self._client_monitor_task and not self._client_monitor_task.done():
             self._client_monitor_task.cancel()

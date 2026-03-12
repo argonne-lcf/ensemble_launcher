@@ -53,7 +53,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
     def _get_child_class(self) -> type:
         """Return AsyncWorkStealingWorker for leaf level, otherwise delegate to base."""
-        if self.level + 1 == self._config.nlevels:
+        if self.level + 1 == self._config.policy_config.nlevels:
             from .async_workstealing_worker import AsyncWorkStealingWorker
 
             return AsyncWorkStealingWorker
@@ -227,7 +227,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
         self.logger.info(f"I am workstealing master")
 
-        if self.level + 1 == self._config.nlevels:
+        if self.level + 1 == self._config.policy_config.nlevels:
             self.logger.info(
                 f"{self.node_id}: Work-stealing mode — {len(self._scheduler.unassigned_task_ids)} tasks in unassigned pool"
             )

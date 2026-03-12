@@ -1,17 +1,18 @@
 import logging
+from logging import Logger
 from abc import ABC, abstractmethod
 from itertools import accumulate
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 
+from ensemble_launcher.config import PolicyConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResource,
     NodeResourceCount,
 )
-
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
     from ensemble_launcher.scheduler.state import ChildrenAssignment
@@ -28,8 +29,13 @@ class Policy(ABC):
         """
         pass
 
-
 class ChildrenPolicy(ABC):
+
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: Logger = None):
+        self.policy_config = policy_config
+        self.node_id = node_id
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
+
     @abstractmethod
     def get_children_resources(
         self, tasks: Dict[str, Task], nodes: JobResource, level: int
@@ -176,10 +182,10 @@ class LargeResourcePolicy(Policy):
         )
 
 
-@policy_registry.register("greedy_children_policy", type="children_policy")
-class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
+@policy_registry.register("bin_packing_children_policy", type="children_policy")
+class BinPackingChildrenPolicy(ChildrenPolicy):
     """
-    A children policy that greedily assigns workers to fit all tasks using bin-packing.
+    A children policy that assigns workers to fit all tasks using bin-packing.
     Tasks are sorted by decreasing node requirements and distributed across workers.
 
     Configuration (class variables):
@@ -190,15 +196,16 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
             nlevels = 3
     """
 
-    def __init__(self, nlevels: int = None, logger: logging.Logger = None, **kwargs):
-        self.logger = logging.getLogger(__name__) if logger is None else logger
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: logging.Logger = None):
+        super().__init__(policy_config, node_id, logger)
+        nlevels = policy_config.nlevels
         if nlevels is None:
             raise ValueError(
-                "nlevels must be specified for GreedyBinPackingChildrenPolicy"
+                "nlevels must be specified for BinPackingChildrenPolicy"
             )
         self.nlevels = nlevels
         self.logger.info(
-            f"Initialized GreedyBinPackingChildrenPolicy with nlevels={self.nlevels}"
+            f"Initialized BinPackingChildrenPolicy with nlevels={self.nlevels}"
         )
 
     def get_children_resources(
@@ -213,7 +220,7 @@ class GreedyBinPackingChildrenPolicy(ChildrenPolicy):
         in ``get_children_tasks``.
         """
         if len(tasks) == 0:
-            self.logger.error("Greedy worker policy needs tasks")
+            self.logger.error("Bin packing policy needs tasks")
             raise ValueError("Needs Tasks for creating workers")
 
         node_names = nodes.nodes
@@ -344,8 +351,9 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
             scheduler = AsyncChildrenScheduler(..., policy="split_8")
     """
 
-    def __init__(self, nchildren: int = None, logger: logging.Logger = None, **kwargs):
-        self.nchildren = nchildren
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: logging.Logger = None, **kwargs):
+        super().__init__(policy_config, node_id, logger)
+        self.nchildren = policy_config.nchildren
         if self.nchildren is None or self.nchildren <= 0:
             raise ValueError(f"nchildren must be positive, got {self.nchildren}")
         self.logger = logging.getLogger(__name__) if logger is None else logger
@@ -442,3 +450,59 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
                 self.logger.warning(f"Task {task_id} does not fit in any worker")
 
         return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
+
+@policy_registry.register("fixed_leafs_children_policy",type="children_policy")
+class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
+
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id:str = None, logger: Logger = None):
+        super().__init__(policy_config, node_id, logger)
+    
+    def get_children_resources(self, tasks: Dict[str, Task], nodes: JobResource, level: int) -> Dict[int, JobResource]:
+        # Interpolate in log2 space to pick a number of workers for this level.
+        nlevels = self.policy_config.nlevels
+        leaf_nodes = self.policy_config.leaf_nodes
+
+        x_vals = [0.0,float(nlevels)]
+        y_vals = [0.0, max(np.log2(leaf_nodes),0)]
+        nchildren_current_level = 2**(np.ceil(np.interp([level],x_vals,y_vals)[0]))
+        nchildren_next_level = 2**(np.ceil(np.interp([level+1],x_vals,y_vals)[0]))
+
+        if level > 0:
+            my_id = int(self.node_id.split(".")[-1].replace("m",""))
+        else:
+            my_id = 0
+        
+        n_children = int(nchildren_next_level // nchildren_current_level)
+        remainder = int(nchildren_next_level % nchildren_current_level)
+        if my_id < remainder:
+            n_children += 1
+
+        nnodes = len(nodes.nodes)
+        result = {}
+        if n_children <= nnodes:
+            base = nnodes // n_children
+            remainder = nnodes % n_children
+            start = 0
+            for wid in range(n_children):
+                count = base + (1 if wid < remainder else 0)
+                end = start + count
+                result[wid] = JobResource(
+                    resources=nodes.resources[start:end],
+                    nodes=nodes.nodes[start:end],
+                )
+                start = end
+        else:
+            if n_children % nnodes != 0:
+                raise ValueError(
+                    f"nchildren ({n_children}) must be a multiple of nnodes ({nnodes})"
+                )
+            splits = n_children // nnodes
+            wid = 0
+            for node_name, node_resource in zip(nodes.nodes, nodes.resources):
+                for part in node_resource.divide(splits):
+                    result[wid] = JobResource(resources=[part], nodes=[node_name])
+                    wid += 1
+
+        return result
+        
+

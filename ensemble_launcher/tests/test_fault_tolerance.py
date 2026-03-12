@@ -9,7 +9,7 @@ import pytest
 from utils import echo_sleep
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
 
@@ -44,7 +44,7 @@ def test_el_fault_tolerance():
             task_executor_name="async_processpool",
             child_executor_name="async_mpi",
             comm_name="async_zmq",
-            nlevels=2,
+            policy_config=PolicyConfig(nlevels=2, nchildren=2),
             return_stdout=True,
             worker_logs=True,
             master_logs=True,
@@ -54,7 +54,6 @@ def test_el_fault_tolerance():
             checkpoint_dir=ckpt_dir,
             report_interval=1.0,
             children_scheduler_policy="simple_split_children_policy",
-            nchildren=2,
             log_level=logging.INFO,
         ),
         Nodes=[socket.gethostname()],

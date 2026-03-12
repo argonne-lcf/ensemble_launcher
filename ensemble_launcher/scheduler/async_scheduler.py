@@ -10,6 +10,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
+from ensemble_launcher.config import PolicyConfig
 from .policy import ChildrenPolicy, Policy, policy_registry
 from .resource import (
     AsyncLocalClusterResource,
@@ -45,6 +46,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         nodes: JobResource,
         config: LauncherConfig,
         tasks: Optional[Dict[str, Task]] = None,
+        node_id: str = None,
     ) -> None:
         """Initialise the worker scheduler.
 
@@ -53,6 +55,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             nodes: Available cluster resources.
             config: Launcher configuration (policy name, nchildren, etc.).
             tasks: Initial task dict; all tasks start in the unassigned pool.
+            node_id: ID of the owning master node.
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
@@ -62,8 +65,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self.policy: ChildrenPolicy = policy_registry.create_policy(
             self._config.children_scheduler_policy,
             policy_kwargs={
-                "nchildren": self._config.nchildren,
-                "nlevels": self._config.nlevels,
+                "policy_config": self._config.policy_config,
+                "node_id": node_id,
                 "logger": logger.getChild("policy"),
             },
         )
@@ -375,7 +378,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if reset:
             self.reset_child_assignments()
 
-        child_suffix = ".w" if level + 1 == self._config.nlevels else ".m"
+        child_suffix = ".w" if level + 1 == self._config.policy_config.nlevels else ".m"
         wid_offset = (
             max((a["wid"] for a in self._child_assignments.values()), default=-1) + 1
             if not reset

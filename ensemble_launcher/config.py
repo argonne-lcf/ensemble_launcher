@@ -3,7 +3,14 @@ import multiprocessing as mp
 from difflib import get_close_matches
 from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    nlevels: int = 1
+    nchildren: int = 1
+    leaf_nodes: int = 1
 
 
 class SystemConfig(BaseModel):
@@ -23,13 +30,9 @@ class LauncherConfig(BaseModel):
     task_executor_name: Union[str, List[str]] = "async_processpool"
     comm_name: Literal["async_zmq"] = "async_zmq"
     report_interval: float = 10.0
-    nlevels: int = 1
     return_stdout: bool = False
     worker_logs: bool = False
     master_logs: bool = False
-    nchildren: Optional[int] = (
-        1  ##Setting this will fix the number of children at each level
-    )
     sequential_child_launch: bool = (
         False  ##If True, launch children one by one even for MPI executor
     )
@@ -42,6 +45,7 @@ class LauncherConfig(BaseModel):
     children_scheduler_policy: str = (
         "simple_split_children_policy"  ##Policy to use for children scheduler
     )
+    policy_config: PolicyConfig = Field(default_factory=PolicyConfig)
     enable_workstealing: bool = (
         False  ##If True, master will listen for task requests from worker children
     )
@@ -57,6 +61,10 @@ class LauncherConfig(BaseModel):
     # Master uses this to detect dead children (via stale status timestamps).
     # if no heartbeat ACK is received for dead_node_factor * report_interval seconds / 2.0.
     # Workers and sub-masters use this to detect a dead parent (via missing HeartBeat ACKs).
+
+    overload_orchestrator_core: bool = (
+        True # Setting this to false reserves the first core of the head compute node for EL orchestrator
+    )
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

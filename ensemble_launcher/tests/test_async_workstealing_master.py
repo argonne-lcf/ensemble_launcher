@@ -5,7 +5,7 @@ import socket
 import pytest
 from utils import echo, echo_stdout
 
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncWorkStealingMaster as AsyncMaster
 from ensemble_launcher.scheduler.resource import (
@@ -37,14 +37,13 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             return_stdout=True,
             master_logs=True,
             comm_name="async_zmq",
-            nlevels=nlevels,
+            policy_config=PolicyConfig(nlevels=nlevels, nchildren=2),
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
             log_level=logging.DEBUG,
             worker_logs=True,
             children_scheduler_policy="simple_split_children_policy",
             cpu_binding_option="",
-            nchildren=2,
         ),
         job_resource,
         tasks,
@@ -83,7 +82,7 @@ async def test_async_mpi_master(nlevels=1):
             return_stdout=True,
             master_logs=True,
             comm_name="async_zmq",
-            nlevels=nlevels,
+            policy_config=PolicyConfig(nlevels=nlevels, nchildren=2),
             child_executor_name="async_mpi",
             task_executor_name="async_mpi",
             log_level=logging.INFO,
@@ -92,7 +91,6 @@ async def test_async_mpi_master(nlevels=1):
             sequential_child_launch=True,
             children_scheduler_policy="simple_split_children_policy",
             cpu_binding_option="",
-            nchildren=2,
         ),
         job_resource,
         tasks,

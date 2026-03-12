@@ -9,7 +9,7 @@ import uuid
 import pytest
 from utils import echo, echo_stdout
 
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster, AsyncWorker, ClusterClient
 from ensemble_launcher.scheduler.resource import (
@@ -111,8 +111,7 @@ async def test_async_master_cluster(
             cpu_binding_option="",
             return_stdout=True,
             children_scheduler_policy="simple_split_children_policy",
-            nchildren=1,
-            nlevels=2,
+            policy_config=PolicyConfig(nlevels=2, nchildren=1),
         ),
         job_resource,
     )
