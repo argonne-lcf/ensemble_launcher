@@ -11,6 +11,7 @@ from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from ensemble_launcher.config import PolicyConfig
+from .child_state import ChildState
 from .policy import ChildrenPolicy, Policy, policy_registry
 from .resource import (
     AsyncLocalClusterResource,
@@ -83,8 +84,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments: Dict[str, ChildrenAssignment] = {}
         self._children_status: Dict[str, "Status"] = {}  # child_id -> Status
         self._child_done_events: Dict[str, asyncio.Event] = {}  # child_id -> done event
-        self._running_children: Set[str] = set()  # child_ids currently running
-        self._dead_children: Set[str] = set()  # child_ids dead before finishing work
+        self._child_states: Dict[str, ChildState] = {}  # child_id -> ChildState
+        self._all_children_done_event: asyncio.Event = asyncio.Event()
         self._child_to_tasks: Dict[
             str, List[str]
         ] = {}  # child_id -> dynamically assigned task_ids
@@ -104,13 +105,15 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments[child_id] = assignment
         self._child_to_tasks.setdefault(child_id, [])
         self._child_done_events[child_id] = asyncio.Event()
+        self._child_states[child_id] = ChildState.NOTREADY
 
     def reset_child_assignments(self) -> None:
         """Clear child bookkeeping. The unassigned task pool is preserved."""
         self._child_assignments = {}
         self._children_status = {}
         self._child_done_events = {}
-        self._running_children = set()
+        self._child_states = {}
+        self._all_children_done_event.clear()
         self._child_to_tasks = {}
         self._task_to_child = {}
         self._child_id_to_wid = {}
@@ -135,38 +138,112 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return self._child_assignments[child_id]
 
     # ------------------------------------------------------------------
-    # Running-children lifecycle
+    # Child lifecycle state machine
     # ------------------------------------------------------------------
 
-    def mark_child_running(self, child_id: str) -> None:
-        """Record that a child process has been submitted to the executor."""
-        self._running_children.add(child_id)
-        if child_id in self._dead_children:
-            self._dead_children.discard(child_id)
-            self._child_done_events[child_id].clear()
+    def _assert_transition(
+        self, child_id: str, from_states: set, to_state: ChildState
+    ) -> None:
+        """Raise RuntimeError if the current state is not in from_states."""
+        current = self._child_states.get(child_id)
+        if current not in from_states:
+            self.logger.error(
+                f"Invalid transition {child_id}: {current} -> {to_state}"
+            )
+            raise RuntimeError(
+                f"Invalid child state transition for {child_id}: {current} -> {to_state}"
+            )
 
-    def mark_child_dead(self, child_id: str) -> None:
-        """Record the child is dead and unblock any wait_for_child() waiters."""
-        self._running_children.discard(child_id)
-        self._dead_children.add(child_id)
+    def _check_all_children_terminal(self) -> None:
+        """Set _all_children_done_event when every registered child is terminal."""
+        terminal = {ChildState.FAILED, ChildState.SUCCESS}
+        if self._child_states and all(
+            s in terminal for s in self._child_states.values()
+        ):
+            self._all_children_done_event.set()
+
+    def get_child_state(self, child_id: str) -> Optional[ChildState]:
+        """Return the current ChildState for child_id, or None if not registered."""
+        return self._child_states.get(child_id)
+
+    def mark_child_ready(self, child_id: str) -> None:
+        """NOTREADY → READY: resources allocated, child ready to launch."""
+        self._assert_transition(child_id, {ChildState.NOTREADY}, ChildState.READY)
+        self._child_states[child_id] = ChildState.READY
+
+    def mark_child_running(self, child_id: str) -> None:
+        """READY/RECOVERING → RUNNING: subprocess submitted to executor."""
+        self._assert_transition(
+            child_id, {ChildState.READY, ChildState.RECOVERING}, ChildState.RUNNING
+        )
+        self._child_states[child_id] = ChildState.RUNNING
+        self._child_done_events[child_id].clear()
+
+    def mark_child_recovering(self, child_id: str) -> None:
+        """RUNNING → RECOVERING: child timed out, recovery in progress.
+
+        Resources are NOT freed here — they will be freed when the terminal
+        state (FAILED/SUCCESS) is set by the result_batch path or when
+        _teardown_child calls remove_child().
+        The done event is not used for teardown (which awaits the future
+        directly); it is only set by mark_child_success/failed.
+        """
+        self._assert_transition(child_id, {ChildState.RUNNING}, ChildState.RECOVERING)
+        self._child_states[child_id] = ChildState.RECOVERING
+
+    def mark_child_failed(self, child_id: str) -> None:
+        """RUNNING/RECOVERING → FAILED: terminal failure; free resources."""
+        self._assert_transition(
+            child_id,
+            {ChildState.RUNNING, ChildState.RECOVERING},
+            ChildState.FAILED,
+        )
+        self._child_states[child_id] = ChildState.FAILED
         self.free(child_id)
-        # Unblock _teardown_child's wait_for_child() so recovery can proceed.
         if child_id in self._child_done_events:
             self._child_done_events[child_id].set()
+        self._check_all_children_terminal()
 
-    def is_child_done(self, child_id: str):
-        return self._child_done_events[child_id].is_set()
+    def mark_child_success(self, child_id: str) -> None:
+        """RUNNING/RECOVERING → SUCCESS: terminal success; free resources."""
+        self._assert_transition(
+            child_id,
+            {ChildState.RUNNING, ChildState.RECOVERING},
+            ChildState.SUCCESS,
+        )
+        self._child_states[child_id] = ChildState.SUCCESS
+        self.free(child_id)
+        if child_id in self._child_done_events:
+            self._child_done_events[child_id].set()
+        self._check_all_children_terminal()
 
-    def is_child_dead(self, child_id: str) -> bool:
-        """Return True if child_id has already been declared dead."""
-        return child_id in self._dead_children
+    def is_child_recovering(self, child_id: str) -> bool:
+        """Return True if child is in RECOVERING state."""
+        return self._child_states.get(child_id) == ChildState.RECOVERING
+
+    def is_child_failed(self, child_id: str) -> bool:
+        """Return True if child is in terminal FAILED state."""
+        return self._child_states.get(child_id) == ChildState.FAILED
+
+    def is_child_terminal(self, child_id: str) -> bool:
+        """Return True if child is in a terminal state (SUCCESS or FAILED)."""
+        return self._child_states.get(child_id) in {
+            ChildState.SUCCESS,
+            ChildState.FAILED,
+        }
+
+    # Deprecated shims — keep until all callers are migrated
+    def mark_child_dead(self, child_id: str) -> None:
+        self.mark_child_failed(child_id)
 
     def mark_child_done(self, child_id: str) -> None:
-        """Discard from running set, free cluster resources, and set done event."""
-        self._running_children.discard(child_id)
-        self.free(child_id)
-        if child_id in self._child_done_events:
-            self._child_done_events[child_id].set()
+        self.mark_child_success(child_id)
+
+    def is_child_dead(self, child_id: str) -> bool:
+        return self.is_child_failed(child_id)
+
+    def is_child_done(self, child_id: str) -> bool:
+        return self.is_child_terminal(child_id)
 
     async def wait_for_child(self, child_id: str) -> None:
         """Await the done event for the given child_id."""
@@ -174,11 +251,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
     @property
     def all_children_done(self) -> bool:
-        """True when every non-dead registered child has set its done event."""
-        return all(
-            event.is_set()
-            for child_id, event in self._child_done_events.items()
-            if child_id not in self._dead_children
+        """True when every registered child is in a terminal state."""
+        terminal = {ChildState.SUCCESS, ChildState.FAILED}
+        return bool(self._child_states) and all(
+            s in terminal for s in self._child_states.values()
         )
 
     # ------------------------------------------------------------------
@@ -270,10 +346,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
             self._unassigned_tasks.add(task_id)
         del self._child_assignments[child_id]
         self._child_done_events.pop(child_id, None)
-        self._running_children.discard(child_id)
+        self._child_states.pop(child_id, None)
         self._children_status.pop(child_id, None)
         self._child_to_tasks.pop(child_id, None)
-        self.free(child_id)  # no-op if already freed by mark_child_done
+        self.free(child_id)  # no-op if already freed by mark_child_success/failed
 
     def get_state(self, node_id: str) -> SchedulerState:
         """Snapshot current state for checkpointing.
@@ -297,6 +373,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child_id_to_wid=dict(self._child_id_to_wid),
             wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
             task_to_child=self._task_to_child,
+            child_states={
+                cid: s.name for cid, s in self._child_states.items()
+            },
         )
 
     def set_state(self, state: SchedulerState) -> None:
@@ -316,11 +395,12 @@ class AsyncChildrenScheduler(AsyncScheduler):
                 "task_ids": list(task_ids),
                 "wid": wid,
             }
-            self.register_child(child_id, assignment)
+            self.register_child(child_id, assignment)  # → NOTREADY
             if resource is not None:
                 allocated, res = self.cluster.allocate(resource)
                 if allocated:
                     self.workers[child_id] = res
+                    self.mark_child_ready(child_id)  # NOTREADY → READY
             self._child_id_to_wid[child_id] = wid
             self._wid_to_child_id[wid] = child_id
 
@@ -401,7 +481,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
                     "task_ids": [],
                     "wid": wid,
                 }
-                self.register_child(child_id, alloc)
+                self.register_child(child_id, alloc)  # → NOTREADY
+                self.mark_child_ready(child_id)        # NOTREADY → READY
                 self._child_id_to_wid[child_id] = wid
                 self._wid_to_child_id[wid] = child_id
             else:

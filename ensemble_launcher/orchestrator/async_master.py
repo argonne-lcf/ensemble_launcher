@@ -33,6 +33,7 @@ from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
+from ensemble_launcher.scheduler.child_state import ChildState
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -90,7 +91,9 @@ class AsyncMaster(Node):
         self._event_registry: Optional[EventRegistry] = None
 
         # asyncio event
-        self._all_children_done_event = asyncio.Event()
+        # _all_children_done_event is owned by the scheduler after _lazy_init;
+        # use __fallback_done_event before the scheduler is created.
+        self.__fallback_done_event = asyncio.Event()
         self._stop_reporting_event = asyncio.Event()
         self._event_loop = None  # Will be set in run()
 
@@ -123,9 +126,6 @@ class AsyncMaster(Node):
         self._last_parent_ack_time: float = time.time()
         self._parent_dead_event: asyncio.Event = asyncio.Event()
 
-        # Recovery guard: child IDs currently being recovered
-        self._children_recovering: set = set()
-
         # Child fault detection: timestamp of last Status ACK sent to each child
         self._last_child_ack_time: Dict[str, float] = {}
 
@@ -139,6 +139,13 @@ class AsyncMaster(Node):
                 yield
         else:
             yield
+
+    @property
+    def _all_children_done_event(self) -> asyncio.Event:
+        """Delegate to scheduler's event once available; use fallback before _lazy_init."""
+        if self._scheduler is not None:
+            return self._scheduler._all_children_done_event
+        return self.__fallback_done_event
 
     @property
     def nodes(self) -> JobResource:
@@ -415,7 +422,9 @@ class AsyncMaster(Node):
             future = self._executor.submit(
                 req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs
             )
-            future.add_done_callback(self._create_done_callback([child_name]))
+            cb = self._create_done_callback([child_name])
+            if cb is not None:
+                future.add_done_callback(cb)
             self._children_futures[child_name] = future
             self._scheduler.mark_child_running(child_name)
         else:
@@ -434,7 +443,9 @@ class AsyncMaster(Node):
             self.logger.info(f"Submitting job,{child_obj}")
             future = self._executor.submit(req, child_obj.create_an_event_loop, env=env)
             self.logger.info("Submitted to the executor")
-            future.add_done_callback(self._create_done_callback([child_name]))
+            cb = self._create_done_callback([child_name])
+            if cb is not None:
+                future.add_done_callback(cb)
             self.logger.info("Added callback")
             self._children_futures[child_name] = future
 
@@ -557,7 +568,9 @@ class AsyncMaster(Node):
                     child_info.append(child_id)
                     self._children_futures[child_id] = future
                     self._scheduler.mark_child_running(child_id)
-                future.add_done_callback(self._create_done_callback(child_info))
+                cb = self._create_done_callback(child_info)
+                if cb is not None:
+                    future.add_done_callback(cb)
             else:
                 ##launch children in parallel using gather
                 launch_tasks = [
@@ -1057,94 +1070,17 @@ class AsyncMaster(Node):
     #                               Callbacks
     # --------------------------------------------------------------------------
 
-    def _mark_children_done(self, child_ids: List[str]) -> None:
-        """Mark children as done (runs in event loop via call_soon_threadsafe).
-
-        Args:
-            child_ids: List of child_ids for completed children.
-        """
-        for child_id in child_ids:
-            if not self._scheduler.is_child_done(child_id):
-                self._scheduler.mark_child_done(child_id)
-        if self._scheduler.all_children_done:
-            self._all_children_done_event.set()
-
-    def _mark_children_crashed(self, child_ids: List[str]) -> None:
-        """Mark children as dead after an unexpected crash (future cancelled or raised).
-
-        Differs from _mark_children_done: records death rather than success, and
-        does NOT set _all_children_done_event — crashed children still have
-        outstanding tasks that need to be recovered.
-        """
-        for child_id in child_ids:
-            if not self._scheduler.is_child_dead(child_id):
-                self._scheduler.mark_child_dead(child_id)
-                self.logger.warning(
-                    f"{self.node_id}: Child {child_id} future ended with an error — marked dead"
-                )
-
     def _create_done_callback(
         self, child_ids: List[str]
-    ) -> Callable[[ConcurrentFuture], None]:
-        """Create a done-callback that marks children complete when their future resolves.
+    ) -> Optional[Callable[[ConcurrentFuture], None]]:
+        """Return a done-callback for the given child futures, or None.
 
-        The callback is invoked from an executor thread and uses call_soon_threadsafe
-        to safely dispatch _mark_children_done into the event loop.
-
-        Args:
-            child_ids: Child node IDs associated with the completing future.
+        The base AsyncMaster does not need a callback: _teardown_child awaits
+        the future directly (asyncio.wrap_future), and crash detection is
+        handled by the _report_status heartbeat loop.  Subclasses that need
+        eager notification (e.g. AsyncWorkStealingMaster) override this.
         """
-
-        def _done_callback(future: AsyncFuture):
-            if self._event_loop is None:
-                self.logger.warning("No event loop stored, can't mark child done!")
-                return
-            # Staleness check: if _teardown_child already ran for this child,
-            # _children_futures no longer maps child_id → this future.  A stale
-            # callback from an old future must not touch the newly-recovered child.
-            for child_id in child_ids:
-                if self._children_futures.get(child_id) is not future:
-                    self.logger.debug(
-                        f"_done_callback: stale future for {child_id}, ignoring"
-                    )
-                    return
-            # Distinguish a clean exit from an unexpected crash.
-            # Following are the scenarios when a child is considered crashed
-            # 1. Child is already marked dead by the report_status() loop
-            # 2. Future is cancelled but the result has not arrived yet
-            #       -> should happen only when _teardown_child is called before the wait_for_finish is resolved
-            # 3. Future is not cancelled but an exception was returned
-            crashed = self._scheduler.is_child_dead(child_id) or (
-                future.cancelled()
-                and all(
-                    [
-                        not self._scheduler.is_child_done(child_id)
-                        for child_id in child_ids
-                    ]
-                )
-            )
-            if crashed:
-                self.logger.info(f"{child_ids} crashed")
-            if not crashed:
-                try:
-                    crashed = future.exception() is not None
-                    if crashed:
-                        self.logger.warning(
-                            f"{child_ids} crashed with exception {future.exception()}"
-                        )
-                except Exception as e:
-                    crashed = True
-                    self.logger.warning(f"{child_ids} crashed with exception {e}")
-            if crashed:
-                self._event_loop.call_soon_threadsafe(
-                    self._mark_children_crashed, child_ids
-                )
-            else:
-                self._event_loop.call_soon_threadsafe(
-                    self._mark_children_done, child_ids
-                )
-
-        return _done_callback
+        return None
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -1164,8 +1100,10 @@ class AsyncMaster(Node):
                 await self._comm.send_message_to_child(
                     child_id, HeartBeat(sender=self.node_id)
                 )
-                if not self._scheduler.is_child_done(child_id):
-                    self._scheduler.mark_child_done(child_id)
+                # Source c (authoritative): mark SUCCESS from RUNNING or RECOVERING.
+                state = self._scheduler.get_child_state(child_id)
+                if state in {ChildState.RUNNING, ChildState.RECOVERING}:
+                    self._scheduler.mark_child_success(child_id)
             else:
                 self.logger.warning(
                     f"{self.node_id}: No result received from {child_id}"
@@ -1196,9 +1134,10 @@ class AsyncMaster(Node):
                 # Loop immediately: recovery may have added more tasks while we waited.
                 continue
             # No new tasks this iteration — check if we are truly done.
+            # _all_children_done_event won't be set while any child is RECOVERING,
+            # so no separate guard is needed.
             if (
                 self._all_children_done_event.is_set()
-                and not self._children_recovering
                 and all(t.done() for t in self._child_result_batch_task.values())
             ):
                 break
@@ -1341,22 +1280,28 @@ class AsyncMaster(Node):
                 # Dead-child detection: check each child's last ACK time.
                 now = time.time()
                 for child_id, last_ack in list(self._last_child_ack_time.items()):
-                    if child_id in self._children_recovering or (
-                        self._scheduler.is_child_done(child_id)
-                        and not self._scheduler.is_child_dead(child_id)
-                    ):
+                    state = self._scheduler.get_child_state(child_id)
+                    if state is None:
+                        # Not registered (between teardown and re-registration).
+                        continue
+                    if state in {
+                        ChildState.NOTREADY,
+                        ChildState.READY,
+                        ChildState.RECOVERING,
+                        ChildState.SUCCESS,
+                    }:
                         continue
                     age = now - last_ack
                     if age > child_threshold:
                         self.logger.warning(
-                            f"{self.node_id}: Child {child_id} appears dead "
+                            f"{self.node_id}: Child {child_id} timed out "
                             f"(no ACK for {age:.1f}s > threshold {child_threshold:.1f}s)"
                         )
-                        if not self._scheduler.is_child_dead(child_id):
-                            self._scheduler.mark_child_dead(child_id)
                         if self._config.restart_children_on_failure:
-                            self._children_recovering.add(child_id)
+                            self._scheduler.mark_child_recovering(child_id)
                             asyncio.create_task(self._recover_dead_child(child_id))
+                        else:
+                            self._scheduler.mark_child_failed(child_id)
                     else:
                         self.logger.info(f"Checked child {child_id} age. {age} < {child_threshold}")
 
@@ -1444,6 +1389,7 @@ class AsyncMaster(Node):
     async def _recover_dead_child(self, child_id: str) -> List[str]:
         """Tear down a dead child and relaunch on the same resources.
 
+        Expects child_id to be in RECOVERING state when called (set by _report_status).
         Returns the list of new child IDs created (for subclasses to extend).
         """
         try:
@@ -1452,9 +1398,14 @@ class AsyncMaster(Node):
             # Capture assignment BEFORE teardown removes it from the scheduler
             assignment = self._scheduler.get_child_assignment(child_id)
 
+            # Blocks until the subprocess exits: callback sees RECOVERING → marks FAILED
+            # → sets done event → wait_for_child() returns.
             await self._teardown_child(child_id)
 
-            self._scheduler.register_child(child_id, assignment)
+            # Re-register child: NOTREADY, then immediately READY so _launch_child
+            # can transition READY → RUNNING.
+            self._scheduler.register_child(child_id, assignment)  # → NOTREADY
+            self._scheduler.mark_child_ready(child_id)             # NOTREADY → READY
 
             # Instantiate a fresh child object — never reuse the old one since it
             # carries stale asyncio.Event / comm state from the previous run, which
@@ -1474,6 +1425,8 @@ class AsyncMaster(Node):
                 self.logger.error(
                     f"{self.node_id}: Exception launching child {child_id}: {e}"
                 )
+                if not self._scheduler.is_child_terminal(child_id):
+                    self._scheduler.mark_child_failed(child_id)
                 await self._teardown_child(child_id)
                 return []
 
@@ -1482,6 +1435,8 @@ class AsyncMaster(Node):
                 self.logger.error(
                     f"{self.node_id}: Failed to relaunch child {child_id}: {result}"
                 )
+                if not self._scheduler.is_child_terminal(child_id):
+                    self._scheduler.mark_child_failed(child_id)
                 await self._teardown_child(child_id)
                 return []
             else:
@@ -1491,8 +1446,11 @@ class AsyncMaster(Node):
                     self._scheduler.discard_unassigned(task_id)
 
             return [child_id]
-        finally:
-            self._children_recovering.discard(child_id)
+        except Exception as e:
+            self.logger.error(f"{self.node_id}: Recovery failed for {child_id}: {e}")
+            if not self._scheduler.is_child_terminal(child_id):
+                self._scheduler.mark_child_failed(child_id)
+            return []
 
     async def _parent_task_update_monitor(self) -> None:
         """Non-root master only: receive TaskUpdates from parent and route tasks to children."""
@@ -1529,7 +1487,6 @@ class AsyncMaster(Node):
                     self.logger.debug(f"Cancelling {child_id} future successful")
                 else:
                     self.logger.warning(f"Cancelling {child_id} future was unsuccessful")
-            await self._scheduler.wait_for_child(child_id)
 
         # Cancel per-child monitor tasks and await them to avoid dangling coroutines.
         tasks_to_cancel = []

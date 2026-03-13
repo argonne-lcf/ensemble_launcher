@@ -8,6 +8,7 @@ from ensemble_launcher.comm.messages import (
     TaskRequest,
     TaskUpdate,
 )
+from ensemble_launcher.scheduler.child_state import ChildState
 from ensemble_launcher.scheduler.resource import JobResource
 
 from .async_master import AsyncMaster
@@ -236,14 +237,33 @@ class AsyncWorkStealingMaster(AsyncMaster):
             )
             self.logger.info(f"{self.node_id}: Started task request monitor")
 
-    def _mark_and_launch(self, child_ids: List[str]) -> None:
-        """Mark children done; relaunch with remaining tasks or signal all-work-done.
+    def _mark_and_launch(self, child_ids: List[str], future) -> None:
+        """Apply state transitions and relaunch children for remaining tasks.
 
-        Called via call_soon_threadsafe from done callbacks. If all children
-        are done but unassigned tasks remain, relaunches up to
-        _max_relaunch_attempts times before giving up and setting the done event.
+        Called via call_soon_threadsafe from done callbacks. Determines
+        SUCCESS/FAILED from the future exit code for RUNNING children.
+        RECOVERING children are handled by _recover_dead_child which awaits
+        the future directly — skip them here to avoid double-transition.
+        If all children reach terminal state but unassigned tasks remain,
+        relaunches up to _max_relaunch_attempts times.
         """
-        super()._mark_children_done(child_ids)
+        for child_id in child_ids:
+            state = self._scheduler.get_child_state(child_id)
+            if state == ChildState.RUNNING:
+                try:
+                    crashed = future.cancelled() or future.exception() is not None
+                except Exception:
+                    crashed = True
+                if crashed:
+                    self._scheduler.mark_child_failed(child_id)
+                else:
+                    self._scheduler.mark_child_success(child_id)
+            else:
+                # RECOVERING (teardown handles via wrap_future), terminal, or
+                # unregistered — no-op.
+                self.logger.debug(
+                    f"_mark_and_launch: no-op for {child_id} in state {state}"
+                )
         if not self._scheduler.all_children_done:
             return
         if self._scheduler.unassigned_task_ids:
@@ -302,7 +322,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
     ) -> Callable[[AsyncFuture], None]:
         def _done_callback(future: AsyncFuture):
             if self._event_loop is not None:
-                self._event_loop.call_soon_threadsafe(self._mark_and_launch, child_ids)
+                self._event_loop.call_soon_threadsafe(
+                    self._mark_and_launch, child_ids, future
+                )
             else:
                 self.logger.warning("No event loop stored, can't mark child done!")
 
