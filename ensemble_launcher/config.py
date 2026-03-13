@@ -33,8 +33,8 @@ class LauncherConfig(BaseModel):
     return_stdout: bool = False
     worker_logs: bool = False
     master_logs: bool = False
-    sequential_child_launch: bool = (
-        False  ##If True, launch children one by one even for MPI executor
+    sequential_child_launch: Optional[bool] = (
+        None  ##If True, launch children one by one even for MPI executor
     )
     profile: Optional[Literal["perfetto"]] = (
         None  ##Enable profiling with event registry and Perfetto export for timeline visualization
@@ -65,6 +65,8 @@ class LauncherConfig(BaseModel):
     overload_orchestrator_core: bool = (
         True # Setting this to false reserves the first core of the head compute node for EL orchestrator
     )
+
+    restart_children_on_failure: bool = True
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

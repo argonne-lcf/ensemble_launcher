@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import signal
 import socket
 import time
@@ -454,17 +455,19 @@ class AsyncMaster(Node):
                         for child in children.values()
                     ]
                 )
-                and len(child_names) > 1
             )
-            if not self._config.sequential_child_launch and worker_equality:
+            if len(child_names) > 1 and ((worker_equality and self._config.sequential_child_launch is None) or 
+                                         (self._config.sequential_child_launch is not None and not self._config.sequential_child_launch)):
                 self.logger.info("Using one shot mpiexec")
+                if not worker_equality:
+                    self.logger.warning(f"All workers are not equal. Using one shot mpiexec can cause issues")
                 ##launch all children in a single shot
                 child_head_nodes = []
                 child_resources = []
                 child_obj_dict = {}
 
                 for child_name, child_obj in children.items():
-                    head_node = child_obj.init_nodes.nodes[0]
+                    head_node = child_obj.init_nodes.nodes[0] + "-" + child_name
                     child_head_nodes.append(head_node)
                     child_resources.append(NodeResourceCount(ncpus=1))
                     child_obj_dict[head_node] = child_obj
@@ -491,12 +494,16 @@ class AsyncMaster(Node):
                         final_dict[key] = {}
 
                 # Populate per-host values
-                for hostname, child_obj in child_obj_dict.items():
+                for hostname_child_id, child_obj in child_obj_dict.items():
+                    hostname = hostname_child_id.split("-")[0]
                     child_dict = child_obj.asdict()
                     for key, value in child_dict.items():
                         if key not in common_keys:
                             self.logger.info(f"{key} not int common keys")
-                            final_dict[key][hostname] = value
+                            if hostname not in final_dict[key]:
+                                final_dict[key][hostname] = [value]
+                            else:
+                                final_dict[key][hostname].append(value)
 
                 self.logger.info(f"Final dict: {final_dict}")
                 # Create embedded command string
@@ -526,13 +533,16 @@ class AsyncMaster(Node):
                             list(range(first_child.init_nodes.resources[0].cpu_count)),
                         )
                     )
-                if self._config.cpu_binding_option == "--cpu-bind":
-                    mpi_kwargs = {self._config.cpu_binding_option: f"list:{cpus}"}
+                mpi_kwargs = {}
+                if worker_equality:
+                    if self._config.cpu_binding_option == "--cpu-bind":
+                        mpi_kwargs.update({self._config.cpu_binding_option: f"list:{cpus}"})
+                    else:
+                        self.logger.warning(
+                            f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning."
+                        )
                 else:
-                    mpi_kwargs = {}
-                    self.logger.warning(
-                        f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning."
-                    )
+                    self.logger.warning(f"All workers are not equal can't use cpu binding!")
 
                 future = self._executor.submit(
                     req,
@@ -749,9 +759,7 @@ class AsyncMaster(Node):
 
         # Create aggregate task once, after all children (including recreated ones) are registered.
         self._aggregate_task = asyncio.create_task(
-            self._aggregate_and_send_result_batch(
-                list(self._child_result_batch_task.values())
-            )
+            self._aggregate_and_send_result_batch()
         )
 
         return None
@@ -1153,6 +1161,9 @@ class AsyncMaster(Node):
             if result_batch is not None:
                 self._results[child_id] = [result_batch]
                 self.logger.info(f"{self.node_id}: Received result from {child_id}")
+                await self._comm.send_message_to_child(
+                    child_id, HeartBeat(sender=self.node_id)
+                )
                 if not self._scheduler.is_child_done(child_id):
                     self._scheduler.mark_child_done(child_id)
             else:
@@ -1167,12 +1178,32 @@ class AsyncMaster(Node):
             )
             self._results[child_id] = []
 
-    async def _aggregate_and_send_result_batch(
-        self, result_tasks: List[asyncio.Task]
-    ) -> None:
-        """Wait for all result collection tasks, aggregate, and send to parent."""
-        # Wait for all result collection tasks to complete
-        await asyncio.gather(*result_tasks, return_exceptions=True)
+    async def _aggregate_and_send_result_batch(self) -> None:
+        """Wait for all result collection tasks, aggregate, and send to parent.
+
+        Dynamically tracks self._child_result_batch_task so that tasks added
+        during child recovery are also awaited before aggregation proceeds.
+        """
+        # Wait for all result collection tasks to complete, including any added
+        # during recovery (which updates self._child_result_batch_task at runtime).
+        seen_tasks: set = set()
+        while True:
+            current_tasks = set(self._child_result_batch_task.values())
+            new_tasks = current_tasks - seen_tasks
+            if new_tasks:
+                seen_tasks.update(new_tasks)
+                await asyncio.gather(*new_tasks, return_exceptions=True)
+                # Loop immediately: recovery may have added more tasks while we waited.
+                continue
+            # No new tasks this iteration — check if we are truly done.
+            if (
+                self._all_children_done_event.is_set()
+                and not self._children_recovering
+                and all(t.done() for t in self._child_result_batch_task.values())
+            ):
+                break
+            # Children still running or recovery in progress; yield and recheck.
+            await asyncio.sleep(0.05)
         self.logger.info(f"{self.node_id}: All result collection tasks completed")
 
         # Cancel the reporting task
@@ -1244,13 +1275,33 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Aggregated results from {len(self._results)} children"
             )
 
-        # Send to parent (skip if parent is dead)
+        # Send to parent with ACK and retries (skip if parent is dead)
+        max_retries = 3
         if self.parent and not self._parent_dead_event.is_set():
-            success = await self._comm.send_message_to_parent(result_batch)
-            if not success:
-                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
+            for attempt in range(max_retries):
+                success = await self._comm.send_message_to_parent(result_batch)
+                if not success:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send results to parent "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    continue
+                ack = await self._comm.recv_message_from_parent(
+                    HeartBeat, timeout=5.0
+                )
+                if ack is not None:
+                    self.logger.info(
+                        f"{self.node_id}: Successfully sent results and received ack from parent"
+                    )
+                    break
+                self.logger.warning(
+                    f"{self.node_id}: No ack for result batch from parent "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
             else:
-                self.logger.info(f"{self.node_id}: Successfully sent results to parent")
+                self.logger.warning(
+                    f"{self.node_id}: Failed to get result batch ack after {max_retries} attempts"
+                )
         elif self.parent:
             self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
 
@@ -1301,19 +1352,23 @@ class AsyncMaster(Node):
                             f"{self.node_id}: Child {child_id} appears dead "
                             f"(no ACK for {age:.1f}s > threshold {child_threshold:.1f}s)"
                         )
-                        self._children_recovering.add(child_id)
                         if not self._scheduler.is_child_dead(child_id):
                             self._scheduler.mark_child_dead(child_id)
-                        asyncio.create_task(self._recover_dead_child(child_id))
+                        if self._config.restart_children_on_failure:
+                            self._children_recovering.add(child_id)
+                            asyncio.create_task(self._recover_dead_child(child_id))
+                    else:
+                        self.logger.info(f"Checked child {child_id} age. {age} < {child_threshold}")
 
                 # Periodic checkpoint: scheduler state, comm state, and collected results.
                 if self._checkpointer is not None:
                     asyncio.create_task(self._write_checkpoint())
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
+                    jitter = random.uniform(-0.05, 0.05) * self._config.report_interval
                     await asyncio.wait_for(
                         self._stop_reporting_event.wait(),
-                        timeout=self._config.report_interval,
+                        timeout=self._config.report_interval + jitter,
                     )
                     break  # Exit if stop event was set
                 except asyncio.TimeoutError:
@@ -1413,7 +1468,14 @@ class AsyncMaster(Node):
 
             self.logger.info(f"Completed init child {child_id}")
 
-            results = await self._launch_and_sync_children([child_id])
+            try:
+                results = await self._launch_and_sync_children([child_id])
+            except Exception as e:
+                self.logger.error(
+                    f"{self.node_id}: Exception launching child {child_id}: {e}"
+                )
+                await self._teardown_child(child_id)
+                return []
 
             result = results[0]
             if result is not None:
@@ -1454,27 +1516,35 @@ class AsyncMaster(Node):
     async def _teardown_child(self, child_id: str) -> None:
         """Cancel per-child tasks, remove the child from all bookkeeping, and prune
         the comm cache so no stale entries remain."""
-        ##Cancel the future and wait for scheduler to mark it done
+        # Cancel the future and wait for the scheduler to mark the child done.
         child_fut = self._children_futures.get(child_id, None)
         if child_fut is None:
-            raise RuntimeError(f"{child_id} Child future doesn't exist!")
-        if not child_fut.done():
-            success = child_fut.cancel()
-            if success:
-                self.logger.debug(f"Cancelling {child_id} future successfull")
-            else:
-                self.logger.warning(f"Cancelling {child_id} future was unsuccessful")
-        await self._scheduler.wait_for_child(child_id)
+            self.logger.warning(
+                f"_teardown_child: no future found for {child_id}, skipping cancel"
+            )
+        else:
+            if not child_fut.done():
+                success = child_fut.cancel()
+                if success:
+                    self.logger.debug(f"Cancelling {child_id} future successful")
+                else:
+                    self.logger.warning(f"Cancelling {child_id} future was unsuccessful")
+            await self._scheduler.wait_for_child(child_id)
 
-        old_task = self._child_result_batch_task.pop(child_id, None)
-        if old_task is not None:
-            old_task.cancel()
-        old_status = self._child_status_task.pop(child_id, None)
-        if old_status is not None:
-            old_status.cancel()
-        old_fwd = self._child_forwarder_task.pop(child_id, None)
-        if old_fwd is not None:
-            old_fwd.cancel()
+        # Cancel per-child monitor tasks and await them to avoid dangling coroutines.
+        tasks_to_cancel = []
+        for task_dict in (
+            self._child_result_batch_task,
+            self._child_status_task,
+            self._child_forwarder_task,
+        ):
+            t = task_dict.pop(child_id, None)
+            if t is not None:
+                t.cancel()
+                tasks_to_cancel.append(t)
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
         self._scheduler.remove_child(child_id)
         self.remove_child(child_id)
         self._child_objs.pop(child_id, None)
@@ -1603,6 +1673,7 @@ class AsyncMaster(Node):
         # Propagate stop to children if work didn't finish naturally.
         # Parent dead → KILL children. Received stop from parent → mirror its type.
         # Any other reason (SIGTERM etc.) → TERMINATE cleanly.
+        stop_type: Optional[StopType] = None
         if not self._all_children_done_event.is_set():
             if self._parent_dead_event.is_set():
                 stop_type = StopType.KILL

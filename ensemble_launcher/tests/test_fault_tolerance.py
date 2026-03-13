@@ -60,7 +60,7 @@ def test_el_fault_tolerance():
     )
 
     el.start()
-    time.sleep(2.0)
+    time.sleep(10.0)
 
     results = {}
     with ClusterClient(checkpoint_dir=ckpt_dir, node_id="global") as client:

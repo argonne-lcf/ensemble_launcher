@@ -14,6 +14,7 @@ load_str = "import base64, json, socket; "\
 
 async_load_str = "import base64, json, socket, asyncio; "\
            "from datetime import datetime; "\
+           "import os; "\
            "from ensemble_launcher.orchestrator.async_worker import AsyncWorker; "\
            "from ensemble_launcher.orchestrator.async_master import AsyncMaster; "\
            "from ensemble_launcher.orchestrator.async_workstealing_worker import AsyncWorkStealingWorker; "\
@@ -22,7 +23,10 @@ async_load_str = "import base64, json, socket, asyncio; "\
            "start = datetime.now(); "\
            "all_children_dict = json.loads(base64.b64decode(json_str_b64).decode('utf-8')); "\
            "common_keys = common_keys_str.split(','); "\
-           "child_dict = {key: all_children_dict[key][hostname] if key not in common_keys and isinstance(all_children_dict[key], dict) and hostname in all_children_dict[key] else all_children_dict[key] for key in all_children_dict.keys()}; "\
+           "pals_id=os.environ.get('PALS_LOCAL_RANKID',None); "\
+           "mpi_id=os.environ.get('MPI_LOCALRANKID',pals_id); "\
+           "idx = 0 if mpi_id is None else int(mpi_id); "\
+           "child_dict = {key: all_children_dict[key][hostname][idx] if key not in common_keys and isinstance(all_children_dict[key], dict) and hostname in all_children_dict[key] else all_children_dict[key] for key in all_children_dict.keys()}; "\
            "after_deserialization = datetime.now(); "\
            "class_map = {'AsyncWorker': AsyncWorker, 'AsyncMaster': AsyncMaster, 'AsyncWorkStealingWorker': AsyncWorkStealingWorker, 'AsyncWorkStealingMaster': AsyncWorkStealingMaster}; "\
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\

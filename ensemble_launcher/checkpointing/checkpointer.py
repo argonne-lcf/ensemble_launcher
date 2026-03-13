@@ -25,6 +25,7 @@ import asyncio
 import base64
 import os
 import socket
+import tempfile
 import time
 from logging import Logger
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
@@ -210,15 +211,33 @@ class Checkpointer:
 
     def _write_json_atomic(self, path: str, json_str: str) -> None:
         """Atomically write *json_str* to *path* via a sibling ``.tmp`` file."""
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "w") as fh:
-                fh.write(json_str)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except Exception as e:
-            self.logger.warning(f"Writing {path} failed with error {e}")
+        target_dir = os.path.dirname(path)
+        max_retries = 3
+        last_exc: Optional[Exception] = None
+        for i in range(max_retries):
+            tmp = None
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as fh:
+                        fh.write(json_str)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                except Exception:
+                    os.close(fd)
+                    raise
+                os.replace(tmp, path)
+                return
+            except Exception as e:
+                last_exc = e
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                self.logger.warning(f"Writing {path} failed with error {e}. retry {i}.....")
+        self.logger.error(f"Failed to write {path} after {max_retries} attempts: {last_exc}")
 
     def _read_json(self, path: str) -> Optional[str]:
         """Return the raw JSON string at *path*, or ``None`` if absent."""

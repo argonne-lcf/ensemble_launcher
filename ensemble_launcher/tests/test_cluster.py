@@ -42,6 +42,7 @@ async def test_async_worker_cluster(
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
+            master_logs=True,
             worker_logs=True,
             report_interval=100.0,
             use_mpi_ppn=False,
@@ -56,7 +57,7 @@ async def test_async_worker_cluster(
 
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
-    time.sleep(2.0)
+    time.sleep(10.0)
     client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}
@@ -95,7 +96,7 @@ async def test_async_master_cluster(
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4)}")
+    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
     w = AsyncMaster(
         "test",
         LauncherConfig(
@@ -103,6 +104,7 @@ async def test_async_master_cluster(
             child_executor_name=task_executor,
             comm_name="async_zmq",
             worker_logs=True,
+            master_logs=True,
             report_interval=100.0,
             use_mpi_ppn=False,
             log_level=logging.INFO,

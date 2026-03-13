@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import signal
 import socket
 import time
@@ -245,6 +246,9 @@ class AsyncWorker(Node):
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
 
+        # Jitter before syncing to avoid thundering herd at startup.
+        await asyncio.sleep(random.uniform(0, 0.1 * self._config.report_interval))
+
         # Syncronize with parent
         await self._sync_with_parent()
 
@@ -430,7 +434,7 @@ class AsyncWorker(Node):
                 self.logger.info(
                     f"{self.node_id}: Updated nodes list with {len(self._init_nodes.nodes)} nodes"
                 )
-                self.logger.debug(f"{self.node_id}: Nodes details: {self._init_nodes}")
+                self.logger.info(f"{self.node_id}: Nodes details: {self._init_nodes}")
             else:
                 self.logger.warning(
                     f"{self.node_id}: Received empty node update from parent"
@@ -488,9 +492,6 @@ class AsyncWorker(Node):
                 )
                 if task_id in self._client_task_map:
                     client_id = self._client_task_map.pop(task_id)
-                    asyncio.create_task(
-                        self._comm.send_message_to_child(client_id, task_result)
-                    )
                     asyncio.create_task(
                         self._comm.send_message_to_child(client_id, task_result)
                     )
@@ -679,9 +680,10 @@ class AsyncWorker(Node):
 
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
+                    jitter = random.uniform(-0.05, 0.05) * self._config.report_interval
                     await asyncio.wait_for(
                         self._stop_reporting.wait(),
-                        timeout=self._config.report_interval,
+                        timeout=self._config.report_interval + jitter,
                     )
                     break  # Exit if stop event was set
                 except asyncio.TimeoutError:
@@ -812,14 +814,32 @@ class AsyncWorker(Node):
             else:
                 self.logger.warning(f"Task {task_id} status {task.status}")
 
-        success = await self._comm.send_message_to_parent(result_batch)
+        max_retries = 3
         if self.parent:
-            if success:
-                self.logger.info(
-                    f"{self.node_id}: Successfully sent the results to parent"
+            for attempt in range(max_retries):
+                success = await self._comm.send_message_to_parent(result_batch)
+                if not success:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send results to parent "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    continue
+                ack = await self._comm.recv_message_from_parent(
+                    HeartBeat, timeout=5.0
+                )
+                if ack is not None:
+                    self.logger.info(
+                        f"{self.node_id}: Successfully sent results and received ack from parent"
+                    )
+                    break
+                self.logger.warning(
+                    f"{self.node_id}: No ack for result batch from parent "
+                    f"(attempt {attempt + 1}/{max_retries})"
                 )
             else:
-                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
+                self.logger.warning(
+                    f"{self.node_id}: Failed to get result batch ack after {max_retries} attempts"
+                )
 
         return result_batch
 

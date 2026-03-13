@@ -275,19 +275,6 @@ class AsyncWorkStealingMaster(AsyncMaster):
             for child_id, child in children.items():
                 await self._init_child(child_id, child)
 
-            # Rebuild the aggregate task so it includes the new collect tasks.
-            if self._aggregate_task and not self._aggregate_task.done():
-                self._aggregate_task.cancel()
-                try:
-                    await self._aggregate_task
-                except asyncio.CancelledError:
-                    pass
-            self._aggregate_task = asyncio.create_task(
-                self._aggregate_and_send_result_batch(
-                    list(self._child_result_batch_task.values())
-                )
-            )
-
             child_names = list(children.keys())
             results = await self._launch_and_sync_children(child_names)
 

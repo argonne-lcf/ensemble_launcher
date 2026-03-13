@@ -99,6 +99,8 @@ class AsyncZMQComm(AsyncComm):
         self.router_socket.setsockopt(
             zmq.IDENTITY, f"{self._node_info.node_id}".encode()
         )
+        self.router_socket.setsockopt(zmq.SNDHWM, 10000)
+        self.router_socket.setsockopt(zmq.RCVHWM, 10000)
         try:
             self.router_socket.bind(f"tcp://{self.my_address}")
             # self.router_socket.bind(f"tcp://*:{self.my_address.split(':')[-1]}")
@@ -144,6 +146,8 @@ class AsyncZMQComm(AsyncComm):
             self.dealer_socket.setsockopt(
                 zmq.IDENTITY, f"{self._node_info.node_id}".encode()
             )
+            self.dealer_socket.setsockopt(zmq.SNDHWM, 10000)
+            self.dealer_socket.setsockopt(zmq.RCVHWM, 10000)
             self.dealer_socket.connect(f"tcp://{self.parent_address}")
             self.logger.info(
                 f"{self._node_info.node_id}: connected to:{self.parent_address}"
@@ -175,77 +179,101 @@ class AsyncZMQComm(AsyncComm):
                 asyncio.create_task(self._monitor_child_sockets())
                 self._child_monitor_started = True
 
+    async def _deserialize_and_dispatch_parent(
+        self, raw_data: bytes, loop: asyncio.AbstractEventLoop, parent_id: str
+    ) -> None:
+        """Deserialize a raw frame from the parent and put it into the appropriate cache."""
+        from .messages import Message
+
+        try:
+            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data)
+            if isinstance(msg, Message):
+                self._cache[parent_id].put_nowait(msg)
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}"
+                )
+            else:
+                self._router_cache[parent_id].put_nowait(msg)
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Cached raw data from parent."
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"{self._node_info.node_id}: Failed to deserialize message from parent: {e}"
+            )
+
+    async def _deserialize_and_dispatch_child(
+        self, raw_data: list, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Deserialize a raw multipart frame from a child and put it into the appropriate cache."""
+        from .messages import Message
+
+        sender_id = raw_data[0].decode()
+        try:
+            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
+            if isinstance(msg, Message):
+                if sender_id.startswith("client:"):
+                    self._client_queue.put_nowait((sender_id, msg))
+                    self.logger.debug(
+                        f"{self._node_info.node_id}: Queued client message from {sender_id}: {type(msg).__name__}"
+                    )
+                else:
+                    self._cache[sender_id].put_nowait(msg)
+                    self.logger.debug(
+                        f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
+                    )
+            else:
+                self._router_cache[sender_id].put_nowait(msg)
+                self.logger.info(
+                    f"{self._node_info.node_id}: Cached raw data from child {sender_id}."
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"{self._node_info.node_id}: Failed to deserialize message from child {sender_id}: {e}"
+            )
+
     async def _monitor_parent_socket(self) -> None:
         """
         Monitor the parent dealer socket for incoming messages and cache them directly to _cache.
+        Deserialization is offloaded to a task so the socket is drained without blocking on unpickling.
         """
-        from .messages import Message
-
         await self._init_router_cache()
         parent_id = self._node_info.parent_id
+        loop = asyncio.get_running_loop()
         failures = 0
         while not self._stop_event.is_set():
             try:
                 raw_data = await self.dealer_socket.recv()
-                msg = cloudpickle.loads(raw_data)
-
-                # Push to _cache if it's a Message object
-                if isinstance(msg, Message):
-                    failures = 0  # Reset on success
-                    self._cache[parent_id].put_nowait(msg)
-                    self.logger.debug(
-                        f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}"
-                    )
-                else:
-                    # Still cache raw data for non-Message types
-                    self._router_cache[parent_id].put_nowait(msg)
-                    self.logger.debug(
-                        f"{self._node_info.node_id}: Cached raw data from parent."
-                    )
+                failures = 0
+                asyncio.create_task(
+                    self._deserialize_and_dispatch_parent(raw_data, loop, parent_id)
+                )
             except Exception as e:
                 failures += 1
                 self.logger.warning(
-                    f"{self._node_info.node_id}: Error caching data from parent failed {failures} times: {e}"
+                    f"{self._node_info.node_id}: Error receiving from parent failed {failures} times: {e}"
                 )
                 await asyncio.sleep(0.01)  # Backoff after repeated failures
 
     async def _monitor_child_sockets(self) -> None:
         """
         Monitor the child router sockets for incoming messages and cache them directly to _cache.
+        Deserialization is offloaded to a task so the socket is drained without blocking on unpickling.
         """
-        from .messages import Message
-
         await self._init_router_cache()
+        loop = asyncio.get_running_loop()
         failures = 0
         while not self._stop_event.is_set():
             try:
                 raw_data = await self.router_socket.recv_multipart()
-                sender_id = raw_data[0].decode()  # Convert bytes to string for child_id
-                msg = cloudpickle.loads(raw_data[1])  # Unpickle the raw data
-
-                # Push to _cache if it's a Message object
-                if isinstance(msg, Message):
-                    failures = 0  # Reset on success
-                    if sender_id.startswith("client:"):
-                        self._client_queue.put_nowait((sender_id, msg))
-                        self.logger.debug(
-                            f"{self._node_info.node_id}: Queued client message from {sender_id}: {type(msg).__name__}"
-                        )
-                    else:
-                        self._cache[sender_id].put_nowait(msg)
-                        self.logger.debug(
-                            f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
-                        )
-                else:
-                    # Still cache raw data for non-Message types
-                    self._router_cache[sender_id].put_nowait(msg)
-                    self.logger.info(
-                        f"{self._node_info.node_id}: Cached raw data from child {sender_id}."
-                    )
+                failures = 0
+                asyncio.create_task(
+                    self._deserialize_and_dispatch_child(raw_data, loop)
+                )
             except Exception as e:
                 failures += 1
                 self.logger.warning(
-                    f"{self._node_info.node_id}: Error caching data from child failed {failures} times: {e}"
+                    f"{self._node_info.node_id}: Error receiving from child failed {failures} times: {e}"
                 )
                 await asyncio.sleep(0.01)  # Backoff after repeated failures
 
