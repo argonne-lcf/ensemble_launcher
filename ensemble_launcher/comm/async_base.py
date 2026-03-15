@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
-from .messages import HeartBeat, Message, all_messages
+from .messages import Message, all_messages
 from .nodeinfo import NodeInfo
 
 T = TypeVar("T", bound="AsyncCommState")
@@ -155,6 +155,9 @@ class AsyncComm(ABC):
         self._cache: Dict[str, AsyncMessageRoutingQueue] = {}
         self._stop_event = None
 
+        self.parent_dead_event: Optional[asyncio.Event] = None
+        self._child_dead_events: Dict[str, asyncio.Event] = {}
+
         self._event_registry: Optional[EventRegistry] = None
         if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
             self.event_registry: EventRegistry = get_registry()
@@ -297,29 +300,14 @@ class AsyncComm(ABC):
         return msg
 
     async def sync_heartbeat_with_parent(self, timeout: Optional[float] = None) -> bool:
-        # heart beat sync with parent
-        if self._node_info.parent_id is None:
-            self.logger.warning("No parent to sync heartbeat with.")
-            return True
-
-        await self.send_message_to_parent(HeartBeat())
-        msg = await self.recv_message_from_parent(HeartBeat, timeout=timeout)
-        if msg is not None:
-            return True
-        return False
+        # Default implementation: subclasses override with HB process logic.
+        return True
 
     async def sync_heartbeat_with_child(
         self, child_id: str, timeout: Optional[float] = None
     ) -> bool:
-        if len(self._node_info.children_ids) == 0:
-            self.logger.warning("No children to sync heartbeat with.")
-            return True
-
-        msg = await self.recv_message_from_child(HeartBeat, child_id, timeout=timeout)
-        await self.send_message_to_child(child_id, HeartBeat())
-        if msg is not None:
-            return True
-        return False
+        # Default implementation: subclasses override with HB process logic.
+        return True
 
     async def clear_cache(self):
         """Close all cache queues and clear remaining messages"""

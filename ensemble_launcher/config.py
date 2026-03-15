@@ -54,13 +54,11 @@ class LauncherConfig(BaseModel):
     checkpoint_dir: Optional[str] = (
         None  # Directory for checkpoints; None disables checkpointing
     )
-    dead_node_factor: float = (
-        3.0  # Liveness threshold multiplier: a node (child or parent) is declared dead
+    heartbeat_interval: float = (
+        1.0  # heart beat interval
     )
-    # if no heartbeat ACK is received for dead_node_factor * report_interval seconds.
-    # Master uses this to detect dead children (via stale status timestamps).
-    # if no heartbeat ACK is received for dead_node_factor * report_interval seconds / 2.0.
-    # Workers and sub-masters use this to detect a dead parent (via missing HeartBeat ACKs).
+
+    heartbeat_dead_threshold: float = 30.0  # Seconds before HB process declares a peer dead.
 
     overload_orchestrator_core: bool = (
         True # Setting this to false reserves the first core of the head compute node for EL orchestrator

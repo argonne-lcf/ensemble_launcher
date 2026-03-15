@@ -71,7 +71,10 @@ class AsyncWorkStealingWorker(AsyncWorker):
         stop_tasks["stop_signal"] = asyncio.create_task(
             self._stop_signal_received.wait()
         )
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+        if self._comm.parent_dead_event is not None:
+            stop_tasks["parent_dead"] = asyncio.create_task(
+                self._comm.parent_dead_event.wait()
+            )
 
         if self.parent is not None:
 
@@ -96,7 +99,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._parent_dead_event.is_set():
+        if self._comm.parent_dead_event is not None and self._comm.parent_dead_event.is_set():
             sys.exit(1)
 
     # ------------------------------------------------------------------

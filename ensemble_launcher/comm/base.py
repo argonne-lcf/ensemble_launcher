@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Type, Union, overload
-from .messages import Message, HeartBeat, Status, all_messages
+from .messages import Message, Status, all_messages
 from dataclasses import dataclass, field
 import time
 from logging import Logger

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import uuid
+import multiprocessing as mp
 from asyncio import Future as AsyncFuture
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
@@ -36,7 +37,8 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
             self._return_stdout = kwargs["return_stdout"]
             del kwargs["return_stdout"]
 
-        super().__init__(**kwargs)
+        mp_context = kwargs.pop("mp_context",mp.get_context("spawn"))
+        super().__init__(mp_context=mp_context, **kwargs)
 
         super().submit(dummy_task)
 

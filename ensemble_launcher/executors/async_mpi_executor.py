@@ -276,7 +276,8 @@ class AsyncMPIExecutor(Executor):
             if task_id in self._processes:
                 del self._processes[task_id]
 
-    def shutdown(self, force: bool = False):
+    def shutdown(self, wait: bool = False):
+        force = not wait
         for task_id, process in self._processes.items():
             if process.returncode is None:
                 if force:

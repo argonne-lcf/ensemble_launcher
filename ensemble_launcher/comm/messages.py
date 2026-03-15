@@ -135,8 +135,8 @@ class NodeUpdate(Message):
 
 
 @dataclass
-class HeartBeat(Message):
-    alive: bool = True
+class ResultAck(Message):
+    pass
 
 
 @dataclass
@@ -157,7 +157,7 @@ all_messages = [
     ResultBatch,
     TaskUpdate,
     NodeUpdate,
-    HeartBeat,
+    ResultAck,
     Stop,
     TaskRequest,
 ]

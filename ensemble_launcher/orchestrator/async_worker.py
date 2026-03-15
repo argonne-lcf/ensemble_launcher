@@ -14,7 +14,6 @@ from ensemble_launcher.comm import (
     AsyncComm,
     AsyncZMQComm,
     AsyncZMQCommState,
-    HeartBeat,
     NodeInfo,
     NodeUpdate,
     Result,
@@ -24,6 +23,7 @@ from ensemble_launcher.comm import (
     StopType,
     TaskUpdate,
 )
+from ensemble_launcher.comm.messages import ResultAck
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import (
@@ -108,10 +108,6 @@ class AsyncWorker(Node):
         # Cluster mode / workstealing mode
         self._stop_signal_received = asyncio.Event()
 
-        # Parent fault detection
-        self._last_parent_ack_time: float = time.time()
-        self._parent_dead_event: asyncio.Event = asyncio.Event()
-
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
@@ -179,9 +175,12 @@ class AsyncWorker(Node):
             self._comm = AsyncZMQComm(
                 self.logger.getChild("comm"),
                 self.info(),
+                parent_comm=self.parent_comm,
                 parent_address=self.parent_comm.my_address
                 if self.parent_comm
                 else None,
+                heartbeat_interval=self._config.heartbeat_interval,
+                heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             )
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
@@ -240,11 +239,11 @@ class AsyncWorker(Node):
         # Restore saved comm state before binding so parent can reconnect.
         self._restore_comm_state()
 
-        # start parent endpoint monitors
-        await self._comm.start_monitors()
-
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
+        
+        # start parent endpoint monitors
+        await self._comm.start_monitors()
 
         # Jitter before syncing to avoid thundering herd at startup.
         await asyncio.sleep(random.uniform(0, 0.1 * self._config.report_interval))
@@ -421,7 +420,6 @@ class AsyncWorker(Node):
                 timeout=30.0
             ):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self._last_parent_ack_time = time.time()
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         node_update: NodeUpdate = await self._comm.recv_message_from_parent(
@@ -654,23 +652,6 @@ class AsyncWorker(Node):
                 if self.parent:
                     await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
-                    # Check for HeartBeat ACK from parent (sent by parent on Status receipt)
-                    threshold = (
-                        self._config.dead_node_factor
-                        * self._config.report_interval
-                        / 2.0
-                    )
-                    ack = await self._comm.recv_message_from_parent(HeartBeat)
-                    if ack is not None:
-                        self._last_parent_ack_time = time.time()
-                    else:
-                        age = time.time() - self._last_parent_ack_time
-                        if age > threshold:
-                            self.logger.error(
-                                f"{self.node_id}: No heartbeat from parent for {age:.1f}s "
-                                f"(threshold {threshold:.1f}s) — self-terminating"
-                            )
-                            self._parent_dead_event.set()
                 else:
                     self.logger.info(status)
 
@@ -710,7 +691,10 @@ class AsyncWorker(Node):
         stop_tasks["stop_signal"] = asyncio.create_task(
             self._stop_signal_received.wait()
         )
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+        if self._comm.parent_dead_event is not None:
+            stop_tasks["parent_dead"] = asyncio.create_task(
+                self._comm.parent_dead_event.wait()
+            )
 
         if not self._config.cluster:
             stop_tasks["work_done"] = asyncio.create_task(
@@ -738,7 +722,7 @@ class AsyncWorker(Node):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._parent_dead_event.is_set():
+        if self._comm.parent_dead_event is not None and self._comm.parent_dead_event.is_set():
             sys.exit(1)
 
     # -------------------------------------------------------------------------
@@ -787,7 +771,7 @@ class AsyncWorker(Node):
                 if success:
                     self.logger.info(f"{self.node_id}: Sent final status to parent")
                     msg = await self._comm.recv_message_from_parent(
-                        HeartBeat, timeout=5.0
+                        ResultAck, timeout=5.0
                     )
                     if msg is None:
                         self.logger.warning(
@@ -825,7 +809,7 @@ class AsyncWorker(Node):
                     )
                     continue
                 ack = await self._comm.recv_message_from_parent(
-                    HeartBeat, timeout=5.0
+                    ResultAck, timeout=5.0
                 )
                 if ack is not None:
                     self.logger.info(
@@ -902,7 +886,7 @@ class AsyncWorker(Node):
         await self._wait_for_stop_condition()
 
         async with self._timer("result_collection"):
-            if not self._parent_dead_event.is_set():
+            if self._comm.parent_dead_event is None or not self._comm.parent_dead_event.is_set():
                 all_results = await self._send_final_results_and_status()
 
         await self.stop()

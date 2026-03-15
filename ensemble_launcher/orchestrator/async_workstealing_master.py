@@ -103,7 +103,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         the scheduler, and replies with a TaskUpdate or a Stop(TERMINATE) if the
         pool is empty.
         """
-        self.logger.debug(
+        self.logger.info(
             f"{self.node_id}: Started monitoring task requests from child {child_id}"
         )
         failures = 0
@@ -165,7 +165,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
     async def monitor_task_requests(self) -> None:
         """Spawn one _monitor_single_child_task_requests coroutine per child and await all."""
         if len(self.children) == 0:
-            self.logger.debug(
+            self.logger.info(
                 f"{self.node_id}: No children to monitor for task requests"
             )
             return
@@ -349,7 +349,8 @@ class AsyncWorkStealingMaster(AsyncMaster):
         received_stop_type: List[Optional[StopType]] = [None]
 
         stop_tasks["work_done"] = asyncio.create_task(self._all_work_done_event.wait())
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+        if self._comm.parent_dead_event is not None:
+            stop_tasks["parent_dead"] = asyncio.create_task(self._comm.parent_dead_event.wait())
         stop_tasks["stop_signal"] = asyncio.create_task(
             self._stop_signal_received.wait()
         )

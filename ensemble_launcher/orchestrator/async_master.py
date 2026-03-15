@@ -15,12 +15,12 @@ from ensemble_launcher.comm import (
     AsyncComm,
     AsyncZMQComm,
     AsyncZMQCommState,
-    HeartBeat,
     NodeInfo,
 )
 from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Result,
+    ResultAck,
     ResultBatch,
     Status,
     Stop,
@@ -122,13 +122,6 @@ class AsyncMaster(Node):
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
         self._stop_signal_received = asyncio.Event()
 
-        # Parent fault detection
-        self._last_parent_ack_time: float = time.time()
-        self._parent_dead_event: asyncio.Event = asyncio.Event()
-
-        # Child fault detection: timestamp of last Status ACK sent to each child
-        self._last_child_ack_time: Dict[str, float] = {}
-
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
@@ -203,9 +196,12 @@ class AsyncMaster(Node):
             self._comm = AsyncZMQComm(
                 self.logger.getChild("comm"),
                 self.info(),
+                parent_comm=self.parent_comm,
                 parent_address=self.parent_comm.my_address
                 if self.parent_comm
                 else None,
+                heartbeat_interval=self._config.heartbeat_interval,
+                heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             )
             self.logger.info(f"{self.node_id}: Done with comm init")
         else:
@@ -339,7 +335,6 @@ class AsyncMaster(Node):
         self.add_child(child_id, child.info())
         child.set_parent(self.info())
         child.parent_comm = self.comm.pickable_copy()
-        self._last_child_ack_time[child_id] = time.time()
         # Extend the comm's node-info so its cache gains an entry for this child.
         await self._comm.update_node_info(self.info())
         # Per-child collect task (waits for the child's final ResultBatch).
@@ -351,6 +346,8 @@ class AsyncMaster(Node):
         self._child_status_task[child_id] = asyncio.create_task(
             self._child_status_monitor(child_id)
         )
+        # Per-child liveness monitor (waits for HB process dead event).
+        asyncio.create_task(self._child_liveness_monitor(child_id))
         if self._config.cluster:
             self._child_forwarder_task[child_id] = asyncio.create_task(
                 self._child_result_monitor(child_id)
@@ -478,10 +475,10 @@ class AsyncMaster(Node):
                 child_obj_dict = {}
 
                 for child_name, child_obj in children.items():
-                    head_node = child_obj.init_nodes.nodes[0] + "-" + child_name
+                    head_node = child_obj.init_nodes.nodes[0]
                     child_head_nodes.append(head_node)
                     child_resources.append(NodeResourceCount(ncpus=1))
-                    child_obj_dict[head_node] = child_obj
+                    child_obj_dict[head_node + "-" + child_name] = child_obj
 
                 # Build combined dictionary structure
                 common_keys = ["type", "parent", "parent_comm"]
@@ -630,16 +627,18 @@ class AsyncMaster(Node):
         # Restore saved comm state before binding so children can reconnect.
         self._restore_comm_state()
 
-        # Start parent comm end point monitor
-        await self._comm.start_monitors(parent_only=True)
-
         # for zmq, setup the sockets
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
+            
+        # Start parent comm end point monitor
+        await self._comm.start_monitors(parent_only=True)
 
         # Receive node update from parent if it has a parent
+        self.logger.info("Syncing with parent")
         if self.parent:
             await self._sync_with_parent()
+        self.logger.info("Done Syncing with parent")
 
         # create scheduler
         self._scheduler = self._create_scheduler()
@@ -856,7 +855,6 @@ class AsyncMaster(Node):
                 timeout=30.0
             ):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self._last_parent_ack_time = time.time()
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         node_update: NodeUpdate = await self._comm.recv_message_from_parent(
@@ -971,13 +969,11 @@ class AsyncMaster(Node):
         """
         # Sync heartbeat with child
         if not await self._comm.sync_heartbeat_with_child(
-            child_id=child_id, timeout=30.0
+            child_id=child_id, timeout=100.0
         ):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
             return await self._get_child_exception(child_id)
-
-        self._last_child_ack_time[child_id] = time.time()
-
+        self.logger.info(f"Successfully synced heart beat")
         # Send node update first
         if node_update is not None:
             await self._comm.send_message_to_child(child_id, node_update)
@@ -1098,7 +1094,7 @@ class AsyncMaster(Node):
                 self._results[child_id] = [result_batch]
                 self.logger.info(f"{self.node_id}: Received result from {child_id}")
                 await self._comm.send_message_to_child(
-                    child_id, HeartBeat(sender=self.node_id)
+                    child_id, ResultAck(sender=self.node_id)
                 )
                 # Source c (authoritative): mark SUCCESS from RUNNING or RECOVERING.
                 state = self._scheduler.get_child_state(child_id)
@@ -1157,7 +1153,10 @@ class AsyncMaster(Node):
 
         # Report final status to parent (or write to file if root / parent dead)
         async with self._timer("report_to_parent"):
-            if self.parent and not self._parent_dead_event.is_set():
+            if self.parent and (
+                self._comm.parent_dead_event is None
+                or not self._comm.parent_dead_event.is_set()
+            ):
                 final_status = self._scheduler.aggregate_status()
                 final_status.tag = "final"
                 success = await self._comm.send_message_to_parent(final_status)
@@ -1170,7 +1169,7 @@ class AsyncMaster(Node):
                         f"{self.node_id}: Successfully reported final status to parent"
                     )
                     ack = await self._comm.recv_message_from_parent(
-                        HeartBeat, timeout=5.0
+                        ResultAck, timeout=5.0
                     )
                     if ack is None:
                         self.logger.warning(
@@ -1216,7 +1215,10 @@ class AsyncMaster(Node):
 
         # Send to parent with ACK and retries (skip if parent is dead)
         max_retries = 3
-        if self.parent and not self._parent_dead_event.is_set():
+        if self.parent and (
+            self._comm.parent_dead_event is None
+            or not self._comm.parent_dead_event.is_set()
+        ):
             for attempt in range(max_retries):
                 success = await self._comm.send_message_to_parent(result_batch)
                 if not success:
@@ -1226,7 +1228,7 @@ class AsyncMaster(Node):
                     )
                     continue
                 ack = await self._comm.recv_message_from_parent(
-                    HeartBeat, timeout=5.0
+                    ResultAck, timeout=5.0
                 )
                 if ack is not None:
                     self.logger.info(
@@ -1245,65 +1247,15 @@ class AsyncMaster(Node):
             self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
 
     async def _report_status(self) -> None:
-        """Periodically aggregate child status and forward to parent.
-
-        Also checks each child's last status timestamp against the dead-child
-        threshold (dead_child_factor * report_interval). Any child whose status
-        has not been updated within that window is treated as dead and scheduled
-        for recovery.
-        """
-        parent_threshold = (
-            self._config.dead_node_factor * self._config.report_interval / 2.0
-        )
-        child_threshold = self._config.dead_node_factor * self._config.report_interval
+        """Periodically aggregate child status and forward to parent."""
         while not self._stop_reporting_event.is_set():
             try:
                 status = self._scheduler.aggregate_status()
                 if self.parent:
                     await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
-                    # Check for HeartBeat ACK from parent (sent by parent on Status receipt)
-                    ack = await self._comm.recv_message_from_parent(HeartBeat)
-                    if ack is not None:
-                        self._last_parent_ack_time = time.time()
-                    else:
-                        age = time.time() - self._last_parent_ack_time
-                        if age > parent_threshold:
-                            self.logger.error(
-                                f"{self.node_id}: No heartbeat from parent for {age:.1f}s "
-                                f"(threshold {parent_threshold:.1f}s) — self-terminating"
-                            )
-                            self._parent_dead_event.set()
                 else:
                     self.logger.info(status)
-
-                # Dead-child detection: check each child's last ACK time.
-                now = time.time()
-                for child_id, last_ack in list(self._last_child_ack_time.items()):
-                    state = self._scheduler.get_child_state(child_id)
-                    if state is None:
-                        # Not registered (between teardown and re-registration).
-                        continue
-                    if state in {
-                        ChildState.NOTREADY,
-                        ChildState.READY,
-                        ChildState.RECOVERING,
-                        ChildState.SUCCESS,
-                    }:
-                        continue
-                    age = now - last_ack
-                    if age > child_threshold:
-                        self.logger.warning(
-                            f"{self.node_id}: Child {child_id} timed out "
-                            f"(no ACK for {age:.1f}s > threshold {child_threshold:.1f}s)"
-                        )
-                        if self._config.restart_children_on_failure:
-                            self._scheduler.mark_child_recovering(child_id)
-                            asyncio.create_task(self._recover_dead_child(child_id))
-                        else:
-                            self._scheduler.mark_child_failed(child_id)
-                    else:
-                        self.logger.info(f"Checked child {child_id} age. {age} < {child_threshold}")
 
                 # Periodic checkpoint: scheduler state, comm state, and collected results.
                 if self._checkpointer is not None:
@@ -1371,9 +1323,8 @@ class AsyncMaster(Node):
                 )
                 if status is not None:
                     self._scheduler.set_child_status(child_id, status)
-                    self._last_child_ack_time[child_id] = time.time()
-                    await self._comm.send_message_to_child(child_id, HeartBeat())
                     if status.tag == "final":
+                        await self._comm.send_message_to_child(child_id, ResultAck())
                         return
             # Drain any remaining status messages after child process exits
             while True:
@@ -1385,6 +1336,24 @@ class AsyncMaster(Node):
                 self._scheduler.set_child_status(child_id, status)
         except asyncio.CancelledError:
             pass
+
+    async def _child_liveness_monitor(self, child_id: str) -> None:
+        """Wait for child dead event and trigger recovery."""
+        ev = self._comm._child_dead_events.get(child_id)
+        if ev is None:
+            return
+        await ev.wait()
+        state = self._scheduler.get_child_state(child_id)
+        if state is None or self._scheduler.is_child_terminal(child_id):
+            return
+        self.logger.warning(
+            f"{self.node_id}: Child {child_id} declared dead by HB process"
+        )
+        if self._config.restart_children_on_failure:
+            self._scheduler.mark_child_recovering(child_id)
+            asyncio.create_task(self._recover_dead_child(child_id))
+        else:
+            self._scheduler.mark_child_failed(child_id)
 
     async def _recover_dead_child(self, child_id: str) -> List[str]:
         """Tear down a dead child and relaunch on the same resources.
@@ -1484,7 +1453,7 @@ class AsyncMaster(Node):
             if not child_fut.done():
                 success = child_fut.cancel()
                 if success:
-                    self.logger.debug(f"Cancelling {child_id} future successful")
+                    self.logger.info(f"Cancelling {child_id} future successful")
                 else:
                     self.logger.warning(f"Cancelling {child_id} future was unsuccessful")
 
@@ -1506,7 +1475,6 @@ class AsyncMaster(Node):
         self.remove_child(child_id)
         self._child_objs.pop(child_id, None)
         self._children_futures.pop(child_id, None)
-        self._last_child_ack_time.pop(child_id, None)
         await self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
@@ -1560,7 +1528,9 @@ class AsyncMaster(Node):
 
         # stop comm and executor
         await self._comm.close()
-        self._executor.shutdown()
+        self.logger.info(f"Shutting down executor")
+        self._executor.shutdown(wait=True)
+        self.logger.info(f"Done Shutting down executor")
 
         if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
@@ -1577,6 +1547,7 @@ class AsyncMaster(Node):
             self.logger.info(f"Exporting event statistics to {fname}")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
+        self.logger.info(f"Done stopping {self.node_id}")
 
     # -------------------------------------------------------------------------
     #                               Entry point
@@ -1603,7 +1574,10 @@ class AsyncMaster(Node):
         stop_tasks["work_done"] = asyncio.create_task(
             self._all_children_done_event.wait()
         )
-        stop_tasks["parent_dead"] = asyncio.create_task(self._parent_dead_event.wait())
+        if self._comm.parent_dead_event is not None:
+            stop_tasks["parent_dead"] = asyncio.create_task(
+                self._comm.parent_dead_event.wait()
+            )
         stop_tasks["stop_signal"] = asyncio.create_task(
             self._stop_signal_received.wait()
         )
@@ -1632,7 +1606,10 @@ class AsyncMaster(Node):
         # Any other reason (SIGTERM etc.) → TERMINATE cleanly.
         stop_type: Optional[StopType] = None
         if not self._all_children_done_event.is_set():
-            if self._parent_dead_event.is_set():
+            if (
+                self._comm.parent_dead_event is not None
+                and self._comm.parent_dead_event.is_set()
+            ):
                 stop_type = StopType.KILL
             elif received_stop_type[0] is not None:
                 stop_type = received_stop_type[0]
