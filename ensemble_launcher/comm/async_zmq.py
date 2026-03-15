@@ -395,12 +395,15 @@ class AsyncZMQComm(AsyncComm):
                 self._last_child_hb_time[sender_id] = time.time()  # GIL-safe
                 ev = self._hb_child_ready.get(sender_id)
                 if ev is not None and not ev.is_set():
-                    main_loop.call_soon_threadsafe(ev.set)
+                    try:
+                        main_loop.call_soon_threadsafe(ev.set)
+                    except RuntimeError:
+                        pass  # main loop already closed
                 await router.send_multipart([parts[0], hb_bytes])
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"{self._node_info.node_id}: HB recv error: {e}")
 
     async def _hb_send_to_parent_thread(
         self,
@@ -415,14 +418,17 @@ class AsyncZMQComm(AsyncComm):
                 await dealer.send(hb_bytes)
                 await dealer.recv()
                 if self._last_parent_hb_time is None and self._hb_parent_ready is not None:
-                    main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
+                    try:
+                        main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
+                    except RuntimeError:
+                        pass  # main loop already closed
                 self._last_parent_hb_time = time.time()  # GIL-safe
                 jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
                 await asyncio.sleep(jitter)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"{self._node_info.node_id}: HB send error: {e}")
 
     async def _hb_run_parent_hb_loop(self) -> None:
         """Check whether the parent has gone silent; set parent_dead_event if so."""
