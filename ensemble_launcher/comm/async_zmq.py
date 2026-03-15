@@ -1,8 +1,10 @@
 import asyncio
 import functools
 import os
+import queue as _queue
 import random
 import socket
+import threading
 import time
 from asyncio import Queue
 from dataclasses import dataclass as _dataclass
@@ -89,13 +91,18 @@ class AsyncZMQComm(AsyncComm):
         self._child_monitor_started = False
         self._monitor_tasks: List[asyncio.Task] = []
 
-        # Heartbeat state — all asyncio-native, no threads or processes
-        self._hb_router: Optional[Any] = None   # zmq ROUTER socket for child HBs
-        self._hb_dealer: Optional[Any] = None   # zmq DEALER socket for parent HBs
-        self._hb_tasks: List[asyncio.Task] = []
-        self._hb_stop: Optional[asyncio.Event] = None
+        # Heartbeat state
+        # send/recv I/O runs in a dedicated thread with its own asyncio loop;
+        # monitoring loops (dead-detection, event-setting) stay in the main loop.
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in thread loop
+        self._hb_tasks: List[asyncio.Task] = []   # main-loop monitoring tasks
+        self._hb_stop: Optional[asyncio.Event] = None  # main-loop stop signal
+        # Timestamps written by HB thread, read by main-loop monitors (GIL-safe)
         self._last_parent_hb_time: Optional[float] = None
         self._last_child_hb_time: Dict[str, float] = {}
+        # asyncio.Events on main loop — set via call_soon_threadsafe from HB thread
         self._hb_parent_ready: Optional[asyncio.Event] = None
         self._hb_child_ready: Dict[str, asyncio.Event] = {}
         self._heartbeat_dead_threshold: float = heartbeat_dead_threshold
@@ -246,66 +253,33 @@ class AsyncZMQComm(AsyncComm):
             self._hb_child_ready[child_id] = asyncio.Event()
             self._last_child_hb_time[child_id] = time.time()
 
-        # Create dedicated HB ROUTER socket (receives HBs from children)
-        self._hb_router = self.zmq_context.socket(zmq.ROUTER, socket_class=Socket)
-        self._hb_router.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
+        # addr_q: thread reports back the actual bound HB address
+        main_loop = asyncio.get_running_loop()
+        addr_q: asyncio.Queue = asyncio.Queue()
 
-        actual_hb_address = self.my_hb_address
+        self._hb_thread = threading.Thread(
+            target=self._hb_thread_main,
+            args=(main_loop, addr_q),
+            daemon=True,
+            name=f"hb-{self._node_info.node_id}",
+        )
+        self._hb_thread.start()
+
+        # Wait for the thread to bind and report its address
         try:
-            self._hb_router.bind(f"tcp://{actual_hb_address}")
-        except Exception as e:
-            if "Address already in use" in str(e):
-                host = actual_hb_address.rsplit(":", 1)[0]
-                base_port = int(actual_hb_address.rsplit(":", 1)[1])
-                for _ in range(10):
-                    try:
-                        port = base_port + random.randint(1, 1000)
-                        actual_hb_address = f"{host}:{port}"
-                        self._hb_router.bind(f"tcp://{actual_hb_address}")
-                        break
-                    except Exception:
-                        continue
-                else:
-                    self.logger.error(
-                        f"{self._node_info.node_id}: Failed to bind HB router after 10 attempts"
-                    )
-                    self._hb_router.close()
-                    self._hb_router = None
-                    return
-            else:
-                self.logger.error(
-                    f"{self._node_info.node_id}: Failed to bind HB router: {e}"
+            actual_hb_addr = await asyncio.wait_for(addr_q.get(), timeout=10.0)
+            if actual_hb_addr is not None:
+                self.my_hb_address = actual_hb_addr
+                self.logger.info(
+                    f"{self._node_info.node_id}: HB thread bound to {self.my_hb_address}"
                 )
-                self._hb_router.close()
-                self._hb_router = None
-                return
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"{self._node_info.node_id}: HB thread did not report bound address"
+            )
 
-        self.my_hb_address = actual_hb_address
-        self.logger.info(
-            f"{self._node_info.node_id}: HB router bound to {self.my_hb_address}"
-        )
-
-        # Create dedicated HB DEALER socket (sends HBs to parent)
+        # Start main-loop monitoring tasks (dead-detection only, no ZMQ)
         if self.parent_hb_address:
-            self._hb_dealer = self.zmq_context.socket(zmq.DEALER, socket_class=Socket)
-            self._hb_dealer.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
-            self._hb_dealer.connect(f"tcp://{self.parent_hb_address}")
-            self.logger.info(
-                f"{self._node_info.node_id}: HB dealer connected to {self.parent_hb_address}"
-            )
-
-        # Start HB coroutines
-        self._hb_tasks.append(
-            asyncio.create_task(
-                self._hb_recv_from_children(), name=f"hb-recv-{self._node_info.node_id}"
-            )
-        )
-        if self._hb_dealer is not None:
-            self._hb_tasks.append(
-                asyncio.create_task(
-                    self._hb_send_to_parent(), name=f"hb-send-{self._node_info.node_id}"
-                )
-            )
             self._hb_tasks.append(
                 asyncio.create_task(
                     self._hb_run_parent_hb_loop(),
@@ -321,41 +295,128 @@ class AsyncZMQComm(AsyncComm):
             )
 
     # ------------------------------------------------------------------ #
-    # HB coroutines — all run in the main event loop                       #
+    # HB thread — dedicated loop for ZMQ send/recv so main loop is never  #
+    # starved of heartbeats under heavy task load                          #
     # ------------------------------------------------------------------ #
 
-    async def _hb_recv_from_children(self) -> None:
-        """Receive HBs from children on the HB router socket and reply."""
+    def _hb_thread_main(
+        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
+    ) -> None:
+        """Entry point for the HB thread. Creates its own event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._hb_thread_loop = loop
+        try:
+            loop.run_until_complete(self._hb_thread_coroutine(main_loop, addr_q))
+        finally:
+            loop.close()
+            self._hb_thread_loop = None
+
+    async def _hb_thread_coroutine(
+        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
+    ) -> None:
+        """Runs inside the HB thread's event loop."""
+        # Create the stop event in this loop so it can be awaited here
+        stop = asyncio.Event()
+        self._hb_asyncio_stop = stop  # exposed for call_soon_threadsafe from close()
+
+        ctx = Context()
+        router = ctx.socket(zmq.ROUTER, socket_class=Socket)
+        router.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
+
+        actual_hb_address = self.my_hb_address
+        try:
+            router.bind(f"tcp://{actual_hb_address}")
+        except Exception as e:
+            if "Address already in use" in str(e):
+                host = actual_hb_address.rsplit(":", 1)[0]
+                base_port = int(actual_hb_address.rsplit(":", 1)[1])
+                for _ in range(10):
+                    try:
+                        port = base_port + random.randint(1, 1000)
+                        actual_hb_address = f"{host}:{port}"
+                        router.bind(f"tcp://{actual_hb_address}")
+                        break
+                    except Exception:
+                        continue
+                else:
+                    main_loop.call_soon_threadsafe(addr_q.put_nowait, None)
+                    router.close()
+                    ctx.term()
+                    return
+            else:
+                main_loop.call_soon_threadsafe(addr_q.put_nowait, None)
+                router.close()
+                ctx.term()
+                return
+
+        # Report actual bound address back to the main loop
+        main_loop.call_soon_threadsafe(addr_q.put_nowait, actual_hb_address)
+
+        dealer = None
+        if self.parent_hb_address:
+            dealer = ctx.socket(zmq.DEALER, socket_class=Socket)
+            dealer.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
+            dealer.connect(f"tcp://{self.parent_hb_address}")
+
+        tasks = [
+            asyncio.create_task(
+                self._hb_recv_from_children_thread(router, main_loop, stop)
+            )
+        ]
+        if dealer is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self._hb_send_to_parent_thread(dealer, main_loop, stop)
+                )
+            )
+
+        await stop.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        router.close()
+        if dealer is not None:
+            dealer.close()
+        ctx.term()
+
+    async def _hb_recv_from_children_thread(
+        self,
+        router: Any,
+        main_loop: asyncio.AbstractEventLoop,
+        stop: asyncio.Event,
+    ) -> None:
+        """Receive HBs from children and echo back. Runs in HB thread's loop."""
         hb_bytes = cloudpickle.dumps(_HeartBeat())
-        while not self._hb_stop.is_set():
+        while not stop.is_set():
             try:
-                parts = await self._hb_router.recv_multipart()
+                parts = await router.recv_multipart()
                 sender_id = parts[0].decode()
-                self.logger.info(f"{self._node_info.node_id}: Received HB from {sender_id}")
-                self._last_child_hb_time[sender_id] = time.time()
+                self._last_child_hb_time[sender_id] = time.time()  # GIL-safe
                 ev = self._hb_child_ready.get(sender_id)
                 if ev is not None and not ev.is_set():
-                    ev.set()
-                    self.logger.info(
-                        f"{self._node_info.node_id}: HB child-ready set for {sender_id}"
-                    )
-                # Echo back so the child can confirm the parent is alive
-                await self._hb_router.send_multipart([parts[0], hb_bytes])
+                    main_loop.call_soon_threadsafe(ev.set)
+                await router.send_multipart([parts[0], hb_bytes])
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
 
-    async def _hb_send_to_parent(self) -> None:
-        """Send periodic HBs to parent on the HB dealer socket and await reply."""
+    async def _hb_send_to_parent_thread(
+        self,
+        dealer: Any,
+        main_loop: asyncio.AbstractEventLoop,
+        stop: asyncio.Event,
+    ) -> None:
+        """Send periodic HBs to parent and await reply. Runs in HB thread's loop."""
         hb_bytes = cloudpickle.dumps(_HeartBeat())
-        while not self._hb_stop.is_set():
+        while not stop.is_set():
             try:
-                await self._hb_dealer.send(hb_bytes)
-                await self._hb_dealer.recv()
+                await dealer.send(hb_bytes)
+                await dealer.recv()
                 if self._last_parent_hb_time is None and self._hb_parent_ready is not None:
-                    self._hb_parent_ready.set()
-                self._last_parent_hb_time = time.time()
+                    main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
+                self._last_parent_hb_time = time.time()  # GIL-safe
                 jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
                 await asyncio.sleep(jitter)
             except asyncio.CancelledError:
@@ -642,7 +703,7 @@ class AsyncZMQComm(AsyncComm):
             await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
         self._monitor_tasks.clear()
 
-        # Stop all HB tasks
+        # Stop main-loop HB monitoring tasks
         if self._hb_stop is not None:
             self._hb_stop.set()
         for t in self._hb_tasks:
@@ -651,11 +712,13 @@ class AsyncZMQComm(AsyncComm):
         if self._hb_tasks:
             await asyncio.gather(*self._hb_tasks, return_exceptions=True)
         self._hb_tasks.clear()
-        if self._hb_router is not None:
-            self._hb_router.close()
-        if self._hb_dealer is not None:
-            self._hb_dealer.close()
-        self.logger.info("Stopped the HB tasks")
+
+        # Stop the HB thread — signal its asyncio stop event, then join
+        if self._hb_thread_loop is not None and self._hb_asyncio_stop is not None:
+            self._hb_thread_loop.call_soon_threadsafe(self._hb_asyncio_stop.set)
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=5.0)
+        self.logger.info("Stopped the HB thread")
 
         await super().clear_cache()
         try:
