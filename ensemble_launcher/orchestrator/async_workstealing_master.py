@@ -41,9 +41,6 @@ class AsyncWorkStealingMaster(AsyncMaster):
         """Initialise work-stealing specific state on top of AsyncMaster."""
         super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
 
-        self._task_monitor_tasks: List[asyncio.Task] = []
-        self._stop_task_monitor_event = asyncio.Event()
-        self._monitor_task_requests_task: Optional[asyncio.Task] = None
         self._all_work_done_event = asyncio.Event()
         self._relaunch_attempts = 0
         self._max_relaunch_attempts = 2
@@ -97,7 +94,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
     # ------------------------------------------------------------------
 
     async def _monitor_single_child_task_requests(self, child_id: str) -> None:
-        """Serve task requests from a single child until the stop event is set.
+        """Serve task requests from a single child until cancelled.
 
         Blocks on each TaskRequest, assigns tasks from the unassigned pool via
         the scheduler, and replies with a TaskUpdate or a Stop(TERMINATE) if the
@@ -108,7 +105,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         )
         failures = 0
 
-        while not self._stop_task_monitor_event.is_set():
+        while True:
             try:
                 task_request: TaskRequest = await self._comm.recv_message_from_child(
                     TaskRequest, child_id=child_id, block=True
@@ -162,68 +159,20 @@ class AsyncWorkStealingMaster(AsyncMaster):
             f"{self.node_id}: Stopped monitoring task requests from child {child_id}"
         )
 
-    async def monitor_task_requests(self) -> None:
-        """Spawn one _monitor_single_child_task_requests coroutine per child and await all."""
-        if len(self.children) == 0:
-            self.logger.info(
-                f"{self.node_id}: No children to monitor for task requests"
-            )
-            return
-
-        self.logger.info(
-            f"{self.node_id}: Starting task request monitor for {len(self.children)} children"
-        )
-
-        self._task_monitor_tasks = [
-            asyncio.create_task(
-                self._monitor_single_child_task_requests(child_id),
-                name=f"task_monitor_{child_id}",
-            )
-            for child_id in self.children
-        ]
-
-        await asyncio.gather(*self._task_monitor_tasks, return_exceptions=True)
-        self.logger.info(f"{self.node_id}: Task request monitor stopped")
-
     # ------------------------------------------------------------------
     # Fault tolerance overrides
     # ------------------------------------------------------------------
 
     async def _recover_dead_child(self, child_id: str) -> List[str]:
-        """Recover a dead child: cancel its task-request monitor, call super, start monitors for new children."""
-        # Cancel the task-request monitor for the dead child
-        dead_monitors = [
-            t
-            for t in self._task_monitor_tasks
-            if t.get_name() == f"task_monitor_{child_id}"
-        ]
-        for t in dead_monitors:
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-        self._task_monitor_tasks = [t for t in self._task_monitor_tasks if not t.done()]
-
-        # Base class tears down, relaunches, and returns new child IDs
-        new_child_ids = await super()._recover_dead_child(child_id)
-
-        # Start task-request monitors for the new children
-        for cid in new_child_ids:
-            task = asyncio.create_task(
-                self._monitor_single_child_task_requests(cid),
-                name=f"task_monitor_{cid}",
-            )
-            self._task_monitor_tasks.append(task)
-
-        return new_child_ids
+        """Recover a dead child: delegate to base (handles teardown and re-init of monitors)."""
+        return await super()._recover_dead_child(child_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def _lazy_init(self) -> None:
-        """Extend base lazy init: start the task-request monitor at the leaf level."""
+        """Extend base lazy init: log work-stealing pool size at the leaf level."""
         await super()._lazy_init()
 
         self.logger.info(f"I am workstealing master")
@@ -232,10 +181,6 @@ class AsyncWorkStealingMaster(AsyncMaster):
             self.logger.info(
                 f"{self.node_id}: Work-stealing mode — {len(self._scheduler.unassigned_task_ids)} tasks in unassigned pool"
             )
-            self._monitor_task_requests_task = asyncio.create_task(
-                self.monitor_task_requests()
-            )
-            self.logger.info(f"{self.node_id}: Started task request monitor")
 
     def _mark_and_launch(self, child_ids: List[str], future) -> None:
         """Apply state transitions and relaunch children for remaining tasks.
@@ -304,15 +249,6 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         f"{self.node_id}: Failed to sync with relaunched child {child_id}: {result.exception}"
                     )
                     await self._teardown_child(child_id)
-                else:
-                    task = asyncio.create_task(
-                        self._monitor_single_child_task_requests(child_id),
-                        name=f"task_monitor_{child_id}",
-                    )
-                    self._task_monitor_tasks.append(task)
-                    self.logger.info(
-                        f"{self.node_id}: Started task monitor for relaunched child {child_id}"
-                    )
 
         except Exception as e:
             self.logger.error(f"{self.node_id}: Error during relaunch: {e}")
@@ -416,31 +352,5 @@ class AsyncWorkStealingMaster(AsyncMaster):
             sys.exit(1)
 
     async def stop(self) -> None:
-        """Extend the base master stop with work-stealing-specific cleanup.
-
-        1. Signal and cancel all per-child task-monitor coroutines
-           (``_task_monitor_tasks``) that watch for steal-able tasks.
-        2. Cancel the ``_monitor_task_requests_task`` that listens for steal
-           requests from children.
-        3. Delegate to ``AsyncMaster.stop()`` for the standard teardown
-           sequence (child teardown, monitors, comm, executor).
-        """
-        if self._task_monitor_tasks:
-            self._stop_task_monitor_event.set()
-            self.logger.info(f"{self.node_id}: Signaled task monitor tasks to stop")
-            for task in self._task_monitor_tasks:
-                task.cancel()
-            await asyncio.gather(*self._task_monitor_tasks, return_exceptions=True)
-            self.logger.info(f"{self.node_id}: All task monitor tasks stopped")
-
-        if (
-            self._monitor_task_requests_task
-            and not self._monitor_task_requests_task.done()
-        ):
-            self._monitor_task_requests_task.cancel()
-            try:
-                await self._monitor_task_requests_task
-            except asyncio.CancelledError:
-                pass
-
+        """Delegate to AsyncMaster.stop() — per-child monitors are cancelled by _teardown_child."""
         return await super().stop()

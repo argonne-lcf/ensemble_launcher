@@ -15,12 +15,14 @@ from ensemble_launcher.comm import (
     AsyncZMQComm,
     AsyncZMQCommState,
     NodeInfo,
+    NodeRequest,
     NodeUpdate,
     Result,
     ResultBatch,
     Status,
     Stop,
     StopType,
+    TaskRequest,
     TaskUpdate,
 )
 from ensemble_launcher.comm.messages import ResultAck
@@ -104,6 +106,10 @@ class AsyncWorker(Node):
         self._task_update_task = None
         self._client_handler_task: Optional[asyncio.Task] = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
+
+        # Node update monitor state
+        self._stop_node_update = asyncio.Event()
+        self._node_update_task = None
 
         # Cluster mode / workstealing mode
         self._stop_signal_received = asyncio.Event()
@@ -193,6 +199,9 @@ class AsyncWorker(Node):
 
         ##start reporting loop
         self._reporting_task = asyncio.create_task(self.report_status())
+
+        if self.parent:
+            self._node_update_task = asyncio.create_task(self._node_update_monitor())
 
         if self._config.cluster and self.parent:
             self._task_update_task = asyncio.create_task(self._task_update_monitor())
@@ -401,45 +410,56 @@ class AsyncWorker(Node):
     # --------------------------------------------------------------------------
 
     async def _receive_initial_tasks(self) -> None:
-        """Receive initial task assignment from parent into _init_tasks. Overridable by subclasses."""
-        task_update: TaskUpdate = await self._comm.recv_message_from_parent(
-            TaskUpdate, timeout=5.0
-        )
-        if task_update is not None:
-            self.logger.info(
-                f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
+        """Request initial task assignment from parent and retry until received."""
+        max_retries = 100 if not self._config.cluster else 2
+        for attempt in range(max_retries):
+            if self._comm.parent_dead_event.is_set():
+                break
+            await self._comm.send_message_to_parent(
+                TaskRequest(sender=self.node_id, ntasks=0, free_resources=self._init_nodes)
             )
-            for task in task_update.added_tasks:
-                self._init_tasks[task.task_id] = task
+            task_update = await self._comm.recv_message_from_parent(TaskUpdate, timeout=5.0)
+            if task_update is not None:
+                self.logger.info(
+                    f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
+                )
+                for task in task_update.added_tasks:
+                    self._init_tasks[task.task_id] = task
+                break
+            self.logger.warning(
+                f"{self.node_id}: TaskRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
+            )
 
     async def _sync_with_parent(self) -> None:
         """Perform initial handshake with the parent: heartbeat, node update, task update."""
+        if self.parent is None:
+            return
         # sync heart beat with parent
         async with self._timer("heartbeat_sync"):
-            if self.parent and not await self._comm.sync_heartbeat_with_parent(
-                timeout=30.0
+            if not await self._comm.sync_heartbeat_with_parent(
+                timeout=100.0
             ):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
-        node_update: NodeUpdate = await self._comm.recv_message_from_parent(
-            NodeUpdate, timeout=10.0
-        )
-        if node_update is not None:
-            self.logger.info(f"{self.node_id}: Received node update from parent")
-            if node_update.nodes:
+        max_retries = 100
+        for attempt in range(max_retries):
+            if self._comm.parent_dead_event.is_set():
+                raise RuntimeError(f"{self.node_id}: Parent died while waiting for NodeUpdate")
+            await self._comm.send_message_to_parent(NodeRequest(sender=self.node_id))
+            node_update = await self._comm.recv_message_from_parent(NodeUpdate, timeout=5.0)
+            if node_update is not None and node_update.nodes:
                 self._init_nodes = node_update.nodes
                 self.logger.info(
-                    f"{self.node_id}: Updated nodes list with {len(self._init_nodes.nodes)} nodes"
+                    f"{self.node_id}: Received NodeUpdate with {len(self._init_nodes.nodes)} nodes"
                 )
-                self.logger.info(f"{self.node_id}: Nodes details: {self._init_nodes}")
-            else:
-                self.logger.warning(
-                    f"{self.node_id}: Received empty node update from parent"
-                )
-        else:
+                break
             self.logger.warning(
-                f"{self.node_id}: No node update received from parent at start"
+                f"{self.node_id}: NodeRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
+            )
+        else:
+            raise RuntimeError(
+                f"{self.node_id}: Failed to receive NodeUpdate after {max_retries} retries"
             )
 
         await self._receive_initial_tasks()
@@ -551,6 +571,24 @@ class AsyncWorker(Node):
                 for task in msg.added_tasks:
                     self._client_task_map[task.task_id] = client_id
                 self._update_tasks(msg)
+
+    async def _node_update_monitor(self) -> None:
+        """Receive NodeUpdate messages from parent and update resource allocation."""
+        while not self._stop_node_update.is_set():
+            try:
+                node_update = await self._comm.recv_message_from_parent(
+                    NodeUpdate, block=True
+                )
+                if node_update is not None and node_update.nodes:
+                    self.nodes = node_update.nodes
+                    self.logger.info(
+                        f"{self.node_id}: Node update received: {len(node_update.nodes.nodes)} nodes"
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Node update monitor error: {e}")
+                await asyncio.sleep(0.1)
 
     async def _task_update_monitor(self) -> None:
         """Receive TaskUpdate messages from parent and incorporate new tasks."""
@@ -739,10 +777,12 @@ class AsyncWorker(Node):
         self._stop_submission.set()
         self._stop_reporting.set()
         self._stop_task_update.set()
+        self._stop_node_update.set()
         for task in [
             self._submission_task,
             self._reporting_task,
             self._task_update_task,
+            self._node_update_task,
             self._client_handler_task,
         ]:
             if task is not None and not task.done():

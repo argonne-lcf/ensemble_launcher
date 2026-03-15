@@ -18,6 +18,7 @@ from ensemble_launcher.comm import (
     NodeInfo,
 )
 from ensemble_launcher.comm.messages import (
+    NodeRequest,
     NodeUpdate,
     Result,
     ResultAck,
@@ -25,6 +26,7 @@ from ensemble_launcher.comm.messages import (
     Status,
     Stop,
     StopType,
+    TaskRequest,
     TaskUpdate,
 )
 from ensemble_launcher.config import LauncherConfig
@@ -121,6 +123,9 @@ class AsyncMaster(Node):
         self._reporting_task: asyncio.Task = None
         self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
         self._stop_signal_received = asyncio.Event()
+
+        # Per-child task request monitor tasks
+        self._child_task_request_task: Dict[str, asyncio.Task] = {}
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -348,6 +353,10 @@ class AsyncMaster(Node):
         )
         # Per-child liveness monitor (waits for HB process dead event).
         asyncio.create_task(self._child_liveness_monitor(child_id))
+        # Per-child task request monitor (handles initial or continuous TaskRequests).
+        self._child_task_request_task[child_id] = asyncio.create_task(
+            self._monitor_single_child_task_requests(child_id)
+        )
         if self._config.cluster:
             self._child_forwarder_task[child_id] = asyncio.create_task(
                 self._child_result_monitor(child_id)
@@ -507,7 +516,6 @@ class AsyncMaster(Node):
                     child_dict = child_obj.asdict()
                     for key, value in child_dict.items():
                         if key not in common_keys:
-                            self.logger.info(f"{key} not int common keys")
                             if hostname not in final_dict[key]:
                                 final_dict[key][hostname] = [value]
                             else:
@@ -850,43 +858,54 @@ class AsyncMaster(Node):
     async def _sync_with_parent(self) -> None:
         """Perform initial handshake with the parent: heartbeat, node update, task update."""
         # sync heart beat with parent
+        if self.parent is None:
+            return
         async with self._timer("heartbeat_sync"):
-            if self.parent and not await self._comm.sync_heartbeat_with_parent(
-                timeout=30.0
+            if not await self._comm.sync_heartbeat_with_parent(
+                timeout=100.0
             ):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
-        node_update: NodeUpdate = await self._comm.recv_message_from_parent(
-            NodeUpdate, timeout=10.0
-        )
-        if node_update is not None:
-            self.logger.info(f"{self.node_id}: Received node update from parent")
-            if node_update.nodes:
+        max_retries = 100
+        for attempt in range(max_retries):
+            if self._comm.parent_dead_event.is_set():
+                raise RuntimeError(f"{self.node_id}: Parent died while waiting for NodeUpdate")
+            await self._comm.send_message_to_parent(NodeRequest(sender=self.node_id))
+            node_update = await self._comm.recv_message_from_parent(NodeUpdate, timeout=5.0)
+            if node_update is not None and node_update.nodes:
                 self._init_nodes = node_update.nodes
                 self.logger.info(
-                    f"{self.node_id}: Updated nodes list with {len(self._init_nodes.nodes)} nodes"
+                    f"{self.node_id}: Received NodeUpdate with {len(self._init_nodes.nodes)} nodes"
                 )
-                self.logger.debug(f"{self.node_id}: Nodes details: {self._init_nodes}")
-            else:
-                self.logger.warning(
-                    f"{self.node_id}: Received empty node update from parent"
-                )
-        else:
+                break
             self.logger.warning(
-                f"{self.node_id}: No node update received from parent at start"
+                f"{self.node_id}: NodeRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
+            )
+        else:
+            raise RuntimeError(
+                f"{self.node_id}: Failed to receive NodeUpdate after {max_retries} retries"
             )
 
-        # Receive task update from parent
-        task_update: TaskUpdate = await self._comm.recv_message_from_parent(
-            TaskUpdate, timeout=5.0
-        )
-        if task_update is not None:
-            self.logger.info(
-                f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
+        # Request initial task assignment from parent
+        max_retries = 100 if not self._config.cluster else 2
+        for attempt in range(max_retries):
+            if self._comm.parent_dead_event.is_set():
+                break
+            await self._comm.send_message_to_parent(
+                TaskRequest(sender=self.node_id, ntasks=0, free_resources=self._init_nodes)
             )
-            for task in task_update.added_tasks:
-                self._init_tasks[task.task_id] = task
+            task_update = await self._comm.recv_message_from_parent(TaskUpdate, timeout=5.0)
+            if task_update is not None:
+                self.logger.info(
+                    f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
+                )
+                for task in task_update.added_tasks:
+                    self._init_tasks[task.task_id] = task
+                break
+            self.logger.warning(
+                f"{self.node_id}: TaskRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
+            )
 
         return
 
@@ -954,7 +973,6 @@ class AsyncMaster(Node):
         self,
         child_id: str,
         node_update: Optional[NodeUpdate],
-        task_update: Optional[TaskUpdate],
     ) -> Optional[Result]:
         """
         Sync with a single child and send initial node/task updates.
@@ -962,30 +980,32 @@ class AsyncMaster(Node):
         Args:
             child_id: The ID of the child to sync with
             node_update: NodeUpdate message to send to the child
-            task_update: TaskUpdate message to send to the child
 
         Returns:
             None if successful, Result object with exception if failed
         """
         # Sync heartbeat with child
         if not await self._comm.sync_heartbeat_with_child(
-            child_id=child_id, timeout=100.0
+            child_id=child_id, timeout=600.0
         ):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
             return await self._get_child_exception(child_id)
         self.logger.info(f"Successfully synced heart beat")
-        # Send node update first
+
+        # Wait for NodeRequest from child before sending NodeUpdate
+        node_req = await self._comm.recv_message_from_child(
+            NodeRequest, child_id=child_id, timeout=600.0
+        )
+        if node_req is None:
+            self.logger.warning(
+                f"{self.node_id}: No NodeRequest from {child_id}, sending NodeUpdate anyway"
+            )
+
+        # Send NodeUpdate (now triggered by child's request)
         if node_update is not None:
             await self._comm.send_message_to_child(child_id, node_update)
             self.logger.info(
                 f"{self.node_id}: Sent node update to {child_id} containing {len(node_update.nodes.nodes)} nodes"
-            )
-
-        # Then send task update
-        if task_update is not None:
-            await self._comm.send_message_to_child(child_id, task_update)
-            self.logger.info(
-                f"{self.node_id}: Sent task update to {child_id} containing {len(task_update.added_tasks)} tasks"
             )
 
         return None
@@ -1000,15 +1020,28 @@ class AsyncMaster(Node):
             # Create node update
             node_update = self._build_init_node_update(child_id)
 
-            # Create task update
-            task_update = self._build_init_task_update(child_id)
+            ##Task update handled by the seperate tast request monitor
 
             # Add sync task
-            sync_tasks.append(self._sync_with_child(child_id, node_update, task_update))
+            sync_tasks.append(self._sync_with_child(child_id, node_update))
 
         # Sync with all children in parallel
         results = await asyncio.gather(*sync_tasks, return_exceptions=True)
         return results
+
+    async def _monitor_single_child_task_requests(self, child_id: str) -> None:
+        """Base: receive initial TaskRequest from child and respond with pre-assigned tasks."""
+        task_req = await self._comm.recv_message_from_child(
+            TaskRequest, child_id=child_id, block=True
+        )
+        if task_req is not None:
+            task_update = self._build_init_task_update(child_id)
+            if task_update is not None:
+                await self._comm.send_message_to_child(child_id, task_update)
+                self.logger.info(
+                    f"{self.node_id}: Sent initial task update to {child_id} "
+                    f"containing {len(task_update.added_tasks)} tasks"
+                )
 
     async def _launch_and_sync_children(
         self, child_names: List[str]
@@ -1463,6 +1496,7 @@ class AsyncMaster(Node):
             self._child_result_batch_task,
             self._child_status_task,
             self._child_forwarder_task,
+            self._child_task_request_task,
         ):
             t = task_dict.pop(child_id, None)
             if t is not None:
@@ -1507,6 +1541,7 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
             self.logger.info("Stopped parent task update monitor")
+
 
         # Tear down children and wait for them to be done
         for child_name in self._scheduler.children_names:

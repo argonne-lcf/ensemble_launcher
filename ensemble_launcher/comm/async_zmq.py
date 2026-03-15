@@ -92,17 +92,24 @@ class AsyncZMQComm(AsyncComm):
         self._monitor_tasks: List[asyncio.Task] = []
 
         # Heartbeat state
-        # send/recv I/O runs in a dedicated thread with its own asyncio loop;
-        # monitoring loops (dead-detection, event-setting) stay in the main loop.
-        self._hb_thread: Optional[threading.Thread] = None
-        self._hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in thread loop
+        # Parent and children HB I/O each run in their own dedicated thread with a
+        # separate asyncio loop; dead-detection monitoring stays in the main loop.
+        self._parent_hb_thread: Optional[threading.Thread] = None
+        self._parent_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._parent_hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in parent thread loop
+        self._parent_hb_started: bool = False
+
+        self._children_hb_thread: Optional[threading.Thread] = None
+        self._children_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._children_hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in children thread loop
+        self._children_hb_started: bool = False
+
         self._hb_tasks: List[asyncio.Task] = []   # main-loop monitoring tasks
         self._hb_stop: Optional[asyncio.Event] = None  # main-loop stop signal
-        # Timestamps written by HB thread, read by main-loop monitors (GIL-safe)
+        # Timestamps written by HB threads, read by main-loop monitors (GIL-safe)
         self._last_parent_hb_time: Optional[float] = None
         self._last_child_hb_time: Dict[str, float] = {}
-        # asyncio.Events on main loop — set via call_soon_threadsafe from HB thread
+        # asyncio.Events on main loop — set via call_soon_threadsafe from HB threads
         self._hb_parent_ready: Optional[asyncio.Event] = None
         self._hb_child_ready: Dict[str, asyncio.Event] = {}
         self._heartbeat_dead_threshold: float = heartbeat_dead_threshold
@@ -115,7 +122,7 @@ class AsyncZMQComm(AsyncComm):
             self._child_dead_events[child_id] = asyncio.Event()
             self._hb_child_ready[child_id] = asyncio.Event()
             self._last_child_hb_time[child_id] = time.time()
-            if self._hb_stop is not None:
+            if self._children_hb_started:
                 t = asyncio.create_task(
                     self._hb_run_child_hb_loop(child_id),
                     name=f"hb-child-{child_id}",
@@ -237,88 +244,125 @@ class AsyncZMQComm(AsyncComm):
                 self._monitor_tasks.append(asyncio.create_task(self._monitor_child_sockets()))
                 self._child_monitor_started = True
 
-        # Idempotency guard: only start HB once
-        if self._hb_stop is not None:
-            return
-
-        self._hb_stop = asyncio.Event()
-
-        # Initialise asyncio events for parent / known children
-        if self._node_info.parent_id:
-            self.parent_dead_event = asyncio.Event()
-            self._hb_parent_ready = asyncio.Event()
-
-        for child_id in self._node_info.children_ids:
-            self._child_dead_events[child_id] = asyncio.Event()
-            self._hb_child_ready[child_id] = asyncio.Event()
-            self._last_child_hb_time[child_id] = time.time()
-
-        # addr_q: thread reports back the actual bound HB address
+        parent_only = kwargs.get("parent_only", False)
+        children_only = kwargs.get("children_only", False)
         main_loop = asyncio.get_running_loop()
-        addr_q: asyncio.Queue = asyncio.Queue()
 
-        self._hb_thread = threading.Thread(
-            target=self._hb_thread_main,
-            args=(main_loop, addr_q),
-            daemon=True,
-            name=f"hb-{self._node_info.node_id}",
-        )
-        self._hb_thread.start()
+        if self._hb_stop is None:
+            self._hb_stop = asyncio.Event()
 
-        # Wait for the thread to bind and report its address
-        try:
-            actual_hb_addr = await asyncio.wait_for(addr_q.get(), timeout=10.0)
-            if actual_hb_addr is not None:
-                self.my_hb_address = actual_hb_addr
-                self.logger.info(
-                    f"{self._node_info.node_id}: HB thread bound to {self.my_hb_address}"
-                )
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                f"{self._node_info.node_id}: HB thread did not report bound address"
+        # --- Parent HB thread (DEALER → parent) ---
+        if not children_only and self.parent_hb_address and not self._parent_hb_started:
+            self._parent_hb_started = True
+            if self._node_info.parent_id:
+                self.parent_dead_event = asyncio.Event()
+                self._hb_parent_ready = asyncio.Event()
+            self._parent_hb_thread = threading.Thread(
+                target=self._parent_hb_thread_main,
+                args=(main_loop,),
+                daemon=True,
+                name=f"hb-parent-{self._node_info.node_id}",
             )
-
-        # Start main-loop monitoring tasks (dead-detection only, no ZMQ)
-        if self.parent_hb_address:
+            self._parent_hb_thread.start()
             self._hb_tasks.append(
                 asyncio.create_task(
                     self._hb_run_parent_hb_loop(),
                     name=f"hb-parent-loop-{self._node_info.node_id}",
                 )
             )
-        for child_id in list(self._last_child_hb_time.keys()):
-            self._hb_tasks.append(
-                asyncio.create_task(
-                    self._hb_run_child_hb_loop(child_id),
-                    name=f"hb-child-{child_id}",
-                )
+
+        # --- Children HB thread (ROUTER ← children) ---
+        if not parent_only and not self._children_hb_started:
+            self._children_hb_started = True
+            for child_id in self._node_info.children_ids:
+                self._child_dead_events[child_id] = asyncio.Event()
+                self._hb_child_ready[child_id] = asyncio.Event()
+                self._last_child_hb_time[child_id] = time.time()
+
+            addr_q: asyncio.Queue = asyncio.Queue()
+            self._children_hb_thread = threading.Thread(
+                target=self._children_hb_thread_main,
+                args=(main_loop, addr_q),
+                daemon=True,
+                name=f"hb-children-{self._node_info.node_id}",
             )
+            self._children_hb_thread.start()
+
+            # Wait for the thread to bind and report its address
+            try:
+                actual_hb_addr = await asyncio.wait_for(addr_q.get(), timeout=10.0)
+                if actual_hb_addr is not None:
+                    self.my_hb_address = actual_hb_addr
+                    self.logger.info(
+                        f"{self._node_info.node_id}: Children HB thread bound to {self.my_hb_address}"
+                    )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"{self._node_info.node_id}: Children HB thread did not report bound address"
+                )
+
+            for child_id in list(self._last_child_hb_time.keys()):
+                self._hb_tasks.append(
+                    asyncio.create_task(
+                        self._hb_run_child_hb_loop(child_id),
+                        name=f"hb-child-{child_id}",
+                    )
+                )
 
     # ------------------------------------------------------------------ #
     # HB thread — dedicated loop for ZMQ send/recv so main loop is never  #
     # starved of heartbeats under heavy task load                          #
     # ------------------------------------------------------------------ #
 
-    def _hb_thread_main(
-        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
-    ) -> None:
-        """Entry point for the HB thread. Creates its own event loop."""
+    def _parent_hb_thread_main(self, main_loop: asyncio.AbstractEventLoop) -> None:
+        """Entry point for the parent HB thread. Creates its own event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self._hb_thread_loop = loop
+        self._parent_hb_thread_loop = loop
         try:
-            loop.run_until_complete(self._hb_thread_coroutine(main_loop, addr_q))
+            loop.run_until_complete(self._parent_hb_coroutine(main_loop))
         finally:
             loop.close()
-            self._hb_thread_loop = None
+            self._parent_hb_thread_loop = None
 
-    async def _hb_thread_coroutine(
+    async def _parent_hb_coroutine(self, main_loop: asyncio.AbstractEventLoop) -> None:
+        """Runs inside the parent HB thread's event loop: sends HBs to parent."""
+        stop = asyncio.Event()
+        self._parent_hb_asyncio_stop = stop
+
+        ctx = Context()
+        dealer = ctx.socket(zmq.DEALER, socket_class=Socket)
+        dealer.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
+        dealer.connect(f"tcp://{self.parent_hb_address}")
+
+        task = asyncio.create_task(
+            self._hb_send_to_parent_thread(dealer, main_loop, stop)
+        )
+        await stop.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        dealer.close()
+        ctx.term()
+
+    def _children_hb_thread_main(
         self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
     ) -> None:
-        """Runs inside the HB thread's event loop."""
-        # Create the stop event in this loop so it can be awaited here
+        """Entry point for the children HB thread. Creates its own event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._children_hb_thread_loop = loop
+        try:
+            loop.run_until_complete(self._children_hb_coroutine(main_loop, addr_q))
+        finally:
+            loop.close()
+            self._children_hb_thread_loop = None
+
+    async def _children_hb_coroutine(
+        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
+    ) -> None:
+        """Runs inside the children HB thread's event loop: receives HBs from children."""
         stop = asyncio.Event()
-        self._hb_asyncio_stop = stop  # exposed for call_soon_threadsafe from close()
+        self._children_hb_asyncio_stop = stop
 
         ctx = Context()
         router = ctx.socket(zmq.ROUTER, socket_class=Socket)
@@ -353,31 +397,13 @@ class AsyncZMQComm(AsyncComm):
         # Report actual bound address back to the main loop
         main_loop.call_soon_threadsafe(addr_q.put_nowait, actual_hb_address)
 
-        dealer = None
-        if self.parent_hb_address:
-            dealer = ctx.socket(zmq.DEALER, socket_class=Socket)
-            dealer.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
-            dealer.connect(f"tcp://{self.parent_hb_address}")
-
-        tasks = [
-            asyncio.create_task(
-                self._hb_recv_from_children_thread(router, main_loop, stop)
-            )
-        ]
-        if dealer is not None:
-            tasks.append(
-                asyncio.create_task(
-                    self._hb_send_to_parent_thread(dealer, main_loop, stop)
-                )
-            )
-
+        task = asyncio.create_task(
+            self._hb_recv_from_children_thread(router, main_loop, stop)
+        )
         await stop.wait()
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         router.close()
-        if dealer is not None:
-            dealer.close()
         ctx.term()
 
     async def _hb_recv_from_children_thread(
@@ -719,12 +745,19 @@ class AsyncZMQComm(AsyncComm):
             await asyncio.gather(*self._hb_tasks, return_exceptions=True)
         self._hb_tasks.clear()
 
-        # Stop the HB thread — signal its asyncio stop event, then join
-        if self._hb_thread_loop is not None and self._hb_asyncio_stop is not None:
-            self._hb_thread_loop.call_soon_threadsafe(self._hb_asyncio_stop.set)
-        if self._hb_thread is not None:
-            self._hb_thread.join(timeout=5.0)
-        self.logger.info("Stopped the HB thread")
+        # Stop parent HB thread
+        if self._parent_hb_thread_loop is not None and self._parent_hb_asyncio_stop is not None:
+            self._parent_hb_thread_loop.call_soon_threadsafe(self._parent_hb_asyncio_stop.set)
+        if self._parent_hb_thread is not None:
+            self._parent_hb_thread.join(timeout=5.0)
+
+        # Stop children HB thread
+        if self._children_hb_thread_loop is not None and self._children_hb_asyncio_stop is not None:
+            self._children_hb_thread_loop.call_soon_threadsafe(self._children_hb_asyncio_stop.set)
+        if self._children_hb_thread is not None:
+            self._children_hb_thread.join(timeout=5.0)
+
+        self.logger.info("Stopped HB threads")
 
         await super().clear_cache()
         try:

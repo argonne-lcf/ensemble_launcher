@@ -150,6 +150,11 @@ class TaskRequest(Message):
     free_resources: Optional[JobResource] = None
 
 
+@dataclass
+class NodeRequest(Message):
+    pass
+
+
 all_messages = [
     Message,
     Status,
@@ -160,4 +165,5 @@ all_messages = [
     ResultAck,
     Stop,
     TaskRequest,
+    NodeRequest,
 ]

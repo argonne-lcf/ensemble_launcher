@@ -3,6 +3,7 @@ from .async_zmq import AsyncZMQComm, AsyncZMQCommState
 from .base import Comm
 from .messages import (
     Message,
+    NodeRequest,
     NodeUpdate,
     Result,
     ResultAck,
@@ -23,6 +24,7 @@ __all__ = [
     "AsyncZMQComm",
     "Comm",
     "Message",
+    "NodeRequest",
     "NodeUpdate",
     "Result",
     "ResultAck",
