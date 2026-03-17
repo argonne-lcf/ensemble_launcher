@@ -121,7 +121,7 @@ class AsyncZMQComm(AsyncComm):
         for child_id in added_children:
             self._child_dead_events[child_id] = asyncio.Event()
             self._hb_child_ready[child_id] = asyncio.Event()
-            self._last_child_hb_time[child_id] = time.time()
+            self._last_child_hb_time[child_id] = None
             if self._children_hb_started:
                 t = asyncio.create_task(
                     self._hb_run_child_hb_loop(child_id),
@@ -277,7 +277,7 @@ class AsyncZMQComm(AsyncComm):
             for child_id in self._node_info.children_ids:
                 self._child_dead_events[child_id] = asyncio.Event()
                 self._hb_child_ready[child_id] = asyncio.Event()
-                self._last_child_hb_time[child_id] = time.time()
+                self._last_child_hb_time[child_id] = None
 
             addr_q: asyncio.Queue = asyncio.Queue()
             self._children_hb_thread = threading.Thread(
@@ -413,11 +413,21 @@ class AsyncZMQComm(AsyncComm):
         stop: asyncio.Event,
     ) -> None:
         """Receive HBs from children and echo back. Runs in HB thread's loop."""
-        hb_bytes = cloudpickle.dumps(_HeartBeat())
         while not stop.is_set():
             try:
                 parts = await router.recv_multipart()
                 sender_id = parts[0].decode()
+                # Parse child's secret_id from the HB payload.
+                # The child verifies the echo matches its own secret_id (see _hb_send_to_parent_thread).
+                child_secret_id, _ = cloudpickle.loads(parts[1])
+                expected = self._node_info.children_secret_ids.get(sender_id)
+                if expected is not None and child_secret_id != expected:
+                    self.logger.warning(
+                        f"{self._node_info.node_id}: HB from {sender_id} has unexpected secret_id — "
+                        f"expecting {expected}, got {child_secret_id}"
+                        f"stale connection, ignoring"
+                    )
+                    continue
                 self._last_child_hb_time[sender_id] = time.time()  # GIL-safe
                 ev = self._hb_child_ready.get(sender_id)
                 if ev is not None and not ev.is_set():
@@ -425,7 +435,9 @@ class AsyncZMQComm(AsyncComm):
                         main_loop.call_soon_threadsafe(ev.set)
                     except RuntimeError:
                         pass  # main loop already closed
-                await router.send_multipart([parts[0], hb_bytes])
+                # Echo secret_id back as a single pickled frame so the child
+                # can validate it with `secret_id == self._node_info.parent_secret_id`.
+                await router.send_multipart([parts[0], cloudpickle.dumps((self._node_info.secret_id, _HeartBeat()))])
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -438,12 +450,17 @@ class AsyncZMQComm(AsyncComm):
         stop: asyncio.Event,
     ) -> None:
         """Send periodic HBs to parent and await reply. Runs in HB thread's loop."""
-        hb_bytes = cloudpickle.dumps(_HeartBeat())
+        hb_bytes = cloudpickle.dumps((self._node_info.secret_id, _HeartBeat()))
         while not stop.is_set():
             try:
                 await dealer.send(hb_bytes)
-                await dealer.recv()
-                if self._last_parent_hb_time is None and self._hb_parent_ready is not None:
+                while True:
+                    msg = await dealer.recv()
+                    parent_secret_id, _ = cloudpickle.loads(msg)
+                    if parent_secret_id == self._node_info.parent_secret_id:
+                        break
+
+                if self._hb_parent_ready is not None and not self._hb_parent_ready.is_set():
                     try:
                         main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
                     except RuntimeError:
@@ -458,6 +475,8 @@ class AsyncZMQComm(AsyncComm):
 
     async def _hb_run_parent_hb_loop(self) -> None:
         """Check whether the parent has gone silent; set parent_dead_event if so."""
+        # The parent need to be marked ready before deciding its death
+        await self._hb_parent_ready.wait()
         while not self._hb_stop.is_set():
             jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
             try:
@@ -477,6 +496,8 @@ class AsyncZMQComm(AsyncComm):
 
     async def _hb_run_child_hb_loop(self, child_id: str) -> None:
         """Check whether a child has gone silent; set its dead event if so."""
+        # The child need to be ready first to mark it dead or alive
+        await self._hb_child_ready.get(child_id).wait()
         while not self._hb_stop.is_set():
             jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
             try:
@@ -520,13 +541,26 @@ class AsyncZMQComm(AsyncComm):
             return False
 
     async def _deserialize_and_dispatch_parent(
-        self, raw_data: bytes, loop: asyncio.AbstractEventLoop, parent_id: str
+        self, raw_data: list, loop: asyncio.AbstractEventLoop, parent_id: str
     ) -> None:
-        """Deserialize a raw frame from the parent and put it into the appropriate cache."""
+        """Deserialize a raw frame from the parent and put it into the appropriate cache.
+
+        raw_data layout (after ROUTER strips the routing identity):
+            [0] secret_id bytes  — sender's secret_id for staleness detection
+            [1] pickled payload
+        """
         from .messages import Message
 
         try:
-            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data)
+            sender_secret_id = raw_data[0].decode()
+            expected = self._node_info.parent_secret_id
+            if expected is not None and sender_secret_id != expected:
+                self.logger.warning(
+                    f"{self._node_info.node_id}: Discarding message from parent {parent_id} — "
+                    f"secret_id mismatch (stale connection)"
+                )
+                return
+            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
             if isinstance(msg, Message):
                 self._cache[parent_id].put_nowait(msg)
                 self.logger.debug(
@@ -545,23 +579,42 @@ class AsyncZMQComm(AsyncComm):
     async def _deserialize_and_dispatch_child(
         self, raw_data: list, loop: asyncio.AbstractEventLoop
     ) -> None:
-        """Deserialize a raw multipart frame from a child and put it into the appropriate cache."""
+        """Deserialize a raw multipart frame from a child and put it into the appropriate cache.
+
+        raw_data layout for regular children:
+            [0] sender_id bytes
+            [1] secret_id bytes  — sender's secret_id for staleness detection
+            [2] pickled payload
+        Cluster clients (sender_id starts with "client:") skip the secret_id frame:
+            [0] client_id bytes
+            [1] pickled payload
+        """
         from .messages import Message
 
         sender_id = raw_data[0].decode()
         try:
-            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
+            if sender_id.startswith("client:"):
+                # Clients do not include a secret_id frame.
+                msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
+                self._client_queue.put_nowait((sender_id, msg))
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Queued client message from {sender_id}: {type(msg).__name__}"
+                )
+                return
+            sender_secret_id = raw_data[1].decode()
+            expected = self._node_info.children_secret_ids.get(sender_id)
+            if expected is not None and sender_secret_id != expected:
+                self.logger.warning(
+                    f"{self._node_info.node_id}: Discarding message from child {sender_id} — "
+                    f"secret_id mismatch (stale connection)"
+                )
+                return
+            msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[2])
             if isinstance(msg, Message):
-                if sender_id.startswith("client:"):
-                    self._client_queue.put_nowait((sender_id, msg))
-                    self.logger.debug(
-                        f"{self._node_info.node_id}: Queued client message from {sender_id}: {type(msg).__name__}"
-                    )
-                else:
-                    self._cache[sender_id].put_nowait(msg)
-                    self.logger.debug(
-                        f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
-                    )
+                self._cache[sender_id].put_nowait(msg)
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
+                )
             else:
                 self._router_cache[sender_id].put_nowait(msg)
                 self.logger.info(
@@ -583,7 +636,7 @@ class AsyncZMQComm(AsyncComm):
         failures = 0
         while not self._stop_event.is_set():
             try:
-                raw_data = await self.dealer_socket.recv()
+                raw_data = await self.dealer_socket.recv_multipart()
                 failures = 0
                 asyncio.create_task(
                     self._deserialize_and_dispatch_parent(raw_data, loop, parent_id)
@@ -625,7 +678,9 @@ class AsyncZMQComm(AsyncComm):
             return False
 
         try:
-            await self.dealer_socket.send(cloudpickle.dumps(data))
+            await self.dealer_socket.send_multipart(
+                [self._node_info.secret_id.encode(), cloudpickle.dumps(data)]
+            )
             self.logger.debug(
                 f"{self._node_info.node_id}: Sent message to parent: {data}"
             )
@@ -674,9 +729,14 @@ class AsyncZMQComm(AsyncComm):
             raise RuntimeError(f"No connection to child {child_id}")
 
         try:
-            await self.router_socket.send_multipart(
-                [f"{child_id}".encode(), cloudpickle.dumps(data)]
-            )
+            if child_id.startswith("client:"):
+                await self.router_socket.send_multipart(
+                    [f"{child_id}".encode(), cloudpickle.dumps(data)]
+                )
+            else:
+                await self.router_socket.send_multipart(
+                    [f"{child_id}".encode(), self._node_info.secret_id.encode(), cloudpickle.dumps(data)]
+                )
             self.logger.debug(
                 f"{self._node_info.node_id}: Sent message to child {child_id}"
             )

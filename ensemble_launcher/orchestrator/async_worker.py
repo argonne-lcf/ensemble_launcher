@@ -246,7 +246,7 @@ class AsyncWorker(Node):
         self._create_comm()
 
         # Restore saved comm state before binding so parent can reconnect.
-        self._restore_comm_state()
+        await self._restore_comm_state()
 
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
@@ -351,7 +351,7 @@ class AsyncWorker(Node):
         self._ckpt_data = await self._checkpointer.read_checkpoint()
         self._ckpt_results = await self._checkpointer.read_results()
 
-    def _restore_comm_state(self) -> None:
+    async def _restore_comm_state(self) -> None:
         """Restore comm from cached checkpoint data using the comm's set_state.
 
         Must be called after _create_comm() and before setup_zmq_sockets() so
@@ -369,6 +369,9 @@ class AsyncWorker(Node):
             f"{self.node_id}: Comm state restored from checkpoint"
             f" (address: {self._comm.my_address})"
         )
+
+        ## Don't restore the node_info. This will be updated once the scheduler is restored
+        await self._comm.update_node_info(self.info())
 
     def _restore_scheduler_checkpoint(self) -> bool:
         """Restore scheduler state from cached checkpoint data.
@@ -962,6 +965,8 @@ class AsyncWorker(Node):
                 "Including tasks in serialization is not implemented yet."
             )
 
+        obj_dict["secret_id"] = self._secret_id
+
         return obj_dict
 
     @classmethod
@@ -997,4 +1002,5 @@ class AsyncWorker(Node):
             children=children,
             parent_comm=parent_comm,
         )
+        worker._secret_id = data["secret_id"]
         return worker
