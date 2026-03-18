@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import queue
 import random
 import signal
 import socket
@@ -25,7 +26,7 @@ from ensemble_launcher.comm import (
     TaskRequest,
     TaskUpdate,
 )
-from ensemble_launcher.comm.messages import ResultAck
+from ensemble_launcher.comm.messages import IResultBatch, ResultAck
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import (
@@ -113,6 +114,11 @@ class AsyncWorker(Node):
 
         # Cluster mode / workstealing mode
         self._stop_signal_received = asyncio.Event()
+
+        # Intermediate result batch queue (cluster mode)
+        self._iresult_q: Dict[str, queue.Queue] = {}
+
+        self._flush_task: Optional[asyncio.Task] = None
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -210,6 +216,7 @@ class AsyncWorker(Node):
             self._client_handler_task = asyncio.create_task(
                 self._client_request_handler()
             )
+            self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
     async def _lazy_init(self) -> None:
         """Set up all resources needed before task execution begins.
@@ -250,7 +257,7 @@ class AsyncWorker(Node):
 
         if self._config.comm_name == "async_zmq":
             await self._comm.setup_zmq_sockets()
-        
+
         # start parent endpoint monitors
         await self._comm.start_monitors()
 
@@ -419,9 +426,13 @@ class AsyncWorker(Node):
             if self._comm.parent_dead_event.is_set():
                 break
             await self._comm.send_message_to_parent(
-                TaskRequest(sender=self.node_id, ntasks=0, free_resources=self._init_nodes)
+                TaskRequest(
+                    sender=self.node_id, ntasks=0, free_resources=self._init_nodes
+                )
             )
-            task_update = await self._comm.recv_message_from_parent(TaskUpdate, timeout=5.0)
+            task_update = await self._comm.recv_message_from_parent(
+                TaskUpdate, timeout=5.0
+            )
             if task_update is not None:
                 self.logger.info(
                     f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
@@ -439,18 +450,20 @@ class AsyncWorker(Node):
             return
         # sync heart beat with parent
         async with self._timer("heartbeat_sync"):
-            if not await self._comm.sync_heartbeat_with_parent(
-                timeout=100.0
-            ):
+            if not await self._comm.sync_heartbeat_with_parent(timeout=100.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         max_retries = 100
         for attempt in range(max_retries):
             if self._comm.parent_dead_event.is_set():
-                raise RuntimeError(f"{self.node_id}: Parent died while waiting for NodeUpdate")
+                raise RuntimeError(
+                    f"{self.node_id}: Parent died while waiting for NodeUpdate"
+                )
             await self._comm.send_message_to_parent(NodeRequest(sender=self.node_id))
-            node_update = await self._comm.recv_message_from_parent(NodeUpdate, timeout=5.0)
+            node_update = await self._comm.recv_message_from_parent(
+                NodeUpdate, timeout=5.0
+            )
             if node_update is not None and node_update.nodes:
                 self._init_nodes = node_update.nodes
                 self.logger.info(
@@ -479,8 +492,42 @@ class AsyncWorker(Node):
 
         return done_callback
 
+    async def _flush_dest_queue(self, dest_id: str) -> float:
+        """Send all buffered results for dest_id as an IResultBatch (or nothing if empty)."""
+        result_q = self._iresult_q.get(dest_id)
+        if result_q is None or result_q.empty():
+            return time.time()
+        results = []
+        while True:
+            try:
+                results.append(result_q.get_nowait())
+            except queue.Empty:
+                break
+        if not results:
+            return
+        msg = IResultBatch(sender=self.node_id, data=results)
+        if dest_id.startswith("client:"):
+            await self._comm.send_message_to_child(dest_id, msg)
+        else:
+            await self._comm.send_message_to_parent(msg)
+
+        return time.time()
+
+    async def _periodic_flush_loop(self) -> None:
+        """Background task: flush all buffered intermediate result queues on a fixed interval."""
+        while True:
+            await asyncio.sleep(self._config.result_flush_interval)
+            for dest_id in list(self._iresult_q.keys()):
+                await self._flush_dest_queue(dest_id)
+
+    async def _flush_and_put(self, dest_id: str, result: Result) -> None:
+        """Flush a full queue then enqueue result (called via create_task from sync callback)."""
+        await self._flush_dest_queue(dest_id)
+        self._iresult_q[dest_id].put_nowait(result)
+
     def _task_callback(self, task: Task, future: AsyncFuture) -> None:
         """Process a completed task future: record status, free resources, forward result."""
+
         task_id = task.task_id
         if self._config.profile == "perfetto" and self._event_registry is not None:
             self._event_registry.record_async_end(
@@ -502,7 +549,7 @@ class AsyncWorker(Node):
 
             self._scheduler.free(task_id, task.status)
 
-            # In cluster mode: eagerly send individual Result to client or parent
+            # In cluster mode: buffer Result in per-destination queue; flush as IResultBatch
             if self._config.cluster:
                 task_result = Result(
                     sender=self.node_id,
@@ -512,12 +559,23 @@ class AsyncWorker(Node):
                     exception=str(exception) if exception else None,
                 )
                 if task_id in self._client_task_map:
-                    client_id = self._client_task_map.pop(task_id)
-                    asyncio.create_task(
-                        self._comm.send_message_to_child(client_id, task_result)
-                    )
+                    dest_id = self._client_task_map.pop(task_id)
                 elif self.parent:
-                    asyncio.create_task(self._comm.send_message_to_parent(task_result))
+                    dest_id = self.parent.node_id
+                else:
+                    dest_id = None
+
+                if dest_id is not None:
+                    if dest_id not in self._iresult_q:
+                        self._iresult_q[dest_id] = queue.Queue(
+                            maxsize=self._config.result_buffer_size
+                        )
+
+                    result_q = self._iresult_q[dest_id]
+                    try:
+                        result_q.put_nowait(task_result)
+                    except queue.Full:
+                        asyncio.create_task(self._flush_and_put(dest_id, task_result))
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -763,7 +821,10 @@ class AsyncWorker(Node):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._comm.parent_dead_event is not None and self._comm.parent_dead_event.is_set():
+        if (
+            self._comm.parent_dead_event is not None
+            and self._comm.parent_dead_event.is_set()
+        ):
             sys.exit(1)
 
     # -------------------------------------------------------------------------
@@ -787,6 +848,7 @@ class AsyncWorker(Node):
             self._task_update_task,
             self._node_update_task,
             self._client_handler_task,
+            self._flush_task,
         ]:
             if task is not None and not task.done():
                 task.cancel()
@@ -805,6 +867,11 @@ class AsyncWorker(Node):
         status send fails the status is also written to a local JSON file as
         a fallback.
         """
+        # Flush any remaining buffered intermediate results before final teardown.
+        if self._config.cluster:
+            for dest_id in list(self._iresult_q.keys()):
+                await self._flush_dest_queue(dest_id)
+
         async with self._timer("final_status"):
             ##also send the final status
             final_status = self.get_status()
@@ -851,9 +918,7 @@ class AsyncWorker(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(
-                    ResultAck, timeout=5.0
-                )
+                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0)
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
@@ -929,7 +994,10 @@ class AsyncWorker(Node):
         await self._wait_for_stop_condition()
 
         async with self._timer("result_collection"):
-            if self._comm.parent_dead_event is None or not self._comm.parent_dead_event.is_set():
+            if (
+                self._comm.parent_dead_event is None
+                or not self._comm.parent_dead_event.is_set()
+            ):
                 all_results = await self._send_final_results_and_status()
 
         await self.stop()

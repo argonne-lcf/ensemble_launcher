@@ -2,6 +2,7 @@ from .async_base import AsyncComm, AsyncCommState
 from .async_zmq import AsyncZMQComm, AsyncZMQCommState
 from .base import Comm
 from .messages import (
+    IResultBatch,
     Message,
     NodeRequest,
     NodeUpdate,
@@ -29,6 +30,7 @@ __all__ = [
     "Result",
     "ResultAck",
     "ResultBatch",
+    "IResultBatch",
     "Status",
     "Stop",
     "StopType",

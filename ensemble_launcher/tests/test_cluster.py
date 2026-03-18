@@ -105,7 +105,7 @@ async def test_async_master_cluster(
             comm_name="async_zmq",
             worker_logs=True,
             master_logs=True,
-            report_interval=100.0,
+            report_interval=1.0,
             use_mpi_ppn=False,
             log_level=logging.INFO,
             cluster=True,
@@ -114,13 +114,14 @@ async def test_async_master_cluster(
             return_stdout=True,
             children_scheduler_policy="simple_split_children_policy",
             policy_config=PolicyConfig(nlevels=2, nchildren=1),
+            result_buffer_size=100,
         ),
         job_resource,
     )
 
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
-    time.sleep(2.0)
+    time.sleep(10.0)
     client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}

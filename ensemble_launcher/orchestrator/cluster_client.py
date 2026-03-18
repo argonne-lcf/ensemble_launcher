@@ -1,7 +1,9 @@
 import abc
+import asyncio
 import logging
 import os
 import threading
+import time
 import uuid
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
@@ -10,7 +12,7 @@ import cloudpickle
 
 from ensemble_launcher.checkpointing import CommCheckpointData
 from ensemble_launcher.checkpointing.checkpointer import _get_comm_state_class
-from ensemble_launcher.comm.messages import Result, TaskUpdate
+from ensemble_launcher.comm.messages import IResultBatch, Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
 
@@ -29,8 +31,8 @@ class _ClientTransport(abc.ABC):
     def send(self, data: bytes) -> None: ...
 
     @abc.abstractmethod
-    def recv(self, timeout_ms: int = 100) -> Optional[bytes]:
-        """Return the next message or None on timeout."""
+    async def recv(self) -> bytes:
+        """Await and return the next message."""
         ...
 
     @abc.abstractmethod
@@ -44,23 +46,19 @@ class _ZMQTransport(_ClientTransport):
 
     def connect(self, address: str, identity: bytes) -> None:
         import zmq
+        import zmq.asyncio
 
-        self._context = zmq.Context()
+        self._context = zmq.asyncio.Context()
         self._socket = self._context.socket(zmq.DEALER)
         self._socket.setsockopt(zmq.IDENTITY, identity)
         self._socket.connect(f"tcp://{address}")
 
     def send(self, data: bytes) -> None:
+        # zmq.asyncio.Socket.send is synchronous (only recv is overridden).
         self._socket.send(data)
 
-    def recv(self, timeout_ms: int = 100) -> Optional[bytes]:
-        import zmq
-
-        self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        try:
-            return self._socket.recv()
-        except zmq.Again:
-            return None
+    async def recv(self) -> bytes:
+        return await self._socket.recv()
 
     def close(self) -> None:
         if self._socket is not None:
@@ -73,6 +71,98 @@ class _ZMQTransport(_ClientTransport):
 _TRANSPORT_REGISTRY: Dict[str, Type[_ClientTransport]] = {
     "AsyncZMQCommState": _ZMQTransport,
 }
+
+
+# ---------------------------------------------------------------------------
+# Worker pipeline
+# ---------------------------------------------------------------------------
+
+
+class _WorkerPipeline:
+    """One independent send/recv pipeline: own thread, event loop, and ZMQ socket."""
+
+    def __init__(self, worker_id: str, transport: _ClientTransport):
+        self.worker_id = worker_id
+        self.transport = transport
+        self.pending: Dict[str, ConcurrentFuture] = {}
+        self.lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_ready = threading.Event()
+        self._recv_task: Optional[asyncio.Task] = None
+        self._thread: Optional[threading.Thread] = None
+        # Profiling accumulators
+        self.recv_time = 0.0
+        self.deser_time = 0.0
+        self.set_result_time = 0.0
+
+    def start(self, node_address: str, logger) -> None:
+        """Start the pipeline's dedicated thread and wait until its event loop is ready."""
+        self._thread = threading.Thread(
+            target=self._run, args=(node_address, logger), daemon=True
+        )
+        self._thread.start()
+        self._loop_ready.wait()
+
+    def _run(self, node_address: str, logger) -> None:
+        """Thread target: create event loop, connect transport, run recv loop."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self.transport.connect(node_address, self.worker_id.encode())
+        self._loop_ready.set()
+        try:
+            self._loop.run_until_complete(self._recv_loop(logger))
+        except Exception as e:
+            logger.error(f"Pipeline {self.worker_id} exited with error: {e}")
+        finally:
+            self._loop.close()
+
+    async def _recv_loop(self, logger) -> None:
+        self._recv_task = asyncio.current_task()
+        try:
+            while True:
+                t0 = time.perf_counter()
+                raw = await self.transport.recv()
+                self.recv_time += time.perf_counter() - t0
+                asyncio.create_task(self._deserialize_and_set(raw))
+        except asyncio.CancelledError:
+            logger.info(
+                f"{self.worker_id} recv={self.recv_time:.3f}s "
+                f"deser={self.deser_time:.3f}s "
+                f"set_result={self.set_result_time:.3f}s"
+            )
+
+    async def _deserialize_and_set(self, raw: bytes) -> None:
+        t0 = time.perf_counter()
+        msg: IResultBatch = await asyncio.get_running_loop().run_in_executor(
+            None, cloudpickle.loads, raw
+        )
+        t1 = time.perf_counter()
+        for result in msg.data:
+            self.set_result(result)
+        self.deser_time += t1 - t0
+        self.set_result_time += time.perf_counter() - t1
+
+    def set_result(self, result: Result) -> None:
+        with self.lock:
+            fut = self.pending.pop(result.task_id, None)
+        if fut is None or fut.done():
+            return
+        if result.success:
+            fut.set_result(result.data)
+        else:
+            fut.set_exception(Exception(result.exception or "Task failed"))
+
+    def send(self, data: bytes) -> None:
+        """Thread-safe send: schedules onto this pipeline's own event loop."""
+        self._loop.call_soon_threadsafe(self.transport.send, data)
+
+    def stop(self) -> None:
+        """Cancel the recv task, join the thread, and close the transport."""
+        if self._loop is not None and self._recv_task is not None:
+            self._loop.call_soon_threadsafe(self._recv_task.cancel)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self.transport.close()
 
 
 # ---------------------------------------------------------------------------
@@ -110,15 +200,20 @@ class ClusterClient:
     actual ``host:port`` address and transport backend.  Node IDs follow the
     scheduler naming convention: ``"main"``, ``"main.w0"``, ``"main.m0.w1"``, etc.
 
+    Set ``n_workers > 1`` to open multiple parallel send/recv pipelines, each
+    with its own ZMQ socket and result-deserialization task.  Tasks are
+    distributed round-robin across pipelines; results are routed back to the
+    pipeline that submitted them via the ZMQ DEALER identity.
+
     Examples::
 
         # Connect to the global master (default):
         with ClusterClient("/scratch/ckpt") as client:
             fut = client.submit(task)
 
-        # Connect to a specific worker node:
-        with ClusterClient("/scratch/ckpt", node_id="main.w0") as client:
-            fut = client.submit(task)
+        # Four parallel pipelines:
+        with ClusterClient("/scratch/ckpt", n_workers=4) as client:
+            futs = client.map(fn, items)
     """
 
     def __init__(
@@ -126,6 +221,7 @@ class ClusterClient:
         checkpoint_dir: str,
         node_id: str = "global",
         client_id: Optional[str] = None,
+        n_workers: int = 1,
         log_dir: str = "logs",
         log_level: int = logging.INFO,
     ):
@@ -138,19 +234,17 @@ class ClusterClient:
                             ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
                             that node.
             client_id:      Optional client identity string; auto-generated if omitted.
+            n_workers:      Number of parallel send/recv pipelines (default 1).
             log_dir:        Directory for log files.  When provided a file
                             ``{log_dir}/{client_id}.log`` is created.  When
                             ``None`` (default) logging goes to the root handler.
             log_level:      Logging level (default ``logging.INFO``).
         """
         self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
+        self._n_workers = n_workers
         self.logger = setup_logger(
             __name__, self._client_id, log_dir=log_dir, level=log_level
         )
-        self._pending: Dict[str, ConcurrentFuture] = {}
-        self._lock = threading.Lock()
-        self._recv_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
         self._node_id = None
 
         resolved_id = _resolve_node_id(checkpoint_dir, node_id)
@@ -174,22 +268,29 @@ class ClusterClient:
         comm_cls = _get_comm_state_class(comm_data.comm_state_type)
         comm_state = comm_cls.deserialize(comm_data.comm_state_json)
         self._node_address = comm_state.my_address
-        self._transport: _ClientTransport = transport_cls()
 
-    def start(self):
-        """Connect to the node and start the result-receive thread."""
-        self._transport.connect(self._node_address, self._client_id.encode())
-        self.logger.info(f"Connected to {self._node_id} at {self._node_address}")
-        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-        self._recv_thread.start()
-        self.logger.info("Started recv thread")
+        # Create one pipeline per worker; transports are connected in _run_event_loop.
+        self._pipelines: List[_WorkerPipeline] = [
+            _WorkerPipeline(
+                worker_id=f"{self._client_id}:w{i}",
+                transport=transport_cls(),
+            )
+            for i in range(n_workers)
+        ]
 
-    def teardown(self):
-        """Shut down the transport and receive thread."""
-        self._stop_event.set()
-        if self._recv_thread is not None:
-            self._recv_thread.join(timeout=5.0)
-        self._transport.close()
+    def start(self) -> None:
+        """Start each pipeline's dedicated thread and wait until all are connected."""
+        for pipeline in self._pipelines:
+            pipeline.start(self._node_address, self.logger)
+        self.logger.info(
+            f"Started {self._n_workers} pipeline(s) connected to "
+            f"{self._node_id} at {self._node_address}"
+        )
+
+    def teardown(self) -> None:
+        """Stop all pipelines."""
+        for pipeline in self._pipelines:
+            pipeline.stop()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -222,15 +323,25 @@ class ClusterClient:
         )
 
     def _send_batch(self, tasks: List[Task]) -> List[ConcurrentFuture]:
-        """Register futures for *tasks* and send them in a single TaskUpdate."""
+        """Register futures and send tasks, distributing round-robin across pipelines."""
         futures: List[ConcurrentFuture] = []
-        with self._lock:
-            for task in tasks:
-                fut: ConcurrentFuture = ConcurrentFuture()
-                self._pending[task.task_id] = fut
-                futures.append(fut)
-        task_update = TaskUpdate(sender=self._client_id, added_tasks=tasks)
-        self._transport.send(cloudpickle.dumps(task_update))
+        # Build per-pipeline batches while preserving future order.
+        pipeline_batches: List[List[Task]] = [[] for _ in self._pipelines]
+        for i, task in enumerate(tasks):
+            pipeline = self._pipelines[i % self._n_workers]
+            fut: ConcurrentFuture = ConcurrentFuture()
+            with pipeline.lock:
+                pipeline.pending[task.task_id] = fut
+            futures.append(fut)
+            pipeline_batches[i % self._n_workers].append(task)
+
+        for pipeline, batch in zip(self._pipelines, pipeline_batches):
+            if batch:
+                data = cloudpickle.dumps(
+                    TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
+                )
+                pipeline.send(data)
+
         return futures
 
     # ------------------------------------------------------------------
@@ -266,7 +377,7 @@ class ClusterClient:
         )[0]
 
     def submit_batch(self, tasks: List[Task]):
-        """Submit a batch of tasks to the cluster"""
+        """Submit a batch of tasks to the cluster."""
         return self._send_batch(tasks)
 
     def map(
@@ -280,9 +391,9 @@ class ClusterClient:
     ) -> List[ConcurrentFuture]:
         """Submit *fn* applied to each element of *iterable* in a single batch.
 
-        All tasks are sent in one :class:`TaskUpdate` message.  Returns a list
-        of :class:`~concurrent.futures.Future` objects in the same order as
-        *iterable*.
+        All tasks are sent in one :class:`TaskUpdate` message per pipeline.
+        Returns a list of :class:`~concurrent.futures.Future` objects in the
+        same order as *iterable*.
 
         Args:
             fn: Callable or shell command string to apply to each item.
@@ -317,21 +428,3 @@ class ClusterClient:
     def __exit__(self, *_):
         self.teardown()
 
-    def _recv_loop(self):
-        """Background thread: receive Result messages and resolve pending Futures."""
-        while not self._stop_event.is_set():
-            raw = self._transport.recv(timeout_ms=100)
-            if raw is None:
-                continue
-            msg = cloudpickle.loads(raw)
-            if not isinstance(msg, Result):
-                continue
-            with self._lock:
-                fut = self._pending.pop(msg.task_id, None)
-            if fut is None or fut.done():
-                continue
-            if msg.success:
-                self.logger.info(f"Got result from task {msg.task_id}")
-                fut.set_result(msg.data)
-            else:
-                fut.set_exception(Exception(msg.exception or "Task failed"))

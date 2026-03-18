@@ -54,17 +54,21 @@ class LauncherConfig(BaseModel):
     checkpoint_dir: Optional[str] = (
         None  # Directory for checkpoints; None disables checkpointing
     )
-    heartbeat_interval: float = (
-        1.0  # heart beat interval
+    heartbeat_interval: float = 1.0  # heart beat interval
+
+    heartbeat_dead_threshold: float = (
+        30.0  # Seconds before HB process declares a peer dead.
     )
 
-    heartbeat_dead_threshold: float = 30.0  # Seconds before HB process declares a peer dead.
-
-    overload_orchestrator_core: bool = (
-        True # Setting this to false reserves the first core of the head compute node for EL orchestrator
-    )
+    overload_orchestrator_core: bool = True  # Setting this to false reserves the first core of the head compute node for EL orchestrator
 
     restart_children_on_failure: bool = True
+
+    result_buffer_size: int = (
+        10000  # max buffer size of the result queue in cluster mode
+    )
+
+    result_flush_interval: float = 5.0  # Flush result queues every fixed time
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""
