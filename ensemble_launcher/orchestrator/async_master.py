@@ -2,8 +2,8 @@ import asyncio
 import base64
 import json
 import os
-import queue
 import random
+from collections import deque
 import signal
 import socket
 import time
@@ -133,9 +133,8 @@ class AsyncMaster(Node):
         # Per-child task request monitor tasks
         self._child_task_request_task: Dict[str, asyncio.Task] = {}
 
-        # Intermediate result batch queue
-        self._iresult_q: Dict[str, queue.Queue[Result]] = {}
-
+        # Intermediate result buffer: only used when forwarding to a parent master (fan-in aggregation)
+        self._iresult_q: Dict[str, deque] = {}
         self._flush_task: Optional[asyncio.Task] = None
 
     @asynccontextmanager
@@ -387,8 +386,8 @@ class AsyncMaster(Node):
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
             )
-            self._flush_task = asyncio.create_task(self._periodic_flush_loop())
             if self.parent:
+                self._flush_task = asyncio.create_task(self._periodic_flush_loop())
                 self._task_update_task = asyncio.create_task(
                     self._parent_task_update_monitor()
                 )
@@ -1319,70 +1318,65 @@ class AsyncMaster(Node):
                 for task in msg.added_tasks:
                     self._client_task_map[task.task_id] = client_id
 
-    async def _flush_dest_queue(self, dest_id: str) -> float:
-        """Send all buffered results for dest_id as a batch (or nothing if empty)."""
+    async def _flush_dest_queue(self, dest_id: str) -> None:
+        """Send all buffered results for dest_id to the parent master as a single IResultBatch."""
         result_q = self._iresult_q.get(dest_id)
-        if result_q is None or result_q.empty():
+        if not result_q:
             return
-        self.logger.info(f"Flushing result queue for {dest_id}")
         results = []
-        while True:
-            try:
-                results.append(result_q.get_nowait())
-            except queue.Empty:
-                break
-        if not results:
-            return
-        msg = IResultBatch(sender=self.node_id, data=results)
-        if dest_id.startswith("client:"):
-            await self._comm.send_message_to_child(dest_id, msg)
-        else:
-            await self._comm.send_message_to_parent(msg)
-        return time.time()
+        while result_q:
+            results.append(result_q.popleft())
+        await self._comm.send_message_to_parent(
+            IResultBatch(sender=self.node_id, data=results)
+        )
 
     async def _periodic_flush_loop(self) -> None:
-        """Background task: flush all buffered intermediate result queues on a fixed interval."""
+        """Flush buffered parent-bound results on a fixed interval with jitter.
+
+        Only runs on masters that have a parent (i.e. there are results to forward upward).
+        """
         while True:
-            await asyncio.sleep(self._config.result_flush_interval)
+            jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
+            await asyncio.sleep(self._config.result_flush_interval + jitter)
             for dest_id in list(self._iresult_q.keys()):
                 await self._flush_dest_queue(dest_id)
 
     async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
-        """Route a result to its originating client if dynamically submitted, otherwise to parent."""
+        """Route a result to its destination.
 
-        async def forward_single_result(single_result: Result):
+        - Client-bound results (root master): forwarded directly as IResultBatch.
+        - Parent-bound results (intermediate master): buffered and flushed periodically
+          to aggregate fan-in across children before sending up the hierarchy.
+        """
+        items = result.data if isinstance(result, IResultBatch) else [result]
+
+        dest_results: Dict[str, List[Result]] = {}
+        for single_result in items:
             dest_id = self._client_task_map.pop(
                 single_result.task_id, self.parent.node_id if self.parent else None
             )
-
             if dest_id is None:
                 self.logger.warning(
                     f"Can't find a destination for task {single_result.task_id}"
                 )
-                return
+                continue
+            dest_results.setdefault(dest_id, []).append(single_result)
 
-            # Lazily initialise per-destination queue on first use.
-            if dest_id not in self._iresult_q:
-                self._iresult_q[dest_id] = queue.Queue(
-                    maxsize=self._config.result_buffer_size
+        for dest_id, results in dest_results.items():
+            if dest_id.startswith("client:"):
+                # Client attached at this level: send directly, no buffering needed
+                await self._comm.send_message_to_child(
+                    dest_id, IResultBatch(sender=self.node_id, data=results)
                 )
-
-            result_q = self._iresult_q[dest_id]
-
-            try:
-                result_q.put_nowait(single_result)
-            except queue.Full:
-                await self._flush_dest_queue(dest_id)
-                result_q.put_nowait(single_result)
-
-        if isinstance(result, Result):
-            await forward_single_result(result)
-        elif isinstance(result, IResultBatch):
-            for single_result in result.data:
-                await forward_single_result(single_result)
-        else:
-            self.logger.error(f"Unsupported type {type(result)}")
-            raise RuntimeError(f"Unsupported type {type(result)}")
+            else:
+                # Parent-bound result: buffer to aggregate fan-in before sending up
+                if dest_id not in self._iresult_q:
+                    self._iresult_q[dest_id] = deque()
+                result_q = self._iresult_q[dest_id]
+                for r in results:
+                    result_q.append(r)
+                if len(result_q) >= self._config.result_buffer_size:
+                    await self._flush_dest_queue(dest_id)
 
     async def _child_result_monitor(self, child_id: str) -> None:
         """Receive IResultBatch messages from child and forward to client or parent."""
@@ -1401,7 +1395,7 @@ class AsyncMaster(Node):
             if msg is None:
                 break
             await self._forward_result(msg)
-        # Flush any results that didn't fill the buffer.
+        # Flush any parent-bound results that didn't reach the buffer threshold.
         for dest_id in list(self._iresult_q.keys()):
             await self._flush_dest_queue(dest_id)
 

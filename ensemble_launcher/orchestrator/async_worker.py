@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-import queue
+from collections import deque
 import random
 import signal
 import socket
@@ -116,7 +116,7 @@ class AsyncWorker(Node):
         self._stop_signal_received = asyncio.Event()
 
         # Intermediate result batch queue (cluster mode)
-        self._iresult_q: Dict[str, queue.Queue] = {}
+        self._iresult_q: Dict[str, deque] = {}
 
         self._flush_task: Optional[asyncio.Task] = None
 
@@ -495,14 +495,11 @@ class AsyncWorker(Node):
     async def _flush_dest_queue(self, dest_id: str) -> float:
         """Send all buffered results for dest_id as an IResultBatch (or nothing if empty)."""
         result_q = self._iresult_q.get(dest_id)
-        if result_q is None or result_q.empty():
+        if not result_q:
             return time.time()
         results = []
-        while True:
-            try:
-                results.append(result_q.get_nowait())
-            except queue.Empty:
-                break
+        while result_q:
+            results.append(result_q.popleft())
         if not results:
             return
         msg = IResultBatch(sender=self.node_id, data=results)
@@ -514,16 +511,15 @@ class AsyncWorker(Node):
         return time.time()
 
     async def _periodic_flush_loop(self) -> None:
-        """Background task: flush all buffered intermediate result queues on a fixed interval."""
+        """Background task: flush all buffered intermediate result queues on a fixed interval.
+
+        Sleep duration is jittered ±5% to avoid thundering herd across workers.
+        """
         while True:
-            await asyncio.sleep(self._config.result_flush_interval)
+            jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
+            await asyncio.sleep(self._config.result_flush_interval + jitter)
             for dest_id in list(self._iresult_q.keys()):
                 await self._flush_dest_queue(dest_id)
-
-    async def _flush_and_put(self, dest_id: str, result: Result) -> None:
-        """Flush a full queue then enqueue result (called via create_task from sync callback)."""
-        await self._flush_dest_queue(dest_id)
-        self._iresult_q[dest_id].put_nowait(result)
 
     def _task_callback(self, task: Task, future: AsyncFuture) -> None:
         """Process a completed task future: record status, free resources, forward result."""
@@ -567,15 +563,12 @@ class AsyncWorker(Node):
 
                 if dest_id is not None:
                     if dest_id not in self._iresult_q:
-                        self._iresult_q[dest_id] = queue.Queue(
-                            maxsize=self._config.result_buffer_size
-                        )
+                        self._iresult_q[dest_id] = deque()
 
                     result_q = self._iresult_q[dest_id]
-                    try:
-                        result_q.put_nowait(task_result)
-                    except queue.Full:
-                        asyncio.create_task(self._flush_and_put(dest_id, task_result))
+                    result_q.append(task_result)
+                    if len(result_q) >= self._config.result_buffer_size:
+                        asyncio.create_task(self._flush_dest_queue(dest_id))
 
     # -------------------------------------------------------------------------
     #                               Monitors
