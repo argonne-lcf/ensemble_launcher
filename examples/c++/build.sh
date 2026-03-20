@@ -7,6 +7,8 @@ if [[ $hostname == *"aurora"* ]]; then
   icpx -o serial_example serial_example.cpp
 elif [[ $hostname == *"polaris"* ]]; then
   echo Building for Polaris ...
+  CC -o mpi_example mpi_example.cpp
+  cc -o serial_example serial_example.cpp
 else
   echo No pre-defined build instructions for host $hostname 
 fi

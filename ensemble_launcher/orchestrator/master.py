@@ -7,8 +7,10 @@ from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
 from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate, NodeUpdate
+from ensemble_launcher.profiling import get_registry, EventRegistry
 import copy
 import logging
+from ensemble_launcher.logging import setup_logger
 from itertools import accumulate
 from typing import Optional, List, Dict, Any
 import os
@@ -54,25 +56,18 @@ class Master(Node):
         self._status: Status = None
 
         self.logger = None
-        self._event_timings: Dict[str, List[float]] = defaultdict(list)  # Store all timing measurements
-        if self._config.profile == "timeline":
-            self._timer = self._profile_timer
-        else:
-            self._timer = self._noop_timer
+        
+        # Initialize event registry for perfetto profiling
+        self._event_registry: Optional[EventRegistry] = None
     
-
     @contextmanager
-    def _profile_timer(self,event_name: str):
-        start_time = time.perf_counter()
-        try:
+    def _timer(self, event_name: str):
+        """Timer that records to event registry for Perfetto export."""
+        if self._event_registry is not None:
+            with self._event_registry.measure(event_name, "master", node_id=self.node_id, pid=os.getpid()):
+                yield
+        else:
             yield
-        finally:
-            self._event_timings[event_name].append(time.perf_counter() - start_time)
-
-
-    @contextmanager
-    def _noop_timer(self, event_name: str):
-        yield
 
     @property
     def nodes(self):
@@ -99,33 +94,19 @@ class Master(Node):
         return self._comm
     
     def _setup_logger(self):
-
-        if self._config.master_logs:
-            os.makedirs(os.path.join(os.getcwd(),"logs"),exist_ok=True)
-            # Configure file handler for this specific self.self.logger
-            file_handler = logging.FileHandler(os.path.join(os.getcwd(),f'logs/master-{self.node_id}.log'))
-            file_handler.setLevel(logging.INFO)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            # Create instance self.self.logger and add handler
-            self.logger = logging.getLogger(f"{__name__}.{self.node_id}")
-            self.logger.addHandler(file_handler)
-            self.logger.setLevel(logging.INFO)
-        else:
-            self.logger = logging.getLogger(__name__)
+        log_dir = os.path.join(os.getcwd(), "logs") if self._config.master_logs else None
+        self.logger = setup_logger(__name__, self.node_id, log_dir=log_dir, level=self._config.log_level)
 
     def _create_comm(self):
         if self._config.comm_name == "multiprocessing":
             self._comm = MPComm(self.logger.getChild('comm'), 
                                 self.info(),
-                                self.parent_comm if self.parent_comm else None, 
-                                profile=self._config.profile)
+                                self.parent_comm if self.parent_comm else None)
         elif self._config.comm_name == "zmq":
             ##sending parent address here because all zmq objects are not picklable
             self._comm = ZMQComm(self.logger.getChild('comm'), 
                                  self.info(),
-                                 parent_address=self.parent_comm.my_address if self.parent_comm else None,
-                                 profile=self._config.profile)
+                                 parent_address=self.parent_comm.my_address if self.parent_comm else None)
         else:
             raise ValueError(f"Unsupported comm {self._config.comm_name}")
 
@@ -137,7 +118,7 @@ class Master(Node):
         self.logger.info(f"Children assignment: {self._child_assignment}")
 
         children = {}
-        if self.level + 1 == self._config.nlevels:
+        if self.level + 1 == self._config.policy_config.nlevels:
             for wid, alloc in assignments.items():
                 child_id = self.node_id+f".w{wid}"
                 self._child_assignment[child_id] = alloc
@@ -167,6 +148,10 @@ class Master(Node):
         return children
 
     def _lazy_init(self) -> Dict[str, Node]:
+        if self._config.profile == "perfetto":
+            self._event_registry = get_registry()
+            self._event_registry.enable()
+
         #lazy logger creation
         tick = time.perf_counter()
         self._setup_logger()
@@ -177,8 +162,7 @@ class Master(Node):
         self._scheduler = WorkerScheduler(self.logger.getChild('scheduler'), self.nodes, self._config)
 
         #create executor
-        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"profile": self._config.profile,
-                                                                                                               "logger": self.logger.getChild('executor'),
+        self._executor: Executor = executor_registry.create_executor(self._config.child_executor_name, kwargs={"logger": self.logger.getChild('executor'),
                                                                                                                "use_ppn": self._config.use_mpi_ppn})
 
         ##create comm: Need to do this after the setting the children to properly create pipes
@@ -545,27 +529,15 @@ class Master(Node):
         return result_batch
 
     def stop(self):
-        if self._config.profile:
+        if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            fname = os.path.join(os.getcwd(),"profiles",f"{self.node_id}_comm_profile.json")
-            with open(fname,"w") as f:
-                json.dump(self._comm._profile_info, f, indent=2)
-        
-        if self._config.profile == "timeline":
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            # Compute statistics for all timed events
-            stats = {}
-            for event_name, timings in self._event_timings.items():
-                if timings:  # Check if list is not empty
-                    stats[event_name] = {
-                        'mean': sum(timings) / len(timings),
-                        'sum': sum(timings),
-                        'std': (sum((x - sum(timings) / len(timings)) ** 2 for x in timings) / len(timings)) ** 0.5 if len(timings) > 1 else 0.0,
-                        'count': len(timings)
-                    }
-
-            # Write statistics to file
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_timeline_stats.json")
+            # Export to Perfetto format
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
+            self._event_registry.export_perfetto(fname)
+            
+            # Also export statistics
+            stats = self._event_registry.get_statistics()
+            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
             

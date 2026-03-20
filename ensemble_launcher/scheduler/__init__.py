@@ -1,15 +1,20 @@
-from .policy import LargeResourcePolicy, policy_registry, Policy, WorkerPolicy
+from .child_state import ChildState
+from .policy import LargeResourcePolicy, policy_registry, Policy, ChildrenPolicy
 from .scheduler import WorkerScheduler, TaskScheduler, Scheduler
-from .async_scheduler import AsyncTaskScheduler, AsyncWorkerScheduler
+from .async_scheduler import AsyncTaskScheduler, AsyncChildrenScheduler
+from .state import SchedulerState, ChildrenAssignment
 
 __all__ = [
+    "ChildState",
     "LargeResourcePolicy",
-    "WorkerScheduler", 
-    "TaskScheduler", 
+    "WorkerScheduler",
+    "TaskScheduler",
     "Scheduler",
     "AsyncTaskScheduler",
-    "AsyncWorkerScheduler",
+    "AsyncChildrenScheduler",
     "policy_registry",
     "Policy",
-    "WorkerPolicy"
+    "ChildrenPolicy",
+    "SchedulerState",
+    "ChildrenAssignment",
 ]

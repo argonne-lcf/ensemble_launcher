@@ -78,6 +78,20 @@ class NodeResource(ABC):
         """Divide this resource into n approximately equal parts."""
         pass
 
+    @abstractmethod
+    def serialize(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dict that includes a ``type`` discriminator."""
+        pass
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResource':
+        """Reconstruct a concrete ``NodeResource`` from a dict produced by ``serialize``."""
+        type_map: Dict[str, type] = {"count": NodeResourceCount, "list": NodeResourceList}
+        kind = d.get("type")
+        if kind not in type_map:
+            raise ValueError(f"Unknown NodeResource type '{kind}'")
+        return type_map[kind].deserialize(d)
+
 
 @dataclass(frozen=True, eq=True)
 class NodeResourceCount(NodeResource):
@@ -132,7 +146,17 @@ class NodeResourceCount(NodeResource):
             result.append(NodeResourceCount(ncpus=cpus, ngpus=gpus))
         
         return result
-    
+
+    def to_dict(self):
+        return {"ncpus":self.ncpus,"ngpus":self.ngpus}
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"type": "count", "ncpus": self.ncpus, "ngpus": self.ngpus}
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResourceCount':
+        return cls(ncpus=d["ncpus"], ngpus=d["ngpus"])
+
     @classmethod
     def from_config(self, info: SystemConfig):
         """creates a node resource list from a dict"""
@@ -256,6 +280,16 @@ class NodeResourceList(NodeResource):
             gpus = tuple(range(info.ngpus)) if len(info.gpus) == 0 else tuple(info.gpus)
         )
 
+    def to_dict(self):
+        return {"cpus":self.cpus,"gpus":self.gpus}
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"type": "list", "cpus": list(self.cpus), "gpus": list(self.gpus)}
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'NodeResourceList':
+        return cls(cpus=tuple(d["cpus"]), gpus=tuple(d["gpus"]))
+
 
 @dataclass(eq=True)
 class JobResource:
@@ -317,3 +351,47 @@ class JobResource:
         nodes = list(resource_dict.keys())
         resources = list(resource_dict.values())
         return cls(resources=resources, nodes=nodes)
+    
+    def __contains__(self, other) -> bool:
+        """Check if another JobResource can be satisfied by this JobResource.
+        
+        Args:
+            other: Another JobResource to check
+            
+        Returns:
+            True if this JobResource can satisfy the other's requirements
+        """
+        if not isinstance(other, JobResource):
+            return False
+        
+        # If other requires more nodes than we have, it can't be contained
+        if len(other.resources) > len(self.resources):
+            return False
+        
+        # Try to match each required resource with an available resource
+        available = list(self.resources)
+        for required in other.resources:
+            # Find a resource that can satisfy this requirement
+            found = False
+            for i, avail in enumerate(available):
+                if required in avail:
+                    available.pop(i)
+                    found = True
+                    break
+            if not found:
+                return False
+        
+        return True
+
+    def serialize(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dict including type-discriminated resources."""
+        return {
+            "resources": [r.serialize() for r in self.resources],
+            "nodes": list(self.nodes),
+        }
+
+    @classmethod
+    def deserialize(cls, d: Dict[str, Any]) -> 'JobResource':
+        """Reconstruct a ``JobResource`` from a dict produced by ``serialize``."""
+        resources = [NodeResource.deserialize(r) for r in d["resources"]]
+        return cls(resources=resources, nodes=d.get("nodes", []))

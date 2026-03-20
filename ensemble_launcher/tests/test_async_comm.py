@@ -6,6 +6,7 @@ from ensemble_launcher.comm.messages import Message, Result
 import time
 import asyncio
 import pytest
+import uuid
 
 import logging
 
@@ -18,11 +19,15 @@ async def test_zmq_comm():
     comms = []
     futures = []
     try:
+        secret_ids = [ str(uuid.uuid4()) for _ in range(3)]
         for i in range(3):
             my_nodeinfo = NodeInfo(
                 node_id=str(i),
+                secret_id=secret_ids[i],
                 parent_id=str(i - 1) if i > 0 else None,
+                parent_secret_id=secret_ids[i-1] if i > 0 else None,
                 children_ids=[str(i + 1)] if i < 2 else [],
+                children_secret_ids={str(i+1):secret_ids[i+1]} if i < 2 else {},
             )
             comm = AsyncZMQComm(logger, node_info=my_nodeinfo, parent_comm=comms[i - 1] if i > 0 else None)
             await comm.setup_zmq_sockets()
