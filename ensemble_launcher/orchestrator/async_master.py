@@ -23,6 +23,7 @@ from ensemble_launcher.comm.messages import (
     IResultBatch,
     NodeRequest,
     NodeUpdate,
+    Ready,
     Result,
     ResultAck,
     ResultBatch,
@@ -139,9 +140,15 @@ class AsyncMaster(Node):
         # Per-child task request monitor tasks
         self._child_task_request_task: Dict[str, asyncio.Task] = {}
 
-        # Intermediate result buffer: only used when forwarding to a parent master (fan-in aggregation)
+        # Intermediate result buffer: used when forwarding to a parent master (fan-in aggregation)
         self._iresult_q: Dict[str, deque] = {}
         self._flush_task: Optional[asyncio.Task] = None
+        # Batch mode root: accumulates results streamed via IResultBatch during execution
+        self._batch_streaming_results: List[Result] = []
+
+        # Parent-ready handshake: set when parent sends a Ready message
+        self._parent_ready_event = asyncio.Event()
+        self._parent_ready_monitor_task: Optional[asyncio.Task] = None
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -375,10 +382,9 @@ class AsyncMaster(Node):
         self._child_task_request_task[child_id] = asyncio.create_task(
             self._monitor_single_child_task_requests(child_id)
         )
-        if self._config.cluster:
-            self._child_forwarder_task[child_id] = asyncio.create_task(
-                self._child_result_monitor(child_id)
-            )
+        self._child_forwarder_task[child_id] = asyncio.create_task(
+            self._child_result_monitor(child_id)
+        )
 
     def _create_monitor_tasks(self) -> None:
         """Start long-running asyncio monitor tasks (status reporter, cluster monitors).
@@ -388,15 +394,20 @@ class AsyncMaster(Node):
         children (including any recreated ones) have been registered.
         """
         self._reporting_task = asyncio.create_task(self._report_status())
+        if self.parent:
+            self._parent_ready_monitor_task = asyncio.create_task(
+                self._parent_ready_monitor()
+            )
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
             )
             if self.parent:
-                self._flush_task = asyncio.create_task(self._periodic_flush_loop())
                 self._task_update_task = asyncio.create_task(
                     self._parent_task_update_monitor()
                 )
+        if self.parent:
+            self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
     async def _launch_child(
         self, child_name: str, child_obj: Node, child_idx: int
@@ -772,6 +783,14 @@ class AsyncMaster(Node):
                 f"{max_retries} retries"
             )
 
+        # All children are launched and synced — signal each one that the master
+        # is ready so they can send their final ResultBatch when done.
+        for child_id in list(self._child_result_batch_task.keys()):
+            await self._comm.send_message_to_child(
+                child_id, Ready(sender=self.node_id)
+            )
+            self.logger.info(f"{self.node_id}: Sent Ready to {child_id}")
+
         # Create aggregate task once, after all children (including recreated ones) are registered.
         self._aggregate_task = asyncio.create_task(
             self._aggregate_and_send_result_batch()
@@ -862,7 +881,7 @@ class AsyncMaster(Node):
         if self.parent is None:
             return
         async with self._timer("heartbeat_sync"):
-            if not await self._comm.sync_heartbeat_with_parent(timeout=100.0):
+            if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
             self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
@@ -1184,6 +1203,14 @@ class AsyncMaster(Node):
             await asyncio.sleep(0.05)
         self.logger.info(f"{self.node_id}: All result collection tasks completed")
 
+        # Wait for all forwarder tasks to finish draining IResultBatch messages.
+        # This ensures all streamed results have been forwarded/accumulated before
+        # we aggregate the final batch.
+        forwarder_tasks = list(self._child_forwarder_task.values())
+        if forwarder_tasks:
+            await asyncio.gather(*forwarder_tasks, return_exceptions=True)
+        self.logger.info(f"{self.node_id}: All forwarder tasks completed")
+
         # Cancel the reporting task
         self._stop_reporting_event.set()
         self._reporting_task.cancel()
@@ -1224,6 +1251,7 @@ class AsyncMaster(Node):
                             self.logger.info(
                                 "Received ack from parent for final status"
                             )
+                            break
             else:
                 try:
                     status = self._scheduler.aggregate_status()
@@ -1253,6 +1281,9 @@ class AsyncMaster(Node):
             else:
                 failed_results = []
             result_batch = ResultBatch(sender=self.node_id, data=failed_results)
+            # Include results streamed during execution (batch mode root master only)
+            for r in self._batch_streaming_results:
+                result_batch.add_result(r)
             for child_id, child_results in self._results.items():
                 for rb in child_results:
                     result_batch += rb
@@ -1290,6 +1321,18 @@ class AsyncMaster(Node):
                 )
         elif self.parent:
             self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
+
+    async def _parent_ready_monitor(self) -> None:
+        """Wait for a Ready message from parent and set the parent-ready event."""
+        try:
+            msg = await self._comm.recv_message_from_parent(Ready, block=True)
+            if msg is not None:
+                self.logger.info(f"{self.node_id}: Received Ready from parent")
+                self._parent_ready_event.set()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.error(f"{self.node_id}: Parent ready monitor error: {e}")
 
     async def _report_status(self) -> None:
         """Periodically aggregate child status and forward to parent."""
@@ -1372,9 +1415,13 @@ class AsyncMaster(Node):
                 single_result.task_id, self.parent.node_id if self.parent else None
             )
             if dest_id is None:
-                self.logger.warning(
-                    f"Can't find a destination for task {single_result.task_id}"
-                )
+                if not self._config.cluster:
+                    # Batch mode root master: accumulate locally
+                    self._batch_streaming_results.append(single_result)
+                else:
+                    self.logger.warning(
+                        f"Can't find a destination for task {single_result.task_id}"
+                    )
                 continue
             dest_results.setdefault(dest_id, []).append(single_result)
 
@@ -1397,12 +1444,26 @@ class AsyncMaster(Node):
     async def _child_result_monitor(self, child_id: str) -> None:
         """Receive IResultBatch messages from child and forward to client or parent."""
         child_done = self._scheduler.get_done_event(child_id)
-        while not child_done.is_set():
-            msg = await self._comm.recv_message_from_child(
-                IResultBatch, child_id=child_id, block=True
+        done_task = asyncio.create_task(child_done.wait())
+        while True:
+            recv_task = asyncio.create_task(
+                self._comm.recv_message_from_child(IResultBatch, child_id=child_id, block=True)
             )
-            if msg is not None:
-                await self._forward_result(msg)
+            done, _ = await asyncio.wait(
+                {recv_task, done_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if recv_task in done:
+                msg = recv_task.result()
+                if msg is not None:
+                    await self._forward_result(msg)
+            else:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except asyncio.CancelledError:
+                    pass
+            if done_task in done:
+                break
         # Drain remaining results after child exits
         while True:
             msg = await self._comm.recv_message_from_child(
@@ -1426,6 +1487,7 @@ class AsyncMaster(Node):
                 if status is not None:
                     self._scheduler.set_child_status(child_id, status)
                     if status.tag == "final":
+                        self.logger.info(f"Received final status from {child_id}. Sending ACK")
                         await self._comm.send_message_to_child(child_id, ResultAck())
                         return
             # Drain any remaining status messages after child process exits
@@ -1460,6 +1522,13 @@ class AsyncMaster(Node):
                         if success:
                             self.logger.info(
                                 f"Child recovered successfully after {i}/{max_retries} retries."
+                            )
+                            # Signal the recovered child that the master is ready.
+                            await self._comm.send_message_to_child(
+                                child_id, Ready(sender=self.node_id)
+                            )
+                            self.logger.info(
+                                f"{self.node_id}: Sent Ready to recovered child {child_id}"
                             )
                             break
                     if not success:
@@ -1605,6 +1674,13 @@ class AsyncMaster(Node):
         4. Close the comm layer and shut down the executor.
         5. Export Perfetto profiling traces if profiling was enabled.
         """
+
+        if self._parent_ready_monitor_task and not self._parent_ready_monitor_task.done():
+            self._parent_ready_monitor_task.cancel()
+            try:
+                await self._parent_ready_monitor_task
+            except asyncio.CancelledError:
+                pass
 
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
@@ -1780,6 +1856,8 @@ class AsyncMaster(Node):
 
         # Return aggregated results
         result_batch = ResultBatch(sender=self.node_id)
+        for r in self._batch_streaming_results:
+                result_batch.add_result(r)
         for child_results in self._results.values():
             for rb in child_results:
                 result_batch += rb

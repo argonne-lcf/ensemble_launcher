@@ -145,14 +145,14 @@ async def test_async_master_cluster(
 
 if __name__ == "__main__":
     print("Testing Async Worker with ProcessPool Executor for 1 task per core")
-    asyncio.run(test_async_master_cluster(task_executor="async_processpool"))
+    asyncio.run(test_async_worker_cluster(task_executor="async_processpool"))
     print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")
     asyncio.run(
-        test_async_master_cluster(task_executor="async_processpool", ntasks_per_core=10)
+        test_async_worker_cluster(task_executor="async_processpool", ntasks_per_core=10)
     )
     print("Testing Async Worker with MPI Executor")
     asyncio.run(
-        test_async_master_cluster(
+        test_async_worker_cluster(
             task_executor="async_mpi", ntasks_per_core=10, exec=echo_stdout
         )
     )
