@@ -1,11 +1,11 @@
 import asyncio
 import json
 import os
-from collections import deque
 import random
 import signal
 import socket
 import time
+from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, Optional, Tuple, Union
@@ -869,26 +869,30 @@ class AsyncWorker(Node):
             ##also send the final status
             final_status = self.get_status()
             final_status.tag = "final"
-            success = await self._comm.send_message_to_parent(final_status)
             if self.parent:
-                if success:
-                    self.logger.info(f"{self.node_id}: Sent final status to parent")
-                    msg = await self._comm.recv_message_from_parent(
-                        ResultAck, timeout=5.0
-                    )
-                    if msg is None:
-                        self.logger.warning(
-                            "Did not get the final status update ack from parent in 5 sec!"
+                max_retries = 10
+                for i in range(max_retries):
+                    success = await self._comm.send_message_to_parent(final_status)
+                    if success:
+                        self.logger.info(f"{self.node_id}: Sent final status to parent")
+                        msg = await self._comm.recv_message_from_parent(
+                            ResultAck, timeout=5.0 + i * 5.0
                         )
+                        if msg is None:
+                            self.logger.warning(
+                                "Did not get the final status update ack from parent in 5 sec!"
+                            )
+                        else:
+                            self.logger.info("Successfully received ack from parent")
+                            break
                     else:
-                        self.logger.info("Successfully received ack from parent")
-                else:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
-                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                    self.logger.info(f"{final_status}")
-                    final_status.to_file(fname)
+                        self.logger.warning(
+                            f"{self.node_id}: Failed to send final status to parent"
+                        )
+                        fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                        self.logger.info(f"{final_status}")
+                        final_status.to_file(fname)
+                        break
         result_batch = ResultBatch(sender=self.node_id)
         for task_id, task in self.tasks.items():
             if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILED:
@@ -901,7 +905,7 @@ class AsyncWorker(Node):
             else:
                 self.logger.warning(f"Task {task_id} status {task.status}")
 
-        max_retries = 3
+        max_retries = 10
         if self.parent:
             for attempt in range(max_retries):
                 success = await self._comm.send_message_to_parent(result_batch)
@@ -911,7 +915,7 @@ class AsyncWorker(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0)
+                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0 + attempt * 5.0)
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
