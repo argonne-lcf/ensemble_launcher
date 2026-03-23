@@ -108,9 +108,9 @@ async def test_async_mpi_master(nlevels=1):
 
 
 if __name__ == "__main__":
-    # print("Testing Async Master with ProcessPool Executor for 1 task per core")
-    # asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
-    # print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
-    # asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
+    print("Testing Async Master with ProcessPool Executor for 1 task per core")
+    asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
+    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
+    asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
     print("Testing Async Master with MPI Executor")
     asyncio.run(test_async_mpi_master(nlevels=1))

@@ -64,7 +64,7 @@ class AsyncMPIExecutor(Executor):
             launcher_cmd.append("-ppn")
             launcher_cmd.append(f"{ppn}")
 
-            if nnodes > 512:
+            if nnodes > 256:
                 # Use hostfile for large node counts to avoid command line length limits
                 hostfile_id = str(uuid.uuid4())
                 hostfile_path = os.path.join(

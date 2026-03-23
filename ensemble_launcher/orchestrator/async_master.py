@@ -3,10 +3,11 @@ import base64
 import json
 import os
 import random
-from collections import deque
+import uuid
 import signal
 import socket
 import time
+from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, List, Optional, Union
@@ -46,7 +47,12 @@ from ensemble_launcher.scheduler.resource import (
 
 from .async_worker import AsyncWorker
 from .node import Node
-from .utils import async_load_str, async_simple_load_str
+from .utils import (
+    async_load_str,
+    async_load_str_file,
+    async_simple_load_str,
+    async_simple_load_str_file,
+)
 
 AsyncFuture = asyncio.Future
 
@@ -410,11 +416,15 @@ class AsyncMaster(Node):
             # Serialize child object
             child_dict = child_obj.asdict()
             json_str = json.dumps(child_dict, default=str)
-            json_str_b64 = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
 
-            # Create embedded command string for this child (simple version, no per-host logic)
-            load_str_embed = async_simple_load_str.replace(
-                "json_str_b64", f"b'{json_str_b64}'"
+            # Write JSON to a temp file to avoid ARG_MAX limits on large payloads
+            json_fname = os.path.join(
+                self._executor.tmp_dir, f"child_{uuid.uuid4()}.json"
+            )
+            with open(json_fname, "w") as _f:
+                _f.write(json_str)
+            load_str_embed = async_simple_load_str_file.replace(
+                "json_file_path", f"'{json_fname}'"
             )
 
             req = JobResource(resources=[NodeResourceCount(ncpus=1)], nodes=[head_node])
@@ -537,14 +547,16 @@ class AsyncMaster(Node):
                                 final_dict[key][hostname].append(value)
 
                 self.logger.info(f"Final dict: {final_dict}")
-                # Create embedded command string
+                # Write JSON to a temp file to avoid ARG_MAX limits on large payloads
                 json_str = json.dumps(final_dict, default=str)
-                json_str_b64 = base64.b64encode(json_str.encode("utf-8")).decode(
-                    "ascii"
+                json_fname = os.path.join(
+                    self._executor.tmp_dir, f"workers_{uuid.uuid4()}.json"
                 )
+                with open(json_fname, "w") as _f:
+                    _f.write(json_str)
                 common_keys_str = ",".join(common_keys)
-                load_str_embed = async_load_str.replace(
-                    "json_str_b64", f"b'{json_str_b64}'"
+                load_str_embed = async_load_str_file.replace(
+                    "json_file_path", f"'{json_fname}'"
                 )
                 load_str_embed = load_str_embed.replace(
                     "common_keys_str", f"'{common_keys_str}'"
@@ -1190,24 +1202,28 @@ class AsyncMaster(Node):
             ):
                 final_status = self._scheduler.aggregate_status()
                 final_status.tag = "final"
-                success = await self._comm.send_message_to_parent(final_status)
-                if not success:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
-                else:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully reported final status to parent"
-                    )
-                    ack = await self._comm.recv_message_from_parent(
-                        ResultAck, timeout=5.0
-                    )
-                    if ack is None:
+                max_retries = 10
+                for i in range(max_retries):
+                    success = await self._comm.send_message_to_parent(final_status)
+                    if not success:
                         self.logger.warning(
-                            "Did not receive ack for final status from parent in 5sec"
+                            f"{self.node_id}: Failed to send final status to parent"
                         )
                     else:
-                        self.logger.info("Received ack from parent for final status")
+                        self.logger.info(
+                            f"{self.node_id}: Successfully reported final status to parent"
+                        )
+                        ack = await self._comm.recv_message_from_parent(
+                            ResultAck, timeout=5.0 + i * 5.0
+                        )
+                        if ack is None:
+                            self.logger.warning(
+                                "Did not receive ack for final status from parent in 5sec"
+                            )
+                        else:
+                            self.logger.info(
+                                "Received ack from parent for final status"
+                            )
             else:
                 try:
                     status = self._scheduler.aggregate_status()
@@ -1245,7 +1261,7 @@ class AsyncMaster(Node):
             )
 
         # Send to parent with ACK and retries (skip if parent is dead)
-        max_retries = 3
+        max_retries = 10
         if self.parent and (
             self._comm.parent_dead_event is None
             or not self._comm.parent_dead_event.is_set()
@@ -1258,7 +1274,7 @@ class AsyncMaster(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0)
+                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0 + attempt * 5.0)
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
