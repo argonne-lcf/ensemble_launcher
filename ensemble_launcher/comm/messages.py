@@ -164,6 +164,11 @@ class ResultAck(Message):
 
 
 @dataclass
+class Ready(Message):
+    pass
+
+
+@dataclass
 class Stop(Message):
     type: Optional[StopType] = None
 
@@ -187,6 +192,7 @@ all_messages = [
     TaskUpdate,
     NodeUpdate,
     ResultAck,
+    Ready,
     Stop,
     TaskRequest,
     NodeRequest,

@@ -453,12 +453,13 @@ class AsyncZMQComm(AsyncComm):
         hb_bytes = cloudpickle.dumps((self._node_info.secret_id, _HeartBeat()))
         while not stop.is_set():
             try:
-                await dealer.send(hb_bytes)
                 while True:
-                    msg = await dealer.recv()
-                    parent_secret_id, _ = cloudpickle.loads(msg)
-                    if parent_secret_id == self._node_info.parent_secret_id:
-                        break
+                    await dealer.send(hb_bytes)
+                    msg = await asyncio.wait_for(dealer.recv(), timeout=10.0)
+                    if msg is not None:
+                        parent_secret_id, _ = cloudpickle.loads(msg)
+                        if parent_secret_id == self._node_info.parent_secret_id:
+                            break
 
                 if self._hb_parent_ready is not None and not self._hb_parent_ready.is_set():
                     try:
