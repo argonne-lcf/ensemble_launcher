@@ -447,7 +447,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
 
             if not assigned:
                 removed_tasks.append(task_id)
-                self.logger.warning(f"Task {task_id} does not fit in any worker")
+                # self.logger.warning(f"Task {task_id} does not fit in any worker")
 
         return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
 

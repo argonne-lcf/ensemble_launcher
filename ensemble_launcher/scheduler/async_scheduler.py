@@ -6,11 +6,10 @@ from collections import Counter
 from logging import Logger
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
-from ensemble_launcher.config import LauncherConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
-from ensemble_launcher.config import PolicyConfig
 from .child_state import ChildState
 from .policy import ChildrenPolicy, Policy, policy_registry
 from .resource import (
@@ -147,9 +146,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Raise RuntimeError if the current state is not in from_states."""
         current = self._child_states.get(child_id)
         if current not in from_states:
-            self.logger.error(
-                f"Invalid transition {child_id}: {current} -> {to_state}"
-            )
+            self.logger.error(f"Invalid transition {child_id}: {current} -> {to_state}")
             raise RuntimeError(
                 f"Invalid child state transition for {child_id}: {current} -> {to_state}"
             )
@@ -310,7 +307,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
     @property
     def unassigned_task_ids(self) -> Set[str]:
         """Read-only view of the unassigned task pool."""
-        return self._unassigned_tasks
+        return copy.deepcopy(self._unassigned_tasks)
 
     def discard_unassigned(self, task_id: str) -> None:
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
@@ -373,9 +370,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child_id_to_wid=dict(self._child_id_to_wid),
             wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
             task_to_child=self._task_to_child,
-            child_states={
-                cid: s.name for cid, s in self._child_states.items()
-            },
+            child_states={cid: s.name for cid, s in self._child_states.items()},
         )
 
     def set_state(self, state: SchedulerState) -> None:
@@ -482,7 +477,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
                     "wid": wid,
                 }
                 self.register_child(child_id, alloc)  # → NOTREADY
-                self.mark_child_ready(child_id)        # NOTREADY → READY
+                self.mark_child_ready(child_id)  # NOTREADY → READY
                 self._child_id_to_wid[child_id] = wid
                 self._wid_to_child_id[wid] = child_id
             else:
@@ -550,9 +545,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         )
 
         if removed_tasks:
-            self.logger.warning(
-                f"Policy could not place {len(removed_tasks)} tasks: {removed_tasks}"
-            )
+            self.logger.debug(f"Policy could not place {len(removed_tasks)} tasks")
 
         child_assignments: Dict[str, List[str]] = {}
         for wid, assigned_ids in wid_to_task_id_map.items():
@@ -1059,3 +1052,7 @@ class AsyncTaskScheduler(AsyncScheduler):
     def remaining_tasks(self) -> Set[str]:
         """Task IDs that have not yet succeeded or failed."""
         return set(self.tasks.keys()) - (self._successful_tasks | self._failed_tasks)
+
+    @property
+    def not_ready_tasks(self) -> PriorityQueue:
+        return self._sorted_tasks

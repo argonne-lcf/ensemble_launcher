@@ -1,14 +1,15 @@
 import asyncio
-from asyncio import Future as AsyncFuture
-from typing import Callable, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 from ensemble_launcher.comm.messages import (
+    IResultBatch,
+    Result,
     Stop,
     StopType,
     TaskRequest,
     TaskUpdate,
 )
-from ensemble_launcher.scheduler.child_state import ChildState
+from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
 
 from .async_master import AsyncMaster
@@ -41,9 +42,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         """Initialise work-stealing specific state on top of AsyncMaster."""
         super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
 
-        self._all_work_done_event = asyncio.Event()
-        self._relaunch_attempts = 0
-        self._max_relaunch_attempts = 2
+        self._completed_task_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Child class selection
@@ -79,7 +78,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
             self.level, self.node_id, reset=not partial, nodes=nodes
         )
 
-        if not partial:
+        if not partial and not self._config.overload_orchestrator_core:
             self._apply_resource_headroom()
 
         target_ids = set(self._scheduler.child_assignments.keys()) - existing_ids
@@ -88,6 +87,15 @@ class AsyncWorkStealingMaster(AsyncMaster):
     def _build_init_task_update(self, child_id: str) -> None:
         """No initial task update is sent in work-stealing mode; tasks arrive on demand."""
         return None
+
+    # --------------------------------------------------------------------------
+    #                               Task Routing
+    # --------------------------------------------------------------------------
+
+    def _route_tasks(self, tasks: List[Task]) -> List[Optional[str]]:
+        """In workstealing mode tasks are only added to the scheduler queue."""
+        for task in tasks:
+            self._scheduler.add_task(task)
 
     # ------------------------------------------------------------------
     # Dynamic task monitoring
@@ -113,7 +121,15 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
                 if task_request is not None:
                     failures = 0
-                    self.logger.info(
+                    # Drain any additional queued requests and keep only the latest.
+                    while True:
+                        next_request = await self._comm.recv_message_from_child(
+                            TaskRequest, child_id=child_id, block=False
+                        )
+                        if next_request is None:
+                            break
+                        task_request = next_request
+                    self.logger.debug(
                         f"{self.node_id}: Received task request from {child_id} for {task_request.ntasks} tasks"
                     )
 
@@ -125,11 +141,16 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
                     assigned_task_ids = child_assignments.get(child_id, [])
                     if not assigned_task_ids:
-                        self.logger.info(
-                            f"{self.node_id}: No tasks to assign, sending stop to {child_id}"
-                        )
-                        stop_msg = Stop(sender=self.node_id, type=StopType.TERMINATE)
-                        await self._comm.send_message_to_child(child_id, stop_msg)
+                        if not self._config.cluster:
+                            self.logger.warning(
+                                f"{self.node_id}: No tasks to assign, sending stop to {child_id}"
+                            )
+                            stop_msg = Stop(
+                                sender=self.node_id, type=StopType.TERMINATE
+                            )
+                            await self._comm.send_message_to_child(child_id, stop_msg)
+                        else:
+                            self.logger.debug(f"{self.node_id}: No tasks to assign.")
                     else:
                         available_tasks = [
                             self._scheduler.tasks[tid] for tid in assigned_task_ids
@@ -138,7 +159,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
                             sender=self.node_id, added_tasks=available_tasks
                         )
                         await self._comm.send_message_to_child(child_id, task_update)
-                        self.logger.info(
+                        self.logger.debug(
                             f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
                         )
 
@@ -182,52 +203,38 @@ class AsyncWorkStealingMaster(AsyncMaster):
                 f"{self.node_id}: Work-stealing mode — {len(self._scheduler.unassigned_task_ids)} tasks in unassigned pool"
             )
 
-    def _mark_and_launch(self, child_ids: List[str], future) -> None:
-        """Apply state transitions and relaunch children for remaining tasks.
+    async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
+        """Forward result upstream and track completed task IDs.
 
-        Called via call_soon_threadsafe from done callbacks. Determines
-        SUCCESS/FAILED from the future exit code for RUNNING children.
-        RECOVERING children are handled by _recover_dead_child which awaits
-        the future directly — skip them here to avoid double-transition.
-        If all children reach terminal state but unassigned tasks remain,
-        relaunches up to _max_relaunch_attempts times.
+        In non-cluster mode, once the count of unique completed task IDs reaches
+        the total task count, sends Stop(TERMINATE) to all children.  The base
+        _wait_for_finish then observes _all_children_done_event (set when every
+        child reaches SUCCESS/FAILED after processing Stop) and handles result
+        aggregation normally.
         """
-        for child_id in child_ids:
-            state = self._scheduler.get_child_state(child_id)
-            if state == ChildState.RUNNING:
-                try:
-                    crashed = future.cancelled() or future.exception() is not None
-                except Exception:
-                    crashed = True
-                if crashed:
-                    self._scheduler.mark_child_failed(child_id)
-                else:
-                    self._scheduler.mark_child_success(child_id)
-            else:
-                # RECOVERING (teardown handles via wrap_future), terminal, or
-                # unregistered — no-op.
-                self.logger.debug(
-                    f"_mark_and_launch: no-op for {child_id} in state {state}"
-                )
-        if not self._scheduler.all_children_done:
+        await super()._forward_result(result)
+        if self._config.cluster:
             return
-        if self._scheduler.unassigned_task_ids:
-            if self._relaunch_attempts < self._max_relaunch_attempts:
-                self._relaunch_attempts += 1
-                self.logger.warning(
-                    f"{self.node_id}: Relaunching children for remaining "
-                    f"{len(self._scheduler.unassigned_task_ids)} tasks "
-                    f"(attempt {self._relaunch_attempts}/{self._max_relaunch_attempts})"
+        items = result.data if isinstance(result, IResultBatch) else [result]
+        for item in items:
+            self._completed_task_ids.add(item.task_id)
+        await self._check_all_tasks_done()
+
+    async def _check_all_tasks_done(self) -> None:
+        """Send Stop(TERMINATE) to all children once every task has a result."""
+        if len(self._completed_task_ids) < len(self._scheduler.tasks):
+            return
+        self.logger.info(
+            f"{self.node_id}: All {len(self._scheduler.tasks)} tasks completed, "
+            f"sending Stop to children"
+        )
+        for child_id in list(self.children.keys()):
+            try:
+                await self._comm.send_message_to_child(
+                    child_id, Stop(sender=self.node_id, type=StopType.TERMINATE)
                 )
-                asyncio.create_task(self._relaunch_children())
-            else:
-                self.logger.error(
-                    f"{self.node_id}: Max relaunch attempts reached, "
-                    f"{len(self._scheduler.unassigned_task_ids)} tasks will not be executed"
-                )
-                self._all_work_done_event.set()
-        else:
-            self._all_work_done_event.set()
+            except Exception as e:
+                self.logger.warning(f"Failed to send Stop to {child_id}: {e}")
 
     async def _relaunch_children(self) -> None:
         """Create, launch, and sync a fresh set of children for the remaining unassigned tasks."""
@@ -252,105 +259,3 @@ class AsyncWorkStealingMaster(AsyncMaster):
 
         except Exception as e:
             self.logger.error(f"{self.node_id}: Error during relaunch: {e}")
-
-    def _create_done_callback(
-        self, child_ids: List[str]
-    ) -> Callable[[AsyncFuture], None]:
-        def _done_callback(future: AsyncFuture):
-            if self._event_loop is not None:
-                self._event_loop.call_soon_threadsafe(
-                    self._mark_and_launch, child_ids, future
-                )
-            else:
-                self.logger.warning("No event loop stored, can't mark child done!")
-
-        return _done_callback
-
-    async def _wait_for_finish(self) -> None:
-        """Wait for all work to complete, accounting for dynamically stolen tasks.
-
-        Races conditions with asyncio.FIRST_COMPLETED:
-        1. Work done — _all_work_done_event (set once all tasks assigned and collected).
-        2. Parent dead locally — consecutive send failures exceeded threshold.
-        3. SIGTERM on this process.
-        4. Stop(TERMINATE/KILL) received from parent (non-root only).
-
-        On parent-dead exit, forwards Stop(KILL) to all children. On any other
-        non-work-done exit, forwards Stop(TERMINATE) cascading the shutdown down
-        the subtree. In both cases skips sending results/status to the dead parent.
-        """
-        import sys
-
-        stop_tasks: Dict[str, asyncio.Task] = {}
-        received_stop_type: List[Optional[StopType]] = [None]
-
-        stop_tasks["work_done"] = asyncio.create_task(self._all_work_done_event.wait())
-        if self._comm.parent_dead_event is not None:
-            stop_tasks["parent_dead"] = asyncio.create_task(self._comm.parent_dead_event.wait())
-        stop_tasks["stop_signal"] = asyncio.create_task(
-            self._stop_signal_received.wait()
-        )
-
-        if self.parent is not None:
-
-            async def _recv_stop_from_parent():
-                msg = await self._comm.recv_message_from_parent(Stop, block=True)
-                if msg is not None:
-                    received_stop_type[0] = msg.type
-
-            stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
-
-        done, pending = await asyncio.wait(
-            set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Propagate stop to children if work didn't finish naturally.
-        # Parent dead → KILL children. Received stop from parent → mirror its type.
-        # Any other reason (SIGTERM etc.) → TERMINATE cleanly.
-        if not self._all_work_done_event.is_set():
-            if self._parent_dead_event.is_set():
-                stop_type = StopType.KILL
-            elif received_stop_type[0] is not None:
-                stop_type = received_stop_type[0]
-            else:
-                stop_type = StopType.TERMINATE
-            self.logger.info(
-                f"{self.node_id}: Propagating {stop_type.value} to children"
-            )
-            for child_id in list(self.children.keys()):
-                try:
-                    await self._comm.send_message_to_child(
-                        child_id, Stop(sender=self.node_id, type=stop_type)
-                    )
-                except Exception:
-                    pass
-
-        # If we KILLed children they won't send results — cancel all result tasks.
-        if not self._all_work_done_event.is_set() and stop_type == StopType.KILL:
-            for t in list(self._child_result_batch_task.values()):
-                t.cancel()
-            await asyncio.gather(
-                *self._child_result_batch_task.values(),
-                return_exceptions=True,
-            )
-            self._aggregate_task.cancel()
-            try:
-                await self._aggregate_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        else:
-            await self._aggregate_task
-
-        # Force-exit after propagating if we received a KILL from our parent.
-        if received_stop_type[0] == StopType.KILL:
-            sys.exit(1)
-
-    async def stop(self) -> None:
-        """Delegate to AsyncMaster.stop() — per-child monitors are cancelled by _teardown_child."""
-        return await super().stop()

@@ -1,8 +1,9 @@
 import asyncio
-from typing import Dict, Optional
+import random
+from typing import Dict, List, Optional
 
 from ensemble_launcher.comm import AsyncComm, NodeInfo
-from ensemble_launcher.comm.messages import Stop, StopType, TaskRequest, TaskUpdate
+from ensemble_launcher.comm.messages import Stop, StopType, TaskRequest
 from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler.resource import JobResource
@@ -32,7 +33,6 @@ class AsyncWorkStealingWorker(AsyncWorker):
     ) -> None:
         """Initialise work-stealing specific state on top of AsyncWorker."""
         super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
-        self._task_request_in_progress = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Initialisation overrides
@@ -43,10 +43,12 @@ class AsyncWorkStealingWorker(AsyncWorker):
         pass
 
     async def _lazy_init(self) -> None:
-        """Extend base init: fire the initial task request after the scheduler is ready."""
+        """Extend base init: start periodic task requester and task update monitor."""
         await super()._lazy_init()
-        self.logger.info(f"{self.node_id}: Sending initial task request")
-        asyncio.create_task(self._request_tasks_from_master())
+        asyncio.create_task(self._periodic_task_requester())
+        # Base only starts _task_update_monitor in cluster mode; start it always here.
+        if self.parent and not self._config.cluster:
+            self._task_update_task = asyncio.create_task(self._task_update_monitor())
 
     # ------------------------------------------------------------------
     # Stop condition
@@ -67,6 +69,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
         import sys
 
         stop_tasks: Dict[str, asyncio.Task] = {}
+        received_stop_type: List[Optional[StopType]] = [None]
 
         stop_tasks["stop_signal"] = asyncio.create_task(
             self._stop_signal_received.wait()
@@ -79,13 +82,9 @@ class AsyncWorkStealingWorker(AsyncWorker):
         if self.parent is not None:
 
             async def _recv_stop_from_parent():
-                while True:
-                    msg = await self._comm.recv_message_from_parent(Stop, block=True)
-                    if msg is not None:
-                        if msg.type == StopType.KILL:
-                            sys.exit(1)
-                        elif msg.type == StopType.TERMINATE:
-                            return
+                msg = await self._comm.recv_message_from_parent(Stop, block=True)
+                if msg is not None:
+                    received_stop_type[0] = msg.type
 
             stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
 
@@ -99,7 +98,10 @@ class AsyncWorkStealingWorker(AsyncWorker):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._comm.parent_dead_event is not None and self._comm.parent_dead_event.is_set():
+        if (
+            self._comm.parent_dead_event is not None
+            and self._comm.parent_dead_event.is_set()
+        ):
             sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -107,82 +109,51 @@ class AsyncWorkStealingWorker(AsyncWorker):
     # ------------------------------------------------------------------
 
     def _task_callback(self, task: Task, future) -> None:
-        """After each task completes, request more tasks if the local queue is now empty."""
+        """After each task completes, delegate to base callback."""
         super()._task_callback(task, future)
-
-        if (
-            self._scheduler._sorted_tasks.empty()
-            and not self._stop_signal_received.is_set()
-        ):
-            self.logger.debug(
-                f"{self.node_id}: Task queue empty after {task.task_id} completion, requesting more"
-            )
-            asyncio.create_task(self._request_tasks_from_master())
+        # Periodic requester loop handles task requests; callback-triggered requests removed.
+        # if (
+        #     self._scheduler._sorted_tasks.empty()
+        #     and not self._stop_signal_received.is_set()
+        # ):
+        #     self.logger.debug(
+        #         f"{self.node_id}: Task queue empty after {task.task_id} completion, requesting more"
+        #     )
+        #     asyncio.create_task(self._request_tasks_from_master())
 
     async def _request_tasks_from_master(self) -> None:
-        """Send a TaskRequest to the master and process the response (TaskUpdate or STOP).
+        """Send a TaskRequest to the master (fire-and-forget).
 
-        A guard flag prevents concurrent requests. On receiving a TaskUpdate the
-        tasks are forwarded to the scheduler; on STOP the stop event is set.
+        The response (TaskUpdate or Stop) is handled separately: TaskUpdate by
+        _task_update_monitor, Stop by _wait_for_stop_condition.
         """
-        # Early check without setting the flag
-        if self._task_request_in_progress.is_set():
-            self.logger.debug(
-                "Task request is already in progress. Not sending a new one"
-            )
-            return
-
-        try:
-            self._task_request_in_progress.set()
-
-            # Calculate how many tasks to request based on available resources
-            ntasks = self.nodes.resources[0].cpu_count * len(self.nodes.nodes)
-            free_resources = self.nodes
-
-            self.logger.info(f"{self.node_id}: Requesting {ntasks} tasks from master")
-
-            # Send task request
-            task_request = TaskRequest(
-                sender=self.node_id, ntasks=ntasks, free_resources=free_resources
-            )
-            await self._comm.send_message_to_parent(task_request)
-
-            # Wait for response - either TaskUpdate or Stop, whichever comes first
-            task_update_task = asyncio.create_task(
-                self._comm.recv_message_from_parent(
-                    TaskUpdate, timeout=None, block=True
+        if (
+            self._scheduler.cluster.free_cpus
+            and self._scheduler.not_ready_tasks.empty()
+        ):
+            try:
+                ntasks = (
+                    self._scheduler.cluster.free_cpus
+                    if self._config.task_request_size is None
+                    else self._config.task_request_size
                 )
+                task_request = TaskRequest(sender=self.node_id, ntasks=ntasks)
+                self.logger.debug(
+                    f"{self.node_id}: Requesting {ntasks} tasks from master"
+                )
+                await self._comm.send_message_to_parent(task_request)
+
+            except Exception as e:
+                self.logger.error(f"Error sending task request: {e}", exc_info=True)
+        else:
+            self.logger.debug(
+                "Skipping task request. Either no free resourcses or still have tasks in queue"
             )
-            action_task = asyncio.create_task(
-                self._comm.recv_message_from_parent(Stop, timeout=None, block=True)
-            )
 
-            done, pending = await asyncio.wait(
-                [task_update_task, action_task], return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            # Check which task completed
-            for task in done:
-                result = await task
-                if isinstance(result, TaskUpdate):
-                    self.logger.info(
-                        f"{self.node_id}: Received {len(result.added_tasks)} tasks from master"
-                    )
-                    if len(result.added_tasks) > 0:
-                        self._update_tasks(result)
-                    else:
-                        self.logger.debug(f"{self.node_id}: Received empty task update")
-
-        except Exception as e:
-            self.logger.error(f"Error requesting tasks from master: {e}", exc_info=True)
-        finally:
-            # Always clear the flag to prevent deadlock
-            self._task_request_in_progress.clear()
+    async def _periodic_task_requester(self) -> None:
+        """Periodically send TaskRequests to master at a fixed interval."""
+        while not self._stop_signal_received.is_set():
+            await self._request_tasks_from_master()
+            ## Avoiding thundering herd issue
+            jitter = random.uniform(0.9, 1.1)
+            await asyncio.sleep(jitter * self._config.task_request_interval)
