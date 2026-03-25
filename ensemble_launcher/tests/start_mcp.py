@@ -6,7 +6,7 @@ import socket
 import time
 import uuid
 
-from utils import async_compute_density, compute_density
+from test_helpers import async_compute_density, compute_density
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig

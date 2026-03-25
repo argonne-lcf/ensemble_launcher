@@ -3,7 +3,7 @@ import socket
 import time
 
 import pytest
-from utils import echo
+from test_helpers import echo
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig

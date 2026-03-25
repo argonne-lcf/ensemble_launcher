@@ -7,7 +7,7 @@ import time
 import uuid
 
 import pytest
-from utils import echo, echo_stdout
+from test_helpers import echo, echo_stdout
 
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task

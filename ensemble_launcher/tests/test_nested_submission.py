@@ -7,7 +7,7 @@ import time
 # ---------------------------------------------------------------------------
 import uuid
 
-from utils import nested_task
+from test_helpers import nested_task
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig

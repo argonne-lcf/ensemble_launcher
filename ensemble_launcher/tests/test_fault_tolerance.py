@@ -6,7 +6,7 @@ import time
 import uuid
 
 import pytest
-from utils import echo_sleep
+from test_helpers import echo_sleep
 
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
