@@ -10,6 +10,13 @@ def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
 
 
+def echo_mpi():
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    return comm.rank
+
+
 def echo_sleep(task_id: str, sleep_time: float = 0.0):
     time.sleep(sleep_time)
     return f"Hello from task {task_id}"
@@ -31,3 +38,16 @@ async def async_compute_density(Temperature: float, Pressure: float) -> float:
     await asyncio.sleep(0)
     R_specific = 8.314 / 28.96e-3
     return Pressure / R_specific / Temperature
+
+
+def nested_task(level: int, ckpt_dir: str):
+    if level == 3:
+        return str(level)
+
+    from utils import nested_task
+
+    from ensemble_launcher.orchestrator import ClusterClient
+
+    with ClusterClient(checkpoint_dir=ckpt_dir) as client:
+        future = client.submit(nested_task, level + 1, ckpt_dir)
+        return str(level) + "," + future.result()

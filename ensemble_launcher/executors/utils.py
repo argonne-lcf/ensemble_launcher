@@ -44,6 +44,25 @@ def run_callable_with_affinity(
     return result
 
 
+def run_callable_with_env(
+    fn: Callable,
+    args: Tuple = (),
+    kwargs: Dict = {},
+    env: Dict[str, Any] = {},
+):
+    """
+    Function to run a callable on specific cpus and reset affinity after execution.
+    """
+    import os
+
+    original_env = os.environ.copy()
+    os.environ.update(env)
+    result = fn(*args, **kwargs)
+    os.environ.clear()
+    os.environ.update(original_env)
+    return result
+
+
 def run_cmd(
     cmd: str,
     args: Tuple = (),
