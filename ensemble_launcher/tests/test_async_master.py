@@ -5,7 +5,12 @@ import socket
 import pytest
 from utils import echo, echo_stdout
 
-from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
+from ensemble_launcher.config import (
+    LauncherConfig,
+    MPIConfig,
+    PolicyConfig,
+    SystemConfig,
+)
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster
 from ensemble_launcher.scheduler.resource import (
@@ -41,9 +46,8 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             task_executor_name="async_processpool",
             log_level=logging.INFO,
             worker_logs=True,
-            cpu_binding_option="",
-            heartbeat_interval=0.1,
-            heartbeat_dead_threshold=0.3,
+            heartbeat_interval=1.0,
+            heartbeat_dead_threshold=5.0,
         ),
         job_resource,
         tasks,
@@ -87,11 +91,10 @@ async def test_async_mpi_master(nlevels=1):
             task_executor_name="async_mpi",
             log_level=logging.DEBUG,
             worker_logs=True,
-            use_mpi_ppn=False,
+            mpi_config=MPIConfig(cpu_bind_method="none", processes_per_node_flag=None),
             sequential_child_launch=True,
-            cpu_binding_option="",
             heartbeat_interval=0.1,
-            heartbeat_dead_threshold=0.3,
+            heartbeat_dead_threshold=5.0,
         ),
         job_resource,
         tasks,

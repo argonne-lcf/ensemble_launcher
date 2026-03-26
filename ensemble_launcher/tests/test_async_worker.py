@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, MPIConfig, SystemConfig
 from ensemble_launcher.ensemble import AsyncTask, Task
 from ensemble_launcher.orchestrator import AsyncWorker
 from ensemble_launcher.scheduler.resource import (
@@ -50,7 +50,6 @@ async def test_async_worker(task_executor="async_processpool", ntasks_per_core=1
             comm_name="async_zmq",
             worker_logs=True,
             report_interval=100.0,
-            use_mpi_ppn=False,
             log_level=logging.INFO,
         ),
         job_resource,
@@ -94,7 +93,7 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
             comm_name="async_zmq",
             worker_logs=True,
             report_interval=100.0,
-            use_mpi_ppn=False,
+            mpi_config=MPIConfig(processes_per_node_flag=None),
             log_level=logging.INFO,
             return_stdout=True,
         ),
@@ -112,6 +111,45 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
             result.split(",")[0].strip() == f"Hello from task {task_id}"
             for task_id, result in results.items()
         ]
+    ), f"{[result for task_id, result in results.items()]}"
+
+
+@pytest.mark.asyncio
+async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
+    tasks = {}
+    for i in range(12):
+        tasks[f"task-{i}"] = Task(
+            task_id=f"task-{i}", nnodes=1, ppn=1, executable=echo, args=(f"task-{i}",)
+        )
+
+    nodes = [socket.gethostname()]
+    sys_info = NodeResourceList.from_config(
+        SystemConfig(name="local", ncpus=12, cpus=list(range(1, 13)))
+    )
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
+
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name=task_executor,
+            comm_name="async_zmq",
+            worker_logs=True,
+            report_interval=100.0,
+            mpi_config=MPIConfig(
+                processes_per_node_flag=None, hosts_flag=None, cpu_bind_method="none"
+            ),
+            log_level=logging.INFO,
+        ),
+        job_resource,
+        tasks,
+    )
+
+    res = await w.run()
+    results = {r.task_id: r.data for r in res.data}
+
+    assert len(results) > 0 and all(
+        result.strip() == f"Hello from task {task_id}"
+        for task_id, result in results.items()
     ), f"{[result for task_id, result in results.items()]}"
 
 
@@ -146,7 +184,6 @@ async def test_async_task_worker():
             comm_name="async_zmq",
             worker_logs=True,
             report_interval=100.0,
-            use_mpi_ppn=False,
             log_level=logging.INFO,
         ),
         job_resource,
@@ -172,5 +209,7 @@ if __name__ == "__main__":
     # )
     # print("Testing Async Worker with MPI Executor")
     # asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
-    print("Testing Async Worker with AsyncTask")
-    asyncio.run(test_async_task_worker())
+    # print("Testing Async Worker with AsyncTask")
+    # asyncio.run(test_async_task_worker())
+    print("Testing Async Worker with MPI Pool Executor")
+    asyncio.run(test_async_mpi_pool_worker())

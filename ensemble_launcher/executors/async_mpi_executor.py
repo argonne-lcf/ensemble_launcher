@@ -8,8 +8,9 @@ import uuid
 from asyncio import Future as AsyncFuture
 from asyncio import Task
 from concurrent.futures import Executor
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from ensemble_launcher.config import MPIConfig
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
 
 from .utils import (
@@ -29,81 +30,75 @@ class AsyncMPIExecutor(Executor):
         logger=logger,
         gpu_selector: str = "ZE_AFFINITY_MASK",
         tmp_dir: str = ".mpiexec_tmp",
-        mpiexec: str = "mpirun",
         return_stdout: bool = True,
-        use_ppn: bool = True,
+        mpi_config: Optional[MPIConfig] = None,
         **kwargs,
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
-        self.mpiexec = mpiexec
         self._processes: Dict[str, subprocess.Popen] = {}
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
-        self.use_ppn = use_ppn
-        self._cpu_binding_option = kwargs.get("cpu_binding_option", "--cpu-bind")
+        self._mpi_config = mpi_config if mpi_config is not None else MPIConfig()
         os.makedirs(self.tmp_dir, exist_ok=True)
         self.logger.info("Initialized AsyncMPI Executor!")
 
     def _build_resource_cmd(self, task_id: str, job_resource: JobResource):
-        """Function to build the mpi cmd from the job resources"""
+        """Build the mpirun resource flags from the job resource and MPIConfig."""
 
+        cfg = self._mpi_config
         ppn = job_resource.resources[0].cpu_count
         nnodes = len(job_resource.nodes)
         ngpus_per_process = (
             job_resource.resources[0].gpu_count // job_resource.resources[0].cpu_count
+            if job_resource.resources[0].cpu_count > 0 else 0
         )
 
         env = {}
         launcher_cmd = []
 
-        launcher_cmd.append("-np")
-        launcher_cmd.append(f"{ppn * nnodes}")
-        if self.use_ppn:
-            launcher_cmd.append("-ppn")
-            launcher_cmd.append(f"{ppn}")
+        # Total process count
+        launcher_cmd += [cfg.nprocesses_flag, str(ppn * nnodes)]
 
-            if nnodes > 256:
-                # Use hostfile for large node counts to avoid command line length limits
-                hostfile_id = str(uuid.uuid4())
-                hostfile_path = os.path.join(
-                    self.tmp_dir, f"hostfile_{hostfile_id}.txt"
-                )
+        # Processes per node
+        if cfg.processes_per_node_flag:
+            launcher_cmd += [cfg.processes_per_node_flag, str(ppn)]
+
+        # Host / node list
+        if cfg.hosts_flag is not None:
+            if nnodes >= cfg.hostfile_threshold and cfg.hostfile_flag:
+                hostfile_path = os.path.join(self.tmp_dir, f"hostfile_{task_id}.txt")
                 with open(hostfile_path, "w") as f:
                     for node in job_resource.nodes:
                         f.write(f"{node}\n")
-                launcher_cmd.append("--hostfile")
-                launcher_cmd.append(hostfile_path)
+                launcher_cmd += [cfg.hostfile_flag, hostfile_path]
                 self.logger.info(
                     f"Created hostfile with {nnodes} nodes at {hostfile_path}"
                 )
             else:
-                launcher_cmd.append("--hosts")
-                launcher_cmd.append(f"{','.join(job_resource.nodes)}")
+                launcher_cmd += [cfg.hosts_flag, ",".join(job_resource.nodes)]
 
-        ##resource pinning
+        # CPU affinity
         if isinstance(job_resource.resources[0], NodeResourceList):
             common_cpus = set.intersection(
-                *[set(node_resource.cpus) for node_resource in job_resource.resources]
+                *[set(nr.cpus) for nr in job_resource.resources]
             )
-
-            use_common_cpus = common_cpus == set(job_resource.resources[0].cpus)
-            if use_common_cpus:
-                cores = ":".join(map(str, job_resource.resources[0].cpus))
-            else:
-                ##TODO: implement host file option
+            if common_cpus != set(job_resource.resources[0].cpus):
                 self.logger.warning(
-                    f"Can't use same CPUs on all the nodes. Over subscribing cores"
+                    "Can't use same CPUs on all nodes. Oversubscribing cores."
                 )
-                cores = ":".join(map(str, job_resource.resources[0].cpus))
-            # TODO: Add bind to for openmpi
-            if self._cpu_binding_option == "--cpu-bind":
-                launcher_cmd.append("--cpu-bind")
-                launcher_cmd.append(f"list:{cores}")
+            cores = ":".join(map(str, job_resource.resources[0].cpus))
+
+            if cfg.cpu_bind_method == "list" and cfg.cpu_bind_flag:
+                launcher_cmd += [cfg.cpu_bind_flag, f"list:{cores}"]
+            elif cfg.cpu_bind_method == "bind-to" and cfg.cpu_bind_flag:
+                launcher_cmd += [cfg.cpu_bind_flag, "core", "--map-by", cfg.openmpi_map_by]
+            elif cfg.cpu_bind_method == "none":
+                pass
             else:
                 self.logger.warning(
-                    f"Unknown bind to core option {self._cpu_binding_option}. Not setting affinity"
+                    f"Unknown cpu_bind_method '{cfg.cpu_bind_method}'. Not setting affinity."
                 )
 
             if ngpus_per_process > 0:
@@ -209,13 +204,17 @@ class AsyncMPIExecutor(Executor):
             self.logger.warning("Can only execute either a callable or a string")
             return None
 
-        if (
-            " ".join(resource_pinning_cmd).strip() == "-np 1"
-            and len(additional_mpi_opts) == 0
-        ):
+        total_ranks = sum(res.cpu_count for res in job_resource.resources)
+        if total_ranks == 1 and not additional_mpi_opts:
             cmd = task_cmd
         else:
-            cmd = [self.mpiexec] + resource_pinning_cmd + additional_mpi_opts + task_cmd
+            cfg = self._mpi_config
+            cmd = (
+                [cfg.launcher, *cfg.extra_launcher_flags]
+                + resource_pinning_cmd
+                + additional_mpi_opts
+                + task_cmd
+            )
 
         merged_env = os.environ.copy()
         merged_env.update(resource_pinning_env)

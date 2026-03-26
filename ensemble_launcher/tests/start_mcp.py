@@ -15,7 +15,7 @@ from ensemble_launcher.mcp import ELFastMCP
 
 
 def start_mcp():
-    CHECKPOINT_DIR = f"{os.getcwd()}/mcp_{str(uuid.uuid4())}"
+    CHECKPOINT_DIR = f"/tmp/mcp_{str(uuid.uuid4())}"
 
     logger = setup_logger("start_mcp", log_dir=f"{os.getcwd()}/logs")
     # --- Start the EnsembleLauncher cluster before creating the interface ---
@@ -28,15 +28,13 @@ def start_mcp():
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
             worker_logs=True,
-            cpu_binding_option="",
-            use_mpi_ppn=False,
             cluster=True,
             checkpoint_dir=CHECKPOINT_DIR,
         ),
         Nodes=[socket.gethostname()],
     )
     el.start()
-    time.sleep(2.0)  # wait for cluster to be ready
+    time.sleep(15.0)  # wait for cluster to be ready
     logger.info("Done starting el")
 
     # --- Create the MCP interface, pointing it at the running cluster ---

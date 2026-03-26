@@ -13,10 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cloudpickle
 
+from ensemble_launcher.logging import setup_logger
+
 from .async_base import AsyncComm, AsyncCommState
 from .nodeinfo import NodeInfo
-
-from ensemble_launcher.logging import setup_logger
 
 try:
     import zmq
@@ -96,15 +96,19 @@ class AsyncZMQComm(AsyncComm):
         # separate asyncio loop; dead-detection monitoring stays in the main loop.
         self._parent_hb_thread: Optional[threading.Thread] = None
         self._parent_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._parent_hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in parent thread loop
+        self._parent_hb_asyncio_stop: Optional[asyncio.Event] = (
+            None  # lives in parent thread loop
+        )
         self._parent_hb_started: bool = False
 
         self._children_hb_thread: Optional[threading.Thread] = None
         self._children_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._children_hb_asyncio_stop: Optional[asyncio.Event] = None  # lives in children thread loop
+        self._children_hb_asyncio_stop: Optional[asyncio.Event] = (
+            None  # lives in children thread loop
+        )
         self._children_hb_started: bool = False
 
-        self._hb_tasks: List[asyncio.Task] = []   # main-loop monitoring tasks
+        self._hb_tasks: List[asyncio.Task] = []  # main-loop monitoring tasks
         self._hb_stop: Optional[asyncio.Event] = None  # main-loop stop signal
         # Timestamps written by HB threads, read by main-loop monitors (GIL-safe)
         self._last_parent_hb_time: Optional[float] = None
@@ -116,7 +120,9 @@ class AsyncZMQComm(AsyncComm):
 
     async def update_node_info(self, node_info: NodeInfo):
         added_children = set(node_info.children_ids) - set(self._node_info.children_ids)
-        removed_children = set(self._node_info.children_ids) - set(node_info.children_ids)
+        removed_children = set(self._node_info.children_ids) - set(
+            node_info.children_ids
+        )
 
         for child_id in added_children:
             self._child_dead_events[child_id] = asyncio.Event()
@@ -227,21 +233,29 @@ class AsyncZMQComm(AsyncComm):
                 self._node_info.parent_id is not None
                 and not self._parent_monitor_started
             ):
-                self._monitor_tasks.append(asyncio.create_task(self._monitor_parent_socket()))
+                self._monitor_tasks.append(
+                    asyncio.create_task(self._monitor_parent_socket())
+                )
                 self._parent_monitor_started = True
         elif kwargs.get("children_only", False):
             if not self._child_monitor_started:
-                self._monitor_tasks.append(asyncio.create_task(self._monitor_child_sockets()))
+                self._monitor_tasks.append(
+                    asyncio.create_task(self._monitor_child_sockets())
+                )
                 self._child_monitor_started = True
         else:
             if (
                 self._node_info.parent_id is not None
                 and not self._parent_monitor_started
             ):
-                self._monitor_tasks.append(asyncio.create_task(self._monitor_parent_socket()))
+                self._monitor_tasks.append(
+                    asyncio.create_task(self._monitor_parent_socket())
+                )
                 self._parent_monitor_started = True
             if not self._child_monitor_started:
-                self._monitor_tasks.append(asyncio.create_task(self._monitor_child_sockets()))
+                self._monitor_tasks.append(
+                    asyncio.create_task(self._monitor_child_sockets())
+                )
                 self._child_monitor_started = True
 
         parent_only = kwargs.get("parent_only", False)
@@ -437,7 +451,12 @@ class AsyncZMQComm(AsyncComm):
                         pass  # main loop already closed
                 # Echo secret_id back as a single pickled frame so the child
                 # can validate it with `secret_id == self._node_info.parent_secret_id`.
-                await router.send_multipart([parts[0], cloudpickle.dumps((self._node_info.secret_id, _HeartBeat()))])
+                await router.send_multipart(
+                    [
+                        parts[0],
+                        cloudpickle.dumps((self._node_info.secret_id, _HeartBeat())),
+                    ]
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -453,20 +472,22 @@ class AsyncZMQComm(AsyncComm):
         hb_bytes = cloudpickle.dumps((self._node_info.secret_id, _HeartBeat()))
         while not stop.is_set():
             try:
-                while True:
-                    await dealer.send(hb_bytes)
-                    msg = await asyncio.wait_for(dealer.recv(), timeout=10.0)
-                    if msg is not None:
-                        parent_secret_id, _ = cloudpickle.loads(msg)
-                        if parent_secret_id == self._node_info.parent_secret_id:
-                            break
-
-                if self._hb_parent_ready is not None and not self._hb_parent_ready.is_set():
-                    try:
-                        main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
-                    except RuntimeError:
-                        pass  # main loop already closed
-                self._last_parent_hb_time = time.time()  # GIL-safe
+                await dealer.send(hb_bytes)
+                msg = await asyncio.wait_for(dealer.recv(), timeout=1.0)
+                if msg is not None:
+                    parent_secret_id, _ = cloudpickle.loads(msg)
+                    if parent_secret_id == self._node_info.parent_secret_id:
+                        if (
+                            self._hb_parent_ready is not None
+                            and not self._hb_parent_ready.is_set()
+                        ):
+                            try:
+                                main_loop.call_soon_threadsafe(
+                                    self._hb_parent_ready.set
+                                )
+                            except RuntimeError:
+                                pass  # main loop already closed
+                        self._last_parent_hb_time = time.time()  # GIL-safe
                 jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
                 await asyncio.sleep(jitter)
             except asyncio.CancelledError:
@@ -486,7 +507,10 @@ class AsyncZMQComm(AsyncComm):
             except asyncio.TimeoutError:
                 pass
             if self._last_parent_hb_time is not None:
-                if time.time() - self._last_parent_hb_time > self._heartbeat_dead_threshold:
+                if (
+                    time.time() - self._last_parent_hb_time
+                    > self._heartbeat_dead_threshold
+                ):
                     self.logger.warning(
                         f"{self._node_info.node_id}: Parent HB dead — setting parent_dead_event"
                     )
@@ -736,7 +760,11 @@ class AsyncZMQComm(AsyncComm):
                 )
             else:
                 await self.router_socket.send_multipart(
-                    [f"{child_id}".encode(), self._node_info.secret_id.encode(), cloudpickle.dumps(data)]
+                    [
+                        f"{child_id}".encode(),
+                        self._node_info.secret_id.encode(),
+                        cloudpickle.dumps(data),
+                    ]
                 )
             self.logger.debug(
                 f"{self._node_info.node_id}: Sent message to child {child_id}"
@@ -807,14 +835,24 @@ class AsyncZMQComm(AsyncComm):
         self._hb_tasks.clear()
 
         # Stop parent HB thread
-        if self._parent_hb_thread_loop is not None and self._parent_hb_asyncio_stop is not None:
-            self._parent_hb_thread_loop.call_soon_threadsafe(self._parent_hb_asyncio_stop.set)
+        if (
+            self._parent_hb_thread_loop is not None
+            and self._parent_hb_asyncio_stop is not None
+        ):
+            self._parent_hb_thread_loop.call_soon_threadsafe(
+                self._parent_hb_asyncio_stop.set
+            )
         if self._parent_hb_thread is not None:
             self._parent_hb_thread.join(timeout=5.0)
 
         # Stop children HB thread
-        if self._children_hb_thread_loop is not None and self._children_hb_asyncio_stop is not None:
-            self._children_hb_thread_loop.call_soon_threadsafe(self._children_hb_asyncio_stop.set)
+        if (
+            self._children_hb_thread_loop is not None
+            and self._children_hb_asyncio_stop is not None
+        ):
+            self._children_hb_thread_loop.call_soon_threadsafe(
+                self._children_hb_asyncio_stop.set
+            )
         if self._children_hb_thread is not None:
             self._children_hb_thread.join(timeout=5.0)
 
