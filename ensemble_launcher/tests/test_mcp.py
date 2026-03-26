@@ -160,5 +160,5 @@ def test_mcp_string():
 
 
 if __name__ == "__main__":
-    # test_mcp()
-    test_mcp_string()
+    test_mcp()
+    # test_mcp_string()

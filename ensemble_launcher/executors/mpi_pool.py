@@ -1,15 +1,22 @@
 """
-MPI pool: rank 0 = gateway (ZMQ IPC <-> MPI), ranks 1..N-1 = workers.
+MPI pool: rank 0 = gateway (ZMQ IPC <-> MPI) + local task executor,
+          ranks 1..N-1 = MPI workers.
+
+Rank 0 manages the ZMQ<->MPI bridge and also executes tasks locally via a
+ThreadPoolExecutor when targeted (i.e. when its CPU is in _cpu_to_pid).
+The async_worker trims rank 0's CPU from the scheduler so it is never
+double-scheduled; mpi_info still includes rank 0's CPU for correct binding.
 
 Launch with:
-    mpirun -n <N+1> python mpi_pool.py --socket-path <ipc_path>
-where N is the number of worker ranks (rank 0 is the master/gateway).
+    mpirun -n <N> python mpi_pool.py --socket-path <ipc_path>
+where N includes rank 0.
 """
 
 import argparse
 import asyncio
 import collections
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import cloudpickle
 import zmq
@@ -20,12 +27,13 @@ COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
 SIZE = COMM.Get_size()
 
-TAG_TASK   = 1
+TAG_TASK = 1
 TAG_RESULT = 2
-TAG_STOP   = 3
+TAG_STOP = 3
 
 
 # ── Workers (ranks 1..N-1) ────────────────────────────────────────────────────
+
 
 def run_worker():
     status = MPI.Status()
@@ -51,8 +59,9 @@ def run_worker():
 
 # ── Master (rank 0) ───────────────────────────────────────────────────────────
 
-def _dispatch(available, task_queue):
-    """Send queued tasks to available workers via MPI."""
+
+def _dispatch(available, task_queue, local_queue):
+    """Send queued tasks to available workers via MPI, or queue locally for rank 0."""
     while task_queue and available:
         msg_id, target, payload = task_queue[0]
         if target is not None and target not in available:
@@ -60,10 +69,15 @@ def _dispatch(available, task_queue):
         worker = target if target is not None else next(iter(available))
         available.discard(worker)
         task_queue.popleft()
-        COMM.send(payload, dest=worker, tag=TAG_TASK)
+        if worker == 0:
+            local_queue.put_nowait(
+                cloudpickle.loads(payload)
+            )  # (msg_id, fn_b, args_b, kw_b, env)
+        else:
+            COMM.send(payload, dest=worker, tag=TAG_TASK)
 
 
-async def _client_loop(sock, available, task_queue, stop):
+async def _client_loop(sock, available, task_queue, local_queue, stop):
     """Receive tasks from AsyncMPIPoolExecutor, dispatch to workers."""
     while True:
         data = await sock.recv()
@@ -78,10 +92,10 @@ async def _client_loop(sock, available, task_queue, stop):
         _, msg_id, target, fn_bytes, args_bytes, kwargs_bytes, env = msg
         payload = cloudpickle.dumps((msg_id, fn_bytes, args_bytes, kwargs_bytes, env))
         task_queue.append((msg_id, target, payload))
-        _dispatch(available, task_queue)
+        _dispatch(available, task_queue, local_queue)
 
 
-async def _mpi_loop(sock, available, task_queue, stop):
+async def _mpi_loop(sock, available, task_queue, local_queue, stop):
     """Poll for MPI results and forward them to the client."""
     status = MPI.Status()
     while not stop.is_set():
@@ -90,9 +104,47 @@ async def _mpi_loop(sock, available, task_queue, stop):
             data = COMM.recv(source=src, tag=TAG_RESULT)
             available.add(src)
             await sock.send(data)  # result bytes pass through unchanged
-            _dispatch(available, task_queue)
+            _dispatch(available, task_queue, local_queue)
         else:
             await asyncio.sleep(0.001)
+
+
+async def _rank0_executor(available, task_queue, local_queue, sock, stop):
+    """Execute tasks locally on rank 0 using a thread pool."""
+    loop = asyncio.get_event_loop()
+    pool = ThreadPoolExecutor(max_workers=1)
+    while True:
+        get_task = asyncio.ensure_future(local_queue.get())
+        stop_task = asyncio.ensure_future(stop.wait())
+        done, pending = await asyncio.wait(
+            [get_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        if stop_task in done:
+            break
+        msg_id, fn_bytes, args_bytes, kwargs_bytes, env = get_task.result()
+
+        def _execute():
+            original_env = os.environ.copy()
+            os.environ.update(env)
+            try:
+                result = cloudpickle.loads(fn_bytes)(
+                    *cloudpickle.loads(args_bytes),
+                    **cloudpickle.loads(kwargs_bytes),
+                )
+                return cloudpickle.dumps(("result", msg_id, "ok", result))
+            except Exception as e:
+                return cloudpickle.dumps(("result", msg_id, "err", e))
+            finally:
+                os.environ.clear()
+                os.environ.update(original_env)
+
+        out = await loop.run_in_executor(pool, _execute)
+        await sock.send(out)
+        available.add(0)
+        _dispatch(available, task_queue, local_queue)
+    pool.shutdown(wait=False)
 
 
 async def run_master(socket_path):
@@ -103,15 +155,19 @@ async def run_master(socket_path):
 
     # Announce ready to the client
     await sock.send(cloudpickle.dumps(("ready",)))
-    print(f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket={socket_path}", flush=True)
+    print(
+        f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket={socket_path}", flush=True
+    )
 
-    available  = set(range(1, SIZE))
+    available = set(range(0, SIZE))  # rank 0 participates as a worker
     task_queue = collections.deque()
-    stop       = asyncio.Event()
+    local_queue = asyncio.Queue()
+    stop = asyncio.Event()
 
     await asyncio.gather(
-        _client_loop(sock, available, task_queue, stop),
-        _mpi_loop   (sock, available, task_queue, stop),
+        _client_loop(sock, available, task_queue, local_queue, stop),
+        _mpi_loop(sock, available, task_queue, local_queue, stop),
+        _rank0_executor(available, task_queue, local_queue, sock, stop),
     )
 
 

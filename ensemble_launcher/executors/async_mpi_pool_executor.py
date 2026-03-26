@@ -23,7 +23,9 @@ from .utils import executor_registry
 _MPI_POOL_SCRIPT = str(pathlib.Path(__file__).parent / "mpi_pool.py")
 
 
-def _build_mpirun_cmd(mpi_info: Dict[str, str], np_workers: int, socket_path: str) -> list:
+def _build_mpirun_cmd(
+    mpi_info: Dict[str, str], np_workers: int, socket_path: str
+) -> list:
     cmd = ["mpirun"]
     for flag, value in mpi_info.items():
         cmd.extend([flag, value])
@@ -66,14 +68,12 @@ class AsyncMPIPoolExecutor:
 
         # Workers are ranks 1..np; rank 0 is the master/gateway
         self._cpu_to_pid = {
-            (hname, cpu_binding[local_rank]): hid * ppn + local_rank + 1
+            (hname, cpu_binding[local_rank]): hid * ppn + local_rank
             for hid, hname in enumerate(hosts)
             for local_rank in range(ppn)
         }
 
-        self._socket_path = str(
-            f"/tmp/mpi_pool_{uuid.uuid4().hex}.ipc"
-        )
+        self._socket_path = str(f"/tmp/mpi_pool_{uuid.uuid4().hex}.ipc")
 
         cmd = _build_mpirun_cmd(self._mpi_info, np, self._socket_path)
         self.logger.info(f"Launching MPI pool: {' '.join(cmd)}")
@@ -107,7 +107,7 @@ class AsyncMPIPoolExecutor:
                 self._rank0_identity = identity
                 self._ready.set()
                 continue
-            _, msg_id, status, value = msg   # ("result", msg_id, "ok"/"err", value)
+            _, msg_id, status, value = msg  # ("result", msg_id, "ok"/"err", value)
             future = self._pending.pop(msg_id, None)
             if future is None or future.cancelled():
                 continue
@@ -159,15 +159,17 @@ class AsyncMPIPoolExecutor:
         msg_id = next(self._msg_counter)
         self._pending[msg_id] = future
 
-        payload = cloudpickle.dumps((
-            "task",
-            msg_id,
-            worker_id,
-            cloudpickle.dumps(fn),
-            cloudpickle.dumps(task_args),
-            cloudpickle.dumps(task_kwargs),
-            env,
-        ))
+        payload = cloudpickle.dumps(
+            (
+                "task",
+                msg_id,
+                worker_id,
+                cloudpickle.dumps(fn),
+                cloudpickle.dumps(task_args),
+                cloudpickle.dumps(task_kwargs),
+                env,
+            )
+        )
 
         async def _send():
             if not self._ready.is_set():

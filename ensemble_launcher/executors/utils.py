@@ -27,7 +27,7 @@ def run_callable_with_affinity(
             original_affinity = os.sched_getaffinity(0)
             os.sched_setaffinity(0, cpu_id)
         except Exception as e:
-            print(f"Setting affinity failed with exception {e}")
+            pass
 
     original_env = os.environ.copy()
     os.environ.update(env)
@@ -40,7 +40,7 @@ def run_callable_with_affinity(
         try:
             os.sched_setaffinity(0, original_affinity)
         except Exception as e:
-            print(f"Resetting affinity failed with exception {e}")
+            pass
     return result
 
 
@@ -82,7 +82,8 @@ def run_cmd(
             original_affinity = os.sched_getaffinity(0)
             os.sched_setaffinity(0, cpu_id)
         except Exception as e:
-            print(f"Setting affinity failed with exception {e}")
+            pass
+            # print(f"Setting affinity failed with exception {e}")
     merged_env = os.environ.copy()
     merged_env.update(env)
     kwargs_list = []
@@ -100,7 +101,8 @@ def run_cmd(
         try:
             os.sched_setaffinity(0, original_affinity)
         except Exception as e:
-            print(f"Resetting affinity failed with exception {e}")
+            pass
+            # print(f"Resetting affinity failed with exception {e}")
     if return_stdout:
         return result.stdout
     else:
@@ -251,9 +253,3 @@ class ExecutorRegistry:
 
 
 executor_registry = ExecutorRegistry()
-
-
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-
-executor_registry.register("async_threadpool")(ThreadPoolExecutor)
-executor_registry.register("async_processpool")(ProcessPoolExecutor)

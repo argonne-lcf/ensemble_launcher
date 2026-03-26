@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import random
@@ -31,6 +32,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import (
     AsyncMPIExecutor,
+    AsyncMPIPoolExecutor,
     AsyncProcessPoolExecutor,
     AsyncThreadPoolExecutor,
     executor_registry,
@@ -97,6 +99,7 @@ class AsyncWorker(Node):
         self._task_id_to_executor: Dict[str, str] = {}
         self._event_loop = None
 
+        self._mpi_init_nodes: Optional[JobResource] = None  # full nodes for mpi_info (async_mpi_processpool)
         self._checkpointer: Optional[Checkpointer] = None
         # Cached checkpoint data — populated early in _lazy_init() before sockets are set up.
         self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
@@ -276,6 +279,33 @@ class AsyncWorker(Node):
         # Syncronize with parent
         await self._sync_with_parent()
 
+        # When using the MPI pool executor, rank 0 occupies the first CPU for
+        # gateway management. Save the full resource for mpi_info (so --cpu-bind
+        # includes rank 0's CPU), then trim _init_nodes so the scheduler never
+        # allocates tasks to rank 0's CPU directly.
+        executor_names = (
+            self._config.task_executor_name
+            if isinstance(self._config.task_executor_name, list)
+            else [self._config.task_executor_name]
+        )
+        if "async_mpi_processpool" in executor_names:
+            self._mpi_init_nodes = self._init_nodes
+            first_res = self._init_nodes.resources[0]
+            if isinstance(first_res, NodeResourceList) and len(first_res.cpus) > 1:
+                trimmed = NodeResourceList(cpus=first_res.cpus[1:], gpus=first_res.gpus)
+            elif isinstance(first_res, NodeResourceCount) and first_res.ncpus > 1:
+                trimmed = NodeResourceCount(ncpus=first_res.ncpus - 1, ngpus=first_res.ngpus)
+            else:
+                trimmed = first_res
+            self._init_nodes = JobResource(
+                resources=[trimmed] + list(self._init_nodes.resources[1:]),
+                nodes=list(self._init_nodes.nodes),
+            )
+            self.logger.info(
+                "async_mpi_processpool: reserved first CPU for rank 0; "
+                f"scheduler sees {self._init_nodes.resources[0].cpu_count} CPUs on first node"
+            )
+
         # Init scheduler
         self._scheduler = AsyncTaskScheduler(
             self.logger.getChild("scheduler"), self._init_tasks, self._init_nodes
@@ -318,9 +348,27 @@ class AsyncWorker(Node):
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
-        if self._config.task_executor_name == "async_mpi":
-            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
+        kwargs["cpu_binding_option"] = self._config.cpu_binding_option
+        kwargs["use_ppn"] = self._config.use_mpi_ppn
+        #
+        # Use the full node resource (including rank 0's CPU) when building
+        # mpi_info for the MPI pool, so --cpu-bind covers all ranks correctly.
+        mpi_src = self._mpi_init_nodes if self._mpi_init_nodes is not None else self.nodes
+        np = sum([node.cpu_count for node in mpi_src.resources])
+        ppn = np // len(mpi_src.resources)
+        hosts = ",".join(mpi_src.nodes)
+        kwargs["mpi_info"] = {"-np": np}
+        if self._config.use_mpi_ppn:
+            kwargs["mpi_info"]["--ppn"] = ppn
+            kwargs["mpi_info"]["--hosts"] = hosts
+
+        if self._config.cpu_binding_option == "--cpu-bind":
+            kwargs["mpi_info"]["--cpu-bind"] = "list:" + ":".join(
+                list(map(str, mpi_src.resources[0].cpus))
+            )
+
+        head_node = self.nodes.resources[0]
+        all_nodes_equal = all([head_node == node for node in self.nodes.resources])
 
         if isinstance(self._config.task_executor_name, list):
             self._executor = {}
@@ -328,6 +376,11 @@ class AsyncWorker(Node):
                 self._executor[exec_name] = executor_registry.create_executor(
                     exec_name, kwargs=kwargs
                 )
+                if exec_name == "async_mpi_processpool" and not all_nodes_equal:
+                    raise ValueError(
+                        "All nodes should have same resources for the async mpi pool"
+                    )
+
             self._default_executor_name = self._config.task_executor_name[0]
         else:
             self._executor = {
@@ -335,6 +388,13 @@ class AsyncWorker(Node):
                     self._config.task_executor_name, kwargs=kwargs
                 )
             }
+            if (
+                self._config.task_executor_name == "async_mpi_processpool"
+                and not all_nodes_equal
+            ):
+                raise ValueError(
+                    "All nodes should have same resources for the async mpi pool"
+                )
             self._default_executor_name = self._config.task_executor_name
 
         self.logger.info(
@@ -947,7 +1007,9 @@ class AsyncWorker(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0 + attempt * 5.0)
+                ack = await self._comm.recv_message_from_parent(
+                    ResultAck, timeout=5.0 + attempt * 5.0
+                )
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
