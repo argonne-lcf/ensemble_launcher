@@ -10,7 +10,6 @@ from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.mcp import ELFastMCP
 from test_helpers import async_compute_density, compute_density
-from utils import async_compute_density, compute_density
 
 from ensemble_launcher import EnsembleLauncher
 

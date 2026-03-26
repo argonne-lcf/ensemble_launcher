@@ -15,6 +15,7 @@ from test_helpers import echo_mpi
 
 @pytest.mark.asyncio
 async def test_mpi_pool():
+    os.environ.update({"PYTHONPATH": str(os.getcwd())})
     logger = setup_logger("mpi_executor", log_dir="logs")
     mpi_info = {}
     mpi_info["-np"] = "12"
