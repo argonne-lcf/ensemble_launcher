@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 import socket
 import stat
 import subprocess
@@ -37,7 +38,8 @@ class AsyncMPIExecutor(Executor):
         self.logger = logger
         self.gpu_selector = gpu_selector
         self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
-        self._processes: Dict[str, subprocess.Popen] = {}
+        self._processes: Dict[str, asyncio.subprocess.Process] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
         self._return_stdout = return_stdout
         self._mpi_config = mpi_config if mpi_config is not None else MPIConfig()
@@ -223,6 +225,8 @@ class AsyncMPIExecutor(Executor):
         asyncio_task = asyncio.create_task(
             self._subprocess_task(task_id, cmd, merged_env)
         )
+        self._tasks[task_id] = asyncio_task
+        asyncio_task.add_done_callback(lambda _: self._tasks.pop(task_id, None))
 
         return asyncio_task
 
@@ -242,6 +246,7 @@ class AsyncMPIExecutor(Executor):
                 env=merged_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         else:
             p = await asyncio.create_subprocess_exec(
@@ -250,6 +255,7 @@ class AsyncMPIExecutor(Executor):
                 env=merged_env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
             )
 
         self._processes[task_id] = p
@@ -275,12 +281,32 @@ class AsyncMPIExecutor(Executor):
             if task_id in self._processes:
                 del self._processes[task_id]
 
+    def _kill_process_group(self, process: asyncio.subprocess.Process, force: bool) -> None:
+        """Send signal to the entire process group so MPI worker children are also killed."""
+        if process.returncode is not None:
+            return
+        try:
+            pgid = os.getpgid(process.pid)
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def shutdown(self, wait: bool = False):
         force = not wait
-        for task_id, process in self._processes.items():
-            if process.returncode is None:
-                if force:
-                    process.kill()
-                else:
-                    process.terminate()
+        for process in list(self._processes.values()):
+            self._kill_process_group(process, force)
         self._processes.clear()
+        for task in list(self._tasks.values()):
+            task.cancel()
+        self._tasks.clear()
+
+    async def ashutdown(self, wait: bool = True) -> None:
+        """Async shutdown: kill process groups and await all asyncio tasks."""
+        force = not wait
+        for process in list(self._processes.values()):
+            self._kill_process_group(process, force)
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._processes.clear()
+        self._tasks.clear()

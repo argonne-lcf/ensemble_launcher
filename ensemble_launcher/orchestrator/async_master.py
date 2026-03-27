@@ -1743,7 +1743,7 @@ class AsyncMaster(Node):
         # stop comm and executor
         await self._comm.close()
         self.logger.info(f"Shutting down executor")
-        self._executor.shutdown(wait=True)
+        self._executor.shutdown()
         self.logger.info(f"Done Shutting down executor")
 
         if self._config.profile == "perfetto" and self._event_registry is not None:

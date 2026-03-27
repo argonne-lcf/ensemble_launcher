@@ -3,7 +3,6 @@ import logging
 import multiprocessing as mp
 import os
 import socket
-import time
 import uuid
 
 import pytest
@@ -42,8 +41,6 @@ async def test_async_worker_cluster(
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
-            master_logs=True,
-            worker_logs=True,
             report_interval=100.0,
             log_level=logging.INFO,
             cluster=True,
@@ -55,7 +52,6 @@ async def test_async_worker_cluster(
 
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
-    time.sleep(15.0)
     client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}
@@ -101,8 +97,6 @@ async def test_async_master_cluster(
             task_executor_name=task_executor,
             child_executor_name=task_executor,
             comm_name="async_zmq",
-            worker_logs=True,
-            master_logs=True,
             report_interval=1.0,
             log_level=logging.INFO,
             cluster=True,
@@ -117,7 +111,6 @@ async def test_async_master_cluster(
 
     process = mp.Process(target=w.create_an_event_loop)
     process.start()
-    time.sleep(15.0)
     client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
     client.start()
     futures = {}

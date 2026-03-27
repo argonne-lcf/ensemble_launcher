@@ -1,6 +1,5 @@
 import os
 import socket
-import time
 
 import pytest
 from utils import echo
@@ -35,7 +34,6 @@ def test_el_run():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=False,
-            worker_logs=False,
         ),
         Nodes=[socket.gethostname()],
     )
@@ -66,7 +64,6 @@ def test_el_cluster_mode():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
-            worker_logs=True,
             cluster=True,
             checkpoint_dir=ckpt_dir,
         ),
@@ -74,7 +71,6 @@ def test_el_cluster_mode():
     )
 
     el.start()
-    time.sleep(10.0)
 
     results = {}
     with ClusterClient(checkpoint_dir=ckpt_dir, node_id="global") as client:

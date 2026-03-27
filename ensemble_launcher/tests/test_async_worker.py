@@ -48,7 +48,6 @@ async def test_async_worker(task_executor="async_processpool", ntasks_per_core=1
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
-            worker_logs=True,
             report_interval=100.0,
             log_level=logging.INFO,
         ),
@@ -91,7 +90,6 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
-            worker_logs=True,
             report_interval=100.0,
             mpi_config=MPIConfig(processes_per_node_flag=None),
             log_level=logging.INFO,
@@ -133,7 +131,6 @@ async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
-            worker_logs=True,
             report_interval=100.0,
             mpi_config=MPIConfig(
                 processes_per_node_flag=None, hosts_flag=None, cpu_bind_method="none"
@@ -182,7 +179,6 @@ async def test_async_task_worker():
         LauncherConfig(
             task_executor_name="async_processpool",
             comm_name="async_zmq",
-            worker_logs=True,
             report_interval=100.0,
             log_level=logging.INFO,
         ),

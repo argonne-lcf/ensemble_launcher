@@ -1,9 +1,10 @@
 import argparse
 import asyncio
+import atexit
 import multiprocessing as mp
 import os
+import signal
 import socket
-import time
 import uuid
 
 from utils import async_compute_density, compute_density
@@ -27,14 +28,20 @@ def start_mcp():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
-            worker_logs=True,
             cluster=True,
             checkpoint_dir=CHECKPOINT_DIR,
         ),
         Nodes=[socket.gethostname()],
     )
     el.start()
-    time.sleep(15.0)  # wait for cluster to be ready
+
+    def _stop_el():
+        el.stop()
+
+    atexit.register(_stop_el)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda signum, frame: (_stop_el(), exit(0)))
+
     logger.info("Done starting el")
 
     # --- Create the MCP interface, pointing it at the running cluster ---
