@@ -215,7 +215,8 @@ class AsyncZMQComm(AsyncComm):
                 zmq.DEALER, socket_class=Socket
             )
             self.dealer_socket.setsockopt(
-                zmq.IDENTITY, f"{self._node_info.node_id}".encode()
+                zmq.IDENTITY,
+                f"{self._node_info.node_id}:{self._node_info.secret_id}".encode(),
             )
             self.dealer_socket.setsockopt(zmq.SNDHWM, 10000)
             self.dealer_socket.setsockopt(zmq.RCVHWM, 10000)
@@ -346,7 +347,10 @@ class AsyncZMQComm(AsyncComm):
 
         ctx = Context()
         dealer = ctx.socket(zmq.DEALER, socket_class=Socket)
-        dealer.setsockopt(zmq.IDENTITY, self._node_info.node_id.encode())
+        dealer.setsockopt(
+            zmq.IDENTITY,
+            f"{self._node_info.node_id}:{self._node_info.secret_id}".encode(),
+        )
         dealer.connect(f"tcp://{self.parent_hb_address}")
 
         task = asyncio.create_task(
@@ -430,7 +434,7 @@ class AsyncZMQComm(AsyncComm):
         while not stop.is_set():
             try:
                 parts = await router.recv_multipart()
-                sender_id = parts[0].decode()
+                sender_id = parts[0].decode().split(":", 1)[0]  # strip :secret_id suffix from ZMQ identity
                 # Parse child's secret_id from the HB payload.
                 # The child verifies the echo matches its own secret_id (see _hb_send_to_parent_thread).
                 child_secret_id, _ = cloudpickle.loads(parts[1])
@@ -488,12 +492,16 @@ class AsyncZMQComm(AsyncComm):
                             except RuntimeError:
                                 pass  # main loop already closed
                         self._last_parent_hb_time = time.time()  # GIL-safe
-                jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
-                await asyncio.sleep(jitter)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.warning(f"{self._node_info.node_id}: HB send error: {e}")
+                self.logger.warning(
+                    f"{self._node_info.node_id}:{self._node_info.secret_id}: HB send error: {e}"
+                )
+            if time.time() - self._last_parent_hb_time > self._heartbeat_dead_threshold:
+                break
+            jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
+            await asyncio.sleep(jitter)
 
     async def _hb_run_parent_hb_loop(self) -> None:
         """Check whether the parent has gone silent; set parent_dead_event if so."""
@@ -616,7 +624,8 @@ class AsyncZMQComm(AsyncComm):
         """
         from .messages import Message
 
-        sender_id = raw_data[0].decode()
+        full_id = raw_data[0].decode()
+        sender_id = full_id if full_id.startswith("client:") else full_id.split(":", 1)[0]
         try:
             if sender_id.startswith("client:"):
                 # Clients do not include a secret_id frame.
@@ -755,13 +764,17 @@ class AsyncZMQComm(AsyncComm):
 
         try:
             if child_id.startswith("client:"):
+                self.logger.info(
+                    f"{self._node_info.node_id}: Sent message to child {child_id}"
+                )
                 await self.router_socket.send_multipart(
                     [f"{child_id}".encode(), cloudpickle.dumps(data)]
                 )
             else:
+                child_zmq_id = f"{child_id}:{self._node_info.children_secret_ids[child_id]}".encode()
                 await self.router_socket.send_multipart(
                     [
-                        f"{child_id}".encode(),
+                        child_zmq_id,
                         self._node_info.secret_id.encode(),
                         cloudpickle.dumps(data),
                     ]

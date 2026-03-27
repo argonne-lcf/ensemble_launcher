@@ -149,6 +149,8 @@ class AsyncMaster(Node):
         self._parent_ready_event = asyncio.Event()
         self._parent_ready_monitor_task: Optional[asyncio.Task] = None
 
+        self._total_streamed = 0
+
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
@@ -1095,7 +1097,9 @@ class AsyncMaster(Node):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    def _route_tasks(self, tasks: List[Task], client_id: Optional[str] = None) -> List[Optional[str]]:
+    def _route_tasks(
+        self, tasks: List[Task], client_id: Optional[str] = None
+    ) -> List[Optional[str]]:
         """Route a list of tasks to the best child via scheduler policy. Returns chosen child_id."""
         for task in tasks:
             self._scheduler.add_task(task, client_id=client_id)
@@ -1431,6 +1435,7 @@ class AsyncMaster(Node):
         for dest_id, results in dest_results.items():
             if dest_id.startswith("client:"):
                 # Client attached at this level: send directly, no buffering needed
+                self._total_streamed += len(results)
                 await self._comm.send_message_to_child(
                     dest_id, IResultBatch(sender=self.node_id, data=results)
                 )

@@ -111,7 +111,6 @@ class AsyncWorker(Node):
         self._task_update_task = None
         self._client_handler_task: Optional[asyncio.Task] = None
 
-
         # Node update monitor state
         self._stop_node_update = asyncio.Event()
         self._node_update_task = None
@@ -467,6 +466,12 @@ class AsyncWorker(Node):
         if scheduler_state is None:
             return False
         self._scheduler.set_state(scheduler_state, self._ckpt_results or {})
+
+        ##Forward the result to the appropriate place.
+        ##task_id to client map should be restored from scheduler state
+        for result in self._ckpt_results.values():
+            self._forward_result(result)
+
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
 
@@ -628,19 +633,23 @@ class AsyncWorker(Node):
                 success=(exception is None),
                 exception=str(exception) if exception else None,
             )
-            dest_id = self._scheduler.get_task_client(task_id)
-            if dest_id is None and self.parent:
-                dest_id = self.parent.node_id
+            self._forward_result(task_result)
 
-            if dest_id is not None:
-                if dest_id not in self._iresult_q:
-                    self._iresult_q[dest_id] = deque()
+    def _forward_result(self, result: Result):
+        task_id = result.task_id
+        dest_id = self._scheduler.get_task_client(task_id)
+        if dest_id is None and self.parent:
+            dest_id = self.parent.node_id
 
-                result_q = self._iresult_q[dest_id]
-                result_q.append(task_result)
-                self._streamed_task_ids.add(task_id)
-                if len(result_q) >= self._config.result_buffer_size:
-                    asyncio.create_task(self._flush_dest_queue(dest_id))
+        if dest_id is not None:
+            if dest_id not in self._iresult_q:
+                self._iresult_q[dest_id] = deque()
+
+            result_q = self._iresult_q[dest_id]
+            result_q.append(result)
+            self._streamed_task_ids.add(task_id)
+            if len(result_q) >= self._config.result_buffer_size:
+                asyncio.create_task(self._flush_dest_queue(dest_id))
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -668,7 +677,9 @@ class AsyncWorker(Node):
         del_status = {}
         for new_task in taskupdate.added_tasks:
             self.logger.debug(f"Adding new task {new_task}")
-            add_status[new_task.task_id] = self._scheduler.add_task(new_task, client_id=client_id)
+            add_status[new_task.task_id] = self._scheduler.add_task(
+                new_task, client_id=client_id
+            )
             if not add_status[new_task.task_id]:
                 self.logger.error(f"Failed to add new task {new_task.task_id}")
             else:

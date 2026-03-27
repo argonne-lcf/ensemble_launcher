@@ -94,9 +94,12 @@ class _WorkerPipeline:
         self.recv_time = 0.0
         self.deser_time = 0.0
         self.set_result_time = 0.0
+        self.total_results = 0
+        self._logger = None
 
     def start(self, node_address: str, logger) -> None:
         """Start the pipeline's dedicated thread and wait until its event loop is ready."""
+        self._logger = logger
         self._thread = threading.Thread(
             target=self._run, args=(node_address, logger), daemon=True
         )
@@ -139,8 +142,14 @@ class _WorkerPipeline:
         t1 = time.perf_counter()
         for result in msg.data:
             self.set_result(result)
+        self.total_results += len(msg.data)
         self.deser_time += t1 - t0
         self.set_result_time += time.perf_counter() - t1
+        if self._logger is not None:
+            self._logger.info(
+                f"{self.worker_id}: received {len(msg.data)} results "
+                f"(total={self.total_results})"
+            )
 
     def set_result(self, result: Result) -> None:
         with self.lock:
@@ -427,4 +436,3 @@ class ClusterClient:
 
     def __exit__(self, *_):
         self.teardown()
-
