@@ -223,12 +223,10 @@ class LargeResourcePolicy(Policy):
         self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None
     ):
         super().__init__(policy_config, logger)
-        self.logger.debug(f"init policy")
 
     def get_score(
         self, task: Task, scheduler_state: Optional["SchedulerState"] = None
     ) -> float:
-        self.logger.debug(f"Hello from policy")
         return (
             task.nnodes
             * task.ppn
@@ -245,11 +243,19 @@ class FIFOPolicy(Policy):
     Best used with ``strict_priority=True`` in PolicyConfig.
     """
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None):
+    def __init__(
+        self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None
+    ):
         super().__init__(policy_config, logger)
 
-    def get_score(self, task: Task, scheduler_state: Optional["SchedulerState"] = None) -> float:
-        pending_size = len(scheduler_state.pending_tasks) if scheduler_state and scheduler_state.pending_tasks else 0
+    def get_score(
+        self, task: Task, scheduler_state: Optional["SchedulerState"] = None
+    ) -> float:
+        pending_size = (
+            len(scheduler_state.pending_tasks)
+            if scheduler_state and scheduler_state.pending_tasks
+            else 0
+        )
         return -pending_size
 
 

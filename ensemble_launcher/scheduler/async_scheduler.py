@@ -93,7 +93,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
         # Pool of task IDs not yet assigned to any child.
         # Seeded at init from tasks; assign_task_ids() drains it as tasks are placed.
-        self._unassigned_tasks: Set[str] = set(self.tasks.keys())
+        self._unassigned_tasks: Dict[str, None] = dict.fromkeys(self.tasks.keys())
         self._child_id_to_wid: Dict[str, int] = {}
         self._wid_to_child_id: Dict[int, str] = {}
 
@@ -307,18 +307,18 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return list(self._child_assignments.get(child_id, {}).get("task_ids", []))
 
     @property
-    def unassigned_task_ids(self) -> Set[str]:
-        """Read-only view of the unassigned task pool."""
-        return copy.deepcopy(self._unassigned_tasks)
+    def unassigned_task_ids(self) -> Dict[str, None]:
+        """Read-only view of the unassigned task pool (insertion-ordered)."""
+        return dict(self._unassigned_tasks)
 
     def discard_unassigned(self, task_id: str) -> None:
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
-        self._unassigned_tasks.discard(task_id)
+        self._unassigned_tasks.pop(task_id, None)
 
     def add_task(self, task: Task, client_id: Optional[str] = None) -> None:
         """Add a task to the scheduler and mark it as unassigned."""
         self.tasks[task.task_id] = task
-        self._unassigned_tasks.add(task.task_id)
+        self._unassigned_tasks[task.task_id] = None
         if client_id is not None:
             self._task_to_client[task.task_id] = client_id
 
@@ -333,7 +333,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         assignment that references it.
         """
         self.tasks.pop(task_id, None)
-        self._unassigned_tasks.discard(task_id)
+        self._unassigned_tasks.pop(task_id, None)
         self._task_to_client.pop(task_id, None)
         for assignment in self._child_assignments.values():
             task_ids: List[str] = assignment["task_ids"]
@@ -349,7 +349,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if child_id not in self._child_assignments:
             return
         for task_id in self._child_assignments[child_id].get("task_ids", []):
-            self._unassigned_tasks.add(task_id)
+            self._unassigned_tasks[task_id] = None
         del self._child_assignments[child_id]
         self._child_done_events.pop(child_id, None)
         self._child_states.pop(child_id, None)
@@ -418,7 +418,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
             for task_ids in state.children_task_ids.values()
             for task_id in task_ids
         }
-        self._unassigned_tasks -= assigned
+        for task_id in assigned:
+            self._unassigned_tasks.pop(task_id, None)
 
         self.logger.info(
             f"set_state: restored {len(state.children_task_ids)} children, "
@@ -495,7 +496,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
     def assign_task_ids(
         self,
-        task_ids: Set[str],
+        task_ids: Union[Set[str], Dict[str, None]],
         ntask: Optional[int] = None,
         child_ids: Optional[List[str]] = None,
     ) -> Tuple[Dict[str, List[str]], Dict[str, str], List[str]]:
@@ -562,7 +563,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child_id = self._wid_to_child_id[wid]
             self._child_assignments[child_id]["task_ids"].extend(assigned_ids)
             for tid in assigned_ids:
-                self._unassigned_tasks.discard(tid)
+                self._unassigned_tasks.pop(tid, None)
             child_assignments[child_id] = assigned_ids
 
         task_to_child: Dict[str, str] = {}
@@ -592,12 +593,14 @@ class PendingTaskHeap:
     """
 
     def __init__(self) -> None:
-        self._heap: List[Tuple[float, str]] = []
+        self._heap: List[Tuple[float, int, str]] = []
         self._task_ids: Set[str] = set()
+        self._seq: int = 0
         self._tasks_available: asyncio.Event = asyncio.Event()
 
     def push(self, priority: float, task_id: str) -> None:
-        heapq.heappush(self._heap, (priority, task_id))
+        heapq.heappush(self._heap, (priority, self._seq, task_id))
+        self._seq += 1
         self._task_ids.add(task_id)
         self._tasks_available.set()
 
@@ -605,7 +608,7 @@ class PendingTaskHeap:
         if task_id not in self._task_ids:
             return False
         self._task_ids.discard(task_id)
-        self._heap = [(p, tid) for p, tid in self._heap if tid != task_id]
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid != task_id]
         heapq.heapify(self._heap)
         if not self._task_ids:
             self._tasks_available.clear()
@@ -613,13 +616,13 @@ class PendingTaskHeap:
 
     def remove_many(self, task_ids: Set[str]) -> None:
         self._task_ids -= task_ids
-        self._heap = [(p, tid) for p, tid in self._heap if tid in self._task_ids]
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid in self._task_ids]
         heapq.heapify(self._heap)
         if not self._task_ids:
             self._tasks_available.clear()
 
-    def sorted_items(self) -> List[Tuple[float, str]]:
-        """Return all items sorted by priority (non-destructive)."""
+    def sorted_items(self) -> List[Tuple[float, int, str]]:
+        """Return all items sorted by priority, then insertion order (non-destructive)."""
         return sorted(self._heap)
 
     def __contains__(self, task_id: str) -> bool:
@@ -637,6 +640,7 @@ class PendingTaskHeap:
     def clear(self) -> None:
         self._heap.clear()
         self._task_ids.clear()
+        self._seq = 0
         self._tasks_available.clear()
 
     async def wait_for_tasks(self) -> None:
@@ -691,7 +695,6 @@ class AsyncTaskScheduler(AsyncScheduler):
                 self.tasks[task_id],
                 scheduler_state=self._build_scheduler_state(),
             )
-            self.logger.debug(f"Got score for {task_id}")
             self._pending_tasks.push(self._priority_from_score(score), task_id)
         self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
 
@@ -877,7 +880,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                 allocated_ids: List[str] = []
                 stale_ids: List[str] = []
 
-                for _priority, task_id in self._pending_tasks.sorted_items():
+                for _priority, _seq, task_id in self._pending_tasks.sorted_items():
                     if self._stop_monitoring.is_set():
                         break
 

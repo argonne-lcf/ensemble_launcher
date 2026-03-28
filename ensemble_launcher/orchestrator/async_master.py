@@ -718,7 +718,7 @@ class AsyncMaster(Node):
         # If there are still tasks un-assigned try to assign them
         if ckpt_restored and len(self._scheduler.unassigned_task_ids):
             self._scheduler.assign_task_ids(
-                set([task_id for task_id in self._scheduler.unassigned_task_ids])
+                self._scheduler.unassigned_task_ids
             )
 
         # Check executor validity
