@@ -309,6 +309,7 @@ class AsyncWorker(Node):
             self._init_nodes,
             policy_config=self._config.policy_config,
         )
+        self.logger.debug("Scheduler init complete")
 
         # Validate that nodes are initialized
         if not self.nodes:

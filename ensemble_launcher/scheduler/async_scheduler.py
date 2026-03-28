@@ -680,22 +680,20 @@ class AsyncTaskScheduler(AsyncScheduler):
         else:
             self.scheduler_policy: Policy = policy
         self._strict_priority: bool = policy_config.strict_priority
-        self._pending_tasks = PendingTaskHeap()
-        for task_id in self.tasks:
-            score = self.scheduler_policy.get_score(
-                self.tasks[task_id],
-                scheduler_state=SchedulerState(
-                    pending_tasks=self._pending_tasks.task_ids
-                ),
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task_id)
-        self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
-        ##
         self.ready_tasks: Queue[Tuple[str, JobResource]] = Queue()
         self._running_tasks: Dict[str, JobResource] = {}
         self._done_tasks: Counter[str] = Counter()
         self._failed_tasks: Set[str] = set()
         self._successful_tasks: Set[str] = set()
+        self._pending_tasks = PendingTaskHeap()
+        for task_id in self.tasks:
+            score = self.scheduler_policy.get_score(
+                self.tasks[task_id],
+                scheduler_state=self._build_scheduler_state(),
+            )
+            self.logger.debug(f"Got score for {task_id}")
+            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
 
         self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
 

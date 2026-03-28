@@ -1,7 +1,7 @@
 import logging
-from logging import Logger
 from abc import ABC, abstractmethod
 from itertools import accumulate
+from logging import Logger
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 import numpy as np
@@ -13,6 +13,7 @@ from ensemble_launcher.scheduler.resource import (
     NodeResource,
     NodeResourceCount,
 )
+
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
     from ensemble_launcher.scheduler.state import ChildrenAssignment, SchedulerState
@@ -21,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 class Policy(ABC):
-
     def __init__(
         self,
         policy_config: PolicyConfig = PolicyConfig(),
@@ -69,9 +69,14 @@ class Policy(ABC):
         """
         pass
 
-class ChildrenPolicy(ABC):
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: Logger = None):
+class ChildrenPolicy(ABC):
+    def __init__(
+        self,
+        policy_config: PolicyConfig = PolicyConfig(),
+        node_id: str = None,
+        logger: Logger = None,
+    ):
         self.policy_config = policy_config
         self.node_id = node_id
         self.logger = logger if logger is not None else logging.getLogger(__name__)
@@ -214,15 +219,38 @@ class LargeResourcePolicy(Policy):
     cpu_weight: float = 1.0
     gpu_weight: float = 2.0
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None):
+    def __init__(
+        self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None
+    ):
         super().__init__(policy_config, logger)
+        self.logger.debug(f"init policy")
 
-    def get_score(self, task: Task, scheduler_state: Optional["SchedulerState"] = None) -> float:
+    def get_score(
+        self, task: Task, scheduler_state: Optional["SchedulerState"] = None
+    ) -> float:
+        self.logger.debug(f"Hello from policy")
         return (
             task.nnodes
             * task.ppn
             * (task.ngpus_per_process * self.gpu_weight + self.cpu_weight)
         )
+
+
+@policy_registry.register("fifo_policy")
+class FIFOPolicy(Policy):
+    """Schedules tasks in submission order (FIFO).
+
+    Score is the negative of the current pending-task count so that
+    earlier-added tasks always have a higher score than later ones.
+    Best used with ``strict_priority=True`` in PolicyConfig.
+    """
+
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None):
+        super().__init__(policy_config, logger)
+
+    def get_score(self, task: Task, scheduler_state: Optional["SchedulerState"] = None) -> float:
+        pending_size = len(scheduler_state.pending_tasks) if scheduler_state and scheduler_state.pending_tasks else 0
+        return -pending_size
 
 
 @policy_registry.register("bin_packing_children_policy", type="children_policy")
@@ -239,13 +267,16 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
             nlevels = 3
     """
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: logging.Logger = None):
+    def __init__(
+        self,
+        policy_config: PolicyConfig = PolicyConfig(),
+        node_id: str = None,
+        logger: logging.Logger = None,
+    ):
         super().__init__(policy_config, node_id, logger)
         nlevels = policy_config.nlevels
         if nlevels is None:
-            raise ValueError(
-                "nlevels must be specified for BinPackingChildrenPolicy"
-            )
+            raise ValueError("nlevels must be specified for BinPackingChildrenPolicy")
         self.nlevels = nlevels
         self.logger.info(
             f"Initialized BinPackingChildrenPolicy with nlevels={self.nlevels}"
@@ -394,7 +425,13 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
             scheduler = AsyncChildrenScheduler(..., policy="split_8")
     """
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id: str = None, logger: logging.Logger = None, **kwargs):
+    def __init__(
+        self,
+        policy_config: PolicyConfig = PolicyConfig(),
+        node_id: str = None,
+        logger: logging.Logger = None,
+        **kwargs,
+    ):
         super().__init__(policy_config, node_id, logger)
         self.nchildren = policy_config.nchildren
         if self.nchildren is None or self.nchildren <= 0:
@@ -494,27 +531,34 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
 
         return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
 
-@policy_registry.register("fixed_leafs_children_policy",type="children_policy")
-class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
 
-    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), node_id:str = None, logger: Logger = None):
+@policy_registry.register("fixed_leafs_children_policy", type="children_policy")
+class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
+    def __init__(
+        self,
+        policy_config: PolicyConfig = PolicyConfig(),
+        node_id: str = None,
+        logger: Logger = None,
+    ):
         super().__init__(policy_config, node_id, logger)
-    
-    def get_children_resources(self, tasks: Dict[str, Task], nodes: JobResource, level: int) -> Dict[int, JobResource]:
+
+    def get_children_resources(
+        self, tasks: Dict[str, Task], nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
         # Interpolate in log2 space to pick a number of workers for this level.
         nlevels = self.policy_config.nlevels
         leaf_nodes = self.policy_config.leaf_nodes
 
-        x_vals = [0.0,float(nlevels)]
-        y_vals = [0.0, max(np.log2(leaf_nodes),0)]
-        nchildren_current_level = 2**(np.ceil(np.interp([level],x_vals,y_vals)[0]))
-        nchildren_next_level = 2**(np.ceil(np.interp([level+1],x_vals,y_vals)[0]))
+        x_vals = [0.0, float(nlevels)]
+        y_vals = [0.0, max(np.log2(leaf_nodes), 0)]
+        nchildren_current_level = 2 ** (np.ceil(np.interp([level], x_vals, y_vals)[0]))
+        nchildren_next_level = 2 ** (np.ceil(np.interp([level + 1], x_vals, y_vals)[0]))
 
         if level > 0:
-            my_id = int(self.node_id.split(".")[-1].replace("m",""))
+            my_id = int(self.node_id.split(".")[-1].replace("m", ""))
         else:
             my_id = 0
-        
+
         n_children = int(nchildren_next_level // nchildren_current_level)
         remainder = int(nchildren_next_level % nchildren_current_level)
         if my_id < remainder:
@@ -547,5 +591,3 @@ class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
                     wid += 1
 
         return result
-        
-

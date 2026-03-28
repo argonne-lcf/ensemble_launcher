@@ -29,6 +29,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             task_id=f"task-{i}", nnodes=1, ppn=1, executable=echo, args=(f"task-{i}",)
         )
 
+    print(tasks.keys())
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(
         SystemConfig(name="local", ncpus=12, cpus=list(range(1, 13)))
@@ -43,9 +44,11 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             policy_config=PolicyConfig(nlevels=nlevels),
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
-            log_level=logging.INFO,
+            log_level=logging.DEBUG,
             heartbeat_interval=1.0,
             heartbeat_dead_threshold=5.0,
+            master_logs=True,
+            worker_logs=True,
         ),
         job_resource,
         tasks,
@@ -91,6 +94,8 @@ async def test_async_mpi_master(nlevels=1):
             sequential_child_launch=True,
             heartbeat_interval=0.1,
             heartbeat_dead_threshold=5.0,
+            master_logs=True,
+            worker_logs=True,
         ),
         job_resource,
         tasks,
@@ -108,9 +113,9 @@ async def test_async_mpi_master(nlevels=1):
 
 
 if __name__ == "__main__":
-    # print("Testing Async Master with ProcessPool Executor for 1 task per core")
-    # asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
+    print("Testing Async Master with ProcessPool Executor for 1 task per core")
+    asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
     # print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
     # asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
-    print("Testing Async Master with MPI Executor")
-    asyncio.run(test_async_mpi_master(nlevels=3))
+    # print("Testing Async Master with MPI Executor")
+    # asyncio.run(test_async_mpi_master(nlevels=3))
