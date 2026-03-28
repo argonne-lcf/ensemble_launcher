@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 import numpy as np
 
 from ensemble_launcher.config import PolicyConfig
-from ensemble_launcher.ensemble import Task
+from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResource,
@@ -15,17 +15,57 @@ from ensemble_launcher.scheduler.resource import (
 )
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Status
-    from ensemble_launcher.scheduler.state import ChildrenAssignment
+    from ensemble_launcher.scheduler.state import ChildrenAssignment, SchedulerState
 
 logger = logging.getLogger(__name__)
 
 
 class Policy(ABC):
+
+    def __init__(
+        self,
+        policy_config: PolicyConfig = PolicyConfig(),
+        logger: Logger = None,
+    ):
+        self.policy_config = policy_config
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
+
     @abstractmethod
-    def get_score(self, task: Task) -> float:
+    def get_score(
+        self,
+        task: Task,
+        scheduler_state: Optional["SchedulerState"] = None,
+    ) -> float:
         """
         Returns a score for scheduling the given task on the given node.
         Higher score means higher priority.
+
+        Args:
+            task: The task to score.
+            scheduler_state: Optional snapshot of the current scheduler state
+                (pending, running, completed, and failed task sets) that
+                implementations can use for state-aware prioritisation.
+        """
+        pass
+
+    def on_task_complete(
+        self,
+        task: Task,
+        status: TaskStatus,
+        scheduler_state: "SchedulerState",
+    ) -> None:
+        """
+        Callback invoked by the task scheduler whenever a task finishes.
+
+        Override this in subclasses to implement custom logic that reacts to
+        task completions (e.g. updating internal weights, logging, triggering
+        re-prioritisation).
+
+        Args:
+            task: The task that just completed.
+            status: Final status of the task (SUCCESS or FAILED).
+            scheduler_state: Snapshot of the scheduler state after the task
+                has been marked complete and its resources freed.
         """
         pass
 
@@ -174,7 +214,10 @@ class LargeResourcePolicy(Policy):
     cpu_weight: float = 1.0
     gpu_weight: float = 2.0
 
-    def get_score(self, task: Task) -> float:
+    def __init__(self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None):
+        super().__init__(policy_config, logger)
+
+    def get_score(self, task: Task, scheduler_state: Optional["SchedulerState"] = None) -> float:
         return (
             task.nnodes
             * task.ppn

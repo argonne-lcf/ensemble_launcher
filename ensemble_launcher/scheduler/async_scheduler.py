@@ -592,6 +592,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         tasks: Dict[str, Task],
         nodes: JobResource,
         policy: Union[str, Policy] = "large_resource_policy",
+        policy_config: PolicyConfig = PolicyConfig(),
     ) -> None:
         """Initialise the task scheduler.
 
@@ -600,12 +601,20 @@ class AsyncTaskScheduler(AsyncScheduler):
             tasks: Initial task dict to schedule.
             nodes: Available cluster resources for this worker.
             policy: Policy name or instance used to score/prioritise tasks.
+            policy_config: Configuration passed to the policy constructor
+                when *policy* is given as a string.
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
         if isinstance(policy, str):
-            self.scheduler_policy: Policy = policy_registry.create_policy(policy)
+            self.scheduler_policy: Policy = policy_registry.create_policy(
+                policy,
+                policy_kwargs={
+                    "policy_config": policy_config,
+                    "logger": logger.getChild("policy"),
+                },
+            )
         else:
             self.scheduler_policy: Policy = policy
         self._sorted_tasks: PriorityQueue[Tuple[float, str]] = PriorityQueue()
@@ -639,6 +648,23 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._event_registry: Optional[EventRegistry] = None
         if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
+
+    def _build_scheduler_state(self) -> SchedulerState:
+        """Build a lightweight state snapshot for passing to policy methods."""
+        successful = set(self._successful_tasks)
+        failed = set(self._failed_tasks)
+        running = set(self._running_tasks.keys())
+        all_ids = set(self.tasks.keys())
+        pending = all_ids - successful - failed - running
+
+        return SchedulerState(
+            node_id="",
+            nodes=self.cluster.nodes,
+            pending_tasks=pending,
+            running_tasks=running,
+            completed_tasks=successful,
+            failed_tasks=failed,
+        )
 
     def get_state(self, node_id: str) -> SchedulerState:
         """Snapshot current state for checkpointing.
@@ -706,10 +732,11 @@ class AsyncTaskScheduler(AsyncScheduler):
                 self._sorted_tasks.get_nowait()
             except Exception:
                 break
+        state = self._build_scheduler_state()
         for task_id in pending:
             self._sorted_tasks.put_nowait(
                 (
-                    1.0 / self.scheduler_policy.get_score(self.tasks[task_id]),
+                    1.0 / self.scheduler_policy.get_score(self.tasks[task_id], scheduler_state=state),
                     task_id,
                 )
             )
@@ -942,7 +969,7 @@ class AsyncTaskScheduler(AsyncScheduler):
             if client_id is not None:
                 self._task_to_client[task.task_id] = client_id
             self._sorted_tasks.put_nowait(
-                (self.scheduler_policy.get_score(task), task.task_id)
+                (self.scheduler_policy.get_score(task, scheduler_state=self._build_scheduler_state()), task.task_id)
             )
             return True
         except Exception as e:
@@ -1038,6 +1065,14 @@ class AsyncTaskScheduler(AsyncScheduler):
                 self._failed_tasks.discard(task_id)
 
             self.logger.debug(f"Freed {task_id}")
+
+            # Notify the policy about the completed task
+            self.scheduler_policy.on_task_complete(
+                task=self.tasks[task_id],
+                status=status,
+                scheduler_state=self._build_scheduler_state(),
+            )
+
         self._check_all_tasks_done()
         return None
 

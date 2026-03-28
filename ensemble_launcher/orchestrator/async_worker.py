@@ -304,7 +304,10 @@ class AsyncWorker(Node):
 
         # Init scheduler
         self._scheduler = AsyncTaskScheduler(
-            self.logger.getChild("scheduler"), self._init_tasks, self._init_nodes
+            self.logger.getChild("scheduler"),
+            self._init_tasks,
+            self._init_nodes,
+            policy_config=self._config.policy_config,
         )
 
         # Validate that nodes are initialized
