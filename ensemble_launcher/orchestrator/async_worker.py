@@ -308,6 +308,7 @@ class AsyncWorker(Node):
             self._init_tasks,
             self._init_nodes,
             policy_config=self._config.policy_config,
+            policy=self._config.task_scheduler_policy,
         )
         self.logger.debug("Scheduler init complete")
 
@@ -765,7 +766,7 @@ class AsyncWorker(Node):
                 task_id, req = await self._scheduler.ready_tasks.get()
 
                 task = self.tasks[task_id]
-                self.logger.debug(
+                self.logger.info(
                     f"Submitting task {task_id}: {task.executable} with resources {req.resources} {task.env}"
                 )
                 task.status = TaskStatus.READY

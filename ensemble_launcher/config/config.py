@@ -46,6 +46,9 @@ class LauncherConfig(BaseModel):
     children_scheduler_policy: str = (
         "simple_split_children_policy"  ##Policy to use for children scheduler
     )
+    task_scheduler_policy: str = (
+        "large_resource_policy"  ##Policy to use for children scheduler
+    )
     policy_config: PolicyConfig = Field(default_factory=PolicyConfig)
     enable_workstealing: bool = (
         False  ##If True, master will listen for task requests from worker children
