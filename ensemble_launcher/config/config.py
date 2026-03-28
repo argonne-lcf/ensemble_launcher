@@ -12,6 +12,7 @@ class PolicyConfig(BaseModel):
     nlevels: int = 1
     nchildren: int = 1
     leaf_nodes: int = 1
+    strict_priority: bool = False  # If True, tasks are scheduled in strict priority order (no lower-priority task runs before a higher-priority one)
 
 
 class SystemConfig(BaseModel):

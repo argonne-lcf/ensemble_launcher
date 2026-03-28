@@ -323,7 +323,7 @@ class AsyncWorker(Node):
         self._scheduler.start_monitoring()  # start the scheduler monitoring
 
         self.logger.info(f"Running {list(self.tasks.keys())} tasks")
-        self.logger.debug(f"Sorted tasks size {self._scheduler._sorted_tasks.qsize()}")
+        self.logger.debug(f"Pending tasks size {len(self._scheduler._pending_tasks)}")
 
         ##lazy executor creation
         if isinstance(self._config.task_executor_name, list):
