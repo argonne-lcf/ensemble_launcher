@@ -38,7 +38,11 @@ from ensemble_launcher.executors import (
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncTaskScheduler
-from ensemble_launcher.scheduler.resource import JobResource
+from ensemble_launcher.scheduler.resource import (
+    JobResource,
+    NodeResourceCount,
+    NodeResourceList,
+)
 
 from .node import Node
 
@@ -106,7 +110,6 @@ class AsyncWorker(Node):
         self._stop_task_update = asyncio.Event()
         self._task_update_task = None
         self._client_handler_task: Optional[asyncio.Task] = None
-        self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
 
         # Node update monitor state
         self._stop_node_update = asyncio.Event()
@@ -276,6 +279,29 @@ class AsyncWorker(Node):
         # Syncronize with parent
         await self._sync_with_parent()
 
+        executor_names = (
+            self._config.task_executor_name
+            if isinstance(self._config.task_executor_name, list)
+            else [self._config.task_executor_name]
+        )
+
+        original_head_node = self._init_nodes.resources[0]
+        if "async_mpi_processpool" in executor_names:
+            self.logger.info(
+                f"{self.node_id}: Reserving first core for gateway in MPI Pool executor. "
+                f"No Tasks will be scheduled on cpu {self._init_nodes.resources[0].cpus[0]} of host {self._init_nodes.nodes[0]}"
+            )
+            if isinstance(original_head_node, NodeResourceCount):
+                trimmed_head_node = NodeResourceCount(
+                    ncpus=original_head_node.ncpus - 1, ngpus=original_head_node.ngpus
+                )
+            else:
+                trimmed_head_node = NodeResourceList(
+                    cpus=original_head_node.cpus[1:], gpus=original_head_node.gpus
+                )
+
+            self._init_nodes.resources[0] = trimmed_head_node
+
         # Init scheduler
         self._scheduler = AsyncTaskScheduler(
             self.logger.getChild("scheduler"), self._init_tasks, self._init_nodes
@@ -318,9 +344,48 @@ class AsyncWorker(Node):
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
-        if self._config.task_executor_name == "async_mpi":
-            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
+
+        ##Async mpi specific options
+        kwargs["mpi_config"] = self._config.mpi_config
+
+        # Async mpi pool specific options
+        np = sum(
+            [original_head_node.cpu_count]
+            + [node.cpu_count for node in self.nodes.resources[1:]]
+        )
+        kwargs["mpi_info"] = {"np": np}
+        all_nodes_identical = (
+            all([original_head_node == node for node in self.nodes.resources])
+            or len(self.nodes.nodes) <= 1
+        )
+        if all_nodes_identical:
+            kwargs["mpi_info"]["ppn"] = original_head_node.cpu_count
+            kwargs["mpi_info"]["hosts"] = ",".join(self.nodes.nodes)
+            if self._config.mpi_config.cpu_bind_method != "none":
+                kwargs["mpi_info"]["cpu_binding"] = ":".join(
+                    list(map(str, original_head_node.cpus))
+                )
+        else:
+            # if (
+            #     "async_mpi_processpool" in executor_names
+            #     and self._config.mpi_config.rankfile_flag is None
+            # ):
+            ## TODO: implement rankfile
+            if "async_mpi_processpool" in executor_names:
+                raise ValueError(
+                    f"{self.node_id}: Not all nodes are identical"
+                    f" and MPI flavour {self._config.mpi_config.flavor} doesn't support rankfile."
+                    f"Impossible to initialize async_mpi_processpool."
+                )
+
+        kwargs["cpu_to_pid"] = {}
+        pid = 0
+        for host, res in zip(
+            self.nodes.nodes, [original_head_node] + self.nodes.resources[1:]
+        ):
+            for cpu_id in res.cpus:
+                kwargs["cpu_to_pid"][(host, cpu_id)] = pid
+                pid += 1
 
         if isinstance(self._config.task_executor_name, list):
             self._executor = {}
@@ -401,6 +466,12 @@ class AsyncWorker(Node):
         if scheduler_state is None:
             return False
         self._scheduler.set_state(scheduler_state, self._ckpt_results or {})
+
+        ##Forward the result to the appropriate place.
+        ##task_id to client map should be restored from scheduler state
+        for result in self._ckpt_results.values():
+            self._forward_result(result)
+
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
 
@@ -562,22 +633,23 @@ class AsyncWorker(Node):
                 success=(exception is None),
                 exception=str(exception) if exception else None,
             )
-            if task_id in self._client_task_map:
-                dest_id = self._client_task_map.pop(task_id)
-            elif self.parent:
-                dest_id = self.parent.node_id
-            else:
-                dest_id = None
+            self._forward_result(task_result)
 
-            if dest_id is not None:
-                if dest_id not in self._iresult_q:
-                    self._iresult_q[dest_id] = deque()
+    def _forward_result(self, result: Result):
+        task_id = result.task_id
+        dest_id = self._scheduler.get_task_client(task_id)
+        if dest_id is None and self.parent:
+            dest_id = self.parent.node_id
 
-                result_q = self._iresult_q[dest_id]
-                result_q.append(task_result)
-                self._streamed_task_ids.add(task_id)
-                if len(result_q) >= self._config.result_buffer_size:
-                    asyncio.create_task(self._flush_dest_queue(dest_id))
+        if dest_id is not None:
+            if dest_id not in self._iresult_q:
+                self._iresult_q[dest_id] = deque()
+
+            result_q = self._iresult_q[dest_id]
+            result_q.append(result)
+            self._streamed_task_ids.add(task_id)
+            if len(result_q) >= self._config.result_buffer_size:
+                asyncio.create_task(self._flush_dest_queue(dest_id))
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -594,7 +666,7 @@ class AsyncWorker(Node):
         )
 
     def _update_tasks(
-        self, taskupdate: TaskUpdate
+        self, taskupdate: TaskUpdate, client_id: Optional[str] = None
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """Apply a TaskUpdate: add new tasks to the scheduler and cancel/delete removed ones.
 
@@ -605,7 +677,9 @@ class AsyncWorker(Node):
         del_status = {}
         for new_task in taskupdate.added_tasks:
             self.logger.debug(f"Adding new task {new_task}")
-            add_status[new_task.task_id] = self._scheduler.add_task(new_task)
+            add_status[new_task.task_id] = self._scheduler.add_task(
+                new_task, client_id=client_id
+            )
             if not add_status[new_task.task_id]:
                 self.logger.error(f"Failed to add new task {new_task.task_id}")
             else:
@@ -631,9 +705,7 @@ class AsyncWorker(Node):
                 continue
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
-                for task in msg.added_tasks:
-                    self._client_task_map[task.task_id] = client_id
-                self._update_tasks(msg)
+                self._update_tasks(msg, client_id=client_id)
 
     async def _parent_ready_monitor(self) -> None:
         """Wait for a Ready message from parent and set the parent-ready event."""
@@ -947,7 +1019,9 @@ class AsyncWorker(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0 + attempt * 5.0)
+                ack = await self._comm.recv_message_from_parent(
+                    ResultAck, timeout=5.0 + attempt * 5.0
+                )
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
@@ -1005,7 +1079,10 @@ class AsyncWorker(Node):
 
         await self._comm.close()
         for executor in self._executor.values():
-            executor.shutdown()
+            if hasattr(executor, "ashutdown"):
+                await executor.ashutdown()
+            else:
+                executor.shutdown()
 
         return
 

@@ -89,6 +89,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             str, List[str]
         ] = {}  # child_id -> dynamically assigned task_ids
         self._task_to_child: Dict[str, str] = {}  # task_id -> child_id
+        self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
         # Pool of task IDs not yet assigned to any child.
         # Seeded at init from tasks; assign_task_ids() drains it as tasks are placed.
         self._unassigned_tasks: Set[str] = set(self.tasks.keys())
@@ -313,10 +314,16 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
         self._unassigned_tasks.discard(task_id)
 
-    def add_task(self, task: Task) -> None:
+    def add_task(self, task: Task, client_id: Optional[str] = None) -> None:
         """Add a task to the scheduler and mark it as unassigned."""
         self.tasks[task.task_id] = task
         self._unassigned_tasks.add(task.task_id)
+        if client_id is not None:
+            self._task_to_client[task.task_id] = client_id
+
+    def get_task_client(self, task_id: str) -> Optional[str]:
+        """Return the client_id that submitted this task, or None."""
+        return self._task_to_client.get(task_id)
 
     def delete_task(self, task_id: str) -> None:
         """Remove a task from the scheduler entirely.
@@ -326,6 +333,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """
         self.tasks.pop(task_id, None)
         self._unassigned_tasks.discard(task_id)
+        self._task_to_client.pop(task_id, None)
         for assignment in self._child_assignments.values():
             task_ids: List[str] = assignment["task_ids"]
             if task_id in task_ids:
@@ -370,6 +378,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child_id_to_wid=dict(self._child_id_to_wid),
             wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
             task_to_child=self._task_to_child,
+            task_to_client=dict(self._task_to_client),
             child_states={cid: s.name for cid, s in self._child_states.items()},
         )
 
@@ -399,8 +408,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
             self._child_id_to_wid[child_id] = wid
             self._wid_to_child_id[wid] = child_id
 
-        # also set the task_id to wid
         self._task_to_child.update(state.task_to_child)
+        self._task_to_client.update(state.task_to_client)
 
         # All tasks that were assigned to children leave the unassigned pool
         assigned = {
@@ -618,6 +627,8 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._done_tasks: Counter[str] = Counter()
         self._failed_tasks: Set[str] = set()
         self._successful_tasks: Set[str] = set()
+
+        self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
 
         self._stop_monitoring = asyncio.Event()
         self._all_tasks_done = asyncio.Event()
@@ -920,7 +931,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         await self._all_tasks_done.wait()
         self.logger.debug("Done waiting for task completion!")
 
-    def add_task(self, task: Task) -> bool:
+    def add_task(self, task: Task, client_id: Optional[str] = None) -> bool:
         """Add a task to the priority queue for scheduling. Returns True on success."""
         try:
             if task.nnodes > len(self.cluster.nodes.nodes):
@@ -928,6 +939,8 @@ class AsyncTaskScheduler(AsyncScheduler):
                     f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes.nodes)} are available"
                 )
             self.tasks[task.task_id] = task
+            if client_id is not None:
+                self._task_to_client[task.task_id] = client_id
             self._sorted_tasks.put_nowait(
                 (self.scheduler_policy.get_score(task), task.task_id)
             )
@@ -935,6 +948,10 @@ class AsyncTaskScheduler(AsyncScheduler):
         except Exception as e:
             self.logger.error(f"Failed to add task {task.task_id}: {e}")
             return False
+
+    def get_task_client(self, task_id: str) -> Optional[str]:
+        """Return the client_id that submitted this task, or None."""
+        return self._task_to_client.get(task_id)
 
     def delete_task(self, task: Task) -> bool:
         """Remove a task from all queues and free its resources. Returns True on success."""

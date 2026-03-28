@@ -35,11 +35,10 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         self._return_stdout = False
         if "return_stdout" in kwargs:
             self._return_stdout = kwargs["return_stdout"]
-            del kwargs["return_stdout"]
 
         # mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
         # super().__init__(mp_context=mp_context, **kwargs)
-        super().__init__(**kwargs)
+        super().__init__(max_workers=kwargs.get("max_workers", None))
 
         super().submit(dummy_task)
 
@@ -103,8 +102,7 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
         self._return_stdout = False
         if "return_stdout" in kwargs:
             self._return_stdout = kwargs["return_stdout"]
-            del kwargs["return_stdout"]
-        super().__init__(**kwargs)
+        super().__init__(max_workers=kwargs.get("max_workers", None))
         self.logger.info("Initialized threadpool executor")
 
     def submit(

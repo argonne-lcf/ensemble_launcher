@@ -94,9 +94,12 @@ class _WorkerPipeline:
         self.recv_time = 0.0
         self.deser_time = 0.0
         self.set_result_time = 0.0
+        self.total_results = 0
+        self._logger = None
 
     def start(self, node_address: str, logger) -> None:
         """Start the pipeline's dedicated thread and wait until its event loop is ready."""
+        self._logger = logger
         self._thread = threading.Thread(
             target=self._run, args=(node_address, logger), daemon=True
         )
@@ -139,8 +142,14 @@ class _WorkerPipeline:
         t1 = time.perf_counter()
         for result in msg.data:
             self.set_result(result)
+        self.total_results += len(msg.data)
         self.deser_time += t1 - t0
         self.set_result_time += time.perf_counter() - t1
+        if self._logger is not None:
+            self._logger.info(
+                f"{self.worker_id}: received {len(msg.data)} results "
+                f"(total={self.total_results})"
+            )
 
     def set_result(self, result: Result) -> None:
         with self.lock:
@@ -168,6 +177,22 @@ class _WorkerPipeline:
 # ---------------------------------------------------------------------------
 # Node resolution
 # ---------------------------------------------------------------------------
+
+
+def _wait_for_path(path: str, timeout: float, poll_interval: float = 1.0) -> None:
+    """Block until *path* exists (file or non-empty directory), or raise TimeoutError."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.path.isfile(path):
+            return
+        if os.path.isdir(path) and os.listdir(path):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out after {timeout:.0f}s waiting for checkpoint path: {path}"
+            )
+        time.sleep(min(poll_interval, remaining))
 
 
 def _resolve_node_id(checkpoint_dir: str, node_id: str) -> str:
@@ -224,21 +249,26 @@ class ClusterClient:
         n_workers: int = 1,
         log_dir: str = "logs",
         log_level: int = logging.INFO,
+        checkpoint_timeout: float = 60.0,
     ):
         """
         Args:
-            checkpoint_dir: Directory containing orchestrator checkpoint files.
-            node_id:        Which node to connect to. ``"global"`` (default) resolves
-                            to the global master (shortest node_id in the checkpoint
-                            dir, e.g. ``"main"``). Pass any scheduler node id such as
-                            ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
-                            that node.
-            client_id:      Optional client identity string; auto-generated if omitted.
-            n_workers:      Number of parallel send/recv pipelines (default 1).
-            log_dir:        Directory for log files.  When provided a file
-                            ``{log_dir}/{client_id}.log`` is created.  When
-                            ``None`` (default) logging goes to the root handler.
-            log_level:      Logging level (default ``logging.INFO``).
+            checkpoint_dir:      Directory containing orchestrator checkpoint files.
+            node_id:             Which node to connect to. ``"global"`` (default) resolves
+                                 to the global master (shortest node_id in the checkpoint
+                                 dir, e.g. ``"main"``). Pass any scheduler node id such as
+                                 ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
+                                 that node.
+            client_id:           Optional client identity string; auto-generated if omitted.
+            n_workers:           Number of parallel send/recv pipelines (default 1).
+            log_dir:             Directory for log files.  When provided a file
+                                 ``{log_dir}/{client_id}.log`` is created.  When
+                                 ``None`` (default) logging goes to the root handler.
+            log_level:           Logging level (default ``logging.INFO``).
+            checkpoint_timeout:  Seconds to wait for checkpoint files to appear before
+                                 raising ``TimeoutError`` (default 60).  Useful when the
+                                 client is started before the orchestrator has written its
+                                 first checkpoint.
         """
         self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
         self._n_workers = n_workers
@@ -247,15 +277,22 @@ class ClusterClient:
         )
         self._node_id = None
 
+        # Wait for the checkpoint directory to be populated before resolving the node id.
+        self.logger.info(
+            f"Waiting for checkpoint directory '{checkpoint_dir}' "
+            f"(timeout={checkpoint_timeout:.0f}s)"
+        )
+        _wait_for_path(checkpoint_dir, timeout=checkpoint_timeout)
+
         resolved_id = _resolve_node_id(checkpoint_dir, node_id)
         self._node_id = resolved_id
         comm_path = os.path.join(
             checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_comm.json"
         )
-        if not os.path.exists(comm_path):
-            raise FileNotFoundError(
-                f"No comm checkpoint found for node '{resolved_id}' in '{checkpoint_dir}'"
-            )
+
+        # Wait for the specific comm checkpoint file to be written.
+        self.logger.info(f"Waiting for comm checkpoint '{comm_path}'")
+        _wait_for_path(comm_path, timeout=checkpoint_timeout)
         with open(comm_path, "r") as f:
             comm_data = CommCheckpointData.model_validate_json(f.read())
 
@@ -427,4 +464,3 @@ class ClusterClient:
 
     def __exit__(self, *_):
         self.teardown()
-

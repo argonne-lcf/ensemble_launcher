@@ -3,10 +3,10 @@ import base64
 import json
 import os
 import random
-import uuid
 import signal
 import socket
 import time
+import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
@@ -134,7 +134,6 @@ class AsyncMaster(Node):
         self._task_update_task: Optional[asyncio.Task] = None
         self._client_monitor_task: Optional[asyncio.Task] = None
         self._reporting_task: asyncio.Task = None
-        self._client_task_map: Dict[str, str] = {}  # task_id -> client_id
         self._stop_signal_received = asyncio.Event()
 
         # Per-child task request monitor tasks
@@ -149,6 +148,8 @@ class AsyncMaster(Node):
         # Parent-ready handshake: set when parent sends a Ready message
         self._parent_ready_event = asyncio.Event()
         self._parent_ready_monitor_task: Optional[asyncio.Task] = None
+
+        self._total_streamed = 0
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -409,6 +410,39 @@ class AsyncMaster(Node):
         if self.parent:
             self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
+    def _cpu_bind_mpi_kwargs(self, child_resource) -> dict:
+        """Return mpi_kwargs that pin a child process to its allocated CPUs.
+
+        Child processes are launched as a single MPI rank (NodeResourceCount),
+        so CPU binding cannot go through _build_resource_cmd (which only applies
+        to NodeResourceList resources).  Instead we inject it as additional MPI
+        options via mpi_kwargs, using MPIConfig to produce the correct flags.
+        """
+        cfg = self._config.mpi_config
+
+        if cfg.cpu_bind_method == "none" or not cfg.cpu_bind_flag:
+            return {}
+
+        if cfg.cpu_bind_method == "bind-to":
+            # OpenMPI: --bind-to core --map-by <map_by>
+            # No need for explicit CPU IDs — MPI assigns cores automatically.
+            return {cfg.cpu_bind_flag: "core", "--map-by": cfg.openmpi_map_by}
+
+        # "list" method: build the colon-separated core-ID string
+        if isinstance(child_resource, NodeResourceList):
+            cpus = ":".join(map(str, child_resource.cpus))
+        else:
+            # NodeResourceCount — fall back to 0..N-1 (best effort)
+            cpus = ":".join(map(str, range(child_resource.cpu_count)))
+
+        if cfg.cpu_bind_method == "list":
+            return {cfg.cpu_bind_flag: f"list:{cpus}"}
+
+        self.logger.warning(
+            f"Unknown cpu_bind_method '{cfg.cpu_bind_method}'. Not setting child affinity."
+        )
+        return {}
+
     async def _launch_child(
         self, child_name: str, child_obj: Node, child_idx: int
     ) -> None:
@@ -442,23 +476,11 @@ class AsyncMaster(Node):
             env = os.environ.copy()
             env["EL_CHILDID"] = str(child_idx)
 
-            ##get mpi kwargs
-            if isinstance(child_obj.init_nodes.resources[0], NodeResourceList):
-                cpus = ":".join(map(str, child_obj.init_nodes.resources[0].cpus))
-            else:
-                cpus = ":".join(
-                    map(str, list(range(child_obj.init_nodes.resources[0].cpu_count)))
-                )
-            if self._config.cpu_binding_option == "--cpu-bind":
-                mpi_kwargs = {self._config.cpu_binding_option: f"list:{cpus}"}
-                self.logger.info(f"Setting cpu affinity to child:{mpi_kwargs}")
-            else:
-                mpi_kwargs = {}
-                self.logger.warning(
-                    f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning."
-                )
+            mpi_kwargs = self._cpu_bind_mpi_kwargs(child_obj.init_nodes.resources[0])
+            self.logger.info(
+                f"Launching child {child_name} with mpi_kwargs={mpi_kwargs}"
+            )
 
-            self.logger.info(f"Launching child {child_name} using MPI executor")
             future = self._executor.submit(
                 req, ["python", "-c", load_str_embed], env=env, mpi_kwargs=mpi_kwargs
             )
@@ -512,7 +534,7 @@ class AsyncMaster(Node):
                 self.logger.info("Using one shot mpiexec")
                 if not worker_equality:
                     self.logger.warning(
-                        f"All workers are not equal. Using one shot mpiexec can cause issues"
+                        "All workers are not equal. Using one shot mpiexec can cause issues"
                     )
                 ##launch all children in a single shot
                 child_head_nodes = []
@@ -576,31 +598,17 @@ class AsyncMaster(Node):
                 req = JobResource(resources=child_resources, nodes=child_head_nodes)
                 env = os.environ.copy()
 
-                self.logger.info("Launching worker using one shot mpiexec")
-                ##get mpi kwargs
-                if isinstance(first_child.init_nodes.resources[0], NodeResourceList):
-                    cpus = ":".join(map(str, first_child.init_nodes.resources[0].cpus))
-                else:
-                    cpus = ":".join(
-                        map(
-                            str,
-                            list(range(first_child.init_nodes.resources[0].cpu_count)),
-                        )
-                    )
-                mpi_kwargs = {}
+                # CPU binding: use first child's resource as the representative.
+                # All workers are equal when we reach here (worker_equality check above),
+                # so every rank on every node gets the same core list.
                 if worker_equality:
-                    if self._config.cpu_binding_option == "--cpu-bind":
-                        mpi_kwargs.update(
-                            {self._config.cpu_binding_option: f"list:{cpus}"}
-                        )
-                    else:
-                        self.logger.warning(
-                            f"Unknown cpu binding option {self._config.cpu_binding_option}. Ignoring child pinning."
-                        )
-                else:
-                    self.logger.warning(
-                        f"All workers are not equal can't use cpu binding!"
+                    mpi_kwargs = self._cpu_bind_mpi_kwargs(
+                        first_child.init_nodes.resources[0]
                     )
+                else:
+                    mpi_kwargs = {}
+                    self.logger.warning("Workers are not equal — skipping CPU binding.")
+                self.logger.info(f"One-shot launch mpi_kwargs={mpi_kwargs}")
 
                 future = self._executor.submit(
                     req,
@@ -722,8 +730,7 @@ class AsyncMaster(Node):
         kwargs["logger"] = self.logger.getChild("executor")
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         if self._config.child_executor_name == "async_mpi":
-            kwargs["cpu_binding_option"] = self._config.cpu_binding_option
-            kwargs["use_ppn"] = self._config.use_mpi_ppn
+            kwargs["mpi_config"] = self._config.mpi_config
 
         # Create executor
         self._executor: Executor = executor_registry.create_executor(
@@ -786,9 +793,7 @@ class AsyncMaster(Node):
         # All children are launched and synced — signal each one that the master
         # is ready so they can send their final ResultBatch when done.
         for child_id in list(self._child_result_batch_task.keys()):
-            await self._comm.send_message_to_child(
-                child_id, Ready(sender=self.node_id)
-            )
+            await self._comm.send_message_to_child(child_id, Ready(sender=self.node_id))
             self.logger.info(f"{self.node_id}: Sent Ready to {child_id}")
 
         # Create aggregate task once, after all children (including recreated ones) are registered.
@@ -1092,10 +1097,12 @@ class AsyncMaster(Node):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    def _route_tasks(self, tasks: List[Task]) -> List[Optional[str]]:
+    def _route_tasks(
+        self, tasks: List[Task], client_id: Optional[str] = None
+    ) -> List[Optional[str]]:
         """Route a list of tasks to the best child via scheduler policy. Returns chosen child_id."""
         for task in tasks:
-            self._scheduler.add_task(task)
+            self._scheduler.add_task(task, client_id=client_id)
         child_assignments, task_to_child, unassigned_tasks = (
             self._scheduler.assign_task_ids({task.task_id for task in tasks})
         )
@@ -1305,7 +1312,9 @@ class AsyncMaster(Node):
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     continue
-                ack = await self._comm.recv_message_from_parent(ResultAck, timeout=5.0 + attempt * 5.0)
+                ack = await self._comm.recv_message_from_parent(
+                    ResultAck, timeout=5.0 + attempt * 5.0
+                )
                 if ack is not None:
                     self.logger.info(
                         f"{self.node_id}: Successfully sent results and received ack from parent"
@@ -1373,9 +1382,7 @@ class AsyncMaster(Node):
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
                 self.logger.info("Received TaskUpdate from client")
-                self._route_tasks(msg.added_tasks)
-                for task in msg.added_tasks:
-                    self._client_task_map[task.task_id] = client_id
+                self._route_tasks(msg.added_tasks, client_id=client_id)
 
     async def _flush_dest_queue(self, dest_id: str) -> None:
         """Send all buffered results for dest_id to the parent master as a single IResultBatch."""
@@ -1411,8 +1418,8 @@ class AsyncMaster(Node):
 
         dest_results: Dict[str, List[Result]] = {}
         for single_result in items:
-            dest_id = self._client_task_map.pop(
-                single_result.task_id, self.parent.node_id if self.parent else None
+            dest_id = self._scheduler.get_task_client(single_result.task_id) or (
+                self.parent.node_id if self.parent else None
             )
             if dest_id is None:
                 if not self._config.cluster:
@@ -1428,6 +1435,7 @@ class AsyncMaster(Node):
         for dest_id, results in dest_results.items():
             if dest_id.startswith("client:"):
                 # Client attached at this level: send directly, no buffering needed
+                self._total_streamed += len(results)
                 await self._comm.send_message_to_child(
                     dest_id, IResultBatch(sender=self.node_id, data=results)
                 )
@@ -1447,7 +1455,9 @@ class AsyncMaster(Node):
         done_task = asyncio.create_task(child_done.wait())
         while True:
             recv_task = asyncio.create_task(
-                self._comm.recv_message_from_child(IResultBatch, child_id=child_id, block=True)
+                self._comm.recv_message_from_child(
+                    IResultBatch, child_id=child_id, block=True
+                )
             )
             done, _ = await asyncio.wait(
                 {recv_task, done_task}, return_when=asyncio.FIRST_COMPLETED
@@ -1487,7 +1497,9 @@ class AsyncMaster(Node):
                 if status is not None:
                     self._scheduler.set_child_status(child_id, status)
                     if status.tag == "final":
-                        self.logger.info(f"Received final status from {child_id}. Sending ACK")
+                        self.logger.info(
+                            f"Received final status from {child_id}. Sending ACK"
+                        )
                         await self._comm.send_message_to_child(child_id, ResultAck())
                         return
             # Drain any remaining status messages after child process exits
@@ -1659,6 +1671,7 @@ class AsyncMaster(Node):
         self.remove_child(child_id)
         self._child_objs.pop(child_id, None)
         self._children_futures.pop(child_id, None)
+        self._iresult_q.pop(child_id, None)
         await self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
@@ -1675,7 +1688,10 @@ class AsyncMaster(Node):
         5. Export Perfetto profiling traces if profiling was enabled.
         """
 
-        if self._parent_ready_monitor_task and not self._parent_ready_monitor_task.done():
+        if (
+            self._parent_ready_monitor_task
+            and not self._parent_ready_monitor_task.done()
+        ):
             self._parent_ready_monitor_task.cancel()
             try:
                 await self._parent_ready_monitor_task
@@ -1727,7 +1743,7 @@ class AsyncMaster(Node):
         # stop comm and executor
         await self._comm.close()
         self.logger.info(f"Shutting down executor")
-        self._executor.shutdown(wait=True)
+        self._executor.shutdown()
         self.logger.info(f"Done Shutting down executor")
 
         if self._config.profile == "perfetto" and self._event_registry is not None:
@@ -1857,7 +1873,7 @@ class AsyncMaster(Node):
         # Return aggregated results
         result_batch = ResultBatch(sender=self.node_id)
         for r in self._batch_streaming_results:
-                result_batch.add_result(r)
+            result_batch.add_result(r)
         for child_results in self._results.values():
             for rb in child_results:
                 result_batch += rb

@@ -1,6 +1,5 @@
 import os
 import socket
-import time
 
 import pytest
 from utils import echo
@@ -35,9 +34,6 @@ def test_el_run():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=False,
-            worker_logs=False,
-            cpu_binding_option="",
-            use_mpi_ppn=False,
         ),
         Nodes=[socket.gethostname()],
     )
@@ -57,7 +53,7 @@ import uuid
 
 
 def test_el_cluster_mode():
-    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
+    ckpt_dir = os.path.join("/tmp", f"ckpt_{str(uuid.uuid4())}")
     tasks = _make_tasks(8)
 
     el = EnsembleLauncher(
@@ -68,9 +64,6 @@ def test_el_cluster_mode():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=True,
-            worker_logs=True,
-            cpu_binding_option="",
-            use_mpi_ppn=False,
             cluster=True,
             checkpoint_dir=ckpt_dir,
         ),
@@ -78,7 +71,6 @@ def test_el_cluster_mode():
     )
 
     el.start()
-    time.sleep(2.0)
 
     results = {}
     with ClusterClient(checkpoint_dir=ckpt_dir, node_id="global") as client:
