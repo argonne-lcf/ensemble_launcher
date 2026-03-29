@@ -893,10 +893,10 @@ class AsyncTaskScheduler(AsyncScheduler):
                     allocated, resource = self.cluster.allocate(req)
 
                     if allocated:
-                        await self.ready_tasks.put((task_id, resource))
                         self._running_tasks[task_id] = resource
                         allocated_ids.append(task_id)
                         self.logger.debug(f"Task {task_id} ready for execution")
+                        await self.ready_tasks.put((task_id, resource))
                     else:
                         if self._strict_priority:
                             self.logger.debug(

@@ -36,7 +36,6 @@ def _build_mpirun_cmd(
     mpi_info: Dict[str, Any],
     mpi_config: MPIConfig,
     socket_path: str,
-    env: Optional[Dict[str, str]] = None,
 ) -> list:
     """Build the mpirun command from structured mpi_info and MPIConfig.
 
@@ -46,24 +45,9 @@ def _build_mpirun_cmd(
       "hosts"         – comma-separated host list
       "cpu_binding"   – colon-separated core IDs, e.g. "0:1:2:3"
       "rankfile_path" – path to a pre-written rankfile (when use_rankfile=True)
-
-    env is forwarded according to mpi_config.env_pass_method:
-      "inherit"  – inherit_env_flag is added (e.g. -genvall); vars set on the subprocess
-      "x-flag"   – -x VAR=VALUE per entry  (OpenMPI)
-      "env-flag" – -env VAR VALUE per entry (Intel mpiexec legacy)
     """
     cfg = mpi_config
     cmd = [cfg.launcher, *cfg.extra_launcher_flags]
-
-    if cfg.env_pass_method == "inherit" and cfg.inherit_env_flag:
-        cmd.append(cfg.inherit_env_flag)
-    elif env:
-        if cfg.env_pass_method == "x-flag":
-            for k, v in env.items():
-                cmd += ["-x", f"{k}={v}"]
-        elif cfg.env_pass_method == "env-flag":
-            for k, v in env.items():
-                cmd += ["-env", k, v]
 
     # Total process count
     cmd += [cfg.nprocesses_flag, str(mpi_info["np"])]
@@ -127,8 +111,9 @@ class AsyncMPIPoolExecutor:
         cwd = os.getcwd()
         existing_pythonpath = launch_env.get("PYTHONPATH", "")
         launch_env["PYTHONPATH"] = f"{cwd}:{existing_pythonpath}" if existing_pythonpath else cwd
-        cmd = _build_mpirun_cmd(self._mpi_info, self._mpi_config, self._socket_path, env=launch_env)
-        self.logger.info(f"Launching MPI pool: {' '.join(cmd)}")
+        self.logger.info(f"MPI pool mpi_info: {self._mpi_info}")
+        cmd = _build_mpirun_cmd(self._mpi_info, self._mpi_config, self._socket_path)
+        self.logger.info(f"MPI pool cmd: {' '.join(cmd)}")
         self._server_proc = subprocess.Popen(cmd, cwd=cwd, env=launch_env)
 
         # ROUTER socket; rank 0 DEALER connects with identity b"mpi_pool"
@@ -239,31 +224,60 @@ class AsyncMPIPoolExecutor:
         return future
 
     async def ashutdown(self, wait: bool = True):
+        self.logger.info("ashutdown: starting")
+
         async def _send_shutdown():
             if not self._ready.is_set():
+                self.logger.info("ashutdown: waiting for MPI pool ready")
                 await self._ready.wait()
+            self.logger.info("ashutdown: sending shutdown command to MPI pool")
             await self._sock.send_multipart(
                 [self._rank0_identity, cloudpickle.dumps(("shutdown",))]
             )
 
         if self._ready.is_set():
             await _send_shutdown()
-            await self._shutdown.wait()
+            self.logger.info("ashutdown: waiting for 'done' ack from MPI pool")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=30)
+                self.logger.info("ashutdown: received 'done' ack")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "ashutdown: timed out waiting for MPI pool 'done'; forcing termination"
+                )
+        else:
+            self.logger.warning("ashutdown: MPI pool never became ready, skipping shutdown command")
 
         if self._recv_task and not self._recv_task.done():
+            self.logger.info("ashutdown: cancelling recv loop")
             self._recv_task.cancel()
 
+        self.logger.info("ashutdown: closing ZMQ socket")
         self._sock.close()
+        self.logger.info("ashutdown: terminating ZMQ context")
         self._ctx.term()
+        self.logger.info("ashutdown: ZMQ teardown complete")
 
-        self._server_proc.terminate()
+        # Wait for the MPI process to exit; SIGTERM if it hasn't already.
+        self.logger.info(f"ashutdown: waiting for MPI process (pid={self._server_proc.pid}) to exit")
         try:
-            self._server_proc.wait(timeout=10)
+            self._server_proc.wait(timeout=5)
+            self.logger.info("ashutdown: MPI process exited normally")
         except subprocess.TimeoutExpired:
-            self.logger.warning("MPI pool did not exit cleanly; killing.")
-            self._server_proc.kill()
-            self._server_proc.wait()
+            self.logger.info("ashutdown: MPI pool still running; sending SIGTERM")
+            self._server_proc.terminate()
+            try:
+                self._server_proc.wait(timeout=10)
+                self.logger.info("ashutdown: MPI process exited after SIGTERM")
+            except subprocess.TimeoutExpired:
+                self.logger.warning("ashutdown: MPI pool did not exit after SIGTERM; sending SIGKILL")
+                self._server_proc.kill()
+                self._server_proc.wait()
+                self.logger.info("ashutdown: MPI process killed")
 
         socket_file = pathlib.Path(self._socket_path)
         if socket_file.exists():
             socket_file.unlink()
+            self.logger.info(f"ashutdown: cleaned up IPC socket {self._socket_path}")
+
+        self.logger.info("ashutdown: complete")

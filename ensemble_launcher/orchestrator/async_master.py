@@ -139,6 +139,10 @@ class AsyncMaster(Node):
         # Per-child task request monitor tasks
         self._child_task_request_task: Dict[str, asyncio.Task] = {}
 
+        # Tasks already sent to children via _route_tasks (before initial sync completes).
+        # Used by _build_init_task_update to avoid double-sending.
+        self._routed_task_ids: Dict[str, set] = {}  # child_id -> set of task_ids
+
         # Intermediate result buffer: used when forwarding to a parent master (fan-in aggregation)
         self._iresult_q: Dict[str, deque] = {}
         self._flush_task: Optional[asyncio.Task] = None
@@ -951,10 +955,14 @@ class AsyncMaster(Node):
 
     def _build_init_task_update(self, child_id: str) -> TaskUpdate:
         """Build the initial TaskUpdate message containing all tasks assigned to a child."""
+        already_sent = self._routed_task_ids.get(child_id, set())
         new_tasks = [
             self._scheduler.tasks[task_id]
             for task_id in self._scheduler.get_child_assignment(child_id)["task_ids"]
+            if task_id not in already_sent
         ]
+        if not new_tasks:
+            return None
         return TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
 
     async def _get_child_exception(self, child_id: str) -> Optional[Result]:
@@ -1119,6 +1127,7 @@ class AsyncMaster(Node):
                     ),
                 )
             )
+            self._routed_task_ids.setdefault(child_id, set()).update(added_tasks)
             self.logger.info(f"Routing {len(added_tasks)} Tasks to {child_id}")
 
         for task_id in unassigned_tasks:
@@ -1858,17 +1867,19 @@ class AsyncMaster(Node):
 
         # Force-exit after propagating if we received a KILL from our parent.
         if received_stop_type[0] == StopType.KILL:
+            await self.stop()
             sys.exit(1)
 
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, wait for all work to finish, stop, return results."""
-        async with self._timer("init"):
-            await self._lazy_init()
+        try:
+            async with self._timer("init"):
+                await self._lazy_init()
 
-        # Wait for aggregation to complete
-        await self._wait_for_finish()
-
-        await self.stop()
+            # Wait for aggregation to complete
+            await self._wait_for_finish()
+        finally:
+            await self.stop()
 
         # Return aggregated results
         result_batch = ResultBatch(sender=self.node_id)

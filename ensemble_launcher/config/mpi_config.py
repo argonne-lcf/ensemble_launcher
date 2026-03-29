@@ -13,8 +13,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": "-rankfile",
         "cpu_bind_flag": "--cpu-bind",
         "cpu_bind_method": "list",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": "-genvall",
     },
     # Cray PALS (mpiexec on Frontier/Aurora)
     "cray-pals": {
@@ -26,8 +24,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": None,
         "cpu_bind_flag": "--cpu-bind",
         "cpu_bind_method": "list",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": None,
     },
     # Open MPI (mpirun/mpiexec)
     "openmpi": {
@@ -39,8 +35,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": "--rankfile",
         "cpu_bind_flag": "--bind-to",
         "cpu_bind_method": "bind-to",
-        "env_pass_method": "x-flag",
-        "inherit_env_flag": None,
     },
     # MPICH (hydra launcher)
     "mpich": {
@@ -52,8 +46,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": None,
         "cpu_bind_flag": "--cpu-bind",
         "cpu_bind_method": "list",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": "-envall",
     },
     # SLURM srun — no explicit host flags, SLURM allocation controls placement
     "srun": {
@@ -65,8 +57,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": None,
         "cpu_bind_flag": "--cpu-bind",
         "cpu_bind_method": "list",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": "--export=ALL",
     },
     # Cray aprun (legacy XC systems)
     "aprun": {
@@ -78,8 +68,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": None,
         "cpu_bind_flag": "-cc",
         "cpu_bind_method": "list",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": None,
     },
     # IBM Spectrum MPI jsrun (Summit/Frontier-like)
     "jsrun": {
@@ -91,8 +79,6 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "rankfile_flag": None,
         "cpu_bind_flag": "--bind",
         "cpu_bind_method": "none",
-        "env_pass_method": "inherit",
-        "inherit_env_flag": None,
     },
 }
 
@@ -172,21 +158,6 @@ class MPIConfig(BaseModel):
     # OpenMPI --map-by value used when cpu_bind_method == "bind-to".
     # Common values: "slot", "node", "socket", "core", "hwthread",
     #                "slot:PE=<n>" to pin N hardware threads per rank.
-
-    # ------------------------------------------------------------------ #
-    # Environment variable forwarding                                      #
-    # ------------------------------------------------------------------ #
-    env_pass_method: Literal["inherit", "x-flag", "env-flag"] = "inherit"
-    # "inherit"  → env vars set on the subprocess; MPI inherits them automatically
-    #              (Intel MPI, MPICH, Cray PALS, srun)
-    # "x-flag"   → -x VAR=VALUE  appended per variable  (OpenMPI mpirun)
-    # "env-flag" → -env VAR VALUE appended per variable  (Intel mpiexec legacy)
-
-    inherit_env_flag: Optional[str] = None
-    # Explicit flag to request full environment inheritance when env_pass_method="inherit".
-    # Added immediately after the launcher binary.
-    # Intel MPI mpirun: "-genvall"  |  MPICH mpiexec: "-envall"
-    # srun: "--export=ALL"  |  None → launcher inherits by default, no flag needed
 
     # ------------------------------------------------------------------ #
     # Misc / catch-all                                                     #

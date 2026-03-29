@@ -207,7 +207,9 @@ class AsyncMPIExecutor(Executor):
             return None
 
         total_ranks = sum(res.cpu_count for res in job_resource.resources)
-        if total_ranks == 1 and not additional_mpi_opts:
+        local_host = socket.gethostname()
+        is_local = all(node == local_host for node in job_resource.nodes)
+        if total_ranks == 1 and is_local:
             cmd = task_cmd
         else:
             cfg = self._mpi_config

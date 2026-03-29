@@ -360,7 +360,7 @@ class AsyncWorker(Node):
         )
         kwargs["mpi_info"] = {"np": np}
         all_nodes_identical = (
-            all([original_head_node == node for node in self.nodes.resources])
+            all([original_head_node == node for node in self.nodes.resources[1:]])
             or len(self.nodes.nodes) <= 1
         )
         if all_nodes_identical:
@@ -766,9 +766,6 @@ class AsyncWorker(Node):
                 task_id, req = await self._scheduler.ready_tasks.get()
 
                 task = self.tasks[task_id]
-                self.logger.info(
-                    f"Submitting task {task_id}: {task.executable} with resources {req.resources} {task.env}"
-                )
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
                 if (
@@ -791,6 +788,7 @@ class AsyncWorker(Node):
                     )
 
                 set_exception = False
+                task.status = TaskStatus.RUNNING
                 if task.executor_name is not None:
                     if task.executor_name in self._executor:
                         future = self._executor[task.executor_name].submit(
@@ -818,9 +816,12 @@ class AsyncWorker(Node):
                         env=task.env,
                     )
                     self._task_id_to_executor[task_id] = self._default_executor_name
+
+                self.logger.info(
+                    f"Submitted task {task_id}: {task.executable} with resources {req.resources} to {self._task_id_to_executor[task_id]} executor"
+                )
                 future.add_done_callback(self.create_done_callback(task))
                 self._task_futures[task_id] = future
-                task.status = TaskStatus.RUNNING
                 if set_exception:
                     future.set_exception(
                         Exception(
@@ -896,6 +897,7 @@ class AsyncWorker(Node):
             async def _recv_stop_from_parent():
                 msg = await self._comm.recv_message_from_parent(Stop, block=True)
                 if msg.type == StopType.KILL:
+                    await self.stop()
                     sys.exit(1)
                 elif msg.type == StopType.TERMINATE:
                     return
@@ -916,6 +918,7 @@ class AsyncWorker(Node):
             self._comm.parent_dead_event is not None
             and self._comm.parent_dead_event.is_set()
         ):
+            await self.stop()
             sys.exit(1)
 
     # -------------------------------------------------------------------------
@@ -1097,21 +1100,22 @@ class AsyncWorker(Node):
 
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, execute tasks, collect results, stop."""
-        async with self._timer("init"):
-            ##lazy init
-            await self._lazy_init()
+        try:
+            async with self._timer("init"):
+                ##lazy init
+                await self._lazy_init()
 
-        self.logger.info("Started waiting for stop condition")
-        await self._wait_for_stop_condition()
+            self.logger.info("Started waiting for stop condition")
+            await self._wait_for_stop_condition()
 
-        async with self._timer("result_collection"):
-            if (
-                self._comm.parent_dead_event is None
-                or not self._comm.parent_dead_event.is_set()
-            ):
-                all_results = await self._send_final_results_and_status()
-
-        await self.stop()
+            async with self._timer("result_collection"):
+                if (
+                    self._comm.parent_dead_event is None
+                    or not self._comm.parent_dead_event.is_set()
+                ):
+                    all_results = await self._send_final_results_and_status()
+        finally:
+            await self.stop()
 
         self.logger.info(f"{self.node_id} stopped")
         return all_results
