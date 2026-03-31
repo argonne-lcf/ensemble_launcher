@@ -89,25 +89,25 @@ class AsyncMPIExecutor(Executor):
             )
             if common_cpus != set(job_resource.resources[0].cpus):
                 self.logger.warning(
-                    "Can't use same CPUs on all nodes. Oversubscribing cores."
+                    "Can't use same CPUs on all nodes. Skipping cpu binding."
                 )
-            cores = ":".join(map(str, job_resource.resources[0].cpus))
-
-            if cfg.cpu_bind_method == "list" and cfg.cpu_bind_flag:
-                launcher_cmd += [cfg.cpu_bind_flag, f"list:{cores}"]
-            elif cfg.cpu_bind_method == "bind-to" and cfg.cpu_bind_flag:
-                launcher_cmd += [
-                    cfg.cpu_bind_flag,
-                    "core",
-                    "--map-by",
-                    cfg.openmpi_map_by,
-                ]
-            elif cfg.cpu_bind_method == "none":
-                pass
             else:
-                self.logger.warning(
-                    f"Unknown cpu_bind_method '{cfg.cpu_bind_method}'. Not setting affinity."
-                )
+                cores = ":".join(map(str, job_resource.resources[0].cpus))
+                if cfg.cpu_bind_method == "list" and cfg.cpu_bind_flag:
+                    launcher_cmd += [cfg.cpu_bind_flag, f"list:{cores}"]
+                elif cfg.cpu_bind_method == "bind-to" and cfg.cpu_bind_flag:
+                    launcher_cmd += [
+                        cfg.cpu_bind_flag,
+                        "core",
+                        "--map-by",
+                        cfg.openmpi_map_by,
+                    ]
+                elif cfg.cpu_bind_method == "none":
+                    pass
+                else:
+                    self.logger.warning(
+                        f"Unknown cpu_bind_method '{cfg.cpu_bind_method}'. Not setting affinity."
+                    )
 
             if ngpus_per_process > 0:
                 ##defaults to Aurora (Level zero)
