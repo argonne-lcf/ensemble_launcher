@@ -38,11 +38,7 @@ TAG_RESULT = 2
 TAG_STOP = 3
 TAG_DONE = 4
 
-logger = setup_logger(
-    __name__,
-    node_id="mpi_pool",
-    log_dir="logs",
-)
+logger = None  # Initialized in main after parsing args
 
 # ── Workers (ranks 1..N-1) ────────────────────────────────────────────────────
 
@@ -274,7 +270,10 @@ async def run_master(socket_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket-path", required=True)
+    parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
+
+    logger = setup_logger(__name__, node_id="mpi_pool", log_dir=args.log_dir)
 
     if RANK == 0:
         asyncio.run(run_master(args.socket_path))

@@ -42,6 +42,7 @@ class LauncherConfig(BaseModel):
         None  ##Enable profiling with event registry and Perfetto export for timeline visualization
     )
     gpu_selector: str = "ZE_AFFINITY_MASK"
+    log_dir: str = "logs"  # Directory for log files
     log_level: int = logging.INFO
     children_scheduler_policy: str = (
         "simple_split_children_policy"  ##Policy to use for children scheduler

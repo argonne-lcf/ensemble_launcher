@@ -110,6 +110,7 @@ class ChildrenPolicy(ABC):
         ntask: int = None,
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
+        level: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
@@ -123,6 +124,7 @@ class ChildrenPolicy(ABC):
             child_assignments: Full assignment state per wid, including
                 already-assigned task_ids and resource info.
             child_status: Most recent Status message per wid.
+            level: Optional current hierarchy level (0 = root master).
             **kwargs: Additional implementation-specific arguments.
 
         Returns:
@@ -366,6 +368,7 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
         ntask: int = None,
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
+        level: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
@@ -493,6 +496,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         ntask: int = None,
         child_assignments: Optional[Dict[int, "ChildrenAssignment"]] = None,
         child_status: Optional[Dict[int, "Status"]] = None,
+        level: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Dict[int, List[str]], Dict[str, int], List[str]]:
         """
@@ -547,6 +551,7 @@ class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
         logger: Logger = None,
     ):
         super().__init__(policy_config, node_id, logger)
+        self.logger.info(f"Using FixedLeadNodePolicy")
 
     def get_children_resources(
         self, tasks: Dict[str, Task], nodes: JobResource, level: int

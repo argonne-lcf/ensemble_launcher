@@ -35,6 +35,7 @@ class SchedulerState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     node_id: str
+    level: Optional[int] = None
     nodes: Optional[JobResource] = None
 
     # ------------------------------------------------------------------ #

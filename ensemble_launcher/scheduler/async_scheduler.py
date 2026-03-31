@@ -48,6 +48,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         config: LauncherConfig,
         tasks: Optional[Dict[str, Task]] = None,
         node_id: str = None,
+        level: Optional[int] = None,
     ) -> None:
         """Initialise the worker scheduler.
 
@@ -57,6 +58,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             config: Launcher configuration (policy name, nchildren, etc.).
             tasks: Initial task dict; all tasks start in the unassigned pool.
             node_id: ID of the owning master node.
+            level: Optional hierarchy level (0 = root master).
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
@@ -96,6 +98,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._unassigned_tasks: Dict[str, None] = dict.fromkeys(self.tasks.keys())
         self._child_id_to_wid: Dict[str, int] = {}
         self._wid_to_child_id: Dict[int, str] = {}
+        self._level: Optional[int] = level
 
     # ------------------------------------------------------------------
     # Child registration / reset
@@ -373,6 +376,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         }
         return SchedulerState(
             node_id=node_id,
+            level=self._level,
             nodes=self.cluster.nodes,
             children_task_ids=children_task_ids,
             children_resources=children_resources,
@@ -392,6 +396,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
         Must be called after scheduler creation but before _create_children().
         """
+        self._level = state.level
         for child_id, task_ids in state.children_task_ids.items():
             resource = state.children_resources.get(child_id)
             wid = state.child_id_to_wid.get(child_id, len(self._child_assignments))
@@ -464,6 +469,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if reset:
             self.reset_child_assignments()
 
+        self._level = level
         child_suffix = ".w" if level + 1 == self._config.policy_config.nlevels else ".m"
         wid_offset = (
             max((a["wid"] for a in self._child_assignments.values()), default=-1) + 1
@@ -552,6 +558,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
                 ntask=ntask,
                 child_assignments=wid_assignments,
                 child_status=wid_status,
+                level=self._level,
             )
         )
 

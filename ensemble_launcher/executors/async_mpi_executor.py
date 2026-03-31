@@ -37,7 +37,7 @@ class AsyncMPIExecutor(Executor):
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
-        self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
+        self.tmp_dir = os.path.join("/tmp", tmp_dir)
         self._processes: Dict[str, asyncio.subprocess.Process] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
@@ -54,7 +54,8 @@ class AsyncMPIExecutor(Executor):
         nnodes = len(job_resource.nodes)
         ngpus_per_process = (
             job_resource.resources[0].gpu_count // job_resource.resources[0].cpu_count
-            if job_resource.resources[0].cpu_count > 0 else 0
+            if job_resource.resources[0].cpu_count > 0
+            else 0
         )
 
         env = {}
@@ -95,7 +96,12 @@ class AsyncMPIExecutor(Executor):
             if cfg.cpu_bind_method == "list" and cfg.cpu_bind_flag:
                 launcher_cmd += [cfg.cpu_bind_flag, f"list:{cores}"]
             elif cfg.cpu_bind_method == "bind-to" and cfg.cpu_bind_flag:
-                launcher_cmd += [cfg.cpu_bind_flag, "core", "--map-by", cfg.openmpi_map_by]
+                launcher_cmd += [
+                    cfg.cpu_bind_flag,
+                    "core",
+                    "--map-by",
+                    cfg.openmpi_map_by,
+                ]
             elif cfg.cpu_bind_method == "none":
                 pass
             else:
@@ -283,7 +289,9 @@ class AsyncMPIExecutor(Executor):
             if task_id in self._processes:
                 del self._processes[task_id]
 
-    def _kill_process_group(self, process: asyncio.subprocess.Process, force: bool) -> None:
+    def _kill_process_group(
+        self, process: asyncio.subprocess.Process, force: bool
+    ) -> None:
         """Send signal to the entire process group so MPI worker children are also killed."""
         if process.returncode is not None:
             return

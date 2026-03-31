@@ -216,7 +216,7 @@ class AsyncMaster(Node):
     def _setup_logger(self) -> None:
         """Configure the logger for this master, optionally writing to a per-node log file."""
         log_dir = (
-            os.path.join(os.getcwd(), "logs") if self._config.master_logs else None
+            os.path.join(os.getcwd(), self._config.log_dir) if self._config.master_logs else None
         )
         self.logger = setup_logger(
             __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
@@ -248,6 +248,7 @@ class AsyncMaster(Node):
             self._config,
             tasks=self._init_tasks,
             node_id=self.node_id,
+            level=self.level,
         )
 
     def _get_child_class(

@@ -36,6 +36,7 @@ def _build_mpirun_cmd(
     mpi_info: Dict[str, Any],
     mpi_config: MPIConfig,
     socket_path: str,
+    log_dir: str = "logs",
 ) -> list:
     """Build the mpirun command from structured mpi_info and MPIConfig.
 
@@ -83,7 +84,7 @@ def _build_mpirun_cmd(
                 cmd += [cfg.cpu_bind_flag, "core", "--map-by", cfg.openmpi_map_by]
 
     # rank 0 = master/gateway, ranks 1..np_workers = workers
-    cmd += [sys.executable, _MPI_POOL_SCRIPT, "--socket-path", socket_path]
+    cmd += [sys.executable, _MPI_POOL_SCRIPT, "--socket-path", socket_path, "--log-dir", log_dir]
     return cmd
 
 
@@ -96,6 +97,7 @@ class AsyncMPIPoolExecutor:
         cpu_to_pid: Dict[Tuple[str, int], int],
         gpu_selector: str = "ZE_AFFINITY_MASK",
         mpi_config: Optional[MPIConfig] = None,
+        log_dir: str = "logs",
         **kwargs,
     ):
         self.logger = logger
@@ -112,7 +114,7 @@ class AsyncMPIPoolExecutor:
         existing_pythonpath = launch_env.get("PYTHONPATH", "")
         launch_env["PYTHONPATH"] = f"{cwd}:{existing_pythonpath}" if existing_pythonpath else cwd
         self.logger.info(f"MPI pool mpi_info: {self._mpi_info}")
-        cmd = _build_mpirun_cmd(self._mpi_info, self._mpi_config, self._socket_path)
+        cmd = _build_mpirun_cmd(self._mpi_info, self._mpi_config, self._socket_path, log_dir=log_dir)
         self.logger.info(f"MPI pool cmd: {' '.join(cmd)}")
         self._server_proc = subprocess.Popen(cmd, cwd=cwd, env=launch_env)
 
