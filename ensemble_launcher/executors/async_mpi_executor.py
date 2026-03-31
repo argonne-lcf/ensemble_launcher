@@ -37,7 +37,7 @@ class AsyncMPIExecutor(Executor):
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
-        self.tmp_dir = os.path.join("/tmp", tmp_dir)
+        self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
         self._processes: Dict[str, asyncio.subprocess.Process] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}

@@ -434,7 +434,9 @@ class AsyncZMQComm(AsyncComm):
         while not stop.is_set():
             try:
                 parts = await router.recv_multipart()
-                sender_id = parts[0].decode().split(":", 1)[0]  # strip :secret_id suffix from ZMQ identity
+                sender_id = (
+                    parts[0].decode().split(":", 1)[0]
+                )  # strip :secret_id suffix from ZMQ identity
                 # Parse child's secret_id from the HB payload.
                 # The child verifies the echo matches its own secret_id (see _hb_send_to_parent_thread).
                 child_secret_id, _ = cloudpickle.loads(parts[1])
@@ -625,7 +627,9 @@ class AsyncZMQComm(AsyncComm):
         from .messages import Message
 
         full_id = raw_data[0].decode()
-        sender_id = full_id if full_id.startswith("client:") else full_id.split(":", 1)[0]
+        sender_id = (
+            full_id if full_id.startswith("client:") else full_id.split(":", 1)[0]
+        )
         try:
             if sender_id.startswith("client:"):
                 # Clients do not include a secret_id frame.
@@ -764,7 +768,7 @@ class AsyncZMQComm(AsyncComm):
 
         try:
             if child_id.startswith("client:"):
-                self.logger.info(
+                self.logger.debug(
                     f"{self._node_info.node_id}: Sent message to child {child_id}"
                 )
                 await self.router_socket.send_multipart(

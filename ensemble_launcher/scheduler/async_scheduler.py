@@ -86,6 +86,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments: Dict[str, ChildrenAssignment] = {}
         self._children_status: Dict[str, "Status"] = {}  # child_id -> Status
         self._child_done_events: Dict[str, asyncio.Event] = {}  # child_id -> done event
+        self._child_ready_events: Dict[str, asyncio.Event] = {}  # child_id -> ready (running) event
         self._child_states: Dict[str, ChildState] = {}  # child_id -> ChildState
         self._all_children_done_event: asyncio.Event = asyncio.Event()
         self._child_to_tasks: Dict[
@@ -109,6 +110,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments[child_id] = assignment
         self._child_to_tasks.setdefault(child_id, [])
         self._child_done_events[child_id] = asyncio.Event()
+        self._child_ready_events[child_id] = asyncio.Event()
         self._child_states[child_id] = ChildState.NOTREADY
 
     def reset_child_assignments(self) -> None:
@@ -116,6 +118,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments = {}
         self._children_status = {}
         self._child_done_events = {}
+        self._child_ready_events = {}
         self._child_states = {}
         self._all_children_done_event.clear()
         self._child_to_tasks = {}
@@ -180,6 +183,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
         )
         self._child_states[child_id] = ChildState.RUNNING
         self._child_done_events[child_id].clear()
+        self._child_ready_events[child_id].set()
+        self.set_child_tasks_status(child_id, TaskStatus.RUNNING)
 
     def mark_child_recovering(self, child_id: str) -> None:
         """RUNNING → RECOVERING: child timed out, recovery in progress.
@@ -207,7 +212,19 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._check_all_children_terminal()
 
     def mark_child_success(self, child_id: str) -> None:
-        """RUNNING/RECOVERING → SUCCESS: terminal success; free resources."""
+        """RUNNING/RECOVERING → SUCCESS: terminal success; free resources.
+
+        If not all tasks associated with this child have reached a terminal
+        status (SUCCESS or FAILED), the transition is skipped. This keeps
+        the child in its current state so that ``wait_for_child`` does not
+        resolve and the liveness monitor can restart the child.
+        """
+        if not self.are_child_tasks_terminal(child_id):
+            self.logger.warning(
+                f"Skipping SUCCESS transition for {child_id}: "
+                "not all tasks are terminal"
+            )
+            return
         self._assert_transition(
             child_id,
             {ChildState.RUNNING, ChildState.RECOVERING},
@@ -247,9 +264,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
     def is_child_done(self, child_id: str) -> bool:
         return self.is_child_terminal(child_id)
 
-    async def wait_for_child(self, child_id: str) -> None:
-        """Await the done event for the given child_id."""
-        await self._child_done_events[child_id].wait()
+    async def wait_for_child_ready(self, child_id: str) -> None:
+        """Await the ready event for the given child_id (set when marked running)."""
+        await self._child_ready_events[child_id].wait()
 
     @property
     def all_children_done(self) -> bool:
@@ -286,6 +303,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Return the asyncio.Event that is set when the given child finishes."""
         return self._child_done_events[child_id]
 
+    def get_ready_event(self, child_id: str) -> asyncio.Event:
+        """Return the asyncio.Event that is set when the child is marked running."""
+        return self._child_ready_events[child_id]
+
     # ------------------------------------------------------------------
     # Dynamic task routing
     # ------------------------------------------------------------------
@@ -308,6 +329,42 @@ class AsyncChildrenScheduler(AsyncScheduler):
     def get_child_task_ids(self, child_id: str) -> List[str]:
         """Return the task IDs assigned to a child."""
         return list(self._child_assignments.get(child_id, {}).get("task_ids", []))
+
+    def get_all_child_task_ids(self, child_id: str) -> List[str]:
+        """Return all task IDs for a child (both static assignments and dynamically routed)."""
+        static = list(self._child_assignments.get(child_id, {}).get("task_ids", []))
+        dynamic = list(self._child_to_tasks.get(child_id, []))
+        return static + dynamic
+
+    # ------------------------------------------------------------------
+    # Task status tracking
+    # ------------------------------------------------------------------
+
+    def set_task_status(self, task_id: str, status: TaskStatus) -> None:
+        """Set the status of a single task."""
+        if task_id in self.tasks:
+            self.tasks[task_id].status = status
+
+    def set_tasks_status(self, task_ids: List[str], status: TaskStatus) -> None:
+        """Set the status of multiple tasks."""
+        for task_id in task_ids:
+            self.set_task_status(task_id, status)
+
+    def set_child_tasks_status(self, child_id: str, status: TaskStatus) -> None:
+        """Set the status of all tasks associated with a child."""
+        self.set_tasks_status(self.get_all_child_task_ids(child_id), status)
+
+    def are_child_tasks_terminal(self, child_id: str) -> bool:
+        """Return True if all tasks for a child are in a terminal state (SUCCESS or FAILED)."""
+        terminal = {TaskStatus.SUCCESS, TaskStatus.FAILED}
+        task_ids = self.get_all_child_task_ids(child_id)
+        if not task_ids:
+            return True
+        return all(
+            self.tasks[tid].status in terminal
+            for tid in task_ids
+            if tid in self.tasks
+        )
 
     @property
     def unassigned_task_ids(self) -> Dict[str, None]:
@@ -355,6 +412,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             self._unassigned_tasks[task_id] = None
         del self._child_assignments[child_id]
         self._child_done_events.pop(child_id, None)
+        self._child_ready_events.pop(child_id, None)
         self._child_states.pop(child_id, None)
         self._children_status.pop(child_id, None)
         self._child_to_tasks.pop(child_id, None)

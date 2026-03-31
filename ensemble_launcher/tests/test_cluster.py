@@ -3,6 +3,7 @@ import logging
 import multiprocessing as mp
 import os
 import socket
+import time
 import uuid
 
 import pytest
@@ -105,6 +106,8 @@ async def test_async_master_cluster(
             children_scheduler_policy="simple_split_children_policy",
             policy_config=PolicyConfig(nlevels=2, nchildren=1),
             result_buffer_size=100,
+            worker_logs=True,
+            master_logs=True,
         ),
         job_resource,
     )
@@ -133,6 +136,19 @@ async def test_async_master_cluster(
 
 
 if __name__ == "__main__":
+    print("Testing Async Master with ProcessPool Executor for 1 task per core")
+    asyncio.run(test_async_master_cluster(task_executor="async_processpool"))
+    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
+    asyncio.run(
+        test_async_master_cluster(task_executor="async_processpool", ntasks_per_core=10)
+    )
+    print("Testing Async Master with MPI Executor")
+    asyncio.run(
+        test_async_master_cluster(
+            task_executor="async_mpi", ntasks_per_core=10, exec=echo_stdout
+        )
+    )
+    ###
     print("Testing Async Worker with ProcessPool Executor for 1 task per core")
     asyncio.run(test_async_worker_cluster(task_executor="async_processpool"))
     print("Testing Async Worker with ProcessPool Executor for 10 tasks per core")

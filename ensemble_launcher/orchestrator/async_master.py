@@ -34,7 +34,7 @@ from ensemble_launcher.comm.messages import (
     TaskUpdate,
 )
 from ensemble_launcher.config import LauncherConfig
-from ensemble_launcher.ensemble import Task
+from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
@@ -216,7 +216,9 @@ class AsyncMaster(Node):
     def _setup_logger(self) -> None:
         """Configure the logger for this master, optionally writing to a per-node log file."""
         log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir) if self._config.master_logs else None
+            os.path.join(os.getcwd(), self._config.log_dir)
+            if self._config.master_logs
+            else None
         )
         self.logger = setup_logger(
             __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
@@ -722,9 +724,7 @@ class AsyncMaster(Node):
 
         # If there are still tasks un-assigned try to assign them
         if ckpt_restored and len(self._scheduler.unassigned_task_ids):
-            self._scheduler.assign_task_ids(
-                self._scheduler.unassigned_task_ids
-            )
+            self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
         # Check executor validity
         assert self._config.child_executor_name in executor_registry.async_executors, (
@@ -1106,7 +1106,7 @@ class AsyncMaster(Node):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    def _route_tasks(
+    async def _route_tasks(
         self, tasks: List[Task], client_id: Optional[str] = None
     ) -> List[Optional[str]]:
         """Route a list of tasks to the best child via scheduler policy. Returns chosen child_id."""
@@ -1119,6 +1119,7 @@ class AsyncMaster(Node):
         for child_id, added_tasks in child_assignments.items():
             if len(added_tasks) == 0:
                 continue
+            await self._scheduler.wait_for_child_ready(child_id)
             asyncio.create_task(
                 self._comm.send_message_to_child(
                     child_id,
@@ -1129,7 +1130,7 @@ class AsyncMaster(Node):
                 )
             )
             self._routed_task_ids.setdefault(child_id, set()).update(added_tasks)
-            self.logger.info(f"Routing {len(added_tasks)} Tasks to {child_id}")
+            self.logger.debug(f"Routing {len(added_tasks)} Tasks to {child_id}")
 
         for task_id in unassigned_tasks:
             self.logger.warning(f"Can't route task {task_id} to any child")
@@ -1173,6 +1174,12 @@ class AsyncMaster(Node):
             if result_batch is not None:
                 self._results[child_id] = [result_batch]
                 self.logger.info(f"{self.node_id}: Received result from {child_id}")
+                # Update task statuses from the final result batch
+                for r in result_batch.data:
+                    self._scheduler.set_task_status(
+                        r.task_id,
+                        TaskStatus.SUCCESS if r.success else TaskStatus.FAILED,
+                    )
                 await self._comm.send_message_to_child(
                     child_id, ResultAck(sender=self.node_id)
                 )
@@ -1392,7 +1399,7 @@ class AsyncMaster(Node):
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
                 self.logger.info("Received TaskUpdate from client")
-                self._route_tasks(msg.added_tasks, client_id=client_id)
+                await self._route_tasks(msg.added_tasks, client_id=client_id)
 
     async def _flush_dest_queue(self, dest_id: str) -> None:
         """Send all buffered results for dest_id to the parent master as a single IResultBatch."""
@@ -1425,6 +1432,12 @@ class AsyncMaster(Node):
           to aggregate fan-in across children before sending up the hierarchy.
         """
         items = result.data if isinstance(result, IResultBatch) else [result]
+
+        for single_result in items:
+            self._scheduler.set_task_status(
+                single_result.task_id,
+                TaskStatus.SUCCESS if single_result.success else TaskStatus.FAILED,
+            )
 
         dest_results: Dict[str, List[Result]] = {}
         for single_result in items:
@@ -1629,7 +1642,7 @@ class AsyncMaster(Node):
                     TaskUpdate, block=True
                 )
                 if task_update is not None:
-                    self._route_tasks(task_update.added_tasks)
+                    await self._route_tasks(task_update.added_tasks)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1681,6 +1694,7 @@ class AsyncMaster(Node):
         self.remove_child(child_id)
         self._child_objs.pop(child_id, None)
         self._children_futures.pop(child_id, None)
+        self._routed_task_ids.pop(child_id, None)
         self._iresult_q.pop(child_id, None)
         await self._comm.update_node_info(self.info())
 
