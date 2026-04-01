@@ -7,16 +7,20 @@ ThreadPoolExecutor when targeted (i.e. when its CPU is in _cpu_to_pid).
 The async_worker trims rank 0's CPU from the scheduler so it is never
 double-scheduled; mpi_info still includes rank 0's CPU for correct binding.
 
+Three dedicated ZMQ sockets separate tasks, results, and control messages
+so that task/result payloads pass through the gateway as opaque blobs —
+no cloudpickle serialization or deserialization on the hot path.
+
 Launch with:
-    mpirun -n <N> python mpi_pool.py --socket-path <ipc_path>
+    mpirun -n <N> python mpi_pool.py --socket-base <ipc_base>
 where N includes rank 0.
 """
 
 import argparse
 import asyncio
-import collections
 import os
 import signal
+import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -38,6 +42,9 @@ TAG_RESULT = 2
 TAG_STOP = 3
 TAG_DONE = 4
 
+# Routing header: (msg_id: int32, target: int32)
+_HEADER_FMT = "!ii"
+
 logger = None  # Initialized in main after parsing args
 
 # ── Workers (ranks 1..N-1) ────────────────────────────────────────────────────
@@ -52,14 +59,12 @@ def run_worker():
             logger.info(f"[rank {RANK}] Received STOP signal, shutting down")
             COMM.send("done", dest=0, tag=TAG_DONE)
             break
-        msg_id, fn_bytes, args_bytes, kwargs_bytes, env = cloudpickle.loads(data)
-        logger.debug(f"[rank {RANK}] Received task {msg_id}")
+        msg_id, fn, args, kwargs, env = cloudpickle.loads(data)
+        logger.info(f"[rank {RANK}] Received task {msg_id}")
         original_env = os.environ.copy()
         os.environ.update(env)
         try:
-            result = cloudpickle.loads(fn_bytes)(
-                *cloudpickle.loads(args_bytes), **cloudpickle.loads(kwargs_bytes)
-            )
+            result = fn(*args, **kwargs)
             logger.debug(f"[rank {RANK}] Task {msg_id} completed successfully")
             out = cloudpickle.dumps(("result", msg_id, "ok", result))
         except Exception as e:
@@ -74,67 +79,76 @@ def run_worker():
 # ── Master (rank 0) ───────────────────────────────────────────────────────────
 
 
-def _dispatch(available, task_queue, local_queue):
-    """Send queued tasks to available workers via MPI, or queue locally for rank 0."""
-    while task_queue and available:
-        msg_id, target, payload = task_queue[0]
-        if target is not None and target not in available:
-            break  # target worker busy; preserve original targeted-dispatch semantics
-        worker = target if target is not None else next(iter(available))
-        available.discard(worker)
-        task_queue.popleft()
-        if worker == 0:
-            logger.debug(f"Dispatching task {msg_id} to rank 0 (local)")
-            local_queue.put_nowait(
-                cloudpickle.loads(payload)
-            )  # (msg_id, fn_b, args_b, kw_b, env)
-        else:
-            logger.debug(f"Dispatching task {msg_id} to rank {worker}")
-            COMM.send(payload, dest=worker, tag=TAG_TASK)
+def _dispatch(header, payload, local_queue):
+    """Deserialize task header and dispatch to the appropriate target."""
+    msg_id, target = struct.unpack(_HEADER_FMT, header)
+    logger.debug(f"[client_loop] Received task {msg_id}, target={target}")
+    if target == 0:
+        local_queue.put_nowait(payload)
+    else:
+        COMM.send(payload, dest=target, tag=TAG_TASK)
 
 
-async def _client_loop(sock, available, task_queue, local_queue, stop):
-    """Receive tasks from AsyncMPIPoolExecutor, dispatch to workers."""
+async def _client_loop(task_sock, local_queue, stop):
+    """Receive tasks from AsyncMPIPoolExecutor via the task socket, forward to workers."""
     logger.info("[client_loop] Started")
-    while not stop.is_set():
-        try:
-            data = await asyncio.wait_for(sock.recv(), timeout=0.1)
-        except asyncio.TimeoutError:
-            continue
-
-        msg = cloudpickle.loads(data)
-
-        if msg[0] == "shutdown":
-            logger.info("[client_loop] Received shutdown command, setting stop event")
-            stop.set()
-            return
-
-        _, msg_id, target, fn_bytes, args_bytes, kwargs_bytes, env = msg
-        logger.debug(f"[client_loop] Received task {msg_id}, target={target}")
-        payload = cloudpickle.dumps((msg_id, fn_bytes, args_bytes, kwargs_bytes, env))
-        task_queue.append((msg_id, target, payload))
-        _dispatch(available, task_queue, local_queue)
-    logger.info("[client_loop] Exiting — stop event was set")
+    recv_fut = asyncio.ensure_future(task_sock.recv_multipart())
+    stop_fut = asyncio.ensure_future(stop.wait())
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                [recv_fut, stop_fut], return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop_fut in done:
+                recv_fut.cancel()
+                break
+            # frames = [header, payload]  (PUSH/PULL — no identity framing)
+            header, payload = recv_fut.result()
+            _dispatch(header, payload, local_queue)
+            recv_fut = asyncio.ensure_future(task_sock.recv_multipart())
+    finally:
+        logger.info("[client_loop] Exiting")
 
 
-async def _mpi_loop(sock, available, task_queue, local_queue, stop):
-    """Poll for MPI results and forward them to the client."""
+async def _msg_loop(msg_sock, stop):
+    """Listen for control messages (shutdown) on the message socket."""
+    logger.info("[msg_loop] Started")
+    recv_fut = asyncio.ensure_future(msg_sock.recv())
+    stop_fut = asyncio.ensure_future(stop.wait())
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                [recv_fut, stop_fut], return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop_fut in done:
+                recv_fut.cancel()
+                break
+            msg = cloudpickle.loads(recv_fut.result())
+            if msg[0] == "shutdown":
+                logger.info("[msg_loop] Received shutdown command, setting stop event")
+                stop.set()
+                return
+            recv_fut = asyncio.ensure_future(msg_sock.recv())
+    finally:
+        logger.info("[msg_loop] Exiting")
+
+
+async def _mpi_loop(result_sock, stop):
+    """Poll for MPI results and forward them to the client via the result socket."""
     logger.info("[mpi_loop] Started")
     status = MPI.Status()
     while not stop.is_set():
         if COMM.Iprobe(source=MPI.ANY_SOURCE, tag=TAG_RESULT, status=status):
             src = status.Get_source()
             data = COMM.recv(source=src, tag=TAG_RESULT)
-            available.add(src)
             logger.debug(f"[mpi_loop] Received result from rank {src}")
-            await sock.send(data)  # result bytes pass through unchanged
-            _dispatch(available, task_queue, local_queue)
+            await result_sock.send(data)  # result bytes pass through unchanged
         else:
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.01)
     logger.info("[mpi_loop] Exiting — stop event was set")
 
 
-async def _rank0_executor(available, task_queue, local_queue, sock, stop):
+async def _rank0_executor(local_queue, result_sock, stop):
     """Execute tasks locally on rank 0 using a thread pool."""
     logger.info("[rank0_executor] Started")
     loop = asyncio.get_event_loop()
@@ -151,17 +165,15 @@ async def _rank0_executor(available, task_queue, local_queue, sock, stop):
             if stop_task in done:
                 logger.info("[rank0_executor] Stop event received, breaking")
                 break
-            msg_id, fn_bytes, args_bytes, kwargs_bytes, env = get_task.result()
+            payload = get_task.result()  # raw bytes from task socket
+            msg_id, fn, args, kwargs, env = cloudpickle.loads(payload)
             logger.debug(f"[rank 0] Executing task {msg_id} locally")
 
             def _execute():
                 original_env = os.environ.copy()
                 os.environ.update(env)
                 try:
-                    result = cloudpickle.loads(fn_bytes)(
-                        *cloudpickle.loads(args_bytes),
-                        **cloudpickle.loads(kwargs_bytes),
-                    )
+                    result = fn(*args, **kwargs)
                     return cloudpickle.dumps(("result", msg_id, "ok", result))
                 except Exception as e:
                     return cloudpickle.dumps(("result", msg_id, "err", e))
@@ -170,9 +182,7 @@ async def _rank0_executor(available, task_queue, local_queue, sock, stop):
                     os.environ.update(original_env)
 
             out = await loop.run_in_executor(pool, _execute)
-            await sock.send(out)
-            available.add(0)
-            _dispatch(available, task_queue, local_queue)
+            await result_sock.send(out)
     finally:
         logger.info("[rank0_executor] Shutting down thread pool")
         pool.shutdown(wait=True)
@@ -205,22 +215,30 @@ def _stop_workers():
         logger.info(f"[_stop_workers] Rank {w} confirmed shutdown")
 
 
-async def run_master(socket_path):
-    logger.info(f"[rank 0] Starting master, SIZE={SIZE}, socket={socket_path}")
+async def run_master(socket_base):
+    logger.info(f"[rank 0] Starting master, SIZE={SIZE}, socket_base={socket_base}")
     ctx = zmq.asyncio.Context()
-    sock = ctx.socket(zmq.DEALER)
-    sock.identity = b"mpi_pool"
-    sock.connect(f"ipc://{socket_path}")
 
-    # Announce ready to the client
-    await sock.send(cloudpickle.dumps(("ready",)))
-    logger.info(f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket={socket_path}")
+    task_sock = ctx.socket(zmq.PULL)
+    task_sock.connect(f"ipc://{socket_base}_task.ipc")
+
+    result_sock = ctx.socket(zmq.PUSH)
+    result_sock.connect(f"ipc://{socket_base}_result.ipc")
+
+    msg_sock = ctx.socket(zmq.DEALER)
+    msg_sock.identity = b"mpi_pool"
+    msg_sock.connect(f"ipc://{socket_base}_msg.ipc")
+
+    # Announce ready to the client on the message socket
+    await msg_sock.send(cloudpickle.dumps(("ready",)))
+    logger.info(
+        f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket_base={socket_base}"
+    )
     print(
-        f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket={socket_path}", flush=True
+        f"[rank 0] MPI pool ready, {SIZE - 1} workers, socket_base={socket_base}",
+        flush=True,
     )
 
-    available = set(range(0, SIZE))  # rank 0 participates as a worker
-    task_queue = collections.deque()
     local_queue = asyncio.Queue()
     stop = asyncio.Event()
 
@@ -234,11 +252,14 @@ async def run_master(socket_path):
     loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
 
     try:
-        logger.info("[rank 0] Entering asyncio.gather for client_loop, mpi_loop, rank0_executor")
+        logger.info(
+            "[rank 0] Entering asyncio.gather for client_loop, msg_loop, mpi_loop, rank0_executor"
+        )
         await asyncio.gather(
-            _client_loop(sock, available, task_queue, local_queue, stop),
-            _mpi_loop(sock, available, task_queue, local_queue, stop),
-            _rank0_executor(available, task_queue, local_queue, sock, stop),
+            _client_loop(task_sock, local_queue, stop),
+            _msg_loop(msg_sock, stop),
+            _mpi_loop(result_sock, stop),
+            _rank0_executor(local_queue, result_sock, stop),
         )
         logger.info("[rank 0] asyncio.gather returned")
     except Exception as e:
@@ -253,14 +274,16 @@ async def run_master(socket_path):
 
         logger.info("[rank 0] Sending 'done' to client")
         try:
-            await sock.send(cloudpickle.dumps("done"))
+            await msg_sock.send(cloudpickle.dumps("done"))
             logger.info("[rank 0] 'done' sent successfully")
         except zmq.ZMQError as e:
             logger.warning(f"[rank 0] Could not send 'done': {e}")
 
-        logger.info("[rank 0] Closing ZMQ socket")
-        sock.close()
-        logger.info("[rank 0] ZMQ socket closed, terminating context")
+        logger.info("[rank 0] Closing ZMQ sockets")
+        task_sock.close()
+        result_sock.close()
+        msg_sock.close()
+        logger.info("[rank 0] ZMQ sockets closed, terminating context")
         ctx.term()
         logger.info("[rank 0] ZMQ context terminated — master shut down cleanly")
 
@@ -269,14 +292,14 @@ async def run_master(socket_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--socket-path", required=True)
+    parser.add_argument("--socket-base", required=True)
     parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
 
     logger = setup_logger(__name__, node_id="mpi_pool", log_dir=args.log_dir)
 
     if RANK == 0:
-        asyncio.run(run_master(args.socket_path))
+        asyncio.run(run_master(args.socket_base))
     else:
         run_worker()
 

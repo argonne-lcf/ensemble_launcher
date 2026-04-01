@@ -42,7 +42,7 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "nprocesses_flag": "-n",
         "processes_per_node_flag": "--ppn",
         "hosts_flag": "-hosts",
-        "hostfile_flag": "-f",
+        "hostfile_flag": "--hostfile",
         "rankfile_flag": None,
         "cpu_bind_flag": "--cpu-bind",
         "cpu_bind_method": "list",

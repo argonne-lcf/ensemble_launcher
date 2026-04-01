@@ -25,6 +25,19 @@ class SystemConfig(BaseModel):
     gpus: List[Union[str, int]] = Field(default_factory=list)
 
 
+def get_system_config(name="aurora"):
+    if name == "aurora":
+        return SystemConfig(
+            name="aurora",
+            ncpus=102,
+            ngpus=12,
+            cpus=list(range(1, 52)) + list(range(53, 104)),
+            gpus=list(map(str, range(12))),
+        )
+    else:
+        raise NotImplementedError(f"unknown system {name}")
+
+
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
 

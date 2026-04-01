@@ -30,7 +30,7 @@ class AsyncMPIExecutor(Executor):
         self,
         logger=logger,
         gpu_selector: str = "ZE_AFFINITY_MASK",
-        tmp_dir: str = ".mpiexec_tmp",
+        tmp_dir: str = f".mpiexec_tmp_{str(uuid.uuid4())}",
         return_stdout: bool = True,
         mpi_config: Optional[MPIConfig] = None,
         **kwargs,
