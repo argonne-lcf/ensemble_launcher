@@ -42,8 +42,8 @@ TAG_RESULT = 2
 TAG_STOP = 3
 TAG_DONE = 4
 
-# Routing header: (msg_id: int32, target: int32)
-_HEADER_FMT = "!ii"
+# Routing header: (target: int32) — batch header, worker_id only
+_HEADER_FMT = "!i"
 
 logger = None  # Initialized in main after parsing args
 
@@ -56,11 +56,11 @@ def run_worker():
     while True:
         data = COMM.recv(source=0, tag=MPI.ANY_TAG, status=status)
         if status.tag == TAG_STOP:
-            logger.info(f"[rank {RANK}] Received STOP signal, shutting down")
+            logger.debug(f"[rank {RANK}] Received STOP signal, shutting down")
             COMM.send("done", dest=0, tag=TAG_DONE)
             break
         msg_id, fn, args, kwargs, env = cloudpickle.loads(data)
-        logger.info(f"[rank {RANK}] Received task {msg_id}")
+        logger.debug(f"[rank {RANK}] Received task {msg_id}")
         original_env = os.environ.copy()
         os.environ.update(env)
         try:
@@ -80,9 +80,8 @@ def run_worker():
 
 
 def _dispatch(header, payload, local_queue):
-    """Deserialize task header and dispatch to the appropriate target."""
-    msg_id, target = struct.unpack(_HEADER_FMT, header)
-    logger.debug(f"[client_loop] Received task {msg_id}, target={target}")
+    """Deserialize task header and dispatch payload to the target worker."""
+    (target,) = struct.unpack(_HEADER_FMT, header)
     if target == 0:
         local_queue.put_nowait(payload)
     else:
@@ -102,9 +101,10 @@ async def _client_loop(task_sock, local_queue, stop):
             if stop_fut in done:
                 recv_fut.cancel()
                 break
-            # frames = [header, payload]  (PUSH/PULL — no identity framing)
-            header, payload = recv_fut.result()
-            _dispatch(header, payload, local_queue)
+            # frames = [header1, payload1, header2, payload2, ...]
+            frames = recv_fut.result()
+            for i in range(0, len(frames), 2):
+                _dispatch(frames[i], frames[i + 1], local_queue)
             recv_fut = asyncio.ensure_future(task_sock.recv_multipart())
     finally:
         logger.info("[client_loop] Exiting")

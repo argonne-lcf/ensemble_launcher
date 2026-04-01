@@ -7,8 +7,9 @@ import subprocess
 import sys
 import uuid
 from asyncio import Future as AsyncFuture
+from collections import deque
 from logging import Logger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
 import zmq
@@ -25,8 +26,8 @@ from .utils import executor_registry
 
 _MPI_POOL_SCRIPT = str(pathlib.Path(__file__).parent / "mpi_pool.py")
 
-# Must match mpi_pool.py
-_HEADER_FMT = "!ii"
+# Must match mpi_pool.py — encodes worker_id only (batch header)
+_HEADER_FMT = "!i"
 
 
 def _write_hostfile(hosts: List[str]) -> str:
@@ -88,7 +89,14 @@ def _build_mpirun_cmd(
                 cmd += [cfg.cpu_bind_flag, "core", "--map-by", cfg.openmpi_map_by]
 
     # rank 0 = master/gateway, ranks 1..np_workers = workers
-    cmd += [sys.executable, _MPI_POOL_SCRIPT, "--socket-base", socket_base, "--log-dir", log_dir]
+    cmd += [
+        sys.executable,
+        _MPI_POOL_SCRIPT,
+        "--socket-base",
+        socket_base,
+        "--log-dir",
+        log_dir,
+    ]
     return cmd
 
 
@@ -116,9 +124,13 @@ class AsyncMPIPoolExecutor:
         launch_env = os.environ.copy()
         cwd = os.getcwd()
         existing_pythonpath = launch_env.get("PYTHONPATH", "")
-        launch_env["PYTHONPATH"] = f"{cwd}:{existing_pythonpath}" if existing_pythonpath else cwd
+        launch_env["PYTHONPATH"] = (
+            f"{cwd}:{existing_pythonpath}" if existing_pythonpath else cwd
+        )
         self.logger.info(f"MPI pool mpi_info: {self._mpi_info}")
-        cmd = _build_mpirun_cmd(self._mpi_info, self._mpi_config, self._socket_base, log_dir=log_dir)
+        cmd = _build_mpirun_cmd(
+            self._mpi_info, self._mpi_config, self._socket_base, log_dir=log_dir
+        )
         self.logger.info(f"MPI pool cmd: {' '.join(cmd)}")
         self._server_proc = subprocess.Popen(cmd, cwd=cwd, env=launch_env)
 
@@ -142,6 +154,9 @@ class AsyncMPIPoolExecutor:
         self._msg_counter = itertools.count()
         self._result_recv_task: Optional[asyncio.Task] = None
         self._msg_recv_task: Optional[asyncio.Task] = None
+        self._queue: Deque = deque()
+        self._batch_interval: float = 0.01
+        self._submitter_task: Optional[asyncio.Task] = None
 
         self.logger.info("Initialized AsyncMPIPoolExecutor!")
 
@@ -150,6 +165,26 @@ class AsyncMPIPoolExecutor:
             self._result_recv_task = asyncio.ensure_future(self._result_loop())
         if self._msg_recv_task is None or self._msg_recv_task.done():
             self._msg_recv_task = asyncio.ensure_future(self._msg_loop())
+
+    def _ensure_submitter(self):
+        if self._submitter_task is None or self._submitter_task.done():
+            self._submitter_task = asyncio.ensure_future(self._submitter_loop())
+
+    async def _submitter_loop(self):
+        await self._ready.wait()
+        while True:
+            await asyncio.sleep(self._batch_interval)
+            if not self._queue:
+                continue
+            frames = []
+            counter = 0
+            while self._queue:
+                header, payload = self._queue.popleft()
+                frames.append(header)
+                frames.append(payload)
+                counter += 1
+            await self._task_sock.send_multipart(frames)
+            self.logger.info(f"Flushed {counter} tasks")
 
     async def _result_loop(self):
         """Receive results from the dedicated result socket (PULL)."""
@@ -230,15 +265,10 @@ class AsyncMPIPoolExecutor:
 
         # Worker payload: forwarded as-is through the gateway to MPI workers
         worker_payload = cloudpickle.dumps((msg_id, fn, task_args, task_kwargs, env))
-        # Routing header: cheap struct unpack at gateway, no cloudpickle needed
-        header = struct.pack(_HEADER_FMT, msg_id, worker_id)
 
-        async def _send():
-            if not self._ready.is_set():
-                await self._ready.wait()
-            await self._task_sock.send_multipart([header, worker_payload])
-
-        asyncio.ensure_future(_send())
+        header = struct.pack(_HEADER_FMT, worker_id)
+        self._queue.append((header, worker_payload))
+        self._ensure_submitter()
         return future
 
     async def ashutdown(self, wait: bool = True):
@@ -264,9 +294,11 @@ class AsyncMPIPoolExecutor:
                     "ashutdown: timed out waiting for MPI pool 'done'; forcing termination"
                 )
         else:
-            self.logger.warning("ashutdown: MPI pool never became ready, skipping shutdown command")
+            self.logger.warning(
+                "ashutdown: MPI pool never became ready, skipping shutdown command"
+            )
 
-        for task in (self._result_recv_task, self._msg_recv_task):
+        for task in (self._result_recv_task, self._msg_recv_task, self._submitter_task):
             if task and not task.done():
                 task.cancel()
         self.logger.info("ashutdown: cancelled recv loops")
@@ -280,7 +312,9 @@ class AsyncMPIPoolExecutor:
         self.logger.info("ashutdown: ZMQ teardown complete")
 
         # Wait for the MPI process to exit; SIGTERM if it hasn't already.
-        self.logger.info(f"ashutdown: waiting for MPI process (pid={self._server_proc.pid}) to exit")
+        self.logger.info(
+            f"ashutdown: waiting for MPI process (pid={self._server_proc.pid}) to exit"
+        )
         try:
             self._server_proc.wait(timeout=5)
             self.logger.info("ashutdown: MPI process exited normally")
@@ -291,7 +325,9 @@ class AsyncMPIPoolExecutor:
                 self._server_proc.wait(timeout=10)
                 self.logger.info("ashutdown: MPI process exited after SIGTERM")
             except subprocess.TimeoutExpired:
-                self.logger.warning("ashutdown: MPI pool did not exit after SIGTERM; sending SIGKILL")
+                self.logger.warning(
+                    "ashutdown: MPI pool did not exit after SIGTERM; sending SIGKILL"
+                )
                 self._server_proc.kill()
                 self._server_proc.wait()
                 self.logger.info("ashutdown: MPI process killed")

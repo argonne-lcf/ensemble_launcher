@@ -1786,6 +1786,9 @@ class AsyncMaster(Node):
             with open(fname, "w") as f:
                 json.dump(stats, f, indent=2)
         self.logger.info(f"Done stopping {self.node_id}")
+        for handler in self.logger.handlers[:]:
+            handler.close()
+            self.logger.removeHandler(handler)
 
     # -------------------------------------------------------------------------
     #                               Entry point

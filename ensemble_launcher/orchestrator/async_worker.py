@@ -1093,7 +1093,10 @@ class AsyncWorker(Node):
             else:
                 executor.shutdown()
 
-        return
+        self.logger.info(f"{self.node_id}: Closing logger")
+        for handler in self.logger.handlers[:]:
+            handler.close()
+            self.logger.removeHandler(handler)
 
     # -------------------------------------------------------------------------
     #                               Entry point
