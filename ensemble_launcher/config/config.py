@@ -87,6 +87,12 @@ class LauncherConfig(BaseModel):
 
     result_flush_interval: float = 5.0  # Flush result queues every fixed time
 
+    task_buffer_size: int = (
+        10000  # max buffer size of the task queue per child
+    )
+
+    task_flush_interval: float = 5.0  # Flush task queues every fixed time
+
     task_request_size: Optional[int] = (
         None  # size of the task request in work stealing mode
     )

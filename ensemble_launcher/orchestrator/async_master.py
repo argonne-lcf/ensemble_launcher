@@ -146,6 +146,9 @@ class AsyncMaster(Node):
         # Intermediate result buffer: used when forwarding to a parent master (fan-in aggregation)
         self._iresult_q: Dict[str, deque] = {}
         self._flush_task: Optional[asyncio.Task] = None
+        # Intermediate task buffer: batches tasks dispatched to children (fan-out)
+        self._itask_q: Dict[str, deque] = {}
+        self._task_flush_task: Optional[asyncio.Task] = None
         # Batch mode root: accumulates results streamed via IResultBatch during execution
         self._batch_streaming_results: List[Result] = []
 
@@ -153,6 +156,7 @@ class AsyncMaster(Node):
         self._parent_ready_event = asyncio.Event()
         self._parent_ready_monitor_task: Optional[asyncio.Task] = None
 
+        self._total_received: int = 0
         self._total_streamed = 0
 
     @asynccontextmanager
@@ -414,6 +418,9 @@ class AsyncMaster(Node):
                 self._task_update_task = asyncio.create_task(
                     self._parent_task_update_monitor()
                 )
+            self._task_flush_task = asyncio.create_task(
+                self._periodic_task_flush_loop()
+            )
         if self.parent:
             self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
@@ -473,8 +480,13 @@ class AsyncMaster(Node):
             json_fname = os.path.join(
                 self._executor.tmp_dir, f"child_{uuid.uuid4()}.json"
             )
-            with open(json_fname, "w") as _f:
-                _f.write(json_str)
+            if hasattr(self._executor, "write_file_to_nodes"):
+                await self._executor.write_file_to_nodes(
+                    json_fname, json_str, [head_node]
+                )
+            else:
+                with open(json_fname, "w") as _f:
+                    _f.write(json_str)
             load_str_embed = async_simple_load_str_file.replace(
                 "json_file_path", f"'{json_fname}'"
             )
@@ -592,8 +604,13 @@ class AsyncMaster(Node):
                 json_fname = os.path.join(
                     self._executor.tmp_dir, f"workers_{uuid.uuid4()}.json"
                 )
-                with open(json_fname, "w") as _f:
-                    _f.write(json_str)
+                if hasattr(self._executor, "write_file_to_nodes"):
+                    await self._executor.write_file_to_nodes(
+                        json_fname, json_str, child_head_nodes
+                    )
+                else:
+                    with open(json_fname, "w") as _f:
+                        _f.write(json_str)
                 common_keys_str = ",".join(common_keys)
                 load_str_embed = async_load_str_file.replace(
                     "json_file_path", f"'{json_fname}'"
@@ -1120,17 +1137,15 @@ class AsyncMaster(Node):
             if len(added_tasks) == 0:
                 continue
             await self._scheduler.wait_for_child_ready(child_id)
-            asyncio.create_task(
-                self._comm.send_message_to_child(
-                    child_id,
-                    TaskUpdate(
-                        sender=self.node_id,
-                        added_tasks=[self.tasks[task_id] for task_id in added_tasks],
-                    ),
-                )
-            )
+            if child_id not in self._itask_q:
+                self._itask_q[child_id] = deque()
+            task_q = self._itask_q[child_id]
+            for task_id in added_tasks:
+                task_q.append(self.tasks[task_id])
             self._routed_task_ids.setdefault(child_id, set()).update(added_tasks)
-            self.logger.debug(f"Routing {len(added_tasks)} Tasks to {child_id}")
+            self.logger.debug(f"Buffering {len(added_tasks)} Tasks for {child_id}")
+            if len(task_q) >= self._config.task_buffer_size or not self._config.cluster:
+                await self._flush_child_task_queue(child_id)
 
         for task_id in unassigned_tasks:
             self.logger.warning(f"Can't route task {task_id} to any child")
@@ -1398,7 +1413,10 @@ class AsyncMaster(Node):
                 continue
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
-                self.logger.info("Received TaskUpdate from client")
+                self._total_received += len(msg.added_tasks)
+                self.logger.info(
+                    f"Received TaskUpdate from client. Total tasks: {self._total_received}"
+                )
                 await self._route_tasks(msg.added_tasks, client_id=client_id)
 
     async def _flush_dest_queue(self, dest_id: str) -> None:
@@ -1423,6 +1441,31 @@ class AsyncMaster(Node):
             await asyncio.sleep(self._config.result_flush_interval + jitter)
             for dest_id in list(self._iresult_q.keys()):
                 await self._flush_dest_queue(dest_id)
+
+    async def _flush_child_task_queue(self, child_id: str) -> None:
+        """Send all buffered tasks for child_id to that child as a single TaskUpdate."""
+        task_q = self._itask_q.get(child_id)
+        if not task_q:
+            return
+        tasks = []
+        while task_q:
+            tasks.append(task_q.popleft())
+        await self._comm.send_message_to_child(
+            child_id,
+            TaskUpdate(sender=self.node_id, added_tasks=tasks),
+        )
+        self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
+
+    async def _periodic_task_flush_loop(self) -> None:
+        """Flush buffered child-bound tasks on a fixed interval with jitter.
+
+        Runs on all masters that have children (i.e. there are tasks to dispatch downward).
+        """
+        while True:
+            jitter = random.uniform(-0.05, 0.05) * self._config.task_flush_interval
+            await asyncio.sleep(self._config.task_flush_interval + jitter)
+            for child_id in list(self._itask_q.keys()):
+                await self._flush_child_task_queue(child_id)
 
     async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
         """Route a result to its destination.
@@ -1696,6 +1739,7 @@ class AsyncMaster(Node):
         self._children_futures.pop(child_id, None)
         self._routed_task_ids.pop(child_id, None)
         self._iresult_q.pop(child_id, None)
+        self._itask_q.pop(child_id, None)
         await self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:

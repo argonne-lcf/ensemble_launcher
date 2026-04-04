@@ -30,14 +30,18 @@ class AsyncMPIExecutor(Executor):
         self,
         logger=logger,
         gpu_selector: str = "ZE_AFFINITY_MASK",
-        tmp_dir: str = f".mpiexec_tmp_{str(uuid.uuid4())}",
+        tmp_dir: str = "/tmp/.mpiexec_tmp",
         return_stdout: bool = True,
         mpi_config: Optional[MPIConfig] = None,
         **kwargs,
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
-        self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
+        if os.path.isabs(tmp_dir):
+            self.tmp_dir = tmp_dir
+        else:
+            self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
+        self._use_local_tmp = self.tmp_dir.startswith("/tmp")
         self._processes: Dict[str, asyncio.subprocess.Process] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
@@ -47,7 +51,12 @@ class AsyncMPIExecutor(Executor):
         self.logger.info("Initialized AsyncMPI Executor!")
 
     def _build_resource_cmd(self, task_id: str, job_resource: JobResource):
-        """Build the mpirun resource flags from the job resource and MPIConfig."""
+        """Build the mpirun resource flags from the job resource and MPIConfig.
+
+        Returns (launcher_cmd, env, setup_files) where setup_files maps
+        "gpu_affinity" -> script_content when self._use_local_tmp is True
+        (the caller must distribute the script via a setup MPI job).
+        """
 
         cfg = self._mpi_config
         ppn = job_resource.resources[0].cpu_count
@@ -60,6 +69,7 @@ class AsyncMPIExecutor(Executor):
 
         env = {}
         launcher_cmd = []
+        setup_files = {}
 
         # Total process count
         launcher_cmd += [cfg.nprocesses_flag, str(ppn * nnodes)]
@@ -119,6 +129,11 @@ class AsyncMPIExecutor(Executor):
                     ]
                 )
                 use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
+                fname = (
+                    f"/tmp/gpu_affinity_file_{task_id}.sh"
+                    if self._use_local_tmp
+                    else os.path.join(self.tmp_dir, f"gpu_affinity_file_{task_id}.sh")
+                )
                 if use_common_gpus:
                     if nnodes == 1 and ppn == 1:
                         env.update(
@@ -132,15 +147,15 @@ class AsyncMPIExecutor(Executor):
                         bash_script = gen_affinity_bash_script_1(
                             ngpus_per_process, self.gpu_selector
                         )
-                        fname = os.path.join(
-                            self.tmp_dir, f"gpu_affinity_file_{task_id}.sh"
-                        )
-                        if not os.path.exists(fname):
-                            with open(fname, "w") as f:
-                                f.write(bash_script)
-                            st = os.stat(fname)
-                            os.chmod(fname, st.st_mode | stat.S_IEXEC)
-                        launcher_cmd.append(f"{fname}")
+                        if self._use_local_tmp:
+                            setup_files["gpu_affinity"] = bash_script
+                        else:
+                            if not os.path.exists(fname):
+                                with open(fname, "w") as f:
+                                    f.write(bash_script)
+                                st = os.stat(fname)
+                                os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                        launcher_cmd.append(fname)
                         ##set environment variables
                         env.update(
                             {
@@ -153,15 +168,15 @@ class AsyncMPIExecutor(Executor):
                     bash_script = gen_affinity_bash_script_2(
                         ngpus_per_process, self.gpu_selector
                     )
-                    fname = os.path.join(
-                        self.tmp_dir, f"gpu_affinity_file_{task_id}.sh"
-                    )
-                    if not os.path.exists(fname):
-                        with open(fname, "w") as f:
-                            f.write(bash_script)
-                        st = os.stat(fname)
-                        os.chmod(fname, st.st_mode | stat.S_IEXEC)
-                    launcher_cmd.append(f"{fname}")
+                    if self._use_local_tmp:
+                        setup_files["gpu_affinity"] = bash_script
+                    else:
+                        if not os.path.exists(fname):
+                            with open(fname, "w") as f:
+                                f.write(bash_script)
+                            st = os.stat(fname)
+                            os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                    launcher_cmd.append(fname)
                     ##Here you need to set the environment variables for each node
                     for nid, node in enumerate(job_resource.nodes):
                         env.update(
@@ -172,7 +187,7 @@ class AsyncMPIExecutor(Executor):
                             }
                         )
 
-        return launcher_cmd, env
+        return launcher_cmd, env, setup_files
 
     def submit(
         self,
@@ -188,8 +203,8 @@ class AsyncMPIExecutor(Executor):
         # task is a str command
         task_id = str(uuid.uuid4())
 
-        resource_pinning_cmd, resource_pinning_env = self._build_resource_cmd(
-            task_id, job_resource
+        resource_pinning_cmd, resource_pinning_env, setup_files = (
+            self._build_resource_cmd(task_id, job_resource)
         )
 
         additional_mpi_opts = []
@@ -231,16 +246,55 @@ class AsyncMPIExecutor(Executor):
         merged_env.update(env)
 
         asyncio_task = asyncio.create_task(
-            self._subprocess_task(task_id, cmd, merged_env)
+            self._subprocess_task(
+                task_id,
+                cmd,
+                merged_env,
+                nodes=job_resource.nodes,
+                setup_files=setup_files,
+            )
         )
         self._tasks[task_id] = asyncio_task
         asyncio_task.add_done_callback(lambda _: self._tasks.pop(task_id, None))
 
         return asyncio_task
 
+    async def write_file_to_nodes(
+        self, path: str, content: str, nodes: List[str], executable: bool = False
+    ) -> None:
+        """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
+        cfg = self._mpi_config
+        setup_code = (
+            "import os, stat\n"
+            f"content = {repr(content)}\n"
+            f"path = {repr(path)}\n"
+            "os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
+            "open(path, 'w').write(content)\n"
+        )
+        if executable:
+            setup_code += "os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)\n"
+        cmd = (
+            [cfg.launcher]
+            + [cfg.nprocesses_flag, str(len(nodes))]
+            + ([cfg.processes_per_node_flag, "1"] if cfg.processes_per_node_flag else [])
+            + ([cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else [])
+            + ["python", "-c", setup_code]
+        )
+        self.logger.info(f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s)")
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+
     async def _subprocess_task(
-        self, task_id: str, cmd: List[str], merged_env: Dict[str, Any]
+        self,
+        task_id: str,
+        cmd: List[str],
+        merged_env: Dict[str, Any],
+        nodes: Optional[List[str]] = None,
+        setup_files: Optional[Dict] = None,
     ):
+        if setup_files and setup_files.get("gpu_affinity") and nodes:
+            fname = f"/tmp/gpu_affinity_file_{task_id}.sh"
+            await self.write_file_to_nodes(fname, setup_files["gpu_affinity"], nodes, executable=True)
         self.logger.info(f"executing: {' '.join(cmd)}")
 
         # We separate the executable from the arguments
