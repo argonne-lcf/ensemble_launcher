@@ -182,7 +182,9 @@ class AsyncWorker(Node):
     def _setup_logger(self) -> None:
         """Configure the logger, optionally writing to a per-worker log file."""
         log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir) if self._config.worker_logs else None
+            os.path.join(os.getcwd(), self._config.log_dir)
+            if self._config.worker_logs
+            else None
         )
         self.logger = setup_logger(
             __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
@@ -590,6 +592,7 @@ class AsyncWorker(Node):
             return
         msg = IResultBatch(sender=self.node_id, data=results)
         if dest_id.startswith("client:"):
+            self.logger.info(f"Flushing queue of size {len(results)} to {dest_id}")
             await self._comm.send_message_to_child(dest_id, msg)
         else:
             await self._comm.send_message_to_parent(msg)

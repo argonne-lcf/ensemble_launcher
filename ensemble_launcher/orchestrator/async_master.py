@@ -284,6 +284,7 @@ class AsyncMaster(Node):
             return (
                 AsyncWorkStealingMaster
                 if self._config.enable_workstealing
+                and self.level + 1 == self._config.policy_config.nlevels - 1
                 else AsyncMaster
             )
 

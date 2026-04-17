@@ -86,7 +86,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments: Dict[str, ChildrenAssignment] = {}
         self._children_status: Dict[str, "Status"] = {}  # child_id -> Status
         self._child_done_events: Dict[str, asyncio.Event] = {}  # child_id -> done event
-        self._child_ready_events: Dict[str, asyncio.Event] = {}  # child_id -> ready (running) event
+        self._child_ready_events: Dict[
+            str, asyncio.Event
+        ] = {}  # child_id -> ready (running) event
         self._child_states: Dict[str, ChildState] = {}  # child_id -> ChildState
         self._all_children_done_event: asyncio.Event = asyncio.Event()
         self._child_to_tasks: Dict[
@@ -361,9 +363,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if not task_ids:
             return True
         return all(
-            self.tasks[tid].status in terminal
-            for tid in task_ids
-            if tid in self.tasks
+            self.tasks[tid].status in terminal for tid in task_ids if tid in self.tasks
         )
 
     @property
@@ -662,12 +662,14 @@ class PendingTaskHeap:
         self._task_ids: Set[str] = set()
         self._seq: int = 0
         self._tasks_available: asyncio.Event = asyncio.Event()
+        self._sorted = False
 
     def push(self, priority: float, task_id: str) -> None:
         heapq.heappush(self._heap, (priority, self._seq, task_id))
         self._seq += 1
         self._task_ids.add(task_id)
         self._tasks_available.set()
+        self._sorted = False
 
     def remove(self, task_id: str) -> bool:
         if task_id not in self._task_ids:
@@ -677,6 +679,7 @@ class PendingTaskHeap:
         heapq.heapify(self._heap)
         if not self._task_ids:
             self._tasks_available.clear()
+        self._sorted = False
         return True
 
     def remove_many(self, task_ids: Set[str]) -> None:
@@ -685,10 +688,14 @@ class PendingTaskHeap:
         heapq.heapify(self._heap)
         if not self._task_ids:
             self._tasks_available.clear()
+        self._sorted = False
 
     def sorted_items(self) -> List[Tuple[float, int, str]]:
         """Return all items sorted by priority, then insertion order (non-destructive)."""
-        return sorted(self._heap)
+        if not self._sorted:
+            self._heap = sorted(self._heap)
+            self._sorted = True
+        return self._heap
 
     def __contains__(self, task_id: str) -> bool:
         return task_id in self._task_ids

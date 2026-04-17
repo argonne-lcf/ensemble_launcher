@@ -6,7 +6,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future as ConcurrentFuture
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union, Deque
+from collections import deque
 
 import cloudpickle
 
@@ -250,6 +251,8 @@ class ClusterClient:
         log_dir: str = "logs",
         log_level: int = logging.INFO,
         checkpoint_timeout: float = 60.0,
+        task_buffer_size: int = 10000,
+        task_flush_interval: float = 5.0,
     ):
         """
         Args:
@@ -269,9 +272,19 @@ class ClusterClient:
                                  raising ``TimeoutError`` (default 60).  Useful when the
                                  client is started before the orchestrator has written its
                                  first checkpoint.
+            task_buffer_size:    Flush the outgoing task buffer when it reaches this many
+                                 tasks (default 10000).
+            task_flush_interval: Seconds between periodic flushes of the task buffer
+                                 (default 5.0).
         """
         self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
         self._n_workers = n_workers
+        self._task_buffer_size = task_buffer_size
+        self._task_flush_interval = task_flush_interval
+        self._task_buffer: Deque[Tuple[Task, ConcurrentFuture]] = deque()
+        self._task_buffer_lock = threading.Lock()
+        self._flush_stop_event = threading.Event()
+        self._flush_thread: Optional[threading.Thread] = None
         self.logger = setup_logger(
             __name__, self._client_id, log_dir=log_dir, level=log_level
         )
@@ -319,13 +332,22 @@ class ClusterClient:
         """Start each pipeline's dedicated thread and wait until all are connected."""
         for pipeline in self._pipelines:
             pipeline.start(self._node_address, self.logger)
+        self._flush_stop_event.clear()
+        self._flush_thread = threading.Thread(
+            target=self._flush_timer_loop, daemon=True
+        )
+        self._flush_thread.start()
         self.logger.info(
             f"Started {self._n_workers} pipeline(s) connected to "
             f"{self._node_id} at {self._node_address}"
         )
 
     def teardown(self) -> None:
-        """Stop all pipelines."""
+        """Flush remaining tasks, stop the flush timer, and stop all pipelines."""
+        self.flush()
+        self._flush_stop_event.set()
+        if self._flush_thread is not None:
+            self._flush_thread.join(timeout=5.0)
         for pipeline in self._pipelines:
             pipeline.stop()
 
@@ -360,16 +382,29 @@ class ClusterClient:
         )
 
     def _send_batch(self, tasks: List[Task]) -> List[ConcurrentFuture]:
-        """Register futures and send tasks, distributing round-robin across pipelines."""
+        """Buffer tasks and return futures. Flushes immediately when buffer is full."""
         futures: List[ConcurrentFuture] = []
-        # Build per-pipeline batches while preserving future order.
+        with self._task_buffer_lock:
+            for task in tasks:
+                fut: ConcurrentFuture = ConcurrentFuture()
+                self._task_buffer.append((task, fut))
+                futures.append(fut)
+            if len(self._task_buffer) >= self._task_buffer_size:
+                self._flush_task_buffer()
+        return futures
+
+    def _flush_task_buffer(self) -> None:
+        """Drain the buffer and send one TaskUpdate per pipeline. Caller must hold _task_buffer_lock."""
+        if not self._task_buffer:
+            return
+        items = list(self._task_buffer)
+        self._task_buffer.clear()
+
         pipeline_batches: List[List[Task]] = [[] for _ in self._pipelines]
-        for i, task in enumerate(tasks):
+        for i, (task, fut) in enumerate(items):
             pipeline = self._pipelines[i % self._n_workers]
-            fut: ConcurrentFuture = ConcurrentFuture()
             with pipeline.lock:
                 pipeline.pending[task.task_id] = fut
-            futures.append(fut)
             pipeline_batches[i % self._n_workers].append(task)
 
         for pipeline, batch in zip(self._pipelines, pipeline_batches):
@@ -378,8 +413,19 @@ class ClusterClient:
                     TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
                 )
                 pipeline.send(data)
+        self.logger.info(f"Flushed {len(items)} tasks across {self._n_workers} pipeline(s)")
 
-        return futures
+    def flush(self) -> None:
+        """Force-flush all buffered tasks. Safe to call from any thread."""
+        with self._task_buffer_lock:
+            self._flush_task_buffer()
+
+    def _flush_timer_loop(self) -> None:
+        """Periodically flush the task buffer until stop event is set."""
+        while not self._flush_stop_event.is_set():
+            self._flush_stop_event.wait(self._task_flush_interval)
+            if not self._flush_stop_event.is_set():
+                self.flush()
 
     # ------------------------------------------------------------------
     # Public API
