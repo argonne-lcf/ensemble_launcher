@@ -166,12 +166,14 @@ class EnsembleLauncher:
                 raise ValueError("Sync Master version is no longer supported")
 
     def run(self):
-        """Simply blocks untils all the tasks are done"""
-        if self.async_orchestrator:
-            results = asyncio.run(self._launcher.run())
-        else:
+        """Simply blocks until all the tasks are done."""
+        if not self.async_orchestrator:
             raise RuntimeError("Sync orchestrator is deprecated")
-            # results = self._launcher.run()
+        try:
+            results = asyncio.run(self._launcher.run())
+        except BaseException:
+            logger.exception("EnsembleLauncher.run() failed, stopping launcher")
+            raise
         return results
 
     def start(self):
@@ -180,11 +182,12 @@ class EnsembleLauncher:
         self._launcher_process.start()
 
     def stop(self):
-        """Terminate the launcher process, waiting for it to exit and force-killing if needed."""
+        """Stop the launcher, terminating child processes if needed."""
         if self._launcher_process is not None:
             self._launcher_process.terminate()
             self._launcher_process.join(timeout=30)
             if self._launcher_process.is_alive():
+                logger.warning("Launcher process did not exit cleanly; killing.")
                 self._launcher_process.kill()
                 self._launcher_process.join()
 

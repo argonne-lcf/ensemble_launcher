@@ -38,6 +38,7 @@ class Task(BaseModel):
     start_time: Any = None
     end_time: Any = None
     executor_name: Optional[str] = None
+    tag: Optional[str] = None
 
     def get_resource_requirements(self) -> "JobResource":
         """Build JobResource requirements from this Task."""
@@ -107,9 +108,7 @@ class _AsyncWrapper:
 
     __slots__ = ("_fn", "_loop")
 
-    def __init__(
-        self, fn: Callable, loop: Optional[Any] = None
-    ) -> None:
+    def __init__(self, fn: Callable, loop: Optional[Any] = None) -> None:
         self._fn = fn
         self._loop = loop
 
@@ -144,7 +143,9 @@ class AsyncTask(Task):
     loop: Optional[Any] = None
 
     def model_post_init(self, _: Any) -> None:
-        object.__setattr__(self, "executable", _AsyncWrapper(self.executable, self.loop))
+        object.__setattr__(
+            self, "executable", _AsyncWrapper(self.executable, self.loop)
+        )
 
 
 class TaskFactory:

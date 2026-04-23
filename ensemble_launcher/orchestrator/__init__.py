@@ -43,7 +43,7 @@ def load_external_policies():
             from ensemble_launcher.scheduler.policy import policy_registry
 
             all_policies = list(policy_registry.available_policies.keys()) + list(
-                policy_registry.available_worker_policies.keys()
+                policy_registry.available_children_policies.keys()
             )
             logger.info(f"External policies loaded. Available policies: {all_policies}")
 

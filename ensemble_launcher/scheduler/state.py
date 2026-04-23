@@ -35,6 +35,7 @@ class SchedulerState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     node_id: str
+    level: Optional[int] = None
     nodes: Optional[JobResource] = None
 
     # ------------------------------------------------------------------ #
@@ -66,6 +67,9 @@ class SchedulerState(BaseModel):
 
     # A map of task_id -> child_id
     task_to_child: Dict[str, str] = Field(default_factory=dict)
+
+    # A map of task_id -> client_id (cluster mode only)
+    task_to_client: Dict[str, str] = Field(default_factory=dict)
 
     # Informational snapshot of child states at checkpoint time.
     # Not used to restore state: children always restart as NOTREADY.

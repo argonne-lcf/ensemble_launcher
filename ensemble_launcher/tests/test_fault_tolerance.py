@@ -9,7 +9,12 @@ import pytest
 from utils import echo_sleep
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
+from ensemble_launcher.config import (
+    LauncherConfig,
+    MPIConfig,
+    PolicyConfig,
+    SystemConfig,
+)
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
 
@@ -33,7 +38,7 @@ def _make_tasks(n: int):
 
 
 def test_el_fault_tolerance():
-    ckpt_dir = os.path.join(os.getcwd(), f"ckpt_{str(uuid.uuid4())}")
+    ckpt_dir = os.path.join("/tmp", f"ckpt_{str(uuid.uuid4())}")
     os.makedirs(ckpt_dir, exist_ok=True)
     tasks = _make_tasks(120)
 
@@ -48,13 +53,14 @@ def test_el_fault_tolerance():
             return_stdout=True,
             worker_logs=True,
             master_logs=True,
-            cpu_binding_option="",
-            use_mpi_ppn=False,
+            mpi_config=MPIConfig(cpu_bind_method="none", processes_per_node_flag=None),
             cluster=True,
             checkpoint_dir=ckpt_dir,
             report_interval=1.0,
             children_scheduler_policy="simple_split_children_policy",
             log_level=logging.INFO,
+            heartbeat_dead_threshold=5.0,
+            heartbeat_interval=0.5,
         ),
         Nodes=[socket.gethostname()],
     )
@@ -66,6 +72,7 @@ def test_el_fault_tolerance():
     with ClusterClient(checkpoint_dir=ckpt_dir, node_id="global") as client:
         futures = {task_id: client.submit(task) for task_id, task in tasks.items()}
 
+        time.sleep(5.0)
         # Kill main.m0 node
         import json
 

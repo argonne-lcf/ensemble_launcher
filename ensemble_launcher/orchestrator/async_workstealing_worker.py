@@ -102,6 +102,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
             self._comm.parent_dead_event is not None
             and self._comm.parent_dead_event.is_set()
         ):
+            await self.stop()
             sys.exit(1)
 
     # ------------------------------------------------------------------

@@ -1,7 +1,8 @@
 import asyncio
 import copy
+import heapq
 import os
-from asyncio import PriorityQueue, Queue
+from asyncio import Queue
 from collections import Counter
 from logging import Logger
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -47,6 +48,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         config: LauncherConfig,
         tasks: Optional[Dict[str, Task]] = None,
         node_id: str = None,
+        level: Optional[int] = None,
     ) -> None:
         """Initialise the worker scheduler.
 
@@ -56,6 +58,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             config: Launcher configuration (policy name, nchildren, etc.).
             tasks: Initial task dict; all tasks start in the unassigned pool.
             node_id: ID of the owning master node.
+            level: Optional hierarchy level (0 = root master).
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
@@ -83,17 +86,22 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments: Dict[str, ChildrenAssignment] = {}
         self._children_status: Dict[str, "Status"] = {}  # child_id -> Status
         self._child_done_events: Dict[str, asyncio.Event] = {}  # child_id -> done event
+        self._child_ready_events: Dict[
+            str, asyncio.Event
+        ] = {}  # child_id -> ready (running) event
         self._child_states: Dict[str, ChildState] = {}  # child_id -> ChildState
         self._all_children_done_event: asyncio.Event = asyncio.Event()
         self._child_to_tasks: Dict[
             str, List[str]
         ] = {}  # child_id -> dynamically assigned task_ids
         self._task_to_child: Dict[str, str] = {}  # task_id -> child_id
+        self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
         # Pool of task IDs not yet assigned to any child.
         # Seeded at init from tasks; assign_task_ids() drains it as tasks are placed.
-        self._unassigned_tasks: Set[str] = set(self.tasks.keys())
+        self._unassigned_tasks: Dict[str, None] = dict.fromkeys(self.tasks.keys())
         self._child_id_to_wid: Dict[str, int] = {}
         self._wid_to_child_id: Dict[int, str] = {}
+        self._level: Optional[int] = level
 
     # ------------------------------------------------------------------
     # Child registration / reset
@@ -104,6 +112,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments[child_id] = assignment
         self._child_to_tasks.setdefault(child_id, [])
         self._child_done_events[child_id] = asyncio.Event()
+        self._child_ready_events[child_id] = asyncio.Event()
         self._child_states[child_id] = ChildState.NOTREADY
 
     def reset_child_assignments(self) -> None:
@@ -111,6 +120,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._child_assignments = {}
         self._children_status = {}
         self._child_done_events = {}
+        self._child_ready_events = {}
         self._child_states = {}
         self._all_children_done_event.clear()
         self._child_to_tasks = {}
@@ -175,6 +185,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
         )
         self._child_states[child_id] = ChildState.RUNNING
         self._child_done_events[child_id].clear()
+        self._child_ready_events[child_id].set()
+        self.set_child_tasks_status(child_id, TaskStatus.RUNNING)
 
     def mark_child_recovering(self, child_id: str) -> None:
         """RUNNING → RECOVERING: child timed out, recovery in progress.
@@ -202,7 +214,19 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self._check_all_children_terminal()
 
     def mark_child_success(self, child_id: str) -> None:
-        """RUNNING/RECOVERING → SUCCESS: terminal success; free resources."""
+        """RUNNING/RECOVERING → SUCCESS: terminal success; free resources.
+
+        If not all tasks associated with this child have reached a terminal
+        status (SUCCESS or FAILED), the transition is skipped. This keeps
+        the child in its current state so that ``wait_for_child`` does not
+        resolve and the liveness monitor can restart the child.
+        """
+        if not self.are_child_tasks_terminal(child_id):
+            self.logger.warning(
+                f"Skipping SUCCESS transition for {child_id}: "
+                "not all tasks are terminal"
+            )
+            return
         self._assert_transition(
             child_id,
             {ChildState.RUNNING, ChildState.RECOVERING},
@@ -242,9 +266,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
     def is_child_done(self, child_id: str) -> bool:
         return self.is_child_terminal(child_id)
 
-    async def wait_for_child(self, child_id: str) -> None:
-        """Await the done event for the given child_id."""
-        await self._child_done_events[child_id].wait()
+    async def wait_for_child_ready(self, child_id: str) -> None:
+        """Await the ready event for the given child_id (set when marked running)."""
+        await self._child_ready_events[child_id].wait()
 
     @property
     def all_children_done(self) -> bool:
@@ -281,6 +305,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Return the asyncio.Event that is set when the given child finishes."""
         return self._child_done_events[child_id]
 
+    def get_ready_event(self, child_id: str) -> asyncio.Event:
+        """Return the asyncio.Event that is set when the child is marked running."""
+        return self._child_ready_events[child_id]
+
     # ------------------------------------------------------------------
     # Dynamic task routing
     # ------------------------------------------------------------------
@@ -304,19 +332,59 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Return the task IDs assigned to a child."""
         return list(self._child_assignments.get(child_id, {}).get("task_ids", []))
 
+    def get_all_child_task_ids(self, child_id: str) -> List[str]:
+        """Return all task IDs for a child (both static assignments and dynamically routed)."""
+        static = list(self._child_assignments.get(child_id, {}).get("task_ids", []))
+        dynamic = list(self._child_to_tasks.get(child_id, []))
+        return static + dynamic
+
+    # ------------------------------------------------------------------
+    # Task status tracking
+    # ------------------------------------------------------------------
+
+    def set_task_status(self, task_id: str, status: TaskStatus) -> None:
+        """Set the status of a single task."""
+        if task_id in self.tasks:
+            self.tasks[task_id].status = status
+
+    def set_tasks_status(self, task_ids: List[str], status: TaskStatus) -> None:
+        """Set the status of multiple tasks."""
+        for task_id in task_ids:
+            self.set_task_status(task_id, status)
+
+    def set_child_tasks_status(self, child_id: str, status: TaskStatus) -> None:
+        """Set the status of all tasks associated with a child."""
+        self.set_tasks_status(self.get_all_child_task_ids(child_id), status)
+
+    def are_child_tasks_terminal(self, child_id: str) -> bool:
+        """Return True if all tasks for a child are in a terminal state (SUCCESS or FAILED)."""
+        terminal = {TaskStatus.SUCCESS, TaskStatus.FAILED}
+        task_ids = self.get_all_child_task_ids(child_id)
+        if not task_ids:
+            return True
+        return all(
+            self.tasks[tid].status in terminal for tid in task_ids if tid in self.tasks
+        )
+
     @property
-    def unassigned_task_ids(self) -> Set[str]:
-        """Read-only view of the unassigned task pool."""
-        return copy.deepcopy(self._unassigned_tasks)
+    def unassigned_task_ids(self) -> Dict[str, None]:
+        """Read-only view of the unassigned task pool (insertion-ordered)."""
+        return dict(self._unassigned_tasks)
 
     def discard_unassigned(self, task_id: str) -> None:
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
-        self._unassigned_tasks.discard(task_id)
+        self._unassigned_tasks.pop(task_id, None)
 
-    def add_task(self, task: Task) -> None:
+    def add_task(self, task: Task, client_id: Optional[str] = None) -> None:
         """Add a task to the scheduler and mark it as unassigned."""
         self.tasks[task.task_id] = task
-        self._unassigned_tasks.add(task.task_id)
+        self._unassigned_tasks[task.task_id] = None
+        if client_id is not None:
+            self._task_to_client[task.task_id] = client_id
+
+    def get_task_client(self, task_id: str) -> Optional[str]:
+        """Return the client_id that submitted this task, or None."""
+        return self._task_to_client.get(task_id)
 
     def delete_task(self, task_id: str) -> None:
         """Remove a task from the scheduler entirely.
@@ -325,7 +393,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
         assignment that references it.
         """
         self.tasks.pop(task_id, None)
-        self._unassigned_tasks.discard(task_id)
+        self._unassigned_tasks.pop(task_id, None)
+        self._task_to_client.pop(task_id, None)
         for assignment in self._child_assignments.values():
             task_ids: List[str] = assignment["task_ids"]
             if task_id in task_ids:
@@ -340,9 +409,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if child_id not in self._child_assignments:
             return
         for task_id in self._child_assignments[child_id].get("task_ids", []):
-            self._unassigned_tasks.add(task_id)
+            self._unassigned_tasks[task_id] = None
         del self._child_assignments[child_id]
         self._child_done_events.pop(child_id, None)
+        self._child_ready_events.pop(child_id, None)
         self._child_states.pop(child_id, None)
         self._children_status.pop(child_id, None)
         self._child_to_tasks.pop(child_id, None)
@@ -364,12 +434,14 @@ class AsyncChildrenScheduler(AsyncScheduler):
         }
         return SchedulerState(
             node_id=node_id,
+            level=self._level,
             nodes=self.cluster.nodes,
             children_task_ids=children_task_ids,
             children_resources=children_resources,
             child_id_to_wid=dict(self._child_id_to_wid),
             wid_to_child_id={wid: cid for wid, cid in self._wid_to_child_id.items()},
             task_to_child=self._task_to_child,
+            task_to_client=dict(self._task_to_client),
             child_states={cid: s.name for cid, s in self._child_states.items()},
         )
 
@@ -382,6 +454,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
         Must be called after scheduler creation but before _create_children().
         """
+        self._level = state.level
         for child_id, task_ids in state.children_task_ids.items():
             resource = state.children_resources.get(child_id)
             wid = state.child_id_to_wid.get(child_id, len(self._child_assignments))
@@ -399,8 +472,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
             self._child_id_to_wid[child_id] = wid
             self._wid_to_child_id[wid] = child_id
 
-        # also set the task_id to wid
         self._task_to_child.update(state.task_to_child)
+        self._task_to_client.update(state.task_to_client)
 
         # All tasks that were assigned to children leave the unassigned pool
         assigned = {
@@ -408,7 +481,8 @@ class AsyncChildrenScheduler(AsyncScheduler):
             for task_ids in state.children_task_ids.values()
             for task_id in task_ids
         }
-        self._unassigned_tasks -= assigned
+        for task_id in assigned:
+            self._unassigned_tasks.pop(task_id, None)
 
         self.logger.info(
             f"set_state: restored {len(state.children_task_ids)} children, "
@@ -453,6 +527,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if reset:
             self.reset_child_assignments()
 
+        self._level = level
         child_suffix = ".w" if level + 1 == self._config.policy_config.nlevels else ".m"
         wid_offset = (
             max((a["wid"] for a in self._child_assignments.values()), default=-1) + 1
@@ -485,7 +560,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
     def assign_task_ids(
         self,
-        task_ids: Set[str],
+        task_ids: Union[Set[str], Dict[str, None]],
         ntask: Optional[int] = None,
         child_ids: Optional[List[str]] = None,
     ) -> Tuple[Dict[str, List[str]], Dict[str, str], List[str]]:
@@ -541,6 +616,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
                 ntask=ntask,
                 child_assignments=wid_assignments,
                 child_status=wid_status,
+                level=self._level,
             )
         )
 
@@ -552,7 +628,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child_id = self._wid_to_child_id[wid]
             self._child_assignments[child_id]["task_ids"].extend(assigned_ids)
             for tid in assigned_ids:
-                self._unassigned_tasks.discard(tid)
+                self._unassigned_tasks.pop(tid, None)
             child_assignments[child_id] = assigned_ids
 
         task_to_child: Dict[str, str] = {}
@@ -573,6 +649,77 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return False
 
 
+class PendingTaskHeap:
+    """Priority-ordered collection of pending tasks with async notification.
+
+    Backed by a heapq list so items can be iterated non-destructively in
+    priority order without the drain-and-refill dance required by
+    ``asyncio.PriorityQueue``.
+    """
+
+    def __init__(self) -> None:
+        self._heap: List[Tuple[float, int, str]] = []
+        self._task_ids: Set[str] = set()
+        self._seq: int = 0
+        self._tasks_available: asyncio.Event = asyncio.Event()
+        self._sorted = False
+
+    def push(self, priority: float, task_id: str) -> None:
+        heapq.heappush(self._heap, (priority, self._seq, task_id))
+        self._seq += 1
+        self._task_ids.add(task_id)
+        self._tasks_available.set()
+        self._sorted = False
+
+    def remove(self, task_id: str) -> bool:
+        if task_id not in self._task_ids:
+            return False
+        self._task_ids.discard(task_id)
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid != task_id]
+        heapq.heapify(self._heap)
+        if not self._task_ids:
+            self._tasks_available.clear()
+        self._sorted = False
+        return True
+
+    def remove_many(self, task_ids: Set[str]) -> None:
+        self._task_ids -= task_ids
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid in self._task_ids]
+        heapq.heapify(self._heap)
+        if not self._task_ids:
+            self._tasks_available.clear()
+        self._sorted = False
+
+    def sorted_items(self) -> List[Tuple[float, int, str]]:
+        """Return all items sorted by priority, then insertion order (non-destructive)."""
+        if not self._sorted:
+            self._heap = sorted(self._heap)
+            self._sorted = True
+        return self._heap
+
+    def __contains__(self, task_id: str) -> bool:
+        return task_id in self._task_ids
+
+    def __len__(self) -> int:
+        return len(self._task_ids)
+
+    def empty(self) -> bool:
+        return len(self._task_ids) == 0
+
+    def task_ids(self) -> Set[str]:
+        return set(self._task_ids)
+
+    def clear(self) -> None:
+        self._heap.clear()
+        self._task_ids.clear()
+        self._seq = 0
+        self._tasks_available.clear()
+
+    async def wait_for_tasks(self) -> None:
+        """Block until at least one task is pending."""
+        await self._tasks_available.wait()
+
+
 class AsyncTaskScheduler(AsyncScheduler):
     """Task-level scheduler used by workers: allocates cluster resources per task
     and exposes a ready_tasks queue consumed by the worker's execution loop."""
@@ -583,6 +730,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         tasks: Dict[str, Task],
         nodes: JobResource,
         policy: Union[str, Policy] = "large_resource_policy",
+        policy_config: PolicyConfig = PolicyConfig(),
     ) -> None:
         """Initialise the task scheduler.
 
@@ -591,33 +739,38 @@ class AsyncTaskScheduler(AsyncScheduler):
             tasks: Initial task dict to schedule.
             nodes: Available cluster resources for this worker.
             policy: Policy name or instance used to score/prioritise tasks.
+            policy_config: Configuration passed to the policy constructor
+                when *policy* is given as a string.
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
         self.tasks: Dict[str, Task] = tasks
         if isinstance(policy, str):
-            self.scheduler_policy: Policy = policy_registry.create_policy(policy)
+            self.scheduler_policy: Policy = policy_registry.create_policy(
+                policy,
+                policy_kwargs={
+                    "policy_config": policy_config,
+                    "logger": logger.getChild("policy"),
+                },
+            )
         else:
             self.scheduler_policy: Policy = policy
-        self._sorted_tasks: PriorityQueue[Tuple[float, str]] = PriorityQueue()
-        for task_id, task in self.tasks.items():
-            try:
-                self._sorted_tasks.put_nowait(
-                    (
-                        1.0 / self.scheduler_policy.get_score(self.tasks[task_id]),
-                        task_id,
-                    )
-                )
-            except asyncio.QueueFull:
-                self.logger.error("Sorted task queue is full!")
-                raise RuntimeError("Sorted task is full!")
-        self.logger.debug(f"Sorted tasks {self._sorted_tasks}")
-        ##
+        self._strict_priority: bool = policy_config.strict_priority
         self.ready_tasks: Queue[Tuple[str, JobResource]] = Queue()
         self._running_tasks: Dict[str, JobResource] = {}
         self._done_tasks: Counter[str] = Counter()
         self._failed_tasks: Set[str] = set()
         self._successful_tasks: Set[str] = set()
+        self._pending_tasks = PendingTaskHeap()
+        for task_id in self.tasks:
+            score = self.scheduler_policy.get_score(
+                self.tasks[task_id],
+                scheduler_state=self._build_scheduler_state(),
+            )
+            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
+
+        self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
 
         self._stop_monitoring = asyncio.Event()
         self._all_tasks_done = asyncio.Event()
@@ -628,6 +781,28 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._event_registry: Optional[EventRegistry] = None
         if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
+
+    @staticmethod
+    def _priority_from_score(score: float) -> float:
+        """Convert a policy score (higher=better) to a heap priority (lower=better)."""
+        return -score
+
+    def _build_scheduler_state(self) -> SchedulerState:
+        """Build a lightweight state snapshot for passing to policy methods."""
+        successful = set(self._successful_tasks)
+        failed = set(self._failed_tasks)
+        running = set(self._running_tasks.keys())
+        all_ids = set(self.tasks.keys())
+        pending = all_ids - successful - failed - running
+
+        return SchedulerState(
+            node_id="",
+            nodes=self.cluster.nodes,
+            pending_tasks=pending,
+            running_tasks=running,
+            completed_tasks=successful,
+            failed_tasks=failed,
+        )
 
     def get_state(self, node_id: str) -> SchedulerState:
         """Snapshot current state for checkpointing.
@@ -687,21 +862,15 @@ class AsyncTaskScheduler(AsyncScheduler):
                     self.tasks[task_id].result = results[task_id].data
                     self.tasks[task_id].exception = results[task_id].exception
 
-        # 3. Rebuild priority queue with only pending tasks
+        # 3. Rebuild pending heap with only pending tasks
         pending = set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
-        # Drain existing queue (all tasks were added at __init__ time)
-        while not self._sorted_tasks.empty():
-            try:
-                self._sorted_tasks.get_nowait()
-            except Exception:
-                break
+        self._pending_tasks.clear()
+        sched_state = self._build_scheduler_state()
         for task_id in pending:
-            self._sorted_tasks.put_nowait(
-                (
-                    1.0 / self.scheduler_policy.get_score(self.tasks[task_id]),
-                    task_id,
-                )
+            score = self.scheduler_policy.get_score(
+                self.tasks[task_id], scheduler_state=sched_state
             )
+            self._pending_tasks.push(self._priority_from_score(score), task_id)
 
         restored = len(state.completed_tasks) + len(state.failed_tasks)
         self.logger.info(
@@ -716,17 +885,13 @@ class AsyncTaskScheduler(AsyncScheduler):
         """
         Find the minimum resource requirement among PENDING tasks only.
         """
-        if self._sorted_tasks.empty():
-            return None
-
-        # Get pending task IDs from sorted_tasks queue
-        pending_task_ids = [task_id for _, task_id in list(self._sorted_tasks._queue)]
-
-        if not pending_task_ids:
+        if self._pending_tasks.empty():
             return None
 
         pending_tasks = [
-            self.tasks[tid] for tid in pending_task_ids if tid in self.tasks
+            self.tasks[tid]
+            for tid in self._pending_tasks.task_ids()
+            if tid in self.tasks
         ]
 
         if not pending_tasks:
@@ -744,111 +909,91 @@ class AsyncTaskScheduler(AsyncScheduler):
         )
 
     async def _monitor_resources(self) -> None:
-        """
-        Monitors free resources and checks if any tasks can be allocated, and moves them to the ready queue.
-        """
+        """Monitors free resources, allocates tasks from the pending heap, and
+        moves them to the ready queue for execution."""
         self.logger.info("Starting resource monitor")
 
         while not self._stop_monitoring.is_set():
             try:
-                # Wait for resources - will be cancelled when monitor is stopped
+                # Wait until the cluster has enough free resources for at least one task
                 min_req = self._find_min_resource_req()
                 self.logger.debug(
-                    f"Waiting for free resources with min requirement: {min_req}. Current free resources: {self.cluster.get_status()}"
+                    f"Waiting for free resources with min requirement: {min_req}. "
+                    f"Current free resources: {self.cluster.get_status()}"
                 )
                 await self._cluster_resource.wait_for_free(min_resources=min_req)
-                self.logger.debug(
-                    f"Resource monitor woke up, checking for task allocation. Current free resources: {self.cluster.get_status()}"
-                )
 
-                # Check stop immediately
                 if self._stop_monitoring.is_set():
                     break
 
-                # Wait for tasks if queue is empty
-                if self._sorted_tasks.empty():
+                # Wait for tasks if none are pending
+                if self._pending_tasks.empty():
                     self.logger.info("No tasks available, waiting for new tasks")
-                    # Wait for either a task to be added or stop signal
-                    wait_task = asyncio.create_task(self._sorted_tasks.get())
                     stop_task = asyncio.create_task(self._stop_monitoring.wait())
-
-                    done, pending = await asyncio.wait(
-                        [wait_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+                    tasks_task = asyncio.create_task(
+                        self._pending_tasks.wait_for_tasks()
                     )
 
-                    # Cancel pending tasks
-                    for task in pending:
-                        task.cancel()
+                    done, pending_aws = await asyncio.wait(
+                        [stop_task, tasks_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in pending_aws:
+                        t.cancel()
                         try:
-                            await task
+                            await t
                         except asyncio.CancelledError:
                             pass
 
-                    # Check which completed
                     if stop_task in done:
                         self.logger.info("Stop signal received while waiting for tasks")
                         break
 
-                    # Put the task back
-                    if wait_task in done:
-                        priority, task_id = await wait_task
-                        self._sorted_tasks.put_nowait((priority, task_id))
-                        self.logger.info("New tasks available, resuming scheduling")
+                # Non-destructive sorted iteration over pending tasks
+                allocated_ids: List[str] = []
+                stale_ids: List[str] = []
 
-                unallocated_tasks = []
-                allocated_count = 0
-
-                # Try to allocate all pending tasks
-                for _ in range(self._sorted_tasks.qsize()):
+                for _priority, _seq, task_id in self._pending_tasks.sorted_items():
                     if self._stop_monitoring.is_set():
                         break
 
-                    try:
-                        priority, task_id = await self._sorted_tasks.get()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    # Thread-safe access to tasks
                     if task_id not in self.tasks:
-                        self.logger.warning(
-                            f"Task {task_id} no longer exists, skipping"
-                        )
+                        stale_ids.append(task_id)
                         continue
+
                     task = self.tasks[task_id]
-
                     req = task.get_resource_requirements()
-
                     allocated, resource = self.cluster.allocate(req)
 
                     if allocated:
-                        # Put in ready queue - awaitable operation yields control
-                        await self.ready_tasks.put((task_id, resource))
-
-                        # Track as running
                         self._running_tasks[task_id] = resource
-
-                        allocated_count += 1
+                        allocated_ids.append(task_id)
                         self.logger.debug(f"Task {task_id} ready for execution")
+                        await self.ready_tasks.put((task_id, resource))
                     else:
-                        unallocated_tasks.append((priority, task_id))
-                        # Only break if cluster has no free resources at all
+                        if self._strict_priority:
+                            self.logger.debug(
+                                f"Strict priority: blocking on task {task_id} until resources available. "
+                                f"Resources requested: {req}. Free resources: {self.cluster.get_status()}"
+                            )
+                            break
                         if not self.cluster._resource_available.is_set():
                             self.logger.debug("No more free resources available")
                             break
-                        else:
-                            self.logger.debug(
-                                f"Insufficient resources for task {task_id}. Resources requested: {req}. Free resources: {self.cluster.get_status()}"
-                            )
+                        self.logger.debug(
+                            f"Insufficient resources for task {task_id}. "
+                            f"Resources requested: {req}. Free resources: {self.cluster.get_status()}"
+                        )
 
-                if allocated_count == 0:
+                # Remove allocated and stale tasks from the heap
+                to_remove = set(allocated_ids) | set(stale_ids)
+                if to_remove:
+                    self._pending_tasks.remove_many(to_remove)
+
+                if not allocated_ids:
                     self.logger.debug(
                         "No tasks allocated in this cycle. Clearing resource available event to wait for new resources."
                     )
                     self._cluster_resource.clear_resource_available()
-
-                # Put back unallocated tasks
-                for item in unallocated_tasks:
-                    self._sorted_tasks.put_nowait(item)
 
             except asyncio.CancelledError:
                 self.logger.info("Scheduler Monitor task cancelled")
@@ -920,7 +1065,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         await self._all_tasks_done.wait()
         self.logger.debug("Done waiting for task completion!")
 
-    def add_task(self, task: Task) -> bool:
+    def add_task(self, task: Task, client_id: Optional[str] = None) -> bool:
         """Add a task to the priority queue for scheduling. Returns True on success."""
         try:
             if task.nnodes > len(self.cluster.nodes.nodes):
@@ -928,13 +1073,20 @@ class AsyncTaskScheduler(AsyncScheduler):
                     f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes.nodes)} are available"
                 )
             self.tasks[task.task_id] = task
-            self._sorted_tasks.put_nowait(
-                (self.scheduler_policy.get_score(task), task.task_id)
+            if client_id is not None:
+                self._task_to_client[task.task_id] = client_id
+            score = self.scheduler_policy.get_score(
+                task, scheduler_state=self._build_scheduler_state()
             )
+            self._pending_tasks.push(self._priority_from_score(score), task.task_id)
             return True
         except Exception as e:
             self.logger.error(f"Failed to add task {task.task_id}: {e}")
             return False
+
+    def get_task_client(self, task_id: str) -> Optional[str]:
+        """Return the client_id that submitted this task, or None."""
+        return self._task_to_client.get(task_id)
 
     def delete_task(self, task: Task) -> bool:
         """Remove a task from all queues and free its resources. Returns True on success."""
@@ -946,19 +1098,8 @@ class AsyncTaskScheduler(AsyncScheduler):
             # Remove from tasks dict
             del self.tasks[task.task_id]
 
-            # Remove from sorted tasks queue
-            temp_items = []
-            while not self._sorted_tasks.empty():
-                try:
-                    priority, tid = self._sorted_tasks.get_nowait()
-                    if tid != task.task_id:
-                        temp_items.append((priority, tid))
-                except asyncio.QueueEmpty:
-                    break
-
-            # Put back all items except the deleted task
-            for item in temp_items:
-                self._sorted_tasks.put_nowait(item)
+            # Remove from pending tasks heap
+            self._pending_tasks.remove(task.task_id)
 
             # Remove from ready tasks queue if present
             temp_ready = []
@@ -1021,6 +1162,14 @@ class AsyncTaskScheduler(AsyncScheduler):
                 self._failed_tasks.discard(task_id)
 
             self.logger.debug(f"Freed {task_id}")
+
+            # Notify the policy about the completed task
+            self.scheduler_policy.on_task_complete(
+                task=self.tasks[task_id],
+                status=status,
+                scheduler_state=self._build_scheduler_state(),
+            )
+
         self._check_all_tasks_done()
         return None
 
@@ -1054,5 +1203,5 @@ class AsyncTaskScheduler(AsyncScheduler):
         return set(self.tasks.keys()) - (self._successful_tasks | self._failed_tasks)
 
     @property
-    def not_ready_tasks(self) -> PriorityQueue:
-        return self._sorted_tasks
+    def not_ready_tasks(self) -> PendingTaskHeap:
+        return self._pending_tasks

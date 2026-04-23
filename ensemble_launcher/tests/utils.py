@@ -6,6 +6,13 @@ def echo(task_id: str):
     return f"Hello from task {task_id}"
 
 
+def echo_mpi():
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    return comm.rank
+
+
 def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
 

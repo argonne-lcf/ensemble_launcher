@@ -4,12 +4,12 @@ import os
 import subprocess
 import time
 
-from utils import noop
-
-from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
+from utils import noop
+
+from ensemble_launcher import EnsembleLauncher
 
 
 def benchmark_roundtrip_latency(
@@ -67,14 +67,27 @@ def benchmark_roundtrip_latency(
 
 
 RESULTS_CSV = os.path.join(os.path.dirname(__file__), "latency_results.csv")
-_CSV_FIELDS = ["timestamp", "git_commit", "nnodes", "nlevels", "nchildren", "n_repeats", "mean_ms", "std_ms"]
+_CSV_FIELDS = [
+    "timestamp",
+    "git_commit",
+    "nnodes",
+    "nlevels",
+    "nchildren",
+    "n_repeats",
+    "mean_ms",
+    "std_ms",
+]
 
 
 def _git_commit() -> str:
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         return "unknown"
 
@@ -127,8 +140,12 @@ def benchmark_extra_level_latency(nodes: list[str], n_repeats: int = 100):
     print(
         f"  extra-level overhead  mean: {overhead.mean() * 1e3:.3f} ms  std: {overhead.std() * 1e3:.3f} ms"
     )
-    record_result(len(nodes2), nlevels=1, nchildren=2, n_repeats=n_repeats, latencies=lat1)
-    record_result(len(nodes2), nlevels=2, nchildren=2, n_repeats=n_repeats, latencies=lat2)
+    record_result(
+        len(nodes2), nlevels=1, nchildren=2, n_repeats=n_repeats, latencies=lat1
+    )
+    record_result(
+        len(nodes2), nlevels=2, nchildren=2, n_repeats=n_repeats, latencies=lat2
+    )
 
 
 if __name__ == "__main__":
@@ -167,4 +184,10 @@ if __name__ == "__main__":
         )
         print(f"  mean : {latencies.mean() * 1e3:.3f} ms")
         print(f"  std  : {latencies.std() * 1e3:.3f} ms")
-        record_result(len(nodes), nlevels=1, nchildren=2, n_repeats=args.repeats, latencies=latencies)
+        record_result(
+            len(nodes),
+            nlevels=1,
+            nchildren=2,
+            n_repeats=args.repeats,
+            latencies=latencies,
+        )

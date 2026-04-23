@@ -87,7 +87,7 @@ class Worker(Node):
         return self._comm
     
     def _setup_logger(self):
-        log_dir = os.path.join(os.getcwd(), "logs") if self._config.worker_logs else None
+        log_dir = os.path.join(os.getcwd(), self._config.log_dir) if self._config.worker_logs else None
         self.logger = setup_logger(__name__, self.node_id, log_dir=log_dir, level=self._config.log_level)
     
     def _create_comm(self):

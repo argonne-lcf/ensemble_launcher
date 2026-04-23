@@ -6,7 +6,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future as ConcurrentFuture
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union, Deque
+from collections import deque
 
 import cloudpickle
 
@@ -94,9 +95,12 @@ class _WorkerPipeline:
         self.recv_time = 0.0
         self.deser_time = 0.0
         self.set_result_time = 0.0
+        self.total_results = 0
+        self._logger = None
 
     def start(self, node_address: str, logger) -> None:
         """Start the pipeline's dedicated thread and wait until its event loop is ready."""
+        self._logger = logger
         self._thread = threading.Thread(
             target=self._run, args=(node_address, logger), daemon=True
         )
@@ -139,8 +143,14 @@ class _WorkerPipeline:
         t1 = time.perf_counter()
         for result in msg.data:
             self.set_result(result)
+        self.total_results += len(msg.data)
         self.deser_time += t1 - t0
         self.set_result_time += time.perf_counter() - t1
+        if self._logger is not None:
+            self._logger.info(
+                f"{self.worker_id}: received {len(msg.data)} results "
+                f"(total={self.total_results})"
+            )
 
     def set_result(self, result: Result) -> None:
         with self.lock:
@@ -168,6 +178,22 @@ class _WorkerPipeline:
 # ---------------------------------------------------------------------------
 # Node resolution
 # ---------------------------------------------------------------------------
+
+
+def _wait_for_path(path: str, timeout: float, poll_interval: float = 1.0) -> None:
+    """Block until *path* exists (file or non-empty directory), or raise TimeoutError."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.path.isfile(path):
+            return
+        if os.path.isdir(path) and os.listdir(path):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out after {timeout:.0f}s waiting for checkpoint path: {path}"
+            )
+        time.sleep(min(poll_interval, remaining))
 
 
 def _resolve_node_id(checkpoint_dir: str, node_id: str) -> str:
@@ -224,38 +250,62 @@ class ClusterClient:
         n_workers: int = 1,
         log_dir: str = "logs",
         log_level: int = logging.INFO,
+        checkpoint_timeout: float = 60.0,
+        task_buffer_size: int = 10000,
+        task_flush_interval: float = 5.0,
     ):
         """
         Args:
-            checkpoint_dir: Directory containing orchestrator checkpoint files.
-            node_id:        Which node to connect to. ``"global"`` (default) resolves
-                            to the global master (shortest node_id in the checkpoint
-                            dir, e.g. ``"main"``). Pass any scheduler node id such as
-                            ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
-                            that node.
-            client_id:      Optional client identity string; auto-generated if omitted.
-            n_workers:      Number of parallel send/recv pipelines (default 1).
-            log_dir:        Directory for log files.  When provided a file
-                            ``{log_dir}/{client_id}.log`` is created.  When
-                            ``None`` (default) logging goes to the root handler.
-            log_level:      Logging level (default ``logging.INFO``).
+            checkpoint_dir:      Directory containing orchestrator checkpoint files.
+            node_id:             Which node to connect to. ``"global"`` (default) resolves
+                                 to the global master (shortest node_id in the checkpoint
+                                 dir, e.g. ``"main"``). Pass any scheduler node id such as
+                                 ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
+                                 that node.
+            client_id:           Optional client identity string; auto-generated if omitted.
+            n_workers:           Number of parallel send/recv pipelines (default 1).
+            log_dir:             Directory for log files.  When provided a file
+                                 ``{log_dir}/{client_id}.log`` is created.  When
+                                 ``None`` (default) logging goes to the root handler.
+            log_level:           Logging level (default ``logging.INFO``).
+            checkpoint_timeout:  Seconds to wait for checkpoint files to appear before
+                                 raising ``TimeoutError`` (default 60).  Useful when the
+                                 client is started before the orchestrator has written its
+                                 first checkpoint.
+            task_buffer_size:    Flush the outgoing task buffer when it reaches this many
+                                 tasks (default 10000).
+            task_flush_interval: Seconds between periodic flushes of the task buffer
+                                 (default 5.0).
         """
         self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
         self._n_workers = n_workers
+        self._task_buffer_size = task_buffer_size
+        self._task_flush_interval = task_flush_interval
+        self._task_buffer: Deque[Tuple[Task, ConcurrentFuture]] = deque()
+        self._task_buffer_lock = threading.Lock()
+        self._flush_stop_event = threading.Event()
+        self._flush_thread: Optional[threading.Thread] = None
         self.logger = setup_logger(
             __name__, self._client_id, log_dir=log_dir, level=log_level
         )
         self._node_id = None
+
+        # Wait for the checkpoint directory to be populated before resolving the node id.
+        self.logger.info(
+            f"Waiting for checkpoint directory '{checkpoint_dir}' "
+            f"(timeout={checkpoint_timeout:.0f}s)"
+        )
+        _wait_for_path(checkpoint_dir, timeout=checkpoint_timeout)
 
         resolved_id = _resolve_node_id(checkpoint_dir, node_id)
         self._node_id = resolved_id
         comm_path = os.path.join(
             checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_comm.json"
         )
-        if not os.path.exists(comm_path):
-            raise FileNotFoundError(
-                f"No comm checkpoint found for node '{resolved_id}' in '{checkpoint_dir}'"
-            )
+
+        # Wait for the specific comm checkpoint file to be written.
+        self.logger.info(f"Waiting for comm checkpoint '{comm_path}'")
+        _wait_for_path(comm_path, timeout=checkpoint_timeout)
         with open(comm_path, "r") as f:
             comm_data = CommCheckpointData.model_validate_json(f.read())
 
@@ -282,13 +332,22 @@ class ClusterClient:
         """Start each pipeline's dedicated thread and wait until all are connected."""
         for pipeline in self._pipelines:
             pipeline.start(self._node_address, self.logger)
+        self._flush_stop_event.clear()
+        self._flush_thread = threading.Thread(
+            target=self._flush_timer_loop, daemon=True
+        )
+        self._flush_thread.start()
         self.logger.info(
             f"Started {self._n_workers} pipeline(s) connected to "
             f"{self._node_id} at {self._node_address}"
         )
 
     def teardown(self) -> None:
-        """Stop all pipelines."""
+        """Flush remaining tasks, stop the flush timer, and stop all pipelines."""
+        self.flush()
+        self._flush_stop_event.set()
+        if self._flush_thread is not None:
+            self._flush_thread.join(timeout=5.0)
         for pipeline in self._pipelines:
             pipeline.stop()
 
@@ -323,16 +382,29 @@ class ClusterClient:
         )
 
     def _send_batch(self, tasks: List[Task]) -> List[ConcurrentFuture]:
-        """Register futures and send tasks, distributing round-robin across pipelines."""
+        """Buffer tasks and return futures. Flushes immediately when buffer is full."""
         futures: List[ConcurrentFuture] = []
-        # Build per-pipeline batches while preserving future order.
+        with self._task_buffer_lock:
+            for task in tasks:
+                fut: ConcurrentFuture = ConcurrentFuture()
+                self._task_buffer.append((task, fut))
+                futures.append(fut)
+            if len(self._task_buffer) >= self._task_buffer_size:
+                self._flush_task_buffer()
+        return futures
+
+    def _flush_task_buffer(self) -> None:
+        """Drain the buffer and send one TaskUpdate per pipeline. Caller must hold _task_buffer_lock."""
+        if not self._task_buffer:
+            return
+        items = list(self._task_buffer)
+        self._task_buffer.clear()
+
         pipeline_batches: List[List[Task]] = [[] for _ in self._pipelines]
-        for i, task in enumerate(tasks):
+        for i, (task, fut) in enumerate(items):
             pipeline = self._pipelines[i % self._n_workers]
-            fut: ConcurrentFuture = ConcurrentFuture()
             with pipeline.lock:
                 pipeline.pending[task.task_id] = fut
-            futures.append(fut)
             pipeline_batches[i % self._n_workers].append(task)
 
         for pipeline, batch in zip(self._pipelines, pipeline_batches):
@@ -341,8 +413,19 @@ class ClusterClient:
                     TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
                 )
                 pipeline.send(data)
+        self.logger.info(f"Flushed {len(items)} tasks across {self._n_workers} pipeline(s)")
 
-        return futures
+    def flush(self) -> None:
+        """Force-flush all buffered tasks. Safe to call from any thread."""
+        with self._task_buffer_lock:
+            self._flush_task_buffer()
+
+    def _flush_timer_loop(self) -> None:
+        """Periodically flush the task buffer until stop event is set."""
+        while not self._flush_stop_event.is_set():
+            self._flush_stop_event.wait(self._task_flush_interval)
+            if not self._flush_stop_event.is_set():
+                self.flush()
 
     # ------------------------------------------------------------------
     # Public API
@@ -427,4 +510,3 @@ class ClusterClient:
 
     def __exit__(self, *_):
         self.teardown()
-
