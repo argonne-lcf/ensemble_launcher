@@ -34,14 +34,6 @@ class _HeartBeat:
     alive: bool = True
 
 
-class AsyncZMQCommState(AsyncCommState):
-    node_info: NodeInfo
-    my_address: str
-    parent_address: Optional[str] = None
-    my_hb_address: Optional[str] = None
-    parent_hb_address: Optional[str] = None
-
-
 class AsyncZMQComm(AsyncComm):
     def __init__(
         self,
@@ -620,7 +612,7 @@ class AsyncZMQComm(AsyncComm):
             [0] sender_id bytes
             [1] secret_id bytes  — sender's secret_id for staleness detection
             [2] pickled payload
-        Cluster clients (sender_id starts with "client:") skip the secret_id frame:
+        Cluster clients (sender_id starts with "client-") skip the secret_id frame:
             [0] client_id bytes
             [1] pickled payload
         """
@@ -628,10 +620,10 @@ class AsyncZMQComm(AsyncComm):
 
         full_id = raw_data[0].decode()
         sender_id = (
-            full_id if full_id.startswith("client:") else full_id.split(":", 1)[0]
+            full_id if full_id.startswith("client-") else full_id.split(":", 1)[0]
         )
         try:
-            if sender_id.startswith("client:"):
+            if sender_id.startswith("client-"):
                 # Clients do not include a secret_id frame.
                 msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
                 self._client_queue.put_nowait((sender_id, msg))
@@ -758,7 +750,7 @@ class AsyncZMQComm(AsyncComm):
 
     async def _send_to_child(self, child_id: str, data: Any) -> bool:
         if (
-            not child_id.startswith("client:")
+            not child_id.startswith("client-")
             and child_id not in self._node_info.children_ids
         ):
             self.logger.error(
@@ -767,7 +759,7 @@ class AsyncZMQComm(AsyncComm):
             raise RuntimeError(f"No connection to child {child_id}")
 
         try:
-            if child_id.startswith("client:"):
+            if child_id.startswith("client-"):
                 self.logger.debug(
                     f"{self._node_info.node_id}: Sent message to child {child_id}"
                 )

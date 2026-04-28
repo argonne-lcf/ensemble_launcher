@@ -1,6 +1,6 @@
 import base64
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import cloudpickle
 
@@ -26,7 +26,7 @@ def run_callable_with_affinity(
         try:
             original_affinity = os.sched_getaffinity(0)
             os.sched_setaffinity(0, cpu_id)
-        except Exception as e:
+        except Exception:
             pass
             # print(f"Setting affinity failed with exception {e}")
 
@@ -40,7 +40,7 @@ def run_callable_with_affinity(
     if cpu_id is not None and original_affinity is not None:
         try:
             os.sched_setaffinity(0, original_affinity)
-        except Exception as e:
+        except Exception:
             pass
             # print(f"Resetting affinity failed with exception {e}")
     return result
@@ -64,7 +64,7 @@ def run_cmd(
         try:
             original_affinity = os.sched_getaffinity(0)
             os.sched_setaffinity(0, cpu_id)
-        except Exception as e:
+        except Exception:
             pass
             # print(f"Setting affinity failed with exception {e}")
     merged_env = os.environ.copy()
@@ -83,7 +83,7 @@ def run_cmd(
     if cpu_id is not None and original_affinity is not None:
         try:
             os.sched_setaffinity(0, original_affinity)
-        except Exception as e:
+        except Exception:
             pass
             # print(f"Resetting affinity failed with exception {e}")
     if return_stdout:
@@ -236,9 +236,3 @@ class ExecutorRegistry:
 
 
 executor_registry = ExecutorRegistry()
-
-
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-
-executor_registry.register("async_threadpool")(ThreadPoolExecutor)
-executor_registry.register("async_processpool")(ProcessPoolExecutor)

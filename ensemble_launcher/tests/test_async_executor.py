@@ -16,9 +16,7 @@ from ensemble_launcher.scheduler.resource import (
 @pytest.mark.asyncio
 async def test_async_mpi_pool():
 
-    mpi_config = MPIConfig(
-        processes_per_node_flag=None, hosts_flag=None, cpu_bind_method="none"
-    )
+    mpi_config = MPIConfig(flavor="test")
     mpi_info = {}
     mpi_info["np"] = 12
     cpu_to_pid = {(socket.gethostname(), i): i for i in range(12)}

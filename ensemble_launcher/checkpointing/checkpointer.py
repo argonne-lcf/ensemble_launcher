@@ -87,42 +87,6 @@ class ResultCheckpointData(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Comm-state deserialisation registry
-# ---------------------------------------------------------------------------
-
-_COMM_STATE_REGISTRY: Dict[str, type] = {}
-
-
-def _get_comm_state_class(type_name: str) -> type:
-    """Return the ``AsyncCommState`` subclass registered under *type_name*.
-
-    Performs a lazy import of known backends on the first miss.
-    """
-    if type_name not in _COMM_STATE_REGISTRY:
-        try:
-            from ensemble_launcher.comm.async_zmq import AsyncZMQCommState
-
-            _COMM_STATE_REGISTRY[AsyncZMQCommState.__name__] = AsyncZMQCommState
-        except ImportError:
-            pass
-    if type_name not in _COMM_STATE_REGISTRY:
-        raise ValueError(
-            f"Unknown comm state type '{type_name}'. "
-            f"Known types: {list(_COMM_STATE_REGISTRY)}"
-        )
-    return _COMM_STATE_REGISTRY[type_name]
-
-
-# Eagerly register built-in comm state types.
-try:
-    from ensemble_launcher.comm.async_zmq import AsyncZMQCommState
-
-    _COMM_STATE_REGISTRY[AsyncZMQCommState.__name__] = AsyncZMQCommState
-except ImportError:
-    pass
-
-
-# ---------------------------------------------------------------------------
 # Checkpointer
 # ---------------------------------------------------------------------------
 
@@ -335,8 +299,7 @@ class Checkpointer:
             raw = self._read_json(self.comm_path)
             if raw is not None:
                 comm_data = CommCheckpointData.model_validate_json(raw)
-                comm_cls = _get_comm_state_class(comm_data.comm_state_type)
-                comm_state = comm_cls.deserialize(comm_data.comm_state_json)
+                comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
 
         tasks: Optional[Dict[str, "Task"]] = None
         if meta.has_tasks:

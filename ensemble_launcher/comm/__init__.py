@@ -1,5 +1,4 @@
 from .async_base import AsyncComm, AsyncCommState
-from .async_zmq import AsyncZMQComm, AsyncZMQCommState
 from .base import Comm
 from .messages import (
     IResultBatch,
@@ -18,12 +17,30 @@ from .messages import (
 )
 from .mp import MPComm
 from .nodeinfo import NodeInfo
+from .pipe import (
+    AsyncConnection,
+    AsyncConnectionState,
+    AsyncMPConnection,
+    AsyncMPTransport,
+    AsyncTransport,
+    AsyncTransportState,
+    AsyncZMQDealerConnection,
+    AsyncZMQDealerConnectionState,
+    AsyncZMQRouterConnection,
+    AsyncZMQRouterConnectionState,
+    AsyncZMQTransport,
+    AsyncZMQTransportState,
+    ClientConnection,
+    ClientConnectionState,
+    ServerConnection,
+    ServerConnectionState,
+    transport_registry,
+)
 from .zmq import ZMQComm
 
 __all__ = [
     "AsyncComm",
     "AsyncCommState",
-    "AsyncZMQComm",
     "Comm",
     "Message",
     "NodeRequest",
@@ -41,5 +58,21 @@ __all__ = [
     "MPComm",
     "NodeInfo",
     "ZMQComm",
-    "AsyncZMQCommState",
+    "AsyncConnection",
+    "AsyncConnectionState",
+    "AsyncTransport",
+    "AsyncTransportState",
+    "AsyncZMQDealerConnection",
+    "AsyncZMQDealerConnectionState",
+    "AsyncZMQRouterConnection",
+    "AsyncZMQRouterConnectionState",
+    "AsyncZMQTransport",
+    "AsyncZMQTransportState",
+    "AsyncMPConnection",
+    "AsyncMPTransport",
+    "ServerConnection",
+    "ServerConnectionState",
+    "ClientConnection",
+    "ClientConnectionState",
+    "transport_registry",
 ]

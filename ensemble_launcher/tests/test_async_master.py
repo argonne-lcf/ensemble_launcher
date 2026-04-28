@@ -15,7 +15,6 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster
 from ensemble_launcher.scheduler.resource import (
     JobResource,
-    NodeResourceCount,
     NodeResourceList,
 )
 
@@ -90,7 +89,7 @@ async def test_async_mpi_master(nlevels=1):
             child_executor_name="async_mpi",
             task_executor_name="async_mpi",
             log_level=logging.DEBUG,
-            mpi_config=MPIConfig(cpu_bind_method="none", processes_per_node_flag=None),
+            mpi_config=MPIConfig(flavor="test"),
             sequential_child_launch=True,
             heartbeat_interval=0.1,
             heartbeat_dead_threshold=5.0,

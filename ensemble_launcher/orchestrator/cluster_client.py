@@ -1,4 +1,3 @@
-import abc
 import asyncio
 import logging
 import os
@@ -7,72 +6,15 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import cloudpickle
 
 from ensemble_launcher.checkpointing import CommCheckpointData
-from ensemble_launcher.checkpointing.checkpointer import _get_comm_state_class
+from ensemble_launcher.comm import AsyncCommState, ClientConnection, transport_registry
 from ensemble_launcher.comm.messages import IResultBatch, Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
-
-# ---------------------------------------------------------------------------
-# Transport abstraction
-# ---------------------------------------------------------------------------
-
-
-class _ClientTransport(abc.ABC):
-    """Abstract send/recv transport used by ClusterClient."""
-
-    @abc.abstractmethod
-    def connect(self, address: str, identity: bytes) -> None: ...
-
-    @abc.abstractmethod
-    def send(self, data: bytes) -> None: ...
-
-    @abc.abstractmethod
-    async def recv(self) -> bytes:
-        """Await and return the next message."""
-        ...
-
-    @abc.abstractmethod
-    def close(self) -> None: ...
-
-
-class _ZMQTransport(_ClientTransport):
-    def __init__(self):
-        self._context = None
-        self._socket = None
-
-    def connect(self, address: str, identity: bytes) -> None:
-        import zmq
-        import zmq.asyncio
-
-        self._context = zmq.asyncio.Context()
-        self._socket = self._context.socket(zmq.DEALER)
-        self._socket.setsockopt(zmq.IDENTITY, identity)
-        self._socket.connect(f"tcp://{address}")
-
-    def send(self, data: bytes) -> None:
-        # zmq.asyncio.Socket.send is synchronous (only recv is overridden).
-        self._socket.send(data)
-
-    async def recv(self) -> bytes:
-        return await self._socket.recv()
-
-    def close(self) -> None:
-        if self._socket is not None:
-            self._socket.close()
-        if self._context is not None:
-            self._context.term()
-
-
-# Maps comm_state_type names → transport class
-_TRANSPORT_REGISTRY: Dict[str, Type[_ClientTransport]] = {
-    "AsyncZMQCommState": _ZMQTransport,
-}
-
 
 # ---------------------------------------------------------------------------
 # Worker pipeline
@@ -80,11 +22,11 @@ _TRANSPORT_REGISTRY: Dict[str, Type[_ClientTransport]] = {
 
 
 class _WorkerPipeline:
-    """One independent send/recv pipeline: own thread, event loop, and ZMQ socket."""
+    """One independent send/recv pipeline: own thread, event loop, and connection."""
 
-    def __init__(self, worker_id: str, transport: _ClientTransport):
+    def __init__(self, worker_id: str, conn: ClientConnection):
         self.worker_id = worker_id
-        self.transport = transport
+        self.conn = conn
         self.pending: Dict[str, ConcurrentFuture] = {}
         self.lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -98,20 +40,18 @@ class _WorkerPipeline:
         self.total_results = 0
         self._logger = None
 
-    def start(self, node_address: str, logger) -> None:
+    def start(self, logger) -> None:
         """Start the pipeline's dedicated thread and wait until its event loop is ready."""
         self._logger = logger
-        self._thread = threading.Thread(
-            target=self._run, args=(node_address, logger), daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, args=(logger,), daemon=True)
         self._thread.start()
         self._loop_ready.wait()
 
-    def _run(self, node_address: str, logger) -> None:
-        """Thread target: create event loop, connect transport, run recv loop."""
+    def _run(self, logger) -> None:
+        """Thread target: create event loop, open connection, run recv loop."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self.transport.connect(node_address, self.worker_id.encode())
+        self._loop.run_until_complete(self.conn.open())
         self._loop_ready.set()
         try:
             self._loop.run_until_complete(self._recv_loop(logger))
@@ -125,9 +65,9 @@ class _WorkerPipeline:
         try:
             while True:
                 t0 = time.perf_counter()
-                raw = await self.transport.recv()
+                parts = await self.conn.recv()
                 self.recv_time += time.perf_counter() - t0
-                asyncio.create_task(self._deserialize_and_set(raw))
+                asyncio.create_task(self._deserialize_and_set(parts[-1]))
         except asyncio.CancelledError:
             logger.info(
                 f"{self.worker_id} recv={self.recv_time:.3f}s "
@@ -164,15 +104,18 @@ class _WorkerPipeline:
 
     def send(self, data: bytes) -> None:
         """Thread-safe send: schedules onto this pipeline's own event loop."""
-        self._loop.call_soon_threadsafe(self.transport.send, data)
+        asyncio.run_coroutine_threadsafe(self.conn.send(data), self._loop)
 
     def stop(self) -> None:
-        """Cancel the recv task, join the thread, and close the transport."""
+        """Cancel the recv task, join the thread, and close the connection."""
         if self._loop is not None and self._recv_task is not None:
             self._loop.call_soon_threadsafe(self._recv_task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
-        self.transport.close()
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self.conn.close(), self._loop).result(
+                timeout=5.0
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +220,7 @@ class ClusterClient:
             task_flush_interval: Seconds between periodic flushes of the task buffer
                                  (default 5.0).
         """
-        self._client_id = client_id or f"client:{uuid.uuid4().hex[:8]}"
+        self._client_id = client_id or f"client-{uuid.uuid4().hex[:8]}"
         self._n_workers = n_workers
         self._task_buffer_size = task_buffer_size
         self._task_flush_interval = task_flush_interval
@@ -311,21 +254,25 @@ class ClusterClient:
         with open(comm_path, "r") as f:
             comm_data = CommCheckpointData.model_validate_json(f.read())
 
-        transport_cls = _TRANSPORT_REGISTRY.get(comm_data.comm_state_type)
-        if transport_cls is None:
-            raise ValueError(
-                f"No transport registered for comm type '{comm_data.comm_state_type}'. "
-                f"Known types: {list(_TRANSPORT_REGISTRY)}"
-            )
-        comm_cls = _get_comm_state_class(comm_data.comm_state_type)
-        comm_state = comm_cls.deserialize(comm_data.comm_state_json)
-        self._node_address = comm_state.my_address
+        comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
+        self._node_address = None
+        if comm_state.data_transport_state is not None:
+            tt = comm_state.data_transport_state.transport_type
+            entry = transport_registry[tt]
+            ClientConn = entry["client_connection"]
+            for cs in comm_state.data_transport_state.server_connections.values():
+                if cs.address is not None:
+                    self._node_address = cs.address
+                    break
 
-        # Create one pipeline per worker; transports are connected in _run_event_loop.
         self._pipelines: List[_WorkerPipeline] = [
             _WorkerPipeline(
-                worker_id=f"{self._client_id}:w{i}",
-                transport=transport_cls(),
+                worker_id=f"{self._client_id}-w{i}",
+                conn=ClientConn(
+                    identity=f"{self._client_id}-w{i}",
+                    secret_id=uuid.uuid4().hex[:8],
+                    remote_address=self._node_address,
+                ),
             )
             for i in range(n_workers)
         ]
@@ -333,7 +280,7 @@ class ClusterClient:
     def start(self) -> None:
         """Start each pipeline's dedicated thread and wait until all are connected."""
         for pipeline in self._pipelines:
-            pipeline.start(self._node_address, self.logger)
+            pipeline.start(self.logger)
         self._flush_stop_event.clear()
         self._flush_thread = threading.Thread(
             target=self._flush_timer_loop, daemon=True
