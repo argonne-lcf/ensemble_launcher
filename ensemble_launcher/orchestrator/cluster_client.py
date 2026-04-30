@@ -5,9 +5,9 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import Future as ConcurrentFuture
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type, Union, Deque
 from collections import deque
+from concurrent.futures import Future as ConcurrentFuture
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import cloudpickle
 
@@ -281,7 +281,9 @@ class ClusterClient:
         self._n_workers = n_workers
         self._task_buffer_size = task_buffer_size
         self._task_flush_interval = task_flush_interval
-        self._task_buffer: Deque[Tuple[Task, ConcurrentFuture]] = deque()
+        self._task_buffer: Deque[
+            Tuple[Task, ConcurrentFuture, List[ConcurrentFuture]]
+        ] = deque()
         self._task_buffer_lock = threading.Lock()
         self._flush_stop_event = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
@@ -381,13 +383,15 @@ class ClusterClient:
             f"submit() expects a Task, callable, or str; got {type(task_or_callable)}"
         )
 
-    def _send_batch(self, tasks: List[Task]) -> List[ConcurrentFuture]:
+    def _send_batch(
+        self, tasks: List[Task], dependencies: Optional[List[List[ConcurrentFuture]]]
+    ) -> List[ConcurrentFuture]:
         """Buffer tasks and return futures. Flushes immediately when buffer is full."""
         futures: List[ConcurrentFuture] = []
         with self._task_buffer_lock:
-            for task in tasks:
+            for task, d in zip(tasks, dependencies):
                 fut: ConcurrentFuture = ConcurrentFuture()
-                self._task_buffer.append((task, fut))
+                self._task_buffer.append((task, fut, d))
                 futures.append(fut)
             if len(self._task_buffer) >= self._task_buffer_size:
                 self._flush_task_buffer()
@@ -400,8 +404,12 @@ class ClusterClient:
         items = list(self._task_buffer)
         self._task_buffer.clear()
 
+        remaining = []
         pipeline_batches: List[List[Task]] = [[] for _ in self._pipelines]
-        for i, (task, fut) in enumerate(items):
+        for i, (task, fut, dependencies) in enumerate(items):
+            if dependencies and not all([d.done() for d in dependencies]):
+                remaining.append((task, fut, dependencies))
+                continue
             pipeline = self._pipelines[i % self._n_workers]
             with pipeline.lock:
                 pipeline.pending[task.task_id] = fut
@@ -413,7 +421,10 @@ class ClusterClient:
                     TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
                 )
                 pipeline.send(data)
-        self.logger.info(f"Flushed {len(items)} tasks across {self._n_workers} pipeline(s)")
+        self.logger.info(
+            f"Flushed {len(items) - len(remaining)} tasks across {self._n_workers} pipeline(s)"
+        )
+        self._task_buffer.extend(remaining)
 
     def flush(self) -> None:
         """Force-flush all buffered tasks. Safe to call from any thread."""
@@ -438,6 +449,7 @@ class ClusterClient:
         nnodes: int = 1,
         ppn: int = 1,
         ngpus_per_process: int = 0,
+        dependencies: Optional[List[ConcurrentFuture]] = None,
         **kwargs,
     ) -> ConcurrentFuture:
         """Send a task to the node. Returns a Future resolved on completion.
@@ -456,12 +468,15 @@ class ClusterClient:
             **kwargs: Keyword arguments forwarded to the callable.
         """
         return self._send_batch(
-            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)]
+            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)],
+            dependencies=[dependencies],
         )[0]
 
-    def submit_batch(self, tasks: List[Task]):
+    def submit_batch(
+        self, tasks: List[Task], dependencies: Optional[List[List[ConcurrentFuture]]]
+    ):
         """Submit a batch of tasks to the cluster."""
-        return self._send_batch(tasks)
+        return self._send_batch(tasks, dependencies=dependencies)
 
     def map(
         self,
@@ -470,6 +485,7 @@ class ClusterClient:
         nnodes: int = 1,
         ppn: int = 1,
         ngpus_per_process: int = 0,
+        dependencies: Optional[List[ConcurrentFuture]] = None,
         **kwargs,
     ) -> List[ConcurrentFuture]:
         """Submit *fn* applied to each element of *iterable* in a single batch.
@@ -502,7 +518,9 @@ class ClusterClient:
             )
             for item in iterable
         ]
-        return self._send_batch(tasks)
+        return self._send_batch(
+            tasks, dependencies=[dependencies] * len(tasks) if dependencies else None
+        )
 
     def __enter__(self) -> "ClusterClient":
         self.start()
