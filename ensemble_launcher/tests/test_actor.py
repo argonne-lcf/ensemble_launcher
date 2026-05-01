@@ -10,7 +10,6 @@ import cloudpickle
 import pytest
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.comm.pipe.async_connection import (
     AsyncZMQDealerConnection,
     AsyncZMQRouterConnection,
@@ -19,8 +18,6 @@ from ensemble_launcher.comm.pipe.async_transport import AsyncZMQTransport
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble.ensemble import Actor
 from ensemble_launcher.orchestrator import ClusterClient
-
-Actor.model_rebuild(_types_namespace={"ClientConnection": ClientConnection})
 
 
 def _free_port() -> int:
@@ -88,7 +85,11 @@ async def test_actor_single_call():
 
         stop_payload = cloudpickle.dumps("stop")
         await server._socket.send_multipart(
-            [target_identity.encode(), f"{server_id}:{server_secret}".encode(), stop_payload]
+            [
+                target_identity.encode(),
+                f"{server_id}:{server_secret}".encode(),
+                stop_payload,
+            ]
         )
 
         proc.join(timeout=5.0)
@@ -152,7 +153,11 @@ async def test_actor_batch_call():
 
         stop_payload = cloudpickle.dumps("stop")
         await server._socket.send_multipart(
-            [target_identity.encode(), f"{server_id}:{server_secret}".encode(), stop_payload]
+            [
+                target_identity.encode(),
+                f"{server_id}:{server_secret}".encode(),
+                stop_payload,
+            ]
         )
 
         proc.join(timeout=5.0)
@@ -207,15 +212,25 @@ async def test_actor_multiple_calls():
         for a, b, expected in [(1, 2, 3), (10, 20, 30), (-1, 1, 0)]:
             payload = cloudpickle.dumps((a, b))
             await server._socket.send_multipart(
-                [target_identity.encode(), f"{server_id}:{server_secret}".encode(), payload]
+                [
+                    target_identity.encode(),
+                    f"{server_id}:{server_secret}".encode(),
+                    payload,
+                ]
             )
             frames = await asyncio.wait_for(server.recv(), timeout=5.0)
             result = cloudpickle.loads(frames[1])
-            assert result == expected, f"add({a}, {b}) expected {expected}, got {result}"
+            assert result == expected, (
+                f"add({a}, {b}) expected {expected}, got {result}"
+            )
 
         stop_payload = cloudpickle.dumps("stop")
         await server._socket.send_multipart(
-            [target_identity.encode(), f"{server_id}:{server_secret}".encode(), stop_payload]
+            [
+                target_identity.encode(),
+                f"{server_id}:{server_secret}".encode(),
+                stop_payload,
+            ]
         )
 
         proc.join(timeout=5.0)

@@ -9,8 +9,9 @@ import cloudpickle
 import numpy as np
 from pydantic import BaseModel, Field
 
+from ensemble_launcher.comm.pipe import ClientConnection
+
 if TYPE_CHECKING:
-    from ensemble_launcher.comm.pipe import ClientConnection
     from ensemble_launcher.scheduler.resource import JobResource
 
 
