@@ -192,9 +192,11 @@ class AsyncComm:
         child_transport: str = "zmq",
         heartbeat_interval: float = 1.0,
         heartbeat_dead_threshold: float = 30.0,
+        cluster_secret: Optional[str] = None,
     ):
         self.logger = logger
         self._node_info = node_info
+        self._cluster_secret = cluster_secret
         self.last_update_time = time.time()
         self.last_heartbeat_time = None
         self.heartbeat_interval = heartbeat_interval
@@ -292,15 +294,28 @@ class AsyncComm:
     #  Child pipe creation
     # -----------------------------------------------------------------
 
+    def _make_client_validator(self):
+        cluster_secret = self._cluster_secret
+
+        def validator(sender_id: str, sender_secret: Optional[str]) -> bool:
+            if not sender_id.startswith("client-"):
+                return False
+            if cluster_secret is not None:
+                return sender_secret == cluster_secret
+            return True
+
+        return validator
+
     def create_child_pipe(
         self, child_id: str, child_secret_id: str
     ) -> Tuple[ClientConnection, ClientConnection]:
-        _, data_client = self._data_transport.create_child_pipe(
+        data_server, data_client = self._data_transport.create_child_pipe(
             self._node_info.node_id,
             self._node_info.secret_id,
             child_id,
             child_secret_id,
         )
+        data_server.set_unknown_sender_validator(self._make_client_validator())
         _, hb_client = self._hb_transport.create_child_pipe(
             self._node_info.node_id,
             self._node_info.secret_id,
@@ -340,12 +355,22 @@ class AsyncComm:
             self._child_dead_events[child_id] = asyncio.Event()
             self._hb_child_ready[child_id] = asyncio.Event()
             self._last_child_hb_time[child_id] = None
+            child_secret = node_info.children_secret_ids.get(child_id)
+            if child_secret:
+                for conn in self._data_transport.get_server_connections():
+                    conn.add_expected_remote(child_id, child_secret)
+                for conn in self._hb_transport.get_server_connections():
+                    conn.add_expected_remote(child_id, child_secret)
 
         for child_id in removed_children:
             self._hb_child_ready.pop(child_id, None)
             self._last_child_hb_time.pop(child_id, None)
             self._child_dead_events.pop(child_id, None)
             self._cache.pop(child_id, None)
+            for conn in self._data_transport.get_server_connections():
+                conn.remove_expected_remote(child_id)
+            for conn in self._hb_transport.get_server_connections():
+                conn.remove_expected_remote(child_id)
 
         self._node_info = node_info
         await self.init_cache()
@@ -665,11 +690,6 @@ class AsyncComm:
                 self._client_queue.put_nowait((full_id, msg))
                 self.logger.debug(
                     f"{self._node_info.node_id}: Queued client message from {full_id}: {type(msg).__name__}"
-                )
-                return
-            if sender_id not in self._node_info.children_ids:
-                self.logger.warning(
-                    f"{self._node_info.node_id}: Discarding message from unknown identity {full_id}"
                 )
                 return
             msg = cloudpickle.loads(raw_data[1])

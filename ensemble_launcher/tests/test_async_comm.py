@@ -5,7 +5,7 @@ from ensemble_launcher.comm.messages import Message, Result
 import time
 import asyncio
 import pytest
-import uuid
+import secrets
 
 import logging
 
@@ -18,7 +18,7 @@ async def test_zmq_comm():
     comms = []
     futures = []
     try:
-        secret_ids = [ str(uuid.uuid4()) for _ in range(3)]
+        secret_ids = [ secrets.token_hex(16) for _ in range(3)]
         for i in range(3):
             my_nodeinfo = NodeInfo(
                 node_id=str(i),
@@ -76,7 +76,7 @@ async def test_mp_comm():
     comms = []
     futures = []
     try:
-        secret_ids = [ str(uuid.uuid4()) for _ in range(3)]
+        secret_ids = [ secrets.token_hex(16) for _ in range(3)]
         for i in range(3):
             my_nodeinfo = NodeInfo(
                 node_id=str(i),
@@ -136,7 +136,7 @@ async def test_comm_state_roundtrip_zmq():
         AsyncZMQTransportState,
     )
 
-    secret_ids = [str(uuid.uuid4()) for _ in range(2)]
+    secret_ids = [secrets.token_hex(16) for _ in range(2)]
     parent_info = NodeInfo(
         node_id="parent",
         secret_id=secret_ids[0],

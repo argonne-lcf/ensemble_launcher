@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -195,7 +196,7 @@ class ClusterClient:
         log_level: int = logging.INFO,
         checkpoint_timeout: float = 60.0,
         task_buffer_size: int = 10000,
-        task_flush_interval: float = 5.0,
+        task_flush_interval: float = 0.5,
     ):
         """
         Args:
@@ -220,7 +221,7 @@ class ClusterClient:
             task_flush_interval: Seconds between periodic flushes of the task buffer
                                  (default 5.0).
         """
-        self._client_id = client_id or f"client-{uuid.uuid4().hex[:8]}"
+        self._client_id = client_id or f"client-{secrets.token_hex(4)}"
         self._n_workers = n_workers
         self._task_buffer_size = task_buffer_size
         self._task_flush_interval = task_flush_interval
@@ -254,6 +255,20 @@ class ClusterClient:
         with open(comm_path, "r") as f:
             comm_data = CommCheckpointData.model_validate_json(f.read())
 
+        # Read cluster secret for authentication.
+        secret_path = os.path.join(
+            checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_secret"
+        )
+        cluster_secret = None
+        if os.path.exists(secret_path):
+            with open(secret_path, "r") as f:
+                cluster_secret = f.read().strip()
+            self.logger.info("Loaded cluster secret from checkpoint")
+        else:
+            self.logger.warning(
+                "No cluster secret file found — connecting without authentication"
+            )
+
         comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
         self._node_address = None
         if comm_state.data_transport_state is not None:
@@ -270,7 +285,7 @@ class ClusterClient:
                 worker_id=f"{self._client_id}-w{i}",
                 conn=ClientConn(
                     identity=f"{self._client_id}-w{i}",
-                    secret_id=uuid.uuid4().hex[:8],
+                    secret_id=cluster_secret or secrets.token_hex(4),
                     remote_address=self._node_address,
                 ),
             )
@@ -331,12 +346,16 @@ class ClusterClient:
         )
 
     def _send_batch(
-        self, tasks: List[Task], dependencies: Optional[List[List[ConcurrentFuture]]]
+        self,
+        tasks: List[Task],
+        dependencies: Optional[List[List[ConcurrentFuture]]] = None,
     ) -> List[ConcurrentFuture]:
         """Buffer tasks and return futures. Flushes immediately when buffer is full."""
         futures: List[ConcurrentFuture] = []
         with self._task_buffer_lock:
-            for task, d in zip(tasks, dependencies):
+            for task, d in zip(
+                tasks, dependencies if dependencies is not None else [None] * len(tasks)
+            ):
                 fut: ConcurrentFuture = ConcurrentFuture()
                 self._task_buffer.append((task, fut, d))
                 futures.append(fut)
@@ -420,7 +439,9 @@ class ClusterClient:
         )[0]
 
     def submit_batch(
-        self, tasks: List[Task], dependencies: Optional[List[List[ConcurrentFuture]]]
+        self,
+        tasks: List[Task],
+        dependencies: Optional[List[List[ConcurrentFuture]]] = None,
     ):
         """Submit a batch of tasks to the cluster."""
         return self._send_batch(tasks, dependencies=dependencies)

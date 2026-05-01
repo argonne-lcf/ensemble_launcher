@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import secrets
 import signal
 import time
 import uuid
@@ -214,6 +215,7 @@ class AsyncWorker(Node):
             hb_parent_conn=self.parent_hb_conn,
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
+            cluster_secret=self._config.cluster_secret,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -278,7 +280,7 @@ class AsyncWorker(Node):
         # We need to create pipe so that a server connection is create and
         #  client could connect to the child too
         self._comm.create_child_pipe(
-            child_id="child0", child_secret_id=str(uuid.uuid4())
+            child_id="child0", child_secret_id=secrets.token_hex(16)
         )
 
         # # Restore saved comm state before binding so parent can reconnect.
@@ -446,6 +448,7 @@ class AsyncWorker(Node):
             self.node_id,
             self._config.checkpoint_dir,
             self.logger.getChild("checkpointer"),
+            cluster_secret=self._config.cluster_secret,
         )
         if not self._checkpointer.checkpoint_exists():
             return

@@ -140,8 +140,12 @@ class AsyncZMQTransport(AsyncTransport):
                 kwargs.get("address")
                 or f"{self._hostname}:{5555 + random.randint(1, 5000)}"
             )
+            expected_remotes = kwargs.get("expected_remotes", None)
             router = AsyncZMQRouterConnection(
-                identity=identity, secret_id=secret_id, address=address
+                identity=identity,
+                secret_id=secret_id,
+                address=address,
+                expected_remotes=expected_remotes,
             )
             self._server_connections[key] = router
         return router
@@ -157,6 +161,8 @@ class AsyncZMQTransport(AsyncTransport):
                 identity=identity,
                 secret_id=secret_id,
                 remote_address=remote_address,
+                remote_identity=kwargs.get("remote_identity"),
+                remote_secret_id=kwargs.get("remote_secret_id"),
             )
             self._client_connections[key] = dealer
         return dealer
@@ -169,10 +175,13 @@ class AsyncZMQTransport(AsyncTransport):
         child_secret: str,
     ) -> Tuple[AsyncZMQRouterConnection, AsyncZMQDealerConnection]:
         server = self.get_server_connection(parent_id, parent_secret, address=None)
+        server.add_expected_remote(child_id, child_secret)
         client = self.get_client_connection(
             child_id,
             child_secret,
             remote_address=server.address,
+            remote_identity=parent_id,
+            remote_secret_id=parent_secret,
         )
         return server, client
 

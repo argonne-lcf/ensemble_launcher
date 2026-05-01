@@ -572,21 +572,14 @@ class AsyncZMQComm(AsyncComm):
     ) -> None:
         """Deserialize a raw frame from the parent and put it into the appropriate cache.
 
+        Identity verification is handled at the connection level (recv()).
         raw_data layout (after ROUTER strips the routing identity):
-            [0] secret_id bytes  — sender's secret_id for staleness detection
+            [0] secret_id bytes
             [1] pickled payload
         """
         from .messages import Message
 
         try:
-            sender_secret_id = raw_data[0].decode()
-            expected = self._node_info.parent_secret_id
-            if expected is not None and sender_secret_id != expected:
-                self.logger.warning(
-                    f"{self._node_info.node_id}: Discarding message from parent {parent_id} — "
-                    f"secret_id mismatch (stale connection)"
-                )
-                return
             msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
             if isinstance(msg, Message):
                 self._cache[parent_id].put_nowait(msg)
@@ -608,11 +601,12 @@ class AsyncZMQComm(AsyncComm):
     ) -> None:
         """Deserialize a raw multipart frame from a child and put it into the appropriate cache.
 
+        Identity verification is handled at the connection level (recv()).
         raw_data layout for regular children:
             [0] sender_id bytes
-            [1] secret_id bytes  — sender's secret_id for staleness detection
+            [1] secret_id bytes
             [2] pickled payload
-        Cluster clients (sender_id starts with "client-") skip the secret_id frame:
+        Cluster clients (sender_id starts with "client-"):
             [0] client_id bytes
             [1] pickled payload
         """
@@ -624,19 +618,10 @@ class AsyncZMQComm(AsyncComm):
         )
         try:
             if sender_id.startswith("client-"):
-                # Clients do not include a secret_id frame.
                 msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[1])
                 self._client_queue.put_nowait((sender_id, msg))
                 self.logger.debug(
                     f"{self._node_info.node_id}: Queued client message from {sender_id}: {type(msg).__name__}"
-                )
-                return
-            sender_secret_id = raw_data[1].decode()
-            expected = self._node_info.children_secret_ids.get(sender_id)
-            if expected is not None and sender_secret_id != expected:
-                self.logger.warning(
-                    f"{self._node_info.node_id}: Discarding message from child {sender_id} — "
-                    f"secret_id mismatch (stale connection)"
                 )
                 return
             msg = await loop.run_in_executor(None, cloudpickle.loads, raw_data[2])

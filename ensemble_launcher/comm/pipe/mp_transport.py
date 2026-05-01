@@ -46,10 +46,16 @@ class AsyncMPTransport(AsyncTransport):
     ) -> Tuple[AsyncMPConnection, AsyncMPConnection]:
         raw_a, raw_b = multiprocessing.Pipe()
         server_conn = AsyncMPConnection(
-            identity=parent_id, secret_id=parent_secret, pipe_conn=raw_a
+            identity=parent_id,
+            secret_id=parent_secret,
+            pipe_conn=raw_a,
+            expected_remotes={child_id: child_secret},
         )
         client_conn = AsyncMPConnection(
-            identity=child_id, secret_id=child_secret, pipe_conn=raw_b
+            identity=child_id,
+            secret_id=child_secret,
+            pipe_conn=raw_b,
+            expected_remotes={parent_id: parent_secret},
         )
         server_key = f"{parent_id}:{parent_secret}"
         client_key = f"{child_id}:{child_secret}"

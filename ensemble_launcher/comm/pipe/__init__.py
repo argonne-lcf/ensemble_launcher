@@ -7,6 +7,7 @@ from .async_connection import (
     AsyncZMQRouterConnectionState,
     ClientConnection,
     ClientConnectionState,
+    IdentityVerificationError,
     ServerConnection,
     ServerConnectionState,
 )
@@ -38,5 +39,6 @@ __all__ = [
     "AsyncZMQTransportState",
     "AsyncMPConnection",
     "AsyncMPTransport",
+    "IdentityVerificationError",
     "transport_registry",
 ]

@@ -32,6 +32,7 @@ from .pipe import (
     AsyncZMQTransportState,
     ClientConnection,
     ClientConnectionState,
+    IdentityVerificationError,
     ServerConnection,
     ServerConnectionState,
     transport_registry,
@@ -74,5 +75,6 @@ __all__ = [
     "ServerConnectionState",
     "ClientConnection",
     "ClientConnectionState",
+    "IdentityVerificationError",
     "transport_registry",
 ]

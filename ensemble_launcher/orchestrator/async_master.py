@@ -246,6 +246,7 @@ class AsyncMaster(Node):
             hb_parent_conn=self.parent_hb_conn,
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
+            cluster_secret=self._config.cluster_secret,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -845,7 +846,10 @@ class AsyncMaster(Node):
         if not self._config.checkpoint_dir:
             return
         self._checkpointer = Checkpointer(
-            self.node_id, self._config.checkpoint_dir, self.logger
+            self.node_id,
+            self._config.checkpoint_dir,
+            self.logger,
+            cluster_secret=self._config.cluster_secret,
         )
         if not self._checkpointer.checkpoint_exists():
             return

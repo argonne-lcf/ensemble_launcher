@@ -1,12 +1,16 @@
+from __future__ import annotations
+
 import asyncio
 import enum
 import os
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
+import cloudpickle
 import numpy as np
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from ensemble_launcher.comm.pipe import ClientConnection
     from ensemble_launcher.scheduler.resource import JobResource
 
 
@@ -96,6 +100,55 @@ class Task(BaseModel):
                 pass
 
         return req
+
+
+class _ActorWrapper:
+    def __init__(
+        self,
+        executable: Callable,
+        connection: ClientConnection,
+        loop: Optional[Any] = None,
+    ):
+        self._callable = executable
+        self._connection = connection
+        self._loop = loop
+        self._stop = asyncio.Event()
+
+    async def _action_loop(self):
+        await self._connection.open()
+        while not self._stop.is_set():
+            frames = await self._connection.recv()
+            args_bytes = frames[-1]
+            args = cloudpickle.loads(args_bytes)
+            if args == "stop":
+                self._stop.set()
+            else:
+                if isinstance(args, list):
+                    results = []
+                    for arg in args:
+                        results.append(self._callable(*arg))
+                    await self._connection.send(cloudpickle.dumps(results))
+                elif isinstance(args, tuple):
+                    result = self._callable(*args)
+                    await self._connection.send(cloudpickle.dumps(result))
+                else:
+                    pass
+
+    def __call__(self, *args, **kwds):
+        if self._loop is None:
+            return asyncio.run(self._action_loop())
+        return self._loop.run_until_complete(self._action_loop())
+
+
+class Actor(Task):
+    model_config = {"arbitrary_types_allowed": True}
+
+    connection: ClientConnection
+
+    def model_post_init(self, _: Any) -> None:
+        object.__setattr__(
+            self, "executable", _ActorWrapper(self.executable, self.connection)
+        )
 
 
 class _AsyncWrapper:
