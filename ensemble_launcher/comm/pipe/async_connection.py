@@ -78,7 +78,7 @@ class AsyncConnection(ABC):
         pass
 
 
-def _decode_identity(raw: bytes):
+def decode_identity(raw: bytes):
     full_id = raw.decode()
     parts = full_id.split(":", 1)
     return full_id, parts[0], parts[1] if len(parts) > 1 else None
@@ -169,7 +169,10 @@ class ClientConnection(AsyncConnection):
             return True
         if sender_id != self._remote_identity:
             return False
-        if self._remote_secret_id is not None and sender_secret != self._remote_secret_id:
+        if (
+            self._remote_secret_id is not None
+            and sender_secret != self._remote_secret_id
+        ):
             return False
         return True
 
@@ -253,7 +256,7 @@ class AsyncZMQRouterConnection(ServerConnection):
         while True:
             frames = await self._socket.recv_multipart()
             if len(frames) >= 1:
-                _, sender_id, sender_secret = _decode_identity(frames[0])
+                _, sender_id, sender_secret = decode_identity(frames[0])
                 if not self.verify_sender(sender_id, sender_secret):
                     logger.warning(
                         f"{self._identity}: Discarding message from {sender_id} "
@@ -348,7 +351,7 @@ class AsyncZMQDealerConnection(ClientConnection):
         while True:
             frames = await self._socket.recv_multipart()
             if self._remote_identity is not None and len(frames) >= 1:
-                _, sender_id, sender_secret = _decode_identity(frames[0])
+                _, sender_id, sender_secret = decode_identity(frames[0])
                 if not self.verify_sender(sender_id, sender_secret):
                     logger.warning(
                         f"{self._identity}: Discarding message from {sender_id} "

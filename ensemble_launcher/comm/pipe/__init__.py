@@ -10,6 +10,7 @@ from .async_connection import (
     IdentityVerificationError,
     ServerConnection,
     ServerConnectionState,
+    decode_identity,
 )
 from .async_transport import (
     AsyncTransport,
@@ -17,7 +18,6 @@ from .async_transport import (
     AsyncZMQTransport,
     AsyncZMQTransportState,
 )
-
 from .mp_connection import AsyncMPConnection
 from .mp_transport import AsyncMPTransport
 from .registry import transport_registry
@@ -41,4 +41,5 @@ __all__ = [
     "AsyncMPTransport",
     "IdentityVerificationError",
     "transport_registry",
+    "decode_identity",
 ]

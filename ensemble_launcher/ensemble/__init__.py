@@ -1,1 +1,1 @@
-from .ensemble import Actor, AsyncTask, Task, TaskFactory, TaskStatus
+from .ensemble import AsyncTask, Task, TaskFactory, TaskKwargs, TaskStatus
