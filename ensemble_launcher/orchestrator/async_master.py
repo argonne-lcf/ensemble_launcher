@@ -453,11 +453,9 @@ class AsyncMaster(Node):
             return {cfg.cpu_bind_flag: "core", "--map-by": cfg.openmpi_map_by}
 
         # "list" method: build the colon-separated core-ID string
-        if isinstance(child_resource, NodeResourceList):
-            cpus = ":".join(map(str, child_resource.cpus))
-        else:
-            # NodeResourceCount — fall back to 0..N-1 (best effort)
-            cpus = ":".join(map(str, range(child_resource.cpu_count)))
+        sorted_cpus = sorted(child_resource.cpus if isinstance(child_resource, NodeResourceList) else list(range(child_resource.cpu_count)))
+
+        cpus = f"{sorted_cpus[0]}-{sorted_cpus[-1]}"
 
         if cfg.cpu_bind_method == "list":
             return {cfg.cpu_bind_flag: f"list:{cpus}"}
@@ -577,7 +575,10 @@ class AsyncMaster(Node):
                     child_obj_dict[head_node + "-" + child_name] = child_obj
 
                 # Build combined dictionary structure
-                common_keys = ["type", "parent", "parent_data_conn", "parent_hb_conn"]
+                common_keys = [
+                    "type",
+                    "parent",
+                ]  # , "parent_data_conn", "parent_hb_conn"]
                 if all(
                     [
                         "task_executor_name" not in cdict

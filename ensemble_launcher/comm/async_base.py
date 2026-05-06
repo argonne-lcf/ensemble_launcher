@@ -395,6 +395,18 @@ class AsyncComm:
                 f"{self._node_info.node_id}: Connected to parent at {self.parent_address}"
             )
 
+        if self._parent_conn is not None:
+            self.logger.info(f"My hb secret: {self._hb_parent_conn._secret_id}")
+            self.logger.info(f"My data secret: {self._parent_conn._secret_id}")
+
+        if self._hb_transport is not None:
+            self.logger.info(
+                f"Expected hb remotes: {[conn.expected_remotes for conn in self._hb_transport.get_server_connections()]}"
+            )
+            self.logger.info(
+                f"Expected data remotes: {[conn.expected_remotes for conn in self._data_transport.get_server_connections()]}"
+            )
+
         parent_only = kwargs.get("parent_only", False)
         children_only = kwargs.get("children_only", False)
 
@@ -492,12 +504,21 @@ class AsyncComm:
 
         hb_conn = self._hb_parent_conn
         await hb_conn.open()
+        self.logger.info(f"Connected hb thread to {hb_conn.remote_address}")
 
         self._last_parent_hb_time = time.time()
         try:
             while not stop.is_set():
                 try:
                     await hb_conn.send(_HB_PING)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    self.logger.warning(
+                        f"{self._node_info.node_id}:{self._node_info.secret_id}: HB send error: {e}"
+                    )
+
+                try:
                     raw = await asyncio.wait_for(hb_conn.recv(), timeout=1.0)
                     if raw is not None and len(raw) >= 2 and raw[1] == _HB_PING:
                         if (
@@ -505,18 +526,21 @@ class AsyncComm:
                             and not self._hb_parent_ready.is_set()
                         ):
                             try:
-                                main_loop.call_soon_threadsafe(
-                                    self._hb_parent_ready.set
-                                )
+                                main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
                             except RuntimeError:
                                 pass
                         self._last_parent_hb_time = time.time()
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Parent didn't respond in time. Pass so the threshold logic can evaluate.
+                    pass 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
+                    # If the parent abruptly dies, recv() might raise EOFError or ConnectionResetError
                     self.logger.warning(
-                        f"{self._node_info.node_id}:{self._node_info.secret_id}: HB send error: {e}"
+                        f"{self._node_info.node_id}:{self._node_info.secret_id}: HB recv error: {e}"
                     )
+
                 if (
                     time.time() - self._last_parent_hb_time
                     > self._heartbeat_dead_threshold
@@ -806,13 +830,13 @@ class AsyncComm:
                     child_id, self._node_info.children_secret_ids[child_id]
                 )
                 await conn.send(packed, target_id)
-            self.logger.debug(
-                f"{self._node_info.node_id}: Sent message of type {type(msg).__name__} to child {target_id}"
-            )
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Sent message of type {type(msg).__name__} to child {target_id}"
+                )
             return True
         except Exception as e:
             self.logger.warning(
-                f"{self._node_info.node_id}: Sending message to child {child_id} failed with {e}"
+                f"{self._node_info.node_id}: hello Sending message to child {child_id} failed with {e}"
             )
             return False
 

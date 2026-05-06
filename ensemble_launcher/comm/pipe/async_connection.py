@@ -1,14 +1,14 @@
 import logging
 import random
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type, TypeVar
+from ensemble_launcher.logging import setup_logger
 
 from pydantic import BaseModel, Field
 
 T = TypeVar("T", bound="AsyncConnectionState")
-
-logger = logging.getLogger(__name__)
 
 
 class IdentityVerificationError(Exception):
@@ -44,6 +44,8 @@ class AsyncConnection(ABC):
     transport_type: str = ""
 
     def __init__(self, identity: str, secret_id: str):
+        os.makedirs(f"{os.getcwd()}/logs/connections", exist_ok=True)
+        self.logger = setup_logger(name=f"connection-{identity}", log_dir=f"{os.getcwd()}/logs/connections")
         self._identity = identity
         self._secret_id = secret_id
         self._is_open = False
@@ -222,6 +224,7 @@ class AsyncZMQRouterConnection(ServerConnection):
 
         try:
             self._socket.bind(f"tcp://{self._address}")
+            self.logger.info(f"Server bound to {self._address}")
         except zmq.error.ZMQError as e:
             if "Address already in use" in str(e):
                 max_attempts = 10
@@ -258,7 +261,7 @@ class AsyncZMQRouterConnection(ServerConnection):
             if len(frames) >= 1:
                 _, sender_id, sender_secret = decode_identity(frames[0])
                 if not self.verify_sender(sender_id, sender_secret):
-                    logger.warning(
+                    self.logger.warning(
                         f"{self._identity}: Discarding message from {sender_id} "
                         f"— secret_id mismatch (stale connection)"
                     )
@@ -341,6 +344,7 @@ class AsyncZMQDealerConnection(ClientConnection):
         self._socket.setsockopt(zmq.SNDHWM, 10000)
         self._socket.setsockopt(zmq.RCVHWM, 10000)
         self._socket.connect(f"tcp://{self._remote_address}")
+        self.logger.info(f"Connected to {self.remote_address}")
         self._is_open = True
 
     async def send(self, data: bytes) -> bool:
@@ -353,7 +357,7 @@ class AsyncZMQDealerConnection(ClientConnection):
             if self._remote_identity is not None and len(frames) >= 1:
                 _, sender_id, sender_secret = decode_identity(frames[0])
                 if not self.verify_sender(sender_id, sender_secret):
-                    logger.warning(
+                    self.logger.warning(
                         f"{self._identity}: Discarding message from {sender_id} "
                         f"— secret_id mismatch (stale connection)"
                     )

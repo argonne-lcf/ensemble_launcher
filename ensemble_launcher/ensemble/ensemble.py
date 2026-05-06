@@ -25,7 +25,7 @@ class Task(BaseModel):
     nnodes: int
     ppn: int
     executable: Union[str, Callable]
-    ngpus_per_process: int = 0
+    ngpus_per_process: Union[int, float] = 0
     args: Tuple = Field(default_factory=tuple)
     kwargs: Dict = Field(default_factory=dict)
     env: Dict = Field(default_factory=dict)
@@ -54,14 +54,14 @@ class Task(BaseModel):
         req = JobResource(
             resources=[
                 NodeResourceCount(
-                    ncpus=self.ppn, ngpus=self.ngpus_per_process * self.ppn
+                    ncpus=self.ppn, ngpus=int(self.ngpus_per_process * self.ppn)
                 )
                 for i in range(self.nnodes)
             ]
         )
         if len(self.cpu_affinity) > 0 or len(self.gpu_affinity) > 0:
             ncpus = self.ppn * self.nnodes
-            ngpus = ncpus * self.ngpus_per_process
+            ngpus = int(ncpus * self.ngpus_per_process)
             if ncpus >= 1 and ngpus >= 1:
                 if self.cpu_affinity and (
                     self.ngpus_per_process > 0 and not self.gpu_affinity
