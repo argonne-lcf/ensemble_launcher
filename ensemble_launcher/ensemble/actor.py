@@ -45,7 +45,7 @@ class Actor(ABC):
         self._server_id = self._name
         self._server_secret = secrets.token_hex(16)
         self._server = self._transport.get_server_connection(
-            self._server_id, self._server_secret
+            self._server_id, self._server_secret, address=None
         )
         self._transport_started = True
 
@@ -55,7 +55,7 @@ class Actor(ABC):
 
         while not self._stop.is_set():
             try:
-                frames = asyncio.wait_for(await self._server.recv(),timeout=5.0)
+                frames = await asyncio.wait_for(self._server.recv(), timeout=5.0)
                 _, id, secret = decode_identity(frames[0])
                 args = cloudpickle.loads(frames[1])
                 await self._input_queue.put((f"{id}:{secret}",args))
@@ -68,7 +68,7 @@ class Actor(ABC):
 
         while not self._stop.is_set():
             try:
-                target_id, data = asyncio.wait_for(await self._output_queue.get(),timeout=5.0)
+                target_id, data = await asyncio.wait_for(self._output_queue.get(), timeout=5.0)
                 await self._server.send(cloudpickle.dumps(data), target_id)
             except TimeoutError:
                 await asyncio.sleep(0.5)

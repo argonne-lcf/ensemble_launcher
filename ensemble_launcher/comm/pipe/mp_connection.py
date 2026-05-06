@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from .async_connection import (
     ServerConnection,
     ServerConnectionState,
-    _decode_identity,
+    decode_identity as _decode_identity,
 )
 
 logger = logging.getLogger(__name__)
