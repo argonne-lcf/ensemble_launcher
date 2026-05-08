@@ -4,10 +4,8 @@ import os
 import signal
 import socket
 import stat
-import subprocess
 import uuid
 from asyncio import Future as AsyncFuture
-from asyncio import Task
 from concurrent.futures import Executor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -199,6 +197,7 @@ class AsyncMPIExecutor(Executor):
         mpi_args: Tuple = (),
         mpi_kwargs: Dict[str, Any] = {},
         serial_launch: bool = False,
+        run_dir: str = os.getcwd(),
     ) -> AsyncFuture:
         # task is a str command
         task_id = str(uuid.uuid4())
@@ -252,6 +251,7 @@ class AsyncMPIExecutor(Executor):
                 merged_env,
                 nodes=job_resource.nodes,
                 setup_files=setup_files,
+                run_dir=run_dir,
             )
         )
         self._tasks[task_id] = asyncio_task
@@ -276,11 +276,17 @@ class AsyncMPIExecutor(Executor):
         cmd = (
             [cfg.launcher]
             + [cfg.nprocesses_flag, str(len(nodes))]
-            + ([cfg.processes_per_node_flag, "1"] if cfg.processes_per_node_flag else [])
+            + (
+                [cfg.processes_per_node_flag, "1"]
+                if cfg.processes_per_node_flag
+                else []
+            )
             + ([cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else [])
             + ["python", "-c", setup_code]
         )
-        self.logger.info(f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s)")
+        self.logger.info(
+            f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s)"
+        )
         proc = await asyncio.create_subprocess_exec(*cmd)
         await proc.wait()
 
@@ -291,10 +297,13 @@ class AsyncMPIExecutor(Executor):
         merged_env: Dict[str, Any],
         nodes: Optional[List[str]] = None,
         setup_files: Optional[Dict] = None,
+        run_dir: Optional[str] = None,
     ):
         if setup_files and setup_files.get("gpu_affinity") and nodes:
             fname = f"/tmp/gpu_affinity_file_{task_id}.sh"
-            await self.write_file_to_nodes(fname, setup_files["gpu_affinity"], nodes, executable=True)
+            await self.write_file_to_nodes(
+                fname, setup_files["gpu_affinity"], nodes, executable=True
+            )
         self.logger.info(f"executing: {' '.join(cmd)}")
 
         # We separate the executable from the arguments
@@ -302,23 +311,32 @@ class AsyncMPIExecutor(Executor):
         args = cmd[1:]
 
         if self._return_stdout:
-            p = await asyncio.create_subprocess_exec(
-                program,
-                *args,
-                env=merged_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    program,
+                    *args,
+                    env=merged_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    cwd=run_dir,
+                )
+            except Exception as e:
+                self.logger.error(f"Submitting task {task_id} failed with error: {e}")
+                raise e
         else:
-            p = await asyncio.create_subprocess_exec(
-                program,
-                *args,
-                env=merged_env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    program,
+                    *args,
+                    env=merged_env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                    cwd=run_dir,
+                )
+            except Exception as e:
+                self.logger.error(f"Submitting task {task_id} failed error: {e}")
 
         self._processes[task_id] = p
 

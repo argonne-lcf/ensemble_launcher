@@ -6,7 +6,6 @@ import signal
 import socket
 import time
 from collections import deque
-from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, Optional, Tuple, Union
 
@@ -801,6 +800,7 @@ class AsyncWorker(Node):
                             task_args=task.args,
                             task_kwargs=task.kwargs,
                             env=task.env,
+                            run_dir=task.run_dir,
                         )
                         self._task_id_to_executor[task_id] = task.executor_name
                     else:
@@ -818,6 +818,7 @@ class AsyncWorker(Node):
                         task_args=task.args,
                         task_kwargs=task.kwargs,
                         env=task.env,
+                        run_dir=task.run_dir,
                     )
                     self._task_id_to_executor[task_id] = self._default_executor_name
 

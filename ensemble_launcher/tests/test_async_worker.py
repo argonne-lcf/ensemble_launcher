@@ -1,7 +1,7 @@
 import asyncio
 import logging
-import multiprocessing as mp
 import os
+import shutil
 import socket
 import time
 
@@ -26,6 +26,10 @@ def echo(task_id: str):
 
 def echo_stdout(task_id: str):
     print(f"Hello from task {task_id}")
+
+
+def echo_cwd(task_id: str):
+    print(f"Hello from task {task_id}: {os.getcwd()}")
 
 
 @pytest.mark.asyncio
@@ -90,9 +94,10 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
         LauncherConfig(
             task_executor_name=task_executor,
             comm_name="async_zmq",
-            report_interval=100.0,
+            report_interval=0.5,
             mpi_config=MPIConfig(processes_per_node_flag=None),
             log_level=logging.INFO,
+            worker_logs=True,
             return_stdout=True,
         ),
         job_resource,
@@ -196,6 +201,59 @@ async def test_async_task_worker():
         )
 
 
+@pytest.mark.asyncio
+async def test_run_dir():
+    ##create tasks
+    tasks = {}
+    for i in range(12):
+        dirname = os.path.join(os.getcwd(), f"task-{i}")
+        os.makedirs(dirname, exist_ok=True)
+        shutil.copy(os.path.join(os.getcwd(), "test_async_worker.py"), dirname)
+        tasks[f"task-{i}"] = Task(
+            task_id=f"task-{i}",
+            nnodes=1,
+            ppn=1,
+            executable=echo_cwd,
+            args=(f"task-{i}",),
+            run_dir=dirname,
+        )
+
+    nodes = [socket.gethostname()]
+    sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
+
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name="async_mpi",
+            comm_name="async_zmq",
+            report_interval=100.0,
+            mpi_config=MPIConfig(processes_per_node_flag=None),
+            log_level=logging.INFO,
+            return_stdout=True,
+            worker_logs=True,
+        ),
+        job_resource,
+        tasks,
+    )
+
+    res = await w.run()
+    results = {}
+    for r in res.data:
+        results[r.task_id] = r.data
+
+    assert len(results) > 0 and all(
+        [
+            result.split(",")[0].strip()
+            == f"Hello from task {task_id}: {os.getcwd()}/{task_id}"
+            for task_id, result in results.items()
+        ]
+    ), f"{[result for task_id, result in results.items()]}"
+    for i in range(12):
+        dirname = os.path.join(os.getcwd(), f"task-{i}")
+        shutil.rmtree(dirname)
+
+
 if __name__ == "__main__":
     # print("Testing Async Worker with ProcessPool Executor for 1 task per core")
     # asyncio.run(test_async_worker(task_executor="async_processpool"))
@@ -207,5 +265,7 @@ if __name__ == "__main__":
     # asyncio.run(test_async_mpi_worker(task_executor="async_mpi"))
     # print("Testing Async Worker with AsyncTask")
     # asyncio.run(test_async_task_worker())
-    print("Testing Async Worker with MPI Pool Executor")
-    asyncio.run(test_async_mpi_pool_worker())
+    # print("Testing Async Worker with MPI Pool Executor")
+    # asyncio.run(test_async_mpi_pool_worker())
+    print("Testing Async Worker rundir")
+    asyncio.run(test_run_dir())
