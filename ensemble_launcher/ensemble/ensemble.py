@@ -1,6 +1,5 @@
 import asyncio
 import enum
-import json
 import os
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -34,7 +33,7 @@ class Task(BaseModel):
     result: Optional[Any] = None
     cpu_affinity: List[int] = Field(default_factory=list)
     gpu_affinity: List[Union[int, str]] = Field(default_factory=list)
-    run_dir: Union[str, os.PathLike] = Field(default="")
+    run_dir: Optional[Union[str, os.PathLike]] = None
     start_time: Any = None
     end_time: Any = None
     executor_name: Optional[str] = None
