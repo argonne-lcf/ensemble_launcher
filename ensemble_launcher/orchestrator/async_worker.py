@@ -801,6 +801,8 @@ class AsyncWorker(Node):
                             task_kwargs=task.kwargs,
                             env=task.env,
                             run_dir=task.run_dir,
+                            stdout_file=task.stdout_file,
+                            stderr_file=task.stderr_file,
                         )
                         self._task_id_to_executor[task_id] = task.executor_name
                     else:
@@ -819,6 +821,8 @@ class AsyncWorker(Node):
                         task_kwargs=task.kwargs,
                         env=task.env,
                         run_dir=task.run_dir,
+                        stdout_file=task.stdout_file,
+                        stderr_file=task.stderr_file,
                     )
                     self._task_id_to_executor[task_id] = self._default_executor_name
 

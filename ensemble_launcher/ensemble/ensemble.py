@@ -38,6 +38,8 @@ class Task(BaseModel):
     end_time: Any = None
     executor_name: Optional[str] = None
     tag: Optional[str] = None
+    stdout_file: Optional[str] = None
+    stderr_file: Optional[str] = None
 
     def get_resource_requirements(self) -> "JobResource":
         """Build JobResource requirements from this Task."""
@@ -177,6 +179,8 @@ class TaskFactory:
                 gpu_affinity=task_dict["gpu_affinity"].split(",")
                 if "gpu_affinity" in task_dict
                 else [],
+                stdout_file=task_dict.get("stdout_file", None),
+                stderr_file=task_dict.get("stderr_file", None),
             )
         return task_objects
 
