@@ -118,6 +118,56 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
 
 
 @pytest.mark.asyncio
+async def test_async_mpi_worker_stdout_file(tmp_path, task_executor="async_mpi"):
+    tasks = {}
+    for i in range(2):
+        tasks[f"task-{i}"] = Task(
+            task_id=f"task-{i}",
+            nnodes=1,
+            ppn=1,
+            executable=f"echo Hello from task task-{i}",
+            args=(),
+            run_dir=str(tmp_path),
+            stdout_file=f"task-{i}.stdout",
+            stderr_file=f"task-{i}.stderr",
+        )
+
+    nodes = [socket.gethostname()]
+    sys_info = NodeResourceCount.from_config(SystemConfig(name="local"))
+    job_resource = JobResource(resources=[sys_info], nodes=nodes)
+
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name=task_executor,
+            comm_name="async_zmq",
+            report_interval=0.5,
+            mpi_config=MPIConfig(processes_per_node_flag=None),
+            log_level=logging.INFO,
+            return_stdout=True,
+        ),
+        job_resource,
+        tasks,
+    )
+
+    res = await w.run()
+    results = {}
+    for r in res.data:
+        results[r.task_id] = r.data
+
+    assert len(results) == 2
+
+    for i in range(2):
+        stdout_path = tmp_path / f"task-{i}.stdout"
+        assert stdout_path.exists(), f"stdout file not found: {stdout_path}"
+        content = stdout_path.read_text()
+        assert f"Hello from task task-{i}" in content
+
+        stderr_path = tmp_path / f"task-{i}.stderr"
+        assert stderr_path.exists(), f"stderr file not found: {stderr_path}"
+
+
+@pytest.mark.asyncio
 async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
     tasks = {}
     for i in range(12):

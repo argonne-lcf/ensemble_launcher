@@ -198,6 +198,8 @@ class AsyncMPIExecutor(Executor):
         mpi_kwargs: Dict[str, Any] = {},
         serial_launch: bool = False,
         run_dir: str = os.getcwd(),
+        stdout_file: Optional[str] = None,
+        stderr_file: Optional[str] = None,
     ) -> AsyncFuture:
         # task is a str command
         task_id = str(uuid.uuid4())
@@ -252,6 +254,8 @@ class AsyncMPIExecutor(Executor):
                 nodes=job_resource.nodes,
                 setup_files=setup_files,
                 run_dir=run_dir,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
             )
         )
         self._tasks[task_id] = asyncio_task
@@ -298,6 +302,8 @@ class AsyncMPIExecutor(Executor):
         nodes: Optional[List[str]] = None,
         setup_files: Optional[Dict] = None,
         run_dir: Optional[str] = None,
+        stdout_file: Optional[str] = None,
+        stderr_file: Optional[str] = None,
     ):
         if setup_files and setup_files.get("gpu_affinity") and nodes:
             fname = f"/tmp/gpu_affinity_file_{task_id}.sh"
@@ -306,45 +312,65 @@ class AsyncMPIExecutor(Executor):
             )
         self.logger.info(f"executing: {' '.join(cmd)}")
 
-        # We separate the executable from the arguments
         program = cmd[0]
         args = cmd[1:]
 
-        if self._return_stdout:
+        base_dir = run_dir if run_dir else os.getcwd()
+        stdout_fh = None
+        stderr_fh = None
+
+        try:
+            if stdout_file:
+                stdout_path = os.path.join(base_dir, stdout_file)
+                os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
+                stdout_fh = open(stdout_path, "w")
+                stdout_target = stdout_fh
+            elif self._return_stdout:
+                stdout_target = asyncio.subprocess.PIPE
+            else:
+                stdout_target = asyncio.subprocess.DEVNULL
+
+            if stderr_file:
+                stderr_path = os.path.join(base_dir, stderr_file)
+                os.makedirs(os.path.dirname(stderr_path) or ".", exist_ok=True)
+                stderr_fh = open(stderr_path, "w")
+                stderr_target = stderr_fh
+            elif self._return_stdout:
+                stderr_target = asyncio.subprocess.PIPE
+            else:
+                stderr_target = asyncio.subprocess.DEVNULL
+
             try:
                 p = await asyncio.create_subprocess_exec(
                     program,
                     *args,
                     env=merged_env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
                     start_new_session=True,
                     cwd=run_dir,
                 )
             except Exception as e:
                 self.logger.error(f"Submitting task {task_id} failed with error: {e}")
                 raise e
-        else:
-            try:
-                p = await asyncio.create_subprocess_exec(
-                    program,
-                    *args,
-                    env=merged_env,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    start_new_session=True,
-                    cwd=run_dir,
-                )
-            except Exception as e:
-                self.logger.error(f"Submitting task {task_id} failed error: {e}")
 
-        self._processes[task_id] = p
+            self._processes[task_id] = p
 
-        try:
             std_out, std_err = await p.communicate()
 
-            out_str = std_out.decode() if std_out else ""
-            err_str = std_err.decode() if std_err else ""
+            if stdout_file and self._return_stdout:
+                stdout_fh.flush()
+                with open(stdout_path, "r") as f:
+                    out_str = f.read()
+            else:
+                out_str = std_out.decode() if std_out else ""
+
+            if stderr_file and self._return_stdout:
+                stderr_fh.flush()
+                with open(stderr_path, "r") as f:
+                    err_str = f.read()
+            else:
+                err_str = std_err.decode() if std_err else ""
 
             if p.returncode != 0:
                 self.logger.error(
@@ -358,6 +384,10 @@ class AsyncMPIExecutor(Executor):
             return out_str + "," + err_str
 
         finally:
+            if stdout_fh:
+                stdout_fh.close()
+            if stderr_fh:
+                stderr_fh.close()
             if task_id in self._processes:
                 del self._processes[task_id]
 
