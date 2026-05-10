@@ -5,7 +5,6 @@ import random
 import secrets
 import signal
 import time
-import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, Optional, Tuple, Union
@@ -229,9 +228,6 @@ class AsyncWorker(Node):
 
         if self.parent:
             self._node_update_task = asyncio.create_task(self._node_update_monitor())
-            self._parent_ready_monitor_task = asyncio.create_task(
-                self._parent_ready_monitor()
-            )
 
         if self._config.cluster and self.parent:
             self._task_update_task = asyncio.create_task(self._task_update_monitor())
@@ -551,6 +547,11 @@ class AsyncWorker(Node):
         """Perform initial handshake with the parent: heartbeat, node update, task update."""
         if self.parent is None:
             return
+
+        # Start the task to detect parent ready, which is set when the parent init is done and is ready to accept results
+        self._parent_ready_monitor_task = asyncio.create_task(
+            self._parent_ready_monitor()
+        )
         # sync heart beat with parent
         async with self._timer("heartbeat_sync"):
             if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):

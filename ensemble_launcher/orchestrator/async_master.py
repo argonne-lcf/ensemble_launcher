@@ -416,10 +416,7 @@ class AsyncMaster(Node):
         children (including any recreated ones) have been registered.
         """
         self._reporting_task = asyncio.create_task(self._report_status())
-        if self.parent:
-            self._parent_ready_monitor_task = asyncio.create_task(
-                self._parent_ready_monitor()
-            )
+
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
@@ -453,7 +450,11 @@ class AsyncMaster(Node):
             return {cfg.cpu_bind_flag: "core", "--map-by": cfg.openmpi_map_by}
 
         # "list" method: build the colon-separated core-ID string
-        sorted_cpus = sorted(child_resource.cpus if isinstance(child_resource, NodeResourceList) else list(range(child_resource.cpu_count)))
+        sorted_cpus = sorted(
+            child_resource.cpus
+            if isinstance(child_resource, NodeResourceList)
+            else list(range(child_resource.cpu_count))
+        )
 
         cpus = f"{sorted_cpus[0]}-{sorted_cpus[-1]}"
 
@@ -787,9 +788,6 @@ class AsyncMaster(Node):
         # Start the shared comm monitor for all child sockets (idempotent).
         await self._comm.start_monitors(children_only=True)
 
-        # Start global monitors (status reporting, result aggregation, cluster tasks).
-        self._create_monitor_tasks()
-
         # Launch and sync children, retrying failures up to 2 times
         children_names = self._scheduler.children_names
         results = await self._launch_and_sync_children(children_names)
@@ -819,6 +817,12 @@ class AsyncMaster(Node):
                 f"{self.node_id}: {len(failed_names)} children still failed after "
                 f"{max_retries} retries"
             )
+
+        # Start global monitors: Result flushing to parent, Task flushing to children, client/parent task updates, and status reporting
+        # Note on task flushing to children:
+        #  Any tasks received before build_init_task_update will be sent directly using req-res pattern during child_sync.
+        #  The task updates between _build_init_task_update and this point should be cached by the communicator.
+        self._create_monitor_tasks()
 
         # All children are launched and synced — signal each one that the master
         # is ready so they can send their final ResultBatch when done.
@@ -918,6 +922,12 @@ class AsyncMaster(Node):
         # sync heart beat with parent
         if self.parent is None:
             return
+
+        # Start the task to detect parent ready, which is set when the parent init is done and is ready to accept results
+        self._parent_ready_monitor_task = asyncio.create_task(
+            self._parent_ready_monitor()
+        )
+
         async with self._timer("heartbeat_sync"):
             if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")

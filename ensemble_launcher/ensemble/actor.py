@@ -22,6 +22,7 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.ensemble.ensemble import TaskKwargs
 from ensemble_launcher.logging import setup_logger
 
+
 class Actor(ABC):
     def __init__(
         self,
@@ -42,18 +43,19 @@ class Actor(ABC):
         self._output_queue: asyncio.Queue = None
         self.logger = None
         self._secret = secrets.token_hex(16)
-    
+
     def _make_validator(self, actor_secret: str) -> Callable:
-        def validator(sender_id:str, sender_secret: str):
+        def validator(sender_id: str, sender_secret: str):
             if sender_secret == actor_secret:
                 return True
             return False
+
         return validator
-    
+
     @property
     def secret(self) -> str:
         return self._secret
-    
+
     @property
     def ckpt_dir(self) -> str:
         return self._ckpt_dir
@@ -68,7 +70,12 @@ class Actor(ABC):
 
     @classmethod
     def create_handle(
-        cls, ckpt_dir: str, name: str, transport_classes: Dict[str, type], secret: str, timeout=300
+        cls,
+        ckpt_dir: str,
+        name: str,
+        transport_classes: Dict[str, type],
+        secret: str,
+        timeout=300,
     ) -> Optional[ClientConnection]:
         fname = f"{ckpt_dir}/{name}.ckpt"
         start = time.time()
@@ -106,7 +113,9 @@ class Actor(ABC):
         )
 
         ## Set a validator
-        self._server.set_unknown_sender_validator(self._make_validator(actor_secret=self._secret))
+        self._server.set_unknown_sender_validator(
+            self._make_validator(actor_secret=self._secret)
+        )
 
         self._transport_started = True
 
@@ -119,10 +128,12 @@ class Actor(ABC):
             try:
                 frames = await asyncio.wait_for(self._server.recv(), timeout=5.0)
                 _, id, secret = decode_identity(frames[0])
+                self.logger.info(f"Received args from {id}:{secret}")
                 args = cloudpickle.loads(frames[1])
                 await self._input_queue.put((f"{id}:{secret}", args))
-            except Exception as e:
-                self.logger.warning(f"Recv failed with error: {str(e)}")
+            except Exception:
+                pass
+                # self.logger.warning(f"Recv failed with error: {str(e)}")
 
     async def _send(self):
         if not self._transport_started:
@@ -135,9 +146,9 @@ class Actor(ABC):
                     self._output_queue.get(), timeout=5.0
                 )
                 await self._server.send(cloudpickle.dumps(data), target_id)
+                self.logger.info(f"Sent results to {target_id}")
             except Exception as e:
-                self.logger.warning(f"Send failed with error: {str(e)}")
-
+                self.logger.debug(f"Send failed with error: {str(e)}")
 
     async def _invoke(self, *args: Any) -> Any:
         result = self.action(*args)
@@ -151,7 +162,7 @@ class Actor(ABC):
             target_id, args = await self._input_queue.get()
             if args == "stop":
                 self._stop.set()
-                self.logger.info(f"Actor stop set")
+                self.logger.info("Actor stop set")
             elif isinstance(args, list):
                 results = []
                 for arg in args:

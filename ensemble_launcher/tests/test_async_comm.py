@@ -73,11 +73,12 @@ async def test_zmq_comm():
 @pytest.mark.asyncio
 async def test_mp_comm():
 
+    nnodes = 3
     comms = []
     futures = []
     try:
-        secret_ids = [ secrets.token_hex(16) for _ in range(3)]
-        for i in range(3):
+        secret_ids = [ secrets.token_hex(16) for _ in range(nnodes)]
+        for i in range(nnodes):
             my_nodeinfo = NodeInfo(
                 node_id=str(i),
                 secret_id=secret_ids[i],
@@ -99,20 +100,20 @@ async def test_mp_comm():
         for comm in comms:
             await comm.start_monitors()
 
-        for i in range(3):
+        for i in range(nnodes):
             comm = comms[i]
             futures.append(asyncio.create_task(comm.sync_heartbeat_with_parent(timeout=5.0)))
-            if i < 2:
+            if i < nnodes - 1:
                 futures.append(asyncio.create_task(comm.sync_heartbeat_with_child(child_id=str(i + 1), timeout=5.0)))
 
         await asyncio.gather(*futures)
 
         msgs = []
-        for i in range(2):
+        for i in range(nnodes-1):
             comm: AsyncComm = comms[i]
             await comm.send_message_to_child(child_id=str(i + 1), msg=Result(data=f"Message from parent {i} to child {i+1}"))
 
-        for i in range(1,3):
+        for i in range(1,nnodes):
             comm: AsyncComm = comms[i]
             msg = await comm.recv_message_from_parent(cls=Result, block=True, timeout=5.0)
             msgs.append(msg.data)
@@ -180,4 +181,9 @@ async def test_comm_state_roundtrip_zmq():
 
 
 if __name__ == "__main__":
-    msgs = asyncio.run(test_zmq_comm())
+    # msgs = asyncio.run(test_zmq_comm())
+    # print("zmq done")
+    # msgs = asyncio.run(test_comm_state_roundtrip_zmq())
+    # print("roundtrip zmq done")
+    msgs = asyncio.run(test_mp_comm())
+    print("mp done")
