@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from logging import Logger
+from typing import Optional
 
 
 def _scatter_fn(node_local_cache: str, model: str, chunk_size: int, ppn: int = 1):
@@ -180,13 +181,13 @@ def scatter_from_root(
     ppn: int = 1,
     chunk_size: int = 100 * 1024 * 1024,
     logger: Logger = None,
+    cpu_binding: Optional[str] = None,
 ):
-    cmd = [
-        "mpirun",
-        "-np",
-        str(nnodes * ppn),
-        "-ppn",
-        str(ppn),
+    cmd = ["mpirun", "-np", str(nnodes * ppn), "-ppn", str(ppn)]
+    if cpu_binding:
+        cmd += [f"{cpu_binding}"]
+
+    cmd += [
         sys.executable,
         "-c",
         f"from ensemble_launcher.inference.copy_model import _scatter_fn; "
