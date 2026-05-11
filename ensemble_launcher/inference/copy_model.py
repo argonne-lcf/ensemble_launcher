@@ -2,79 +2,146 @@ import math
 import os
 import subprocess
 import sys
+from logging import Logger
 
 
-def _scatter_fn(node_local_cache: str, model: str, chunk_size: int):
+def _scatter_fn(node_local_cache: str, model: str, chunk_size: int, ppn: int = 1):
     from mpi4py import MPI
 
     comm = MPI.COMM_WORLD
     my_rank = comm.rank
+
+    my_color = my_rank % ppn
+    sub_comm = comm.Split(color=my_color, key=my_rank // ppn)
+    sub_rank = sub_comm.rank
+    is_node_lead = my_color == 0
 
     model_cache = os.path.join(
         node_local_cache, "hub", f"models--{model.replace('/', '--')}"
     )
 
     if my_rank == 0:
-        files = []
+        regular_files = []
+        symlinks = []
         for dirpath, _, filenames in os.walk(model_cache):
             for filename in filenames:
-                files.append(os.path.join(dirpath, filename))
-        if not files:
+                filepath = os.path.join(dirpath, filename)
+                if os.path.islink(filepath):
+                    symlinks.append((filepath, os.readlink(filepath)))
+                else:
+                    regular_files.append(filepath)
+        if not regular_files and not symlinks:
             print(
                 f"WARNING: No files found in {model_cache}. Nothing to sync.",
                 file=sys.stderr,
             )
     else:
-        files = None
+        regular_files = None
+        symlinks = None
 
-    files = comm.bcast(files, root=0)
+    regular_files = comm.bcast(regular_files, root=0)
+    symlinks = comm.bcast(symlinks, root=0)
 
-    if not files:
+    if not regular_files and not symlinks:
+        sub_comm.Free()
         return
 
     recv_buffer = bytearray(chunk_size)
 
-    for file in files:
-        if my_rank > 0:
+    for file in regular_files:
+        if is_node_lead and sub_rank > 0:
             os.makedirs(os.path.dirname(file), exist_ok=True)
 
-        if my_rank == 0:
+        if sub_rank == 0:
             file_size = os.path.getsize(file)
         else:
             file_size = None
-
-        file_size = comm.bcast(file_size, root=0)
+        file_size = sub_comm.bcast(file_size, root=0)
 
         if file_size == 0:
-            if my_rank > 0:
+            if is_node_lead and sub_rank > 0:
                 open(file, "wb").close()
+            if ppn > 1:
+                comm.Barrier()
             continue
 
-        nchunks = math.ceil(file_size / chunk_size)
-
-        if my_rank == 0:
-            f = open(file, "rb")
+        base_part_size = file_size // ppn
+        remainder = file_size % ppn
+        if my_color < remainder:
+            my_part_size = base_part_size + 1
+            part_start = my_color * (base_part_size + 1)
         else:
-            f = open(file, "wb")
+            my_part_size = base_part_size
+            part_start = (
+                remainder * (base_part_size + 1)
+                + (my_color - remainder) * base_part_size
+            )
 
-        try:
-            for cid in range(nchunks):
-                current_chunk_size = min(chunk_size, file_size - cid * chunk_size)
+        if ppn > 1 and my_part_size > 0:
+            part_file = f"{file}.__part{my_color}__"
+        else:
+            part_file = file
 
-                if my_rank == 0:
-                    chunk = f.read(current_chunk_size)
-                    recv_buffer[:current_chunk_size] = chunk
+        nchunks = math.ceil(my_part_size / chunk_size) if my_part_size > 0 else 0
 
-                comm.Bcast([recv_buffer, current_chunk_size, MPI.BYTE], root=0)
+        if my_part_size > 0:
+            if sub_rank == 0:
+                f_in = open(file, "rb")
+                f_in.seek(part_start)
+            else:
+                f_in = None
 
-                if my_rank > 0:
-                    f.write(recv_buffer[:current_chunk_size])
-        finally:
-            f.close()
+            if sub_rank > 0:
+                os.makedirs(os.path.dirname(part_file), exist_ok=True)
+                f_out = open(part_file, "wb")
+            else:
+                f_out = None
+
+            try:
+                for cid in range(nchunks):
+                    current_chunk_size = min(
+                        chunk_size, my_part_size - cid * chunk_size
+                    )
+                    if sub_rank == 0:
+                        chunk = f_in.read(current_chunk_size)
+                        recv_buffer[:current_chunk_size] = chunk
+                    sub_comm.Bcast([recv_buffer, current_chunk_size, MPI.BYTE], root=0)
+                    if sub_rank > 0:
+                        f_out.write(recv_buffer[:current_chunk_size])
+            finally:
+                if f_in is not None:
+                    f_in.close()
+                if f_out is not None:
+                    f_out.close()
+
+        if ppn > 1:
+            comm.Barrier()
+            if is_node_lead and sub_rank > 0:
+                with open(file, "wb") as f_merged:
+                    for p in range(ppn):
+                        pf = f"{file}.__part{p}__"
+                        if os.path.exists(pf):
+                            with open(pf, "rb") as pf_in:
+                                while True:
+                                    data = pf_in.read(chunk_size)
+                                    if not data:
+                                        break
+                                    f_merged.write(data)
+                            os.remove(pf)
+
+    if is_node_lead and sub_rank > 0:
+        for link_path, target in symlinks:
+            os.makedirs(os.path.dirname(link_path), exist_ok=True)
+            if os.path.lexists(link_path):
+                os.remove(link_path)
+            os.symlink(target, link_path)
+
+    sub_comm.Free()
 
     if my_rank == 0:
         print(
-            f"Successfully scattered {len(files)} files to {comm.size - 1} worker nodes."
+            f"Successfully scattered {len(regular_files)} files and "
+            f"{len(symlinks)} symlinks to {comm.size // ppn - 1} worker nodes."
         )
 
 
@@ -83,6 +150,7 @@ def sync_to_root(
     cache_dir: str,
     node_local_cache: str = "/tmp/model_cache",
     np: int = 16,
+    logger: Logger = None,
 ):
     src = os.path.join(cache_dir, "hub", f"models--{model.replace('/', '--')}")
     dst = os.path.join(node_local_cache, "hub", f"models--{model.replace('/', '--')}")
@@ -93,9 +161,14 @@ def sync_to_root(
     p = subprocess.run(cmd, capture_output=True, text=True)
 
     if p.returncode != 0:
-        raise RuntimeError(
-            f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
-        )
+        if logger:
+            logger.warning(
+                f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
+            )
+        else:
+            print(
+                f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
+            )
 
     return p
 
@@ -106,20 +179,28 @@ def scatter_from_root(
     nnodes: int,
     ppn: int = 1,
     chunk_size: int = 100 * 1024 * 1024,
+    logger: Logger = None,
 ):
     cmd = [
         "mpirun",
-        "-np", str(nnodes * ppn),
-        "-ppn", str(ppn),
-        sys.executable, "-c",
+        "-np",
+        str(nnodes * ppn),
+        "-ppn",
+        str(ppn),
+        sys.executable,
+        "-c",
         f"from ensemble_launcher.inference.copy_model import _scatter_fn; "
-        f"_scatter_fn({node_local_cache!r}, {model!r}, {chunk_size!r})",
+        f"_scatter_fn({node_local_cache!r}, {model!r}, {chunk_size!r}, {ppn!r})",
     ]
     p = subprocess.run(cmd, capture_output=True, text=True)
+    if logger:
+        logger.info(f"Scatter_from_root: Executing {cmd}")
 
     if p.returncode != 0:
         raise RuntimeError(
             f"scatter failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
         )
+    else:
+        logger.debug(p.stdout)
 
     return p
