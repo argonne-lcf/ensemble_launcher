@@ -22,9 +22,7 @@ class VLLMInference(PublicActor):
 
     def on_start(self):
         if self.logger is None:
-            self.logger = setup_logger(
-                name=self._name, log_dir=f"{os.getcwd()}/logs"
-            )
+            self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
             from vllm import LLM
 
@@ -32,11 +30,15 @@ class VLLMInference(PublicActor):
                 f"{self.cache_dir}/hub/models--{self.model.replace('/', '--')}/snapshots/*"
             )
             self.logger.info(f"model: {snapshots[0]}")
-            self._llm = LLM(
-                model=snapshots[0],
-                tensor_parallel_size=self.tensor_parallel_size,
-                trust_remote_code=True,
-            )
+            try:
+                self._llm = LLM(
+                    model=snapshots[0],
+                    tensor_parallel_size=self.tensor_parallel_size,
+                    trust_remote_code=True,
+                )
+            except Exception as e:
+                self.logger.error(f"Starting LLM failed with Exception: {e}")
+                raise RuntimeError(str(e))
             self.logger.info("init done!")
 
     def action(self, prompts="hello", temperature=0.0, max_tokens=1024):
