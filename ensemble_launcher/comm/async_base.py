@@ -504,7 +504,10 @@ class AsyncComm:
 
         hb_conn = self._hb_parent_conn
         await hb_conn.open()
-        self.logger.info(f"Connected hb thread to {hb_conn.remote_address}")
+        try:
+            self.logger.info(f"Connected hb thread to {hb_conn.remote_address}")
+        except Exception:
+            pass
 
         self._last_parent_hb_time = time.time()
         try:
@@ -526,13 +529,15 @@ class AsyncComm:
                             and not self._hb_parent_ready.is_set()
                         ):
                             try:
-                                main_loop.call_soon_threadsafe(self._hb_parent_ready.set)
+                                main_loop.call_soon_threadsafe(
+                                    self._hb_parent_ready.set
+                                )
                             except RuntimeError:
                                 pass
                         self._last_parent_hb_time = time.time()
                 except (asyncio.TimeoutError, TimeoutError):
                     # Parent didn't respond in time. Pass so the threshold logic can evaluate.
-                    pass 
+                    pass
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

@@ -457,7 +457,7 @@ class AsyncMPIExecutor(Executor):
             task.cancel()
         self._tasks.clear()
 
-    async def ashutdown(self, wait: bool = True) -> None:
+    async def ashutdown(self, wait: bool = False) -> None:
         """Async shutdown: kill process groups and await all asyncio tasks."""
         force = not wait
         for process in list(self._processes.values()):
