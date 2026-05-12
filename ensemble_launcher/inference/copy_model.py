@@ -6,7 +6,13 @@ from logging import Logger
 from typing import Optional
 
 
-def _scatter_fn(node_local_cache: str, model: str, chunk_size: int, ppn: int = 1):
+def _scatter_fn(
+    node_local_cache: str,
+    model: str,
+    chunk_size: int,
+    ppn: int = 1,
+    cache_modelinfo: bool = False,
+):
     from mpi4py import MPI
 
     comm = MPI.COMM_WORLD
@@ -17,9 +23,12 @@ def _scatter_fn(node_local_cache: str, model: str, chunk_size: int, ppn: int = 1
     sub_rank = sub_comm.rank
     is_node_lead = my_color == 0
 
-    model_cache = os.path.join(
-        node_local_cache, "hub", f"models--{model.replace('/', '--')}"
-    )
+    if cache_modelinfo:
+        model_cache = node_local_cache
+    else:
+        model_cache = os.path.join(
+            node_local_cache, "hub", f"models--{model.replace('/', '--')}"
+        )
 
     if my_rank == 0:
         regular_files = []
@@ -152,26 +161,45 @@ def sync_to_root(
     node_local_cache: str = "/tmp/model_cache",
     np: int = 16,
     logger: Logger = None,
-):
+    cache_modelinfo: bool = False,
+) -> list:
+
+    processes = []
+
+    def _dsync(src, dst):
+        os.makedirs(dst, exist_ok=True)
+
+        cmd = ["mpirun", "-np", str(np), "-ppn", str(np), "dsync", f"{src}/", f"{dst}/"]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+
+        if p.returncode != 0:
+            if logger:
+                logger.warning(
+                    f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
+                )
+            else:
+                print(
+                    f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
+                )
+        return p
+
     src = os.path.join(cache_dir, "hub", f"models--{model.replace('/', '--')}")
     dst = os.path.join(node_local_cache, "hub", f"models--{model.replace('/', '--')}")
+    processes.append(_dsync(src, dst))
 
-    os.makedirs(dst, exist_ok=True)
-
-    cmd = ["mpirun", "-np", str(np), "-ppn", str(np), "dsync", f"{src}/", f"{dst}/"]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-
-    if p.returncode != 0:
+    if cache_modelinfo:
         if logger:
-            logger.warning(
-                f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
-            )
-        else:
-            print(
-                f"dsync failed (rc={p.returncode})\nstdout: {p.stdout}\nstderr: {p.stderr}"
-            )
+            logger.info("Trying to dsync model infos, torch aot compile")
 
-    return p
+        for dirname in ["modelinfos", "torch_aot_compile", "torch_compile_cache"]:
+            if os.path.exists(os.path.join(cache_dir, dirname)):
+                if logger:
+                    logger.info(f"Dsync {dirname}")
+                src = os.path.join(cache_dir, dirname)
+                dst = os.path.join(node_local_cache, dirname)
+                processes.append(_dsync(src, dst))
+
+    return processes
 
 
 def scatter_from_root(

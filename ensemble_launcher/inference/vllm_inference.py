@@ -13,17 +13,21 @@ class VLLMInference(PublicActor):
         cache_dir: str,
         tensor_parallel_size: int = 1,
         transport: str = "zmq",
+        cache_modelinfo: bool = False,
     ):
         super().__init__(name, transport)
         self.model = model
         self.cache_dir = cache_dir
         self.tensor_parallel_size = tensor_parallel_size
         self._llm = None
+        self._cache_modelinfo = cache_modelinfo
 
     def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
+            if self._cache_modelinfo:
+                os.environ["VLLM_CACHE_ROOT"] = self.cache_dir
             from vllm import LLM
 
             snapshots = glob(
