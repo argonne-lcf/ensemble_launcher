@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import os
 import random
@@ -15,9 +14,9 @@ from typing import Callable, Dict, List, Optional, Union
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
     AsyncComm,
-    AsyncZMQComm,
-    AsyncZMQCommState,
+    ClientConnection,
     NodeInfo,
+    transport_registry,
 )
 from ensemble_launcher.comm.messages import (
     IResultBatch,
@@ -49,9 +48,7 @@ from ensemble_launcher.scheduler.resource import (
 from .async_worker import AsyncWorker
 from .node import Node
 from .utils import (
-    async_load_str,
     async_load_str_file,
-    async_simple_load_str,
     async_simple_load_str_file,
 )
 
@@ -76,13 +73,15 @@ class AsyncMaster(Node):
         tasks: Optional[Dict[str, Task]] = None,
         parent: Optional[NodeInfo] = None,
         children: Optional[Dict[str, NodeInfo]] = None,
-        parent_comm: Optional[AsyncComm] = None,
+        parent_data_conn: Optional[ClientConnection] = None,
+        parent_hb_conn: Optional[ClientConnection] = None,
     ):
         super().__init__(id, parent=parent, children=children)
         self._init_tasks = tasks
         self._init_nodes = Nodes
         self._config = config
-        self._parent_comm = parent_comm
+        self._parent_data_conn = parent_data_conn
+        self._parent_hb_conn = parent_hb_conn
 
         ##lazily created in run
         self._executor = None
@@ -187,13 +186,22 @@ class AsyncMaster(Node):
         self._scheduler.cluster.update_nodes(value)
 
     @property
-    def parent_comm(self) -> Optional[AsyncComm]:
-        """Communication channel to the parent node, or None if this is the root."""
-        return self._parent_comm
+    def parent_data_conn(self):
+        """Connection to the parent node, or None if this is the root."""
+        return self._parent_data_conn
 
-    @parent_comm.setter
-    def parent_comm(self, value: AsyncComm) -> None:
-        self._parent_comm = value
+    @parent_data_conn.setter
+    def parent_data_conn(self, value) -> None:
+        self._parent_data_conn = value
+
+    @property
+    def parent_hb_conn(self):
+        """Connection to the parent node, or None if this is the root."""
+        return self._parent_hb_conn
+
+    @parent_hb_conn.setter
+    def parent_hb_conn(self, value) -> None:
+        self._parent_hb_conn = value
 
     @property
     def comm(self) -> Optional[AsyncComm]:
@@ -229,22 +237,18 @@ class AsyncMaster(Node):
         )
 
     def _create_comm(self) -> None:
-        """Instantiate the communication backend (currently only async_zmq is supported)."""
-        if self._config.comm_name == "async_zmq":
-            self.logger.info(f"{self.node_id}: Starting comm init")
-            self._comm = AsyncZMQComm(
-                self.logger.getChild("comm"),
-                self.info(),
-                parent_comm=self.parent_comm,
-                parent_address=self.parent_comm.my_address
-                if self.parent_comm
-                else None,
-                heartbeat_interval=self._config.heartbeat_interval,
-                heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
-            )
-            self.logger.info(f"{self.node_id}: Done with comm init")
-        else:
-            raise ValueError(f"Unsupported comm {self._config.comm_name}")
+        """Instantiate the communication backend."""
+        self.logger.info(f"{self.node_id}: Starting comm init")
+        self._comm = AsyncComm(
+            self.logger.getChild("comm"),
+            self.info(),
+            parent_conn=self.parent_data_conn,
+            hb_parent_conn=self.parent_hb_conn,
+            heartbeat_interval=self._config.heartbeat_interval,
+            heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
+            cluster_secret=self._config.cluster_secret,
+        )
+        self.logger.info(f"{self.node_id}: Done with comm init")
 
     def _create_scheduler(self) -> AsyncChildrenScheduler:
         """Instantiate the worker scheduler.  Override to change init args."""
@@ -375,9 +379,14 @@ class AsyncMaster(Node):
         self._child_objs[child_id] = child
         self.add_child(child_id, child.info())
         child.set_parent(self.info())
-        child.parent_comm = self.comm.pickable_copy()
-        # Extend the comm's node-info so its cache gains an entry for this child.
         await self._comm.update_node_info(self.info())
+        child_data_conn, child_hb_conn = self._comm.create_child_pipe(
+            child_id=child.info().node_id, child_secret_id=child.info().secret_id
+        )
+        child.parent_data_conn = child_data_conn
+        child.parent_hb_conn = child_hb_conn
+        # Extend the comm's node-info so its cache gains an entry for this child.
+
         # Per-child collect task (waits for the child's final ResultBatch).
         task = asyncio.create_task(
             self._collect_final_result_batch_from_child(child_id)
@@ -407,10 +416,7 @@ class AsyncMaster(Node):
         children (including any recreated ones) have been registered.
         """
         self._reporting_task = asyncio.create_task(self._report_status())
-        if self.parent:
-            self._parent_ready_monitor_task = asyncio.create_task(
-                self._parent_ready_monitor()
-            )
+
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
@@ -444,11 +450,13 @@ class AsyncMaster(Node):
             return {cfg.cpu_bind_flag: "core", "--map-by": cfg.openmpi_map_by}
 
         # "list" method: build the colon-separated core-ID string
-        if isinstance(child_resource, NodeResourceList):
-            cpus = ":".join(map(str, child_resource.cpus))
-        else:
-            # NodeResourceCount — fall back to 0..N-1 (best effort)
-            cpus = ":".join(map(str, range(child_resource.cpu_count)))
+        sorted_cpus = sorted(
+            child_resource.cpus
+            if isinstance(child_resource, NodeResourceList)
+            else list(range(child_resource.cpu_count))
+        )
+
+        cpus = f"{sorted_cpus[0]}-{sorted_cpus[-1]}"
 
         if cfg.cpu_bind_method == "list":
             return {cfg.cpu_bind_flag: f"list:{cpus}"}
@@ -568,7 +576,10 @@ class AsyncMaster(Node):
                     child_obj_dict[head_node + "-" + child_name] = child_obj
 
                 # Build combined dictionary structure
-                common_keys = ["type", "parent", "parent_comm"]
+                common_keys = [
+                    "type",
+                    "parent",
+                ]  # , "parent_data_conn", "parent_hb_conn"]
                 if all(
                     [
                         "task_executor_name" not in cdict
@@ -707,11 +718,8 @@ class AsyncMaster(Node):
         self._create_comm()  ###This will only create picklable objects
 
         # Restore saved comm state before binding so children can reconnect.
-        await self._restore_comm_state()
-
-        # for zmq, setup the sockets
-        if self._config.comm_name == "async_zmq":
-            await self._comm.setup_zmq_sockets()
+        ## Removed this as we are restarting the whole subtree
+        # await self._restore_comm_state()
 
         # Start parent comm end point monitor
         await self._comm.start_monitors(parent_only=True)
@@ -780,9 +788,6 @@ class AsyncMaster(Node):
         # Start the shared comm monitor for all child sockets (idempotent).
         await self._comm.start_monitors(children_only=True)
 
-        # Start global monitors (status reporting, result aggregation, cluster tasks).
-        self._create_monitor_tasks()
-
         # Launch and sync children, retrying failures up to 2 times
         children_names = self._scheduler.children_names
         results = await self._launch_and_sync_children(children_names)
@@ -813,6 +818,12 @@ class AsyncMaster(Node):
                 f"{max_retries} retries"
             )
 
+        # Start global monitors: Result flushing to parent, Task flushing to children, client/parent task updates, and status reporting
+        # Note on task flushing to children:
+        #  Any tasks received before build_init_task_update will be sent directly using req-res pattern during child_sync.
+        #  The task updates between _build_init_task_update and this point should be cached by the communicator.
+        self._create_monitor_tasks()
+
         # All children are launched and synced — signal each one that the master
         # is ready so they can send their final ResultBatch when done.
         for child_id in list(self._child_result_batch_task.keys()):
@@ -840,7 +851,10 @@ class AsyncMaster(Node):
         if not self._config.checkpoint_dir:
             return
         self._checkpointer = Checkpointer(
-            self.node_id, self._config.checkpoint_dir, self.logger
+            self.node_id,
+            self._config.checkpoint_dir,
+            self.logger,
+            cluster_secret=self._config.cluster_secret,
         )
         if not self._checkpointer.checkpoint_exists():
             return
@@ -849,7 +863,7 @@ class AsyncMaster(Node):
     async def _restore_comm_state(self) -> None:
         """Restore comm from cached checkpoint data using the comm's set_state.
 
-        Must be called after _create_comm() and before setup_zmq_sockets() so
+        Must be called after _create_comm() and before setup_connections() so
         the node re-binds to its previous address and reconnecting children
         can find it.
         """
@@ -908,6 +922,12 @@ class AsyncMaster(Node):
         # sync heart beat with parent
         if self.parent is None:
             return
+
+        # Start the task to detect parent ready, which is set when the parent init is done and is ready to accept results
+        self._parent_ready_monitor_task = asyncio.create_task(
+            self._parent_ready_monitor()
+        )
+
         async with self._timer("heartbeat_sync"):
             if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
                 raise TimeoutError(f"{self.node_id}: Can't connect to parent")
@@ -1500,7 +1520,7 @@ class AsyncMaster(Node):
             dest_results.setdefault(dest_id, []).append(single_result)
 
         for dest_id, results in dest_results.items():
-            if dest_id.startswith("client:"):
+            if dest_id.startswith("client-"):
                 # Client attached at this level: send directly, no buffering needed
                 self._total_streamed += len(results)
                 await self._comm.send_message_to_child(
@@ -1636,7 +1656,7 @@ class AsyncMaster(Node):
             allocated, _ = self._scheduler.cluster.allocate(assignment["job_resource"])
             if not allocated:
                 self.logger.error(
-                    f"Can't allocate the identical child resources while recovering"
+                    "Can't allocate the identical child resources while recovering"
                 )
                 raise RuntimeError(
                     "Can't allocate the identical child resources while recovering"
@@ -1811,9 +1831,9 @@ class AsyncMaster(Node):
 
         # stop comm and executor
         await self._comm.close()
-        self.logger.info(f"Shutting down executor")
+        self.logger.info("Shutting down executor")
         self._executor.shutdown()
-        self.logger.info(f"Done Shutting down executor")
+        self.logger.info("Done Shutting down executor")
 
         if self._config.profile == "perfetto" and self._event_registry is not None:
             os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
@@ -1971,8 +1991,11 @@ class AsyncMaster(Node):
             "children": {
                 child_id: child.serialize() for child_id, child in self.children.items()
             },
-            "parent_comm": self.parent_comm.get_state().serialize()
-            if self.parent_comm is not None
+            "parent_data_conn": self.parent_data_conn.get_state().serialize()
+            if self.parent_data_conn is not None
+            else None,
+            "parent_hb_conn": self.parent_hb_conn.get_state().serialize()
+            if self.parent_hb_conn is not None
             else None,
         }
 
@@ -1994,26 +2017,40 @@ class AsyncMaster(Node):
             for child_id, child_json in data["children"].items()
         }
 
-        if config.comm_name == "async_zmq":
-            # AsyncZMQComm might need special handling due to non-picklable attributes
-            parent_comm = (
-                AsyncZMQComm.set_state(
-                    AsyncZMQCommState.deserialize(data["parent_comm"])
-                )
-                if data["parent_comm"]
-                else None
+        ##Get the serial state
+        parent_data_conn_data: Dict = data.get("parent_data_conn")
+        parent_hb_conn_data: Dict = data.get("parent_hb_conn")
+        ##
+        parent_data_conn = None
+        parent_hb_conn = None
+        if parent_data_conn_data is not None:
+            tt = transport_registry.get(
+                json.loads(parent_data_conn_data)["transport_type"]
             )
-        else:
-            raise ValueError(f"Unsupported comm type {config.comm_name}")
+
+            parent_data_conn_state = tt["client_connection_state"].deserialize(
+                parent_data_conn_data
+            )
+            parent_data_conn = tt["client_connection"].set_state(parent_data_conn_state)
+        ##
+        if parent_hb_conn_data is not None:
+            tt = transport_registry.get(
+                json.loads(parent_hb_conn_data)["transport_type"]
+            )
+            parent_hb_conn_state = tt["client_connection_state"].deserialize(
+                parent_hb_conn_data
+            )
+            parent_hb_conn = tt["client_connection"].set_state(parent_hb_conn_state)
 
         master = cls(
             id=data["node_id"],
             config=config,
-            Nodes=None,  # Nodes will be received via NodeUpdate message
-            tasks={},  # Tasks are not included in serialization
+            Nodes=None,
+            tasks={},
             parent=parent,
             children=children,
-            parent_comm=parent_comm,
+            parent_data_conn=parent_data_conn,
+            parent_hb_conn=parent_hb_conn,
         )
         master._secret_id = data["secret_id"]
         return master

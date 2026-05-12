@@ -1,5 +1,5 @@
 from typing import Union, List, Dict, Optional
-import uuid
+import secrets
 import logging
 from dataclasses import dataclass, field
 from ensemble_launcher.comm import NodeInfo
@@ -21,7 +21,7 @@ class Node:
         
         self._level = 0 if self.parent is None else self.parent.level + 1
 
-        self._secret_id = str(uuid.uuid4())
+        self._secret_id = secrets.token_hex(16)
 
     @property
     def level(self):

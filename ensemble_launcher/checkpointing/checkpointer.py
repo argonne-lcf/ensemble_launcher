@@ -25,6 +25,7 @@ import asyncio
 import base64
 import os
 import socket
+import stat
 import tempfile
 import time
 from logging import Logger
@@ -87,42 +88,6 @@ class ResultCheckpointData(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Comm-state deserialisation registry
-# ---------------------------------------------------------------------------
-
-_COMM_STATE_REGISTRY: Dict[str, type] = {}
-
-
-def _get_comm_state_class(type_name: str) -> type:
-    """Return the ``AsyncCommState`` subclass registered under *type_name*.
-
-    Performs a lazy import of known backends on the first miss.
-    """
-    if type_name not in _COMM_STATE_REGISTRY:
-        try:
-            from ensemble_launcher.comm.async_zmq import AsyncZMQCommState
-
-            _COMM_STATE_REGISTRY[AsyncZMQCommState.__name__] = AsyncZMQCommState
-        except ImportError:
-            pass
-    if type_name not in _COMM_STATE_REGISTRY:
-        raise ValueError(
-            f"Unknown comm state type '{type_name}'. "
-            f"Known types: {list(_COMM_STATE_REGISTRY)}"
-        )
-    return _COMM_STATE_REGISTRY[type_name]
-
-
-# Eagerly register built-in comm state types.
-try:
-    from ensemble_launcher.comm.async_zmq import AsyncZMQCommState
-
-    _COMM_STATE_REGISTRY[AsyncZMQCommState.__name__] = AsyncZMQCommState
-except ImportError:
-    pass
-
-
-# ---------------------------------------------------------------------------
 # Checkpointer
 # ---------------------------------------------------------------------------
 
@@ -166,6 +131,7 @@ class Checkpointer:
         node_id: str,
         checkpoint_dir: str,
         logger: Logger,
+        cluster_secret: Optional[str] = None,
     ) -> None:
         self.node_id = node_id
         self.checkpoint_dir = checkpoint_dir
@@ -180,6 +146,9 @@ class Checkpointer:
                 raise RuntimeError(
                     f"Checkpoint path {self.checkpoint_sub_dir!r} exists but is not a directory"
                 )
+
+        if cluster_secret is not None:
+            self._write_secret(cluster_secret)
 
     # ------------------------------------------------------------------
     # File paths
@@ -204,6 +173,10 @@ class Checkpointer:
     @property
     def results_path(self) -> str:
         return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_results.json")
+
+    @property
+    def secret_path(self) -> str:
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_secret")
 
     # ------------------------------------------------------------------
     # Synchronous I/O helpers (dispatched to a thread via run_in_executor)
@@ -245,6 +218,27 @@ class Checkpointer:
             return None
         with open(path, "r") as fh:
             return fh.read()
+
+    def _write_secret(self, cluster_secret: str) -> None:
+        target_dir = os.path.dirname(self.secret_path)
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(cluster_secret)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except Exception:
+            os.close(fd)
+            raise
+        os.replace(tmp, self.secret_path)
+        os.chmod(self.secret_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    def _read_secret(self) -> Optional[str]:
+        if not os.path.exists(self.secret_path):
+            return None
+        with open(self.secret_path, "r") as fh:
+            return fh.read().strip()
 
     def _delete_file(self, path: str) -> None:
         try:
@@ -335,8 +329,7 @@ class Checkpointer:
             raw = self._read_json(self.comm_path)
             if raw is not None:
                 comm_data = CommCheckpointData.model_validate_json(raw)
-                comm_cls = _get_comm_state_class(comm_data.comm_state_type)
-                comm_state = comm_cls.deserialize(comm_data.comm_state_json)
+                comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
 
         tasks: Optional[Dict[str, "Task"]] = None
         if meta.has_tasks:
@@ -477,6 +470,7 @@ class Checkpointer:
             self.scheduler_path,
             self.comm_path,
             self.tasks_path,
+            self.secret_path,
         ):
             await loop.run_in_executor(None, self._delete_file, path)
         self.logger.debug(f"[Checkpointer] Checkpoint deleted for {self.node_id}")

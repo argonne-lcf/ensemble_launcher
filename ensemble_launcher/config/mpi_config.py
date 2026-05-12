@@ -36,6 +36,16 @@ _MPI_FLAVOR_DEFAULTS: Dict[str, Dict] = {
         "cpu_bind_flag": "--bind-to",
         "cpu_bind_method": "bind-to",
     },
+    "test": {
+        "launcher": "mpirun",
+        "nprocesses_flag": "-np",
+        "processes_per_node_flag": None,
+        "hosts_flag": None,
+        "hostfile_flag": None,
+        "rankfile_flag": None,
+        "cpu_bind_flag": "none",
+        "cpu_bind_method": "none",
+    },
     # MPICH (hydra launcher)
     "mpich": {
         "launcher": "mpiexec",
@@ -98,7 +108,9 @@ class MPIConfig(BaseModel):
     # Individual fields below always take precedence over flavor defaults. #
     # ------------------------------------------------------------------ #
     flavor: Optional[
-        Literal["intel", "cray-pals", "openmpi", "mpich", "srun", "aprun", "jsrun"]
+        Literal[
+            "intel", "cray-pals", "openmpi", "mpich", "srun", "aprun", "jsrun", "test"
+        ]
     ] = None
 
     # ------------------------------------------------------------------ #

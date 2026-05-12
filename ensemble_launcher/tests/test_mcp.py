@@ -2,7 +2,6 @@ import asyncio
 import math
 import os
 
-import pytest
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from utils import async_compute_density, compute_density
@@ -35,6 +34,9 @@ async def call_ensemble_tools():
                     "Pressure": [1.0, 1.0, 1.0],
                 },
             )
+            print("*" * 50)
+            print(result)
+            print("*" * 50)
             return result
 
 
@@ -160,5 +162,5 @@ def test_mcp_string():
 
 
 if __name__ == "__main__":
-    # test_mcp()
+    test_mcp()
     test_mcp_string()

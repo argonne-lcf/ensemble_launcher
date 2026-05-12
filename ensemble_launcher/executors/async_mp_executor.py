@@ -28,7 +28,7 @@ def dummy_task():
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
     def __init__(
-        self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", **kwargs
+        self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", worker_method: str = "spawn", **kwargs
     ):
         self.logger = logger
         self._gpu_selector = gpu_selector
@@ -36,9 +36,12 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         if "return_stdout" in kwargs:
             self._return_stdout = kwargs["return_stdout"]
 
-        # mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
-        # super().__init__(mp_context=mp_context, **kwargs)
-        super().__init__(max_workers=kwargs.get("max_workers", None))
+        if worker_method == "spawn":
+            mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
+            super().__init__(mp_context=mp_context, max_workers=kwargs.get("max_workers", None))
+        else:
+            super().__init__(max_workers=kwargs.get("max_workers", None))
+        # super().__init__()
 
         super().submit(dummy_task)
 

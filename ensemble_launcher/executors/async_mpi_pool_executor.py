@@ -12,8 +12,6 @@ from logging import Logger
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
-import zmq
-import zmq.asyncio
 
 from ensemble_launcher.config import MPIConfig
 from ensemble_launcher.scheduler.resource import (
@@ -112,6 +110,9 @@ class AsyncMPIPoolExecutor:
         log_dir: str = "logs",
         **kwargs,
     ):
+        import zmq
+        import zmq.asyncio
+
         self.logger = logger
         self._gpu_selector = gpu_selector
         self._return_stdout = kwargs.pop("return_stdout", False)
@@ -188,6 +189,8 @@ class AsyncMPIPoolExecutor:
 
     async def _result_loop(self):
         """Receive results from the dedicated result socket (PULL)."""
+        import zmq
+
         while True:
             try:
                 data = await self._result_sock.recv()
@@ -205,6 +208,8 @@ class AsyncMPIPoolExecutor:
 
     async def _msg_loop(self):
         """Receive control messages (ready, done) from the message socket."""
+        import zmq
+
         while True:
             try:
                 identity, data = await self._msg_sock.recv_multipart()

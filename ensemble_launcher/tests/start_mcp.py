@@ -1,7 +1,4 @@
-import argparse
-import asyncio
 import atexit
-import multiprocessing as mp
 import os
 import signal
 import socket
@@ -30,6 +27,8 @@ def start_mcp():
             return_stdout=True,
             cluster=True,
             checkpoint_dir=CHECKPOINT_DIR,
+            worker_logs=True,
+            master_logs=True,
         ),
         Nodes=[socket.gethostname()],
     )

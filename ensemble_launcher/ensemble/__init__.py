@@ -1,1 +1,2 @@
-from .ensemble import Task, AsyncTask, TaskStatus, TaskFactory
+from .ensemble import AsyncTask, Task, TaskFactory, TaskKwargs, TaskStatus
+from .actor import Actor, PublicActor, PrivateActor, actor

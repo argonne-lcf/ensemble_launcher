@@ -27,8 +27,6 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.getcwd())
 
 import cloudpickle
-import zmq
-import zmq.asyncio
 from mpi4py import MPI
 
 from ensemble_launcher.logging import setup_logger
@@ -216,6 +214,9 @@ def _stop_workers():
 
 
 async def run_master(socket_base):
+    import zmq
+    import zmq.asyncio
+
     logger.info(f"[rank 0] Starting master, SIZE={SIZE}, socket_base={socket_base}")
     ctx = zmq.asyncio.Context()
 

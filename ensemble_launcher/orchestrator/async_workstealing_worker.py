@@ -29,10 +29,11 @@ class AsyncWorkStealingWorker(AsyncWorker):
         tasks: Optional[Dict[str, Task]] = None,
         parent: Optional[NodeInfo] = None,
         children: Optional[Dict[str, NodeInfo]] = None,
-        parent_comm: Optional[AsyncComm] = None,
+        parent_data_conn=None,
+        parent_hb_conn=None,
     ) -> None:
         """Initialise work-stealing specific state on top of AsyncWorker."""
-        super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
+        super().__init__(id, config, Nodes, tasks, parent, children, parent_data_conn=parent_data_conn, parent_hb_conn=parent_hb_conn)
 
     # ------------------------------------------------------------------
     # Initialisation overrides

@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 setup(
     name="ensemble_launcher",
@@ -11,15 +11,16 @@ setup(
         "matplotlib",
         "scienceplots",
         "pytest",
+        "pytest-timeout",
         "pytest-asyncio",
         "cloudpickle",
         "pydantic",
         "pyzmq",
-        "typer"
+        "typer",
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
-        "mcp": ["mcp","paramiko"],
+        "mcp": ["mcp", "paramiko"],
     },
     entry_points={
         "console_scripts": [

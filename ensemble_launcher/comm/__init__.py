@@ -1,6 +1,4 @@
 from .async_base import AsyncComm, AsyncCommState
-from .async_zmq import AsyncZMQComm, AsyncZMQCommState
-from .base import Comm
 from .messages import (
     IResultBatch,
     Message,
@@ -16,15 +14,31 @@ from .messages import (
     TaskRequest,
     TaskUpdate,
 )
-from .mp import MPComm
 from .nodeinfo import NodeInfo
-from .zmq import ZMQComm
+from .pipe import (
+    AsyncConnection,
+    AsyncConnectionState,
+    AsyncMPConnection,
+    AsyncMPTransport,
+    AsyncTransport,
+    AsyncTransportState,
+    AsyncZMQDealerConnection,
+    AsyncZMQDealerConnectionState,
+    AsyncZMQRouterConnection,
+    AsyncZMQRouterConnectionState,
+    AsyncZMQTransport,
+    AsyncZMQTransportState,
+    ClientConnection,
+    ClientConnectionState,
+    IdentityVerificationError,
+    ServerConnection,
+    ServerConnectionState,
+    transport_registry,
+)
 
 __all__ = [
     "AsyncComm",
     "AsyncCommState",
-    "AsyncZMQComm",
-    "Comm",
     "Message",
     "NodeRequest",
     "NodeUpdate",
@@ -38,8 +52,23 @@ __all__ = [
     "StopType",
     "TaskRequest",
     "TaskUpdate",
-    "MPComm",
     "NodeInfo",
-    "ZMQComm",
-    "AsyncZMQCommState",
+    "AsyncConnection",
+    "AsyncConnectionState",
+    "AsyncTransport",
+    "AsyncTransportState",
+    "AsyncZMQDealerConnection",
+    "AsyncZMQDealerConnectionState",
+    "AsyncZMQRouterConnection",
+    "AsyncZMQRouterConnectionState",
+    "AsyncZMQTransport",
+    "AsyncZMQTransportState",
+    "AsyncMPConnection",
+    "AsyncMPTransport",
+    "ServerConnection",
+    "ServerConnectionState",
+    "ClientConnection",
+    "ClientConnectionState",
+    "IdentityVerificationError",
+    "transport_registry",
 ]

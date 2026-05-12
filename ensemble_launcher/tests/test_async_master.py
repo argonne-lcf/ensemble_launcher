@@ -3,8 +3,6 @@ import logging
 import socket
 
 import pytest
-from utils import echo, echo_stdout
-
 from ensemble_launcher.config import (
     LauncherConfig,
     MPIConfig,
@@ -15,11 +13,13 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster
 from ensemble_launcher.scheduler.resource import (
     JobResource,
-    NodeResourceCount,
     NodeResourceList,
 )
 
+from utils import echo, echo_stdout
 
+
+@pytest.mark.timeout(60)
 @pytest.mark.asyncio
 async def test_async_master(nlevels=1, ntask_per_core=1):
     ##create tasks
@@ -44,7 +44,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             policy_config=PolicyConfig(nlevels=nlevels),
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
-            log_level=logging.DEBUG,
+            log_level=logging.INFO,
             heartbeat_interval=1.0,
             heartbeat_dead_threshold=5.0,
             master_logs=True,
@@ -62,6 +62,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
     ), f"{[result for task_id, result in results.items()]}"
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.asyncio
 async def test_async_mpi_master(nlevels=1):
     ##create tasks
@@ -89,8 +90,8 @@ async def test_async_mpi_master(nlevels=1):
             policy_config=PolicyConfig(nlevels=nlevels),
             child_executor_name="async_mpi",
             task_executor_name="async_mpi",
-            log_level=logging.DEBUG,
-            mpi_config=MPIConfig(cpu_bind_method="none", processes_per_node_flag=None),
+            log_level=logging.INFO,
+            mpi_config=MPIConfig(flavor="test"),
             sequential_child_launch=True,
             heartbeat_interval=0.1,
             heartbeat_dead_threshold=5.0,
@@ -115,7 +116,7 @@ async def test_async_mpi_master(nlevels=1):
 if __name__ == "__main__":
     print("Testing Async Master with ProcessPool Executor for 1 task per core")
     asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
-    # print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
-    # asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
-    # print("Testing Async Master with MPI Executor")
-    # asyncio.run(test_async_mpi_master(nlevels=3))
+    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
+    asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
+    print("Testing Async Master with MPI Executor")
+    asyncio.run(test_async_mpi_master(nlevels=3))

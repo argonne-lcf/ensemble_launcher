@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import signal
@@ -268,16 +269,8 @@ class AsyncMPIExecutor(Executor):
     ) -> None:
         """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
         cfg = self._mpi_config
-        setup_code = (
-            "import os, stat\n"
-            f"content = {repr(content)}\n"
-            f"path = {repr(path)}\n"
-            "os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
-            "open(path, 'w').write(content)\n"
-        )
-        if executable:
-            setup_code += "os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)\n"
-        cmd = (
+
+        base_cmd = (
             [cfg.launcher]
             + [cfg.nprocesses_flag, str(len(nodes))]
             + (
@@ -285,14 +278,65 @@ class AsyncMPIExecutor(Executor):
                 if cfg.processes_per_node_flag
                 else []
             )
-            + ([cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else [])
-            + ["python", "-c", setup_code]
         )
+
+        if len(nodes) >= cfg.hostfile_threshold and cfg.hostfile_flag:
+            hostfile_path = os.path.join(
+                self.tmp_dir, f"hostfile_{str(uuid.uuid4())}.txt"
+            )
+            with open(hostfile_path, "w") as f:
+                for node in nodes:
+                    f.write(f"{node}\n")
+            base_cmd += [cfg.hostfile_flag, hostfile_path]
+        else:
+            base_cmd += [cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else []
+
+        # 500 chars base64-encodes to ~670 bytes, keeping the total command length
+        # well under the strict 4096-byte MPI/OS limits.
+        CHUNK_SIZE = 3000
+        chunks = (
+            [content[i : i + CHUNK_SIZE] for i in range(0, len(content), CHUNK_SIZE)]
+            if content
+            else [""]
+        )
+
+        # Base64 encode the path to prevent shell issues if the path contains spaces or special characters
+        encoded_path = base64.b64encode(path.encode("utf-8")).decode("utf-8")
+
         self.logger.info(
-            f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s)"
+            f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s) in {len(chunks)} chunk(s)"
         )
-        proc = await asyncio.create_subprocess_exec(*cmd)
-        await proc.wait()
+
+        for i, chunk in enumerate(chunks):
+            mode = "w" if i == 0 else "a"
+            encoded_chunk = base64.b64encode(chunk.encode("utf-8")).decode("utf-8")
+
+            # Base64 payload sidesteps all remote Bash parsing, quoting, and newline mangling.
+            setup_code = (
+                "import base64, os\n"
+                f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
+                "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+                f"with open(p, '{mode}') as f:\n"
+                f"    f.write(base64.b64decode('{encoded_chunk}').decode('utf-8'))\n"
+            )
+
+            cmd = base_cmd + ["python", "-c", setup_code]
+            self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
+
+            proc = await asyncio.create_subprocess_exec(*cmd)
+            await proc.wait()
+
+        if executable:
+            chmod_code = (
+                "import base64, os, stat\n"
+                f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
+                "os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)\n"
+            )
+            cmd = base_cmd + ["python", "-c", chmod_code]
+            self.logger.debug(f"Executing chmod for {path}")
+
+            proc = await asyncio.create_subprocess_exec(*cmd)
+            await proc.wait()
 
     async def _subprocess_task(
         self,
@@ -413,7 +457,7 @@ class AsyncMPIExecutor(Executor):
             task.cancel()
         self._tasks.clear()
 
-    async def ashutdown(self, wait: bool = True) -> None:
+    async def ashutdown(self, wait: bool = False) -> None:
         """Async shutdown: kill process groups and await all asyncio tasks."""
         force = not wait
         for process in list(self._processes.values()):

@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+import secrets
 from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -85,23 +86,29 @@ class LauncherConfig(BaseModel):
         1000000  # max buffer size of the result queue in cluster mode
     )
 
-    result_flush_interval: float = 5.0  # Flush result queues every fixed time
+    result_flush_interval: float = 0.5  # Flush result queues every fixed time
 
     task_buffer_size: int = 1000000  # max buffer size of the task queue per child
 
-    task_flush_interval: float = 5.0  # Flush task queues every fixed time
+    cluster_secret: Optional[str] = None
+
+    task_flush_interval: float = 0.5  # Flush task queues every fixed time
 
     task_request_size: Optional[int] = (
         None  # size of the task request in work stealing mode
     )
 
     task_request_interval: float = (
-        5.0  # Seconds between periodic task requests in workstealing mode
+        0.5  # Seconds between periodic task requests in workstealing mode
     )
 
     mpi_config: MPIConfig = MPIConfig(
         flavor="mpich"
     )  ## Configuration to help build mpi options like -np, -ppn etc
+
+    def model_post_init(self, _) -> None:
+        if self.cluster and self.cluster_secret is None:
+            object.__setattr__(self, "cluster_secret", secrets.token_hex(16))
 
     def __str__(self) -> str:
         """Return a nicely formatted string representation of the config"""

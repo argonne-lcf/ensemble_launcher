@@ -37,10 +37,11 @@ class AsyncWorkStealingMaster(AsyncMaster):
         tasks=None,
         parent=None,
         children=None,
-        parent_comm=None,
+        parent_data_conn=None,
+        parent_hb_conn=None,
     ) -> None:
         """Initialise work-stealing specific state on top of AsyncMaster."""
-        super().__init__(id, config, Nodes, tasks, parent, children, parent_comm)
+        super().__init__(id, config, Nodes, tasks, parent, children, parent_data_conn=parent_data_conn, parent_hb_conn=parent_hb_conn)
 
         self._completed_task_ids: Set[str] = set()
 

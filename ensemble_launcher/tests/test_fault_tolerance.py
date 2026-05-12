@@ -5,7 +5,6 @@ import socket
 import time
 import uuid
 
-import pytest
 from utils import echo_sleep
 
 from ensemble_launcher import EnsembleLauncher
@@ -53,7 +52,7 @@ def test_el_fault_tolerance():
             return_stdout=True,
             worker_logs=True,
             master_logs=True,
-            mpi_config=MPIConfig(cpu_bind_method="none", processes_per_node_flag=None),
+            mpi_config=MPIConfig(flavor="test"),
             cluster=True,
             checkpoint_dir=ckpt_dir,
             report_interval=1.0,
