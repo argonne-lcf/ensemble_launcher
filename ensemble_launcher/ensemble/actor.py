@@ -51,16 +51,13 @@ class _ActorBase(ABC):
         return f"{id}:{secret}"
 
     @abstractmethod
-    async def _do_send(self, target_id: str, data: bytes) -> None:
-        ...
+    async def _do_send(self, target_id: str, data: bytes) -> None: ...
 
     @abstractmethod
-    def _start_transport(self):
-        ...
+    def _start_transport(self): ...
 
     @abstractmethod
-    async def _run(self):
-        ...
+    async def _run(self): ...
 
     async def _recv(self):
         self.logger.info("Receive loop started.")
@@ -115,6 +112,8 @@ class _ActorBase(ABC):
                     self.logger.error(f"Invoke failed with error: {e}")
                     raise e
                 await self._output_queue.put((target_id, result))
+            else:
+                raise ValueError("Argments has to be either List[Tuple] or Tuple")
 
     @abstractmethod
     def action(self, *args: Any) -> Any: ...
