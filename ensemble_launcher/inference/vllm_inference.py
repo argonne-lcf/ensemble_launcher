@@ -14,8 +14,9 @@ class VLLMInference(PublicActor):
         tensor_parallel_size: int = 1,
         transport: str = "zmq",
         cache_modelinfo: bool = False,
+        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
-        super().__init__(name, transport)
+        super().__init__(name, transport, ckpt_dir=ckpt_dir)
         self.model = model
         self.cache_dir = cache_dir
         self.tensor_parallel_size = tensor_parallel_size
