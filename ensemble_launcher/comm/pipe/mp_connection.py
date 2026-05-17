@@ -5,6 +5,8 @@ from typing import Dict, List, Optional
 from .async_connection import (
     ServerConnection,
     ServerConnectionState,
+)
+from .async_connection import (
     decode_identity as _decode_identity,
 )
 

@@ -1,7 +1,7 @@
 import os
 from typing import Dict
 
-from ensemble_launcher.ensemble.actor import PublicActor
+from ensemble_launcher.ensemble.actor import PublicActor, action
 from ensemble_launcher.logging import setup_logger
 
 _ALCF_HTTP_PROXY_ENV = {
@@ -46,7 +46,8 @@ class OpenAIInference(PublicActor):
             )
             self.logger.info(f"OpenAI client connected to {self.base_url}")
 
-    def action(self, prompts="hello", temperature=0.0, max_tokens=1024):
+    @action
+    def generate(self, prompts="hello", temperature=0.0, max_tokens=1024):
         if isinstance(prompts, str):
             prompts = [prompts]
             single = True

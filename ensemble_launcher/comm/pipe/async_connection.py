@@ -1,12 +1,12 @@
-import logging
-import random
 import os
+import random
 import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type, TypeVar
-from ensemble_launcher.logging import setup_logger
 
 from pydantic import BaseModel, Field
+
+from ensemble_launcher.logging import setup_logger
 
 T = TypeVar("T", bound="AsyncConnectionState")
 
@@ -45,7 +45,9 @@ class AsyncConnection(ABC):
 
     def __init__(self, identity: str, secret_id: str):
         os.makedirs(f"{os.getcwd()}/logs/connections", exist_ok=True)
-        self.logger = setup_logger(name=f"connection-{identity}", log_dir=f"{os.getcwd()}/logs/connections")
+        self.logger = setup_logger(
+            name=f"connection-{identity}", log_dir=f"{os.getcwd()}/logs/connections"
+        )
         self._identity = identity
         self._secret_id = secret_id
         self._is_open = False
@@ -59,7 +61,7 @@ class AsyncConnection(ABC):
         pass
 
     @abstractmethod
-    async def send(self, data: bytes) -> bool:
+    async def send(self, data: bytes, target_id: str) -> bool:
         pass
 
     @abstractmethod
