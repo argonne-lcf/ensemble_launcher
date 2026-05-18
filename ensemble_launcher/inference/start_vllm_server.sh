@@ -90,12 +90,12 @@ mkdir -p "$LOG_DIR"
 # Launch vLLM server
 if [ $NGPUS -eq 1 ]; then
     echo "$(date) Starting vllm with 1 GPU on port $PORT"
-    vllm serve ${VLLM_MODEL} --port $PORT --trust-remote-code \
+    vllm serve ${VLLM_MODEL} --host $(hostname) --port $PORT --trust-remote-code \
         1> "$LOG_DIR/vllm.server.log" \
         2> "$LOG_DIR/vllm.server.err"
 else
     echo "$(date) Starting vllm with ${NGPUS} GPUs on port $PORT"
-    vllm serve ${VLLM_MODEL} --distributed-executor-backend mp --port $PORT \
+    vllm serve ${VLLM_MODEL} --distributed-executor-backend mp --host $(hostname) --port $PORT \
         --tensor-parallel-size ${NGPUS} --trust-remote-code \
         1> "$LOG_DIR/vllm.server.log" \
         2> "$LOG_DIR/vllm.server.err"

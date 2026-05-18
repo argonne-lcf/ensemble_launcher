@@ -93,12 +93,19 @@ class OnlineVLLMInference(PublicActor):
         script_path = os.path.join(os.path.dirname(__file__), "start_vllm_server.sh")
         hostname = socket.gethostname()
         self._server_process = subprocess.Popen(
-            [script_path, str(self.port), str(self.tensor_parallel_size),
-             self.model, self.cache_dir],
+            [
+                script_path,
+                str(self.port),
+                str(self.tensor_parallel_size),
+                self.model,
+                self.cache_dir,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self.logger.info(f"Started vLLM server process (pid={self._server_process.pid})")
+        self.logger.info(
+            f"Started vLLM server process (pid={self._server_process.pid})"
+        )
         url = f"http://{hostname}:{self.port}/v1/models"
         start = time.time()
         timeout = 600
@@ -114,6 +121,7 @@ class OnlineVLLMInference(PublicActor):
 
     def on_stop(self):
         if self._server_process is not None:
+            subprocess.run(["pkill", "-f", "vllm serve *"])
             self._server_process.terminate()
             try:
                 self._server_process.wait(timeout=10)
