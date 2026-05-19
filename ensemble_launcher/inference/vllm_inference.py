@@ -28,7 +28,7 @@ class VLLMInference(PublicActor):
         self._llm = None
         self._cache_modelinfo = cache_modelinfo
 
-    def on_start(self):
+    async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
@@ -81,23 +81,28 @@ class OnlineVLLMInference(PublicActor):
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
         super().__init__(name, transport, ckpt_dir=ckpt_dir)
-        self.model = model
+        self._model_name = model
         self.cache_dir = cache_dir
         self.port = port
         self.tensor_parallel_size = tensor_parallel_size
         self._server_process = None
 
-    def on_start(self):
+    async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         script_path = os.path.join(os.path.dirname(__file__), "start_vllm_server.sh")
-        hostname = socket.gethostname()
+        self._hostname = (
+            socket.gethostname()
+            if ".local" not in socket.gethostname()
+            else "localhost"
+        )
         self._server_process = subprocess.Popen(
             [
                 script_path,
+                self._hostname,
                 str(self.port),
                 str(self.tensor_parallel_size),
-                self.model,
+                self._model_name,
                 self.cache_dir,
             ],
             stdout=subprocess.DEVNULL,
@@ -106,20 +111,20 @@ class OnlineVLLMInference(PublicActor):
         self.logger.info(
             f"Started vLLM server process (pid={self._server_process.pid})"
         )
-        url = f"http://{hostname}:{self.port}/v1/models"
+        url = f"http://{self._hostname}:{self.port}/v1/models"
         start = time.time()
         timeout = 600
         while time.time() - start < timeout:
             try:
                 urllib.request.urlopen(url, timeout=5)
-                self.logger.info(f"vLLM server ready at {hostname}:{self.port}")
+                self.logger.info(f"vLLM server ready at {self._hostname}:{self.port}")
                 return
             except Exception:
                 self.logger.info(f"Waiting for vLLM ({time.time() - start:.0f}s)...")
                 time.sleep(10)
         raise RuntimeError(f"vLLM server not ready after {timeout}s")
 
-    def on_stop(self):
+    async def on_stop(self):
         if self._server_process is not None:
             subprocess.run(["pkill", "-f", "vllm serve *"])
             self._server_process.terminate()
@@ -131,4 +136,8 @@ class OnlineVLLMInference(PublicActor):
 
     @action
     def get_address(self):
-        return f"{socket.gethostname()}:{self.port}"
+        return f"{self._hostname}:{self.port}"
+
+    @action
+    def model(self):
+        return self._model_name

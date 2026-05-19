@@ -31,7 +31,7 @@ class OpenAIInference(PublicActor):
         self.http_proxy_env = http_proxy_env
         self._openai_client = None
 
-    def on_start(self):
+    async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._openai_client is None:

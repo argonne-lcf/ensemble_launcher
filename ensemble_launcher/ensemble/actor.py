@@ -1,9 +1,10 @@
 import asyncio
+import inspect
 import os
 import secrets
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import cloudpickle
 from typing_extensions import Unpack
@@ -31,25 +32,40 @@ class AgentHandle:
     def __init__(
         self,
         conn: Union[ClientConnection, ServerConnection],
-        actions: List[str],
+        actions: Dict[str, inspect.Signature],
         default_target_id: Optional[str] = None,
     ):
         self._conn = conn
-        self._actions = set(actions)
+        self._actions = actions
         self._default_target_id = default_target_id
 
     def __getattr__(self, name):
-        if name in self._actions:
+        _actions = self.__dict__.get("_actions")
+        if _actions is not None:
+            if name in _actions:
+                sig = _actions[name]
 
-            async def proxy(*args, target_id: Optional[str] = None):
-                await self.send((name, *args), target_id=target_id)
-                return await self.recv()
+                async def proxy(
+                    *args,
+                    target_id: Optional[str] = None,
+                    **kwargs,
+                ):
+                    await self.send((name, args, kwargs), target_id=target_id)
+                    return await self.recv()
 
-            return proxy
-        elif hasattr(self._conn, name):
-            return getattr(self._conn, name)
-        else:
-            raise AttributeError(f"No attribute named {name}")
+                proxy.__name__ = name
+                proxy.__qualname__ = name
+                proxy.__signature__ = sig
+                proxy.__annotations__ = {
+                    k: v.annotation
+                    for k, v in sig.parameters.items()
+                    if v.annotation is not inspect.Parameter.empty
+                }
+                return proxy
+        _conn = self.__dict__.get("_conn")
+        if _conn is not None and hasattr(_conn, name):
+            return getattr(_conn, name)
+        raise AttributeError(f"No attribute named {name}")
 
     async def recv(self):
         frames = await self._conn.recv()
@@ -104,6 +120,14 @@ class _ActorBase(ABC):
     @abstractmethod
     def create_handle(self, *args, **kwargs): ...
 
+    def _build_action_signatures(self) -> Dict[str, inspect.Signature]:
+        sigs = {}
+        for name, fn in self.__actions__.items():
+            sig = inspect.signature(fn)
+            params = [p for p in sig.parameters.values() if p.name != "self"]
+            sigs[name] = sig.replace(parameters=params)
+        return sigs
+
     @abstractmethod
     async def _run(self): ...
 
@@ -137,12 +161,19 @@ class _ActorBase(ABC):
 
     @action
     def stop(self):
-        self._stop.set()
-        self.logger.info("Actor stop set")
+        try:
+            self._stop.set()
+            self.logger.info("Actor stop set")
+        except Exception as e:
+            self.logger.error(f"Setting stop failed with exception {e}")
+            raise
 
-    async def _invoke(self, action_name: str, *args: Any) -> Any:
+    async def _invoke(
+        self, action_name: str, args: tuple = (), kwargs: Optional[dict] = None
+    ) -> Any:
         act = self.__actions__.get(action_name)
-        result = act(self, *args)
+        self.logger.info(f"Invoking {action_name}")
+        result = act(self, *args, **(kwargs or {}))
         if asyncio.iscoroutine(result):
             result = await result
         return result
@@ -150,30 +181,31 @@ class _ActorBase(ABC):
     async def _main_loop(self):
         self.logger.info("Main loop started.")
         while not self._stop.is_set():
-            target_id, args = await self._input_queue.get()
-            if isinstance(args, list):
+            target_id, msg = await self._input_queue.get()
+            if isinstance(msg, list):
                 results = []
-                for arg in args:
+                for action_name, args, kwargs in msg:
                     try:
-                        results.append(await self._invoke(*arg))
+                        results.append(await self._invoke(action_name, args, kwargs))
                     except Exception as e:
                         self.logger.error(f"Invoke failed with error: {e}")
                         raise e
                 await self._output_queue.put((target_id, results))
-            elif isinstance(args, tuple):
+            elif isinstance(msg, tuple):
+                action_name, args, kwargs = msg
                 try:
-                    result = await self._invoke(*args)
+                    result = await self._invoke(action_name, args, kwargs)
                 except Exception as e:
                     self.logger.error(f"Invoke failed with error: {e}")
                     raise e
                 await self._output_queue.put((target_id, result))
             else:
-                raise ValueError("Argments has to be either List[Tuple] or Tuple")
+                raise ValueError("Message must be either List[Tuple] or Tuple")
 
-    def on_start(self):
+    async def on_start(self):
         pass
 
-    def on_stop(self):
+    async def on_stop(self):
         pass
 
     def __call__(self):
@@ -254,7 +286,7 @@ class PublicActor(_ActorBase):
 
         return AgentHandle(
             clientconn,
-            list(self.__actions__.keys()),
+            self._build_action_signatures(),
             default_target_id=f"{self.name}:{self.secret}",
         )
 
@@ -275,7 +307,7 @@ class PublicActor(_ActorBase):
     async def _run(self):
         self._init_runtime()
 
-        result = self.on_start()
+        result = await self.on_start()
 
         self._start_transport()
         await self._conn.open()
@@ -292,7 +324,7 @@ class PublicActor(_ActorBase):
 
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
 
-        result = self.on_stop()
+        result = await self.on_stop()
         if asyncio.iscoroutine(result):
             await result
 
@@ -327,14 +359,14 @@ class PrivateActor(_ActorBase):
         target_id = f"{self._name}:{self._secret}"
         return AgentHandle(
             self._server_conn,
-            list(self.__actions__.keys()),
+            self._build_action_signatures(),
             default_target_id=target_id,
         )
 
     async def _run(self):
         self._init_runtime()
 
-        result = self.on_start()
+        result = await self.on_start()
 
         await self._conn.open()
 
@@ -345,7 +377,7 @@ class PrivateActor(_ActorBase):
 
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
 
-        result = self.on_stop()
+        result = await self.on_stop()
         if asyncio.iscoroutine(result):
             await result
 

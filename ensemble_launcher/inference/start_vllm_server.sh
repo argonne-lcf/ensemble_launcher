@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./start_vllm_server.sh PORT NGPUS [VLLM_MODEL] [CACHE_DIR] [TEMPDIR]
+# Usage: ./start_vllm_server.sh HOST PORT NGPUS [VLLM_MODEL] [CACHE_DIR] [TEMPDIR]
 #
 # Required Arguments:
 #   PORT         - vLLM server port
@@ -11,15 +11,16 @@
 #   TEMPDIR      - Temporary directory (default: /tmp)
 #
 # Examples:
-#   ./start_vllm_server.sh 8000 8
-#   ./start_vllm_server.sh 8001 4 meta-llama/Llama-3.1-70B-Instruct
+#   ./start_vllm_server.sh $(hostname) 8000 8
+#   ./start_vllm_server.sh $(hostname) 8001 4 meta-llama/Llama-3.1-70B-Instruct
 
 # Check required arguments
-if [ $# -lt 2 ]; then
+if [ $# -lt 3 ]; then
     echo "ERROR: Missing required arguments"
-    echo "Usage: $0 PORT NGPUS [VLLM_MODEL] [CACHE_DIR] [TEMPDIR]"
+    echo "Usage: $0 HOST PORT NGPUS [VLLM_MODEL] [CACHE_DIR] [TEMPDIR]"
     echo ""
     echo "Required arguments:"
+    echo "  HOST         - vLLM server host"
     echo "  PORT         - vLLM server port"
     echo "  NGPUS        - Number of GPUs to use"
     echo ""
@@ -28,11 +29,12 @@ if [ $# -lt 2 ]; then
 fi
 
 # Command line arguments
-PORT=${1}
-NGPUS=${2}
-VLLM_MODEL=${3:-"meta-llama/Llama-3.1-8B-Instruct"}
-CACHE_DIR=${4:-"$(pwd)/.cache"}
-TEMPDIR=${5:-"/tmp"}
+HOST=${1}
+PORT=${2}
+NGPUS=${3}
+VLLM_MODEL=${4:-"meta-llama/Llama-3.1-8B-Instruct"}
+CACHE_DIR=${5:-"$(pwd)/.cache"}
+TEMPDIR=${6:-"/tmp"}
 
 echo "PORT: $PORT"
 echo "NGPUS: $NGPUS"
@@ -90,12 +92,12 @@ mkdir -p "$LOG_DIR"
 # Launch vLLM server
 if [ $NGPUS -eq 1 ]; then
     echo "$(date) Starting vllm with 1 GPU on port $PORT"
-    vllm serve ${VLLM_MODEL} --host $(hostname) --port $PORT --trust-remote-code \
+    vllm serve ${VLLM_MODEL} --host ${HOST} --port $PORT --trust-remote-code  --enable-auto-tool-choice --tool-call-parser hermes \
         1> "$LOG_DIR/vllm.server.log" \
         2> "$LOG_DIR/vllm.server.err"
 else
     echo "$(date) Starting vllm with ${NGPUS} GPUs on port $PORT"
-    vllm serve ${VLLM_MODEL} --distributed-executor-backend mp --host $(hostname) --port $PORT \
+    vllm serve ${VLLM_MODEL} --distributed-executor-backend mp --host ${HOST} --port $PORT  --enable-auto-tool-choice --tool-call-parser hermes \
         --tensor-parallel-size ${NGPUS} --trust-remote-code \
         1> "$LOG_DIR/vllm.server.log" \
         2> "$LOG_DIR/vllm.server.err"
