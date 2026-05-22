@@ -1,12 +1,9 @@
 import asyncio
 import os
-import secrets
 
-import cloudpickle
 import pytest
 
-from ensemble_launcher.comm.pipe import transport_registry
-from ensemble_launcher.ensemble.actor import Actor, PublicActor, PrivateActor, actor, action
+from ensemble_launcher.ensemble.actor import Actor, PrivateActor, action, actor
 
 
 def add(a, b):
@@ -297,3 +294,27 @@ async def test_private_actor_batch_call():
 
     await a._conn.close()
     await handle.close()
+
+
+if __name__ == "__main__":
+    from ensemble_launcher import EnsembleLauncher
+    from ensemble_launcher.config import LauncherConfig, SystemConfig
+    from ensemble_launcher.orchestrator import ClusterClient
+
+    async def main():
+        sys_config = SystemConfig(name="local")
+        launcher_config = LauncherConfig(cluster=True, checkpoint_dir="./ckpt_dir")
+        el = EnsembleLauncher(
+            ensemble_file={}, system_config=sys_config, launcher_config=launcher_config
+        )
+        el.start()
+        with ClusterClient(checkpoint_dir="./ckpt_dir") as client:
+            actor = AddActor(name="add_actor")
+            task = actor.create_task(task_id="actor_task")
+            client.submit(task)
+            handle = actor.create_handle()
+            await handle.open()
+            result = await handle.add(1, 2)
+        return result
+
+    asyncio.run(main())
