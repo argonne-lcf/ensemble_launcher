@@ -16,6 +16,7 @@ setup(
         "cloudpickle",
         "pydantic",
         "pyzmq",
+        "loky",
         "typer",
     ],
     extras_require={

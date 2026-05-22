@@ -7,6 +7,8 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
+import loky
+
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -184,3 +186,69 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
             raise TypeError(f"Task must be str or callable, got {type(fn)}")
 
         return asyncio.wrap_future(future)
+
+
+@executor_registry.register("async_loky", type="async")
+class AsyncLokyExecutor:
+    def __init__(
+        self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", **kwargs
+    ):
+        self.logger = logger
+        self._gpu_selector = gpu_selector
+        self._return_stdout = kwargs.pop("return_stdout", False)
+        max_workers = kwargs.pop("max_workers", None)
+        self._timeout = kwargs.pop("timeout", 300)
+        self._executor = loky.get_reusable_executor(
+            max_workers=max_workers, timeout=self._timeout
+        )
+        self._event_registry: Optional[EventRegistry] = None
+        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
+            self._event_registry = get_registry()
+        self.logger.info("Initialized AsyncLoky Executor!")
+
+    def submit(
+        self,
+        job_resource: JobResource,
+        fn: Union[Callable, str],
+        task_args: Tuple = (),
+        task_kwargs: Dict = {},
+        env: Dict[str, Any] = {},
+        **kwargs,
+    ) -> AsyncFuture:
+        if len(job_resource.nodes) > 1:
+            raise ValueError(
+                "AsyncLokyExecutor can only execute single node tasks"
+            )
+
+        req = job_resource.resources[0]
+        if isinstance(req, NodeResourceCount):
+            cpu_id = None
+        elif isinstance(req, NodeResourceList):
+            cpu_id = req.cpus
+
+        if req.gpu_count > 0:
+            if isinstance(req, NodeResourceCount):
+                gpu_ids = ",".join([str(gpu) for gpu in req.gpu_count])
+                self.logger.warning(
+                    "Received non-zero gpu request using NodeResourceCount. Oversubscribing"
+                )
+            elif isinstance(req, NodeResourceList):
+                gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
+            env.update({self._gpu_selector: gpu_ids})
+
+        if callable(fn):
+            future = self._executor.submit(
+                run_callable_with_affinity, *(fn, task_args, task_kwargs, cpu_id, env)
+            )
+        elif isinstance(fn, str):
+            future = self._executor.submit(
+                run_cmd, *(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout)
+            )
+        else:
+            self.logger.warning("Can only execute either a str or a callable")
+            return None
+
+        return asyncio.wrap_future(future)
+
+    def shutdown(self, wait: bool = True, kill_workers: bool = False):
+        self._executor.shutdown(wait=wait, kill_workers=kill_workers)
