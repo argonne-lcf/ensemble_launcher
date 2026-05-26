@@ -1,8 +1,11 @@
 import logging
 import socket
 
+import pytest
 from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.comm.messages import ResultBatch
+
+pytestmark = pytest.mark.core
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"

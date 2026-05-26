@@ -21,6 +21,8 @@ from ensemble_launcher.scheduler.resource import (
     NodeResourceList,
 )
 
+pytestmark = pytest.mark.core
+
 
 @pytest.mark.asyncio
 async def test_async_worker_cluster(

@@ -976,7 +976,12 @@ class AsyncComm:
         try:
             if self._parent_conn and self._parent_conn.is_open:
                 await self._parent_conn.close()
+            if self._hb_parent_conn and self._hb_parent_conn.is_open:
+                await self._hb_parent_conn.close()
             for conn in self._data_transport.get_server_connections():
+                if conn.is_open:
+                    await conn.close()
+            for conn in self._hb_transport.get_server_connections():
                 if conn.is_open:
                     await conn.close()
         except Exception as e:

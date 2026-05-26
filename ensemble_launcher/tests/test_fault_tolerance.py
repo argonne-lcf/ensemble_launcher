@@ -5,6 +5,7 @@ import socket
 import time
 import uuid
 
+import pytest
 from utils import echo_sleep
 
 from ensemble_launcher import EnsembleLauncher
@@ -16,6 +17,8 @@ from ensemble_launcher.config import (
 )
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
+
+pytestmark = pytest.mark.core
 
 
 def _make_tasks(n: int):

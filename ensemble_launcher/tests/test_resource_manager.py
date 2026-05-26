@@ -1,5 +1,9 @@
-from ensemble_launcher.scheduler.resource import NodeResourceList, LocalClusterResource, NodeResourceCount, JobResource
 import logging
+
+import pytest
+from ensemble_launcher.scheduler.resource import NodeResourceList, LocalClusterResource, NodeResourceCount, JobResource
+
+pytestmark = pytest.mark.core
 
 logger = logging.getLogger()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

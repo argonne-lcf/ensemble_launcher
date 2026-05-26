@@ -1,12 +1,11 @@
-import logging
-import random
 import os
-import threading
+import random
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type, TypeVar
-from ensemble_launcher.logging import setup_logger
 
 from pydantic import BaseModel, Field
+
+from ensemble_launcher.logging import setup_logger
 
 T = TypeVar("T", bound="AsyncConnectionState")
 
@@ -45,7 +44,9 @@ class AsyncConnection(ABC):
 
     def __init__(self, identity: str, secret_id: str):
         os.makedirs(f"{os.getcwd()}/logs/connections", exist_ok=True)
-        self.logger = setup_logger(name=f"connection-{identity}", log_dir=f"{os.getcwd()}/logs/connections")
+        self.logger = setup_logger(
+            name=f"connection-{identity}", log_dir=f"{os.getcwd()}/logs/connections"
+        )
         self._identity = identity
         self._secret_id = secret_id
         self._is_open = False
@@ -59,7 +60,7 @@ class AsyncConnection(ABC):
         pass
 
     @abstractmethod
-    async def send(self, data: bytes) -> bool:
+    async def send(self, data: bytes, target_id: str) -> bool:
         pass
 
     @abstractmethod
@@ -95,7 +96,6 @@ class ServerConnection(AsyncConnection):
     ):
         super().__init__(identity=identity, secret_id=secret_id)
         self._expected_remotes: Dict[str, str] = dict(expected_remotes or {})
-        self._remotes_lock = threading.Lock()
         self._unknown_sender_validator: Optional[
             Callable[[str, Optional[str]], bool]
         ] = None
@@ -106,16 +106,13 @@ class ServerConnection(AsyncConnection):
 
     @property
     def expected_remotes(self) -> Dict[str, str]:
-        with self._remotes_lock:
-            return dict(self._expected_remotes)
+        return dict(self._expected_remotes)
 
     def add_expected_remote(self, node_id: str, secret_id: str) -> None:
-        with self._remotes_lock:
-            self._expected_remotes[node_id] = secret_id
+        self._expected_remotes[node_id] = secret_id
 
     def remove_expected_remote(self, node_id: str) -> None:
-        with self._remotes_lock:
-            self._expected_remotes.pop(node_id, None)
+        self._expected_remotes.pop(node_id, None)
 
     def set_unknown_sender_validator(
         self, validator: Callable[[str, Optional[str]], bool]
@@ -125,15 +122,14 @@ class ServerConnection(AsyncConnection):
     def verify_sender(
         self, sender_id: str, sender_secret: Optional[str] = None
     ) -> bool:
-        with self._remotes_lock:
-            if not self._expected_remotes:
-                return True
-            expected_secret = self._expected_remotes.get(sender_id)
-            if expected_secret is None:
-                if self._unknown_sender_validator is not None:
-                    return self._unknown_sender_validator(sender_id, sender_secret)
-                return False
-            return sender_secret == expected_secret
+        if not self._expected_remotes:
+            return True
+        expected_secret = self._expected_remotes.get(sender_id)
+        if expected_secret is None:
+            if self._unknown_sender_validator is not None:
+                return self._unknown_sender_validator(sender_id, sender_secret)
+            return False
+        return sender_secret == expected_secret
 
 
 class ClientConnection(AsyncConnection):

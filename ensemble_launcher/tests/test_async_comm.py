@@ -2,11 +2,15 @@ import asyncio
 import logging
 import multiprocessing as mp
 import secrets
+import sys
 
 import pytest
+
 from ensemble_launcher.comm.async_base import AsyncComm
 from ensemble_launcher.comm.messages import Result
 from ensemble_launcher.comm.nodeinfo import NodeInfo
+
+pytestmark = pytest.mark.core
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger()
@@ -26,6 +30,7 @@ def _node_worker(
         parent_hb_conn,
         transport: str,
     ):
+        sys.stdout.write(f"depth:{depth},max_depth:{max_depth}")
         parent_id = str(depth - 1) if depth > 0 else None
         my_nodeinfo = NodeInfo(
             node_id=str(depth),
@@ -178,8 +183,8 @@ async def test_comm_state_roundtrip_zmq():
 
 
 if __name__ == "__main__":
-    msgs = test_zmq_comm()
-    print("zmq done")
+    # msgs = test_zmq_comm()
+    # print("zmq done")
     # msgs = asyncio.run(test_comm_state_roundtrip_zmq())
     # print("roundtrip zmq done")
     msgs = test_mp_comm()

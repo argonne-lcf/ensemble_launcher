@@ -59,6 +59,7 @@ class _WorkerPipeline:
         except Exception as e:
             logger.error(f"Pipeline {self.worker_id} exited with error: {e}")
         finally:
+            self._loop.run_until_complete(self.conn.close())
             self._loop.close()
 
     async def _recv_loop(self, logger) -> None:
@@ -108,15 +109,15 @@ class _WorkerPipeline:
         asyncio.run_coroutine_threadsafe(self.conn.send(data), self._loop)
 
     def stop(self) -> None:
-        """Cancel the recv task, join the thread, and close the connection."""
+        """Cancel the recv task and wait for the thread to finish.
+
+        The connection is closed inside _run()'s finally block so that
+        the ZMQ socket is always cleaned up before the event loop closes.
+        """
         if self._loop is not None and self._recv_task is not None:
             self._loop.call_soon_threadsafe(self._recv_task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
-        if self._loop is not None and not self._loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self.conn.close(), self._loop).result(
-                timeout=5.0
-            )
 
 
 # ---------------------------------------------------------------------------

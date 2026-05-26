@@ -9,6 +9,8 @@ from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import ClusterClient
 
+pytestmark = pytest.mark.core
+
 
 def _make_tasks(n: int):
     return {
