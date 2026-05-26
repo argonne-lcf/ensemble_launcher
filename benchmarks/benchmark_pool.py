@@ -4,13 +4,13 @@ import socket
 import time
 import uuid
 
+from utils import noop
+
+from ensemble_launcher import EnsembleLauncher
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator import ClusterClient
-from utils import noop
-
-from ensemble_launcher import EnsembleLauncher
 
 
 def _create_tasks(ntasks):
@@ -33,11 +33,16 @@ def benchmark_max_throughput(task_executor="async_mpi_processpool"):
         result_flush_interval=0.05,
         checkpoint_dir=ckpt_dir,
     )
-    cpus = list(range(104))
-    cpus.pop(52)  # can't use these cores on Aurora
-    cpus.pop(0)  # can't use these cores on Aurora
-    gpus = list(range(12))
-    sys_config = SystemConfig(name="Aurora", cpus=cpus, gpus=gpus)
+
+    if os.cpu_count() == 104:
+        cpus = list(range(104))
+        cpus.pop(52)  # can't use these cores on Aurora
+        cpus.pop(0)  # can't use these cores on Aurora
+        gpus = list(range(12))
+        sys_config = SystemConfig(name="system", cpus=cpus, gpus=gpus)
+    else:
+        cpus = list(range(os.cpu_count()))
+        sys_config = SystemConfig(name="system", cpus=cpus, ncpus=len(cpus))
 
     el = EnsembleLauncher(
         ensemble_file={},
@@ -67,4 +72,5 @@ def benchmark_max_throughput(task_executor="async_mpi_processpool"):
 
 
 if __name__ == "__main__":
-    benchmark_max_throughput(task_executor="async_mpi_processpool")
+    task_executor = input("task_executor_name:")
+    benchmark_max_throughput(task_executor=task_executor)
