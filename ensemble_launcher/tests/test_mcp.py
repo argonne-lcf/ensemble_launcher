@@ -2,9 +2,12 @@ import asyncio
 import math
 import os
 
+import pytest
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from utils import async_compute_density, compute_density
+
+pytestmark = pytest.mark.extensions
 
 
 async def call_tools():

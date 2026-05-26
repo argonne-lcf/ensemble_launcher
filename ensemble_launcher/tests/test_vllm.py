@@ -20,6 +20,8 @@ from ensemble_launcher.orchestrator import ClusterClient
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+pytestmark = pytest.mark.extensions
+
 
 @pytest.mark.asyncio
 async def test_offline_inference():

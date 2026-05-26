@@ -1,6 +1,5 @@
 import os
 import random
-import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type, TypeVar
 
@@ -97,7 +96,6 @@ class ServerConnection(AsyncConnection):
     ):
         super().__init__(identity=identity, secret_id=secret_id)
         self._expected_remotes: Dict[str, str] = dict(expected_remotes or {})
-        self._remotes_lock = threading.Lock()
         self._unknown_sender_validator: Optional[
             Callable[[str, Optional[str]], bool]
         ] = None
@@ -108,16 +106,13 @@ class ServerConnection(AsyncConnection):
 
     @property
     def expected_remotes(self) -> Dict[str, str]:
-        with self._remotes_lock:
-            return dict(self._expected_remotes)
+        return dict(self._expected_remotes)
 
     def add_expected_remote(self, node_id: str, secret_id: str) -> None:
-        with self._remotes_lock:
-            self._expected_remotes[node_id] = secret_id
+        self._expected_remotes[node_id] = secret_id
 
     def remove_expected_remote(self, node_id: str) -> None:
-        with self._remotes_lock:
-            self._expected_remotes.pop(node_id, None)
+        self._expected_remotes.pop(node_id, None)
 
     def set_unknown_sender_validator(
         self, validator: Callable[[str, Optional[str]], bool]
@@ -127,15 +122,14 @@ class ServerConnection(AsyncConnection):
     def verify_sender(
         self, sender_id: str, sender_secret: Optional[str] = None
     ) -> bool:
-        with self._remotes_lock:
-            if not self._expected_remotes:
-                return True
-            expected_secret = self._expected_remotes.get(sender_id)
-            if expected_secret is None:
-                if self._unknown_sender_validator is not None:
-                    return self._unknown_sender_validator(sender_id, sender_secret)
-                return False
-            return sender_secret == expected_secret
+        if not self._expected_remotes:
+            return True
+        expected_secret = self._expected_remotes.get(sender_id)
+        if expected_secret is None:
+            if self._unknown_sender_validator is not None:
+                return self._unknown_sender_validator(sender_id, sender_secret)
+            return False
+        return sender_secret == expected_secret
 
 
 class ClientConnection(AsyncConnection):

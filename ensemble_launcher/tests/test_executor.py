@@ -2,6 +2,7 @@ import logging
 import socket
 import sys
 
+import pytest
 from ensemble_launcher.config import SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.executors.mp_executor import MultiprocessingExecutor
@@ -12,6 +13,8 @@ from ensemble_launcher.scheduler.resource import (
     NodeResourceCount,
     NodeResourceList,
 )
+
+pytestmark = pytest.mark.core
 
 logging.basicConfig(
     stream=sys.stdout,

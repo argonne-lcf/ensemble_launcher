@@ -18,6 +18,8 @@ from ensemble_launcher.scheduler.resource import (
 
 from utils import echo, echo_stdout
 
+pytestmark = pytest.mark.core
+
 
 @pytest.mark.timeout(60)
 @pytest.mark.asyncio

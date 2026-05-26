@@ -3,6 +3,7 @@ import inspect
 import os
 import secrets
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -232,9 +233,10 @@ class PublicActor(_ActorBase):
         self,
         name: str,
         transport: str = "zmq",
-        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}",
     ):
         super().__init__(name)
+        os.makedirs(ckpt_dir, exist_ok=True)
         self._ckpt_dir = ckpt_dir
         self._transport_classes = transport_registry.get(transport)
         self._transport: AsyncTransport = None

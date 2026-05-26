@@ -2,10 +2,13 @@ import logging
 import socket
 import sys
 
+import pytest
 from ensemble_launcher.config import LauncherConfig, SystemConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.scheduler import TaskScheduler
 from ensemble_launcher.scheduler.resource import LocalClusterResource, NodeResourceList
+
+pytestmark = pytest.mark.core
 
 logging.basicConfig(
     stream=sys.stdout,

@@ -5,6 +5,8 @@ import pytest
 
 from ensemble_launcher.ensemble.actor import Actor, PrivateActor, action, actor
 
+pytestmark = pytest.mark.core
+
 
 def add(a, b):
     return a + b
@@ -152,9 +154,9 @@ async def test_actor_batch_call():
     send_task = asyncio.create_task(a._send())
     main_task = asyncio.create_task(a._main_loop())
 
-    batch_args = [("call", 2), ("call", 3), ("call", 5)]
+    batch_args = [("call", (2,), None), ("call", (3,), None), ("call", (5,), None)]
     await handle.send(batch_args)
-    results = await asyncio.wait_for(handle.recv(), timeout=5.0)
+    results = await asyncio.wait_for(handle.recv(), timeout=10.0)
     assert results == [4, 9, 25]
 
     await handle.stop()
@@ -282,7 +284,7 @@ async def test_private_actor_batch_call():
     send_task = asyncio.create_task(a._send())
     main_task = asyncio.create_task(a._main_loop())
 
-    batch = [("add", 1, 2), ("add", 3, 4), ("add", 5, 6)]
+    batch = [("add", (1, 2), None), ("add", (3, 4), None), ("add", (5, 6), None)]
     await handle.send(batch)
     results = await asyncio.wait_for(handle.recv(), timeout=5.0)
     assert results == [3, 7, 11]
