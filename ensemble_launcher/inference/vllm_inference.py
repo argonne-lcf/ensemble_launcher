@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import socket
@@ -17,6 +18,38 @@ from ensemble_launcher.ensemble.actor import PublicActor, action
 from ensemble_launcher.logging import setup_logger
 
 from .utils import _build_model_cache
+
+
+def _setup_vllm_file_logging(log_file: str):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "vllm": {
+                "class": "vllm.logging_utils.NewLineFormatter",
+                "datefmt": "%m-%d %H:%M:%S",
+                "format": "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] %(message)s",
+            }
+        },
+        "handlers": {
+            "vllm": {
+                "class": "logging.FileHandler",
+                "formatter": "vllm",
+                "level": "INFO",
+                "filename": log_file,
+            }
+        },
+        "loggers": {
+            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
+        },
+    }
+    cfg_path = os.path.join(
+        tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json"
+    )
+    with open(cfg_path, "w") as f:
+        json.dump(config, f)
+    os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
 
 
 class VLLMInference(PublicActor):
@@ -334,6 +367,8 @@ class MultiNodeVLLMInference(PublicActor):
         )
 
         ## Import modules
+        log_dir = f"{os.getcwd()}/logs"
+        _setup_vllm_file_logging(f"{log_dir}/vllm_{self._name}_rank{self._rank}.log")
         from vllm import LLM, envs  # isort: skip
         import torch  # isort: skip
 
