@@ -9,11 +9,14 @@ import urllib.error
 import urllib.request
 import uuid
 from glob import glob
+from typing import Optional
 
 import cloudpickle
 
 from ensemble_launcher.ensemble.actor import PublicActor, action
 from ensemble_launcher.logging import setup_logger
+
+from .utils import _build_model_cache
 
 
 class VLLMInference(PublicActor):
@@ -24,7 +27,8 @@ class VLLMInference(PublicActor):
         cache_dir: str,
         tensor_parallel_size: int = 1,
         transport: str = "zmq",
-        cache_modelinfo: bool = False,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
         super().__init__(name, transport, ckpt_dir=ckpt_dir)
@@ -32,14 +36,26 @@ class VLLMInference(PublicActor):
         self.cache_dir = cache_dir
         self.tensor_parallel_size = tensor_parallel_size
         self._llm = None
-        self._cache_modelinfo = cache_modelinfo
+        self._use_cached_modelinfo = use_cached_modelinfo
+        self._model_info_cache = model_info_cache
+        if self._use_cached_modelinfo:
+            assert model_info_cache is not None, "model_info_cache can't be None"
 
     async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
-            if self._cache_modelinfo:
-                os.environ["VLLM_CACHE_ROOT"] = self.cache_dir
+            if self._use_cached_modelinfo:
+                os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+            else:
+                self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+                os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+                try:
+                    os.makedirs(os.environ["VLLM_CACHE_ROOT"])
+                    _build_model_cache(logger=self.logger.getChild("BuildModelInfo"))
+                except Exception as e:
+                    self.logger.error(f"Building model infos failed with error {e}")
+                    raise
             from vllm import LLM
 
             snapshots = glob(
@@ -84,6 +100,8 @@ class OnlineVLLMInference(PublicActor):
         port: int = 8000,
         tensor_parallel_size: int = 1,
         transport: str = "zmq",
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
         super().__init__(name, transport, ckpt_dir=ckpt_dir)
@@ -92,6 +110,10 @@ class OnlineVLLMInference(PublicActor):
         self.port = port
         self.tensor_parallel_size = tensor_parallel_size
         self._server_process = None
+        self._use_cached_modelinfo = use_cached_modelinfo
+        self._model_info_cache = model_info_cache
+        if self._use_cached_modelinfo:
+            assert model_info_cache is not None, "model_info_cache can't be None"
 
     async def on_start(self):
         if self.logger is None:
@@ -102,6 +124,18 @@ class OnlineVLLMInference(PublicActor):
             if ".local" not in socket.gethostname()
             else "localhost"
         )
+
+        if self._use_cached_modelinfo:
+            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+        else:
+            self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+            try:
+                os.makedirs(os.environ["VLLM_CACHE_ROOT"])
+                _build_model_cache(logger=self.logger.getChild("BuildModelInfo"))
+            except Exception as e:
+                self.logger.error(f"Building model infos failed with error {e}")
+                raise
         self._server_process = subprocess.Popen(
             [
                 script_path,
@@ -158,19 +192,22 @@ class MultiNodeVLLMInference(PublicActor):
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         transport: str = "zmq",
-        cache_modelinfo: bool = False,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
         sync_location: str = f"file://file_{uuid.uuid4().hex}",
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
-        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
-        super().__init__(name, transport, ckpt_dir=ckpt_dir)
+        super().__init__(name, transport)
         self._model_name = model
         self.cache_dir = cache_dir
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
-        self._cache_modelinfo = cache_modelinfo
+        self._use_cached_modelinfo = use_cached_modelinfo
+        self._model_info_cache = model_info_cache
+        if self._use_cached_modelinfo:
+            assert self._model_info_cache is not None, "model_info_cache can't be None"
         self.rank_env = rank_env
         self.local_rank_env = local_rank_env
         self.sync_timeout = sync_timeout
@@ -190,6 +227,8 @@ class MultiNodeVLLMInference(PublicActor):
     async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+
+        os.environ["TMPDIR"] = "/tmp"
 
         try:
             self._local_rank = int(os.getenv(self.local_rank_env))
@@ -279,20 +318,67 @@ class MultiNodeVLLMInference(PublicActor):
             self._sub_socket.connect(f"tcp://{pub_address}")
             self.logger.info(f"SUB socket connected to {pub_address}")
 
+        ##Setup env
         os.environ["LOCAL_RANK"] = str(self._local_rank)
         os.environ["RANK"] = str(self._rank)
         os.environ["WORLD_SIZE"] = str(
             self.tensor_parallel_size * self.pipeline_parallel_size
         )
+        os.environ.pop("ZE_AFFINITY_MASK", None)
+        os.environ["ZE_AFFINITY_MASK"] = os.environ.get(
+            f"AVAILABLE_GPUS_{hostname}",
+            os.environ.get(
+                "AVAILABLE_GPUS",
+                ",".join(map(str, list(range(self.tensor_parallel_size)))),
+            ),
+        )
 
-        if self._cache_modelinfo:
-            os.environ["VLLM_CACHE_ROOT"] = self.cache_dir
-        from vllm import LLM
+        ## Import modules
+        from vllm import LLM, envs  # isort: skip
+        import torch  # isort: skip
+
+        torch.xpu.set_device(self._local_rank)
+
+        # Build model infos, if needed
+        _build_success = b"0"
+        _build_failed = b"1"
+        if self._use_cached_modelinfo:
+            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+        else:
+            if self._rank == 0:
+                self._model_info_cache = os.path.join(
+                    self.ckpt_dir, f"vllm_cache_{uuid.uuid4().hex[:6]}"
+                )
+                os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+                try:
+                    os.makedirs(self._model_info_cache)
+                    _build_model_cache(logger=self.logger.getChild("BuildModelInfo"))
+                    await self._pub_socket.send(_build_success)
+                    await self._pub_socket.send(
+                        cloudpickle.dumps(self._model_info_cache)
+                    )
+                except Exception as e:
+                    await self._pub_socket.send(_build_failed)
+                    self.logger.error(f"Building model infos failed with error {e}")
+                    raise
+            else:
+                success = await self._sub_socket.recv()
+                if success == _build_failed:
+                    raise
+                else:
+                    frame = await self._sub_socket.recv()
+                    self._model_info_cache = cloudpickle.loads(frame)
+
+            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
 
         snapshots = glob(
             f"{self.cache_dir}/hub/models--{self._model_name.replace('/', '--')}/snapshots/*"
         )
         self.logger.info(f"model: {snapshots[0]}")
+        self.logger.info(f"VLLM_CACHE_ROOT:{envs.VLLM_CACHE_ROOT}")
+        self.logger.info(
+            f"{self._rank},{self._local_rank},{os.environ['ZE_AFFINITY_MASK']}"
+        )
         try:
             self._llm = LLM(
                 model=snapshots[0],

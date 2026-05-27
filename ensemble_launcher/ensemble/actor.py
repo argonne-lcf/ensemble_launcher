@@ -233,9 +233,11 @@ class PublicActor(_ActorBase):
         self,
         name: str,
         transport: str = "zmq",
-        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}",
+        ckpt_dir: Optional[str] = None,
     ):
         super().__init__(name)
+        if ckpt_dir is None:
+            ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
         os.makedirs(ckpt_dir, exist_ok=True)
         self._ckpt_dir = ckpt_dir
         self._transport_classes = transport_registry.get(transport)
