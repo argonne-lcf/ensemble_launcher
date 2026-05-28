@@ -14,7 +14,8 @@ from typing import Optional
 
 import cloudpickle
 
-from ensemble_launcher.ensemble.actor import PublicActor, action
+from ensemble_launcher.comm.pipe import ClientConnection, ServerConnection
+from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import setup_logger
 
 from .utils import _build_model_cache
@@ -52,19 +53,20 @@ def _setup_vllm_file_logging(log_file: str):
     os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
 
 
-class VLLMInference(PublicActor):
-    def __init__(
+# ---------------------------------------------------------------------------
+# Mixin 1: Offline (in-process) vLLM inference
+# ---------------------------------------------------------------------------
+
+
+class _VLLMOfflineMixin:
+    def _init_vllm(
         self,
-        name: str,
         model: str,
         cache_dir: str,
         tensor_parallel_size: int = 1,
-        transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
-        super().__init__(name, transport, ckpt_dir=ckpt_dir)
         self.model = model
         self.cache_dir = cache_dir
         self.tensor_parallel_size = tensor_parallel_size
@@ -124,20 +126,59 @@ class VLLMInference(PublicActor):
         return results[0] if single else results
 
 
-class OnlineVLLMInference(PublicActor):
+class VLLMInference(_VLLMOfflineMixin, PublicActor):
     def __init__(
         self,
         name: str,
         model: str,
         cache_dir: str,
-        port: int = 8000,
         tensor_parallel_size: int = 1,
         transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
     ):
-        super().__init__(name, transport, ckpt_dir=ckpt_dir)
+        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
+        self._init_vllm(
+            model, cache_dir, tensor_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+        )
+
+
+class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        client_conn: ClientConnection,
+        server_conn: ServerConnection,
+        tensor_parallel_size: int = 1,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+    ):
+        PrivateActor.__init__(self, name, client_conn, server_conn)
+        self._init_vllm(
+            model, cache_dir, tensor_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mixin 2: Online vLLM server (subprocess)
+# ---------------------------------------------------------------------------
+
+
+class _VLLMOnlineMixin:
+    def _init_vllm_online(
+        self,
+        model: str,
+        cache_dir: str,
+        port: int = 8000,
+        tensor_parallel_size: int = 1,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+    ):
         self._model_name = model
         self.cache_dir = cache_dir
         self.port = port
@@ -216,15 +257,59 @@ class OnlineVLLMInference(PublicActor):
         return self._model_name
 
 
-class MultiNodeVLLMInference(PublicActor):
+class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
     def __init__(
         self,
         name: str,
         model: str,
         cache_dir: str,
+        port: int = 8000,
+        tensor_parallel_size: int = 1,
+        transport: str = "zmq",
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+    ):
+        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
+        self._init_vllm_online(
+            model, cache_dir, port, tensor_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+        )
+
+
+class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        client_conn: ClientConnection,
+        server_conn: ServerConnection,
+        port: int = 8000,
+        tensor_parallel_size: int = 1,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+    ):
+        PrivateActor.__init__(self, name, client_conn, server_conn)
+        self._init_vllm_online(
+            model, cache_dir, port, tensor_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mixin 3: Multi-node vLLM with PUB/SUB rank coordination
+# ---------------------------------------------------------------------------
+
+
+class _MultiNodeVLLMMixin:
+    def _init_multinode_vllm(
+        self,
+        model: str,
+        cache_dir: str,
+        ckpt_dir: str,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
-        transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         sync_location: str = f"file://file_{uuid.uuid4().hex}",
@@ -232,9 +317,9 @@ class MultiNodeVLLMInference(PublicActor):
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
     ):
-        super().__init__(name, transport)
         self._model_name = model
         self.cache_dir = cache_dir
+        self._ckpt_dir = ckpt_dir
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self._use_cached_modelinfo = use_cached_modelinfo
@@ -246,7 +331,7 @@ class MultiNodeVLLMInference(PublicActor):
         self.sync_timeout = sync_timeout
         if sync_location.startswith("file://"):
             self.sync_location = os.path.join(
-                self.ckpt_dir, sync_location.replace("file://", "")
+                self._ckpt_dir, sync_location.replace("file://", "")
             )
         else:
             raise ValueError("Unknown sync location prefix")
@@ -309,7 +394,7 @@ class MultiNodeVLLMInference(PublicActor):
             self.logger.info(f"PUB socket bound to {pub_address}")
 
             with tempfile.NamedTemporaryFile(
-                mode="w", dir=self.ckpt_dir, delete=False
+                mode="w", dir=self._ckpt_dir, delete=False
             ) as temp:
                 temp.write(
                     f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}\n"
@@ -351,7 +436,6 @@ class MultiNodeVLLMInference(PublicActor):
             self._sub_socket.connect(f"tcp://{pub_address}")
             self.logger.info(f"SUB socket connected to {pub_address}")
 
-        ##Setup env
         os.environ["LOCAL_RANK"] = str(self._local_rank)
         os.environ["RANK"] = str(self._rank)
         os.environ["WORLD_SIZE"] = str(
@@ -366,7 +450,6 @@ class MultiNodeVLLMInference(PublicActor):
             ),
         )
 
-        ## Import modules
         log_dir = f"{os.getcwd()}/logs"
         _setup_vllm_file_logging(f"{log_dir}/vllm_{self._name}_rank{self._rank}.log")
         from vllm import LLM, envs  # isort: skip
@@ -374,7 +457,6 @@ class MultiNodeVLLMInference(PublicActor):
 
         torch.xpu.set_device(self._local_rank)
 
-        # Build model infos, if needed
         _build_success = b"0"
         _build_failed = b"1"
         if self._use_cached_modelinfo:
@@ -382,7 +464,7 @@ class MultiNodeVLLMInference(PublicActor):
         else:
             if self._rank == 0:
                 self._model_info_cache = os.path.join(
-                    self.ckpt_dir, f"vllm_cache_{uuid.uuid4().hex[:6]}"
+                    self._ckpt_dir, f"vllm_cache_{uuid.uuid4().hex[:6]}"
                 )
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 try:
@@ -428,18 +510,15 @@ class MultiNodeVLLMInference(PublicActor):
             raise RuntimeError(str(e))
         self.logger.info(f"Rank {self._rank}: vLLM init done!")
 
+    async def _setup_rank0_connection(self):
+        raise NotImplementedError
+
     async def _run(self):
         self._init_runtime()
         await self.on_start()
 
         if self._rank == 0:
-            self._start_transport()
-            await self._conn.open()
-            os.makedirs(self.ckpt_dir, exist_ok=True)
-            fname = f"{self.ckpt_dir}/{self.name}.ckpt"
-            with open(fname, "w") as f:
-                f.write(self._conn.get_state().serialize())
-            self.logger.info("Rank 0: ROUTER transport ready, checkpoint written.")
+            await self._setup_rank0_connection()
 
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
         await self.on_stop()
@@ -502,3 +581,68 @@ class MultiNodeVLLMInference(PublicActor):
         results = [output.outputs[0].text for output in outputs]
 
         return results[0] if single else results
+
+
+class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        transport: str = "zmq",
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+        sync_location: str = f"file://file_{uuid.uuid4().hex}",
+        rank_env: str = "PALS_RANKID",
+        local_rank_env: str = "PALS_LOCAL_RANKID",
+        sync_timeout: float = 60,
+    ):
+        PublicActor.__init__(self, name, transport)
+        self._init_multinode_vllm(
+            model, cache_dir, self.ckpt_dir,
+            tensor_parallel_size, pipeline_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+            sync_location, rank_env, local_rank_env, sync_timeout,
+        )
+
+    async def _setup_rank0_connection(self):
+        self._start_transport()
+        await self._conn.open()
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        fname = f"{self.ckpt_dir}/{self.name}.ckpt"
+        with open(fname, "w") as f:
+            f.write(self._conn.get_state().serialize())
+        self.logger.info("Rank 0: ROUTER transport ready, checkpoint written.")
+
+
+class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        client_conn: ClientConnection,
+        server_conn: ServerConnection,
+        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+        sync_location: str = f"file://file_{uuid.uuid4().hex}",
+        rank_env: str = "PALS_RANKID",
+        local_rank_env: str = "PALS_LOCAL_RANKID",
+        sync_timeout: float = 60,
+    ):
+        PrivateActor.__init__(self, name, client_conn, server_conn)
+        self._init_multinode_vllm(
+            model, cache_dir, ckpt_dir,
+            tensor_parallel_size, pipeline_parallel_size,
+            use_cached_modelinfo, model_info_cache,
+            sync_location, rank_env, local_rank_env, sync_timeout,
+        )
+
+    async def _setup_rank0_connection(self):
+        await self._conn.open()
+        self.logger.info("Rank 0: transport ready.")

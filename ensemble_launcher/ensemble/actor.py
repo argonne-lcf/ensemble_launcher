@@ -337,30 +337,15 @@ class PrivateActor(_ActorBase):
     def __init__(
         self,
         name: str,
-        transport: str = "zmq",
+        client_conn: ClientConnection,
+        server_conn: ServerConnection,
     ):
         super().__init__(name)
-        self._transport_classes = transport_registry.get(transport)
-        self._transport: AsyncTransport = None
-        self._server_conn: ServerConnection = None
-
-    def _start_transport(self):
-        if self._transport is not None:
-            return
-        transport = self._transport_classes["transport"]()
-        self._transport = transport
-        server, client = transport.create_child_pipe(
-            parent_id=f"{self._name}-handle",
-            parent_secret=self._secret,
-            child_id=self._name,
-            child_secret=self._secret,
-        )
-        self._conn = client
-        self._server_conn = server
+        self._conn = client_conn
+        self._server_conn = server_conn
 
     def create_handle(self) -> AgentHandle:
-        assert self._server_conn is not None, "call create_task first"
-        target_id = f"{self._name}:{self._secret}"
+        target_id = f"{self._conn.identity}:{self._conn.secret_id}"
         return AgentHandle(
             self._server_conn,
             self._build_action_signatures(),
@@ -384,11 +369,6 @@ class PrivateActor(_ActorBase):
         result = await self.on_stop()
         if asyncio.iscoroutine(result):
             await result
-
-    def create_task(self, task_id, nnodes, ppn, **kwargs):
-        task = super().create_task(task_id, nnodes, ppn, **kwargs)
-        self._start_transport()
-        return task
 
 
 Actor = PublicActor

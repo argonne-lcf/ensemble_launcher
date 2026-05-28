@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from ensemble_launcher.comm.pipe import transport_registry
 from ensemble_launcher.ensemble.actor import Actor, PrivateActor, action, actor
 
 pytestmark = pytest.mark.core
@@ -244,7 +245,16 @@ class AddPrivateActor(PrivateActor):
 
 @pytest.mark.asyncio
 async def test_private_actor_single_call():
-    a = AddPrivateActor(name="priv-actor")
+    transport = transport_registry.get("zmq")["transport"]()
+    server, client = transport.create_child_pipe(
+        parent_id="priv-actor-handle",
+        parent_secret="secret",
+        child_id="priv-actor",
+        child_secret="secret",
+    )
+    a = AddPrivateActor(
+        name="priv-actor", client_conn=client, server_conn=server
+    )
     task = a.create_task(task_id="t0", nnodes=1, ppn=1)
     handle = a.create_handle()
 
@@ -271,7 +281,16 @@ async def test_private_actor_single_call():
 
 @pytest.mark.asyncio
 async def test_private_actor_batch_call():
-    a = AddPrivateActor(name="priv-batch")
+    transport = transport_registry.get("zmq")["transport"]()
+    server, client = transport.create_child_pipe(
+        parent_id="priv-batch-handle",
+        parent_secret="secret",
+        child_id="priv-batch",
+        child_secret="secret",
+    )
+    a = AddPrivateActor(
+        name="priv-batch", client_conn=client, server_conn=server
+    )
     task = a.create_task(task_id="t0", nnodes=1, ppn=1)
     handle = a.create_handle()
 

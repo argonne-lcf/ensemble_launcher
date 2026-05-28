@@ -55,6 +55,14 @@ class AsyncConnection(ABC):
     def is_open(self) -> bool:
         return self._is_open
 
+    @property
+    def identity(self):
+        return self._identity
+
+    @property
+    def secret_id(self):
+        return self._secret_id
+
     @abstractmethod
     async def open(self) -> None:
         pass
