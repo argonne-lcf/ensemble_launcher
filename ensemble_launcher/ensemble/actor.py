@@ -23,6 +23,8 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.ensemble.ensemble import TaskKwargs
 from ensemble_launcher.logging import setup_logger
 
+_READY_SENTINEL = b"__ACTOR_READY__"
+
 
 def action(fn: Callable):
     fn.__action_name__ = fn.__name__
@@ -82,6 +84,78 @@ class AgentHandle:
         return
 
 
+class PrivateActorHandle:
+    def __init__(
+        self,
+        conn: ServerConnection,
+        actions: Dict[str, inspect.Signature],
+    ):
+        self._conn = conn
+        self._actions = actions
+        self._ready_actors: set = set()
+        self._ready_events: Dict[str, asyncio.Event] = {}
+        self._ready_condition: asyncio.Condition = asyncio.Condition()
+        self._results_queue: asyncio.Queue = asyncio.Queue()
+        self._recv_task = None
+
+    async def open(self):
+        await self._conn.open()
+        self._recv_task = asyncio.create_task(self._recv_loop())
+
+    async def close(self):
+        if self._recv_task:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        await self._conn.close()
+
+    async def _recv_loop(self):
+        try:
+            while True:
+                frames = await self._conn.recv()
+                full_id, _, _ = decode_identity(frames[0])
+                if frames[1] == _READY_SENTINEL:
+                    self._ready_actors.add(full_id)
+                    event = self._ready_events.get(full_id)
+                    if event:
+                        event.set()
+                    async with self._ready_condition:
+                        self._ready_condition.notify_all()
+                else:
+                    result = cloudpickle.loads(frames[1])
+                    await self._results_queue.put((full_id, result))
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def recv(self) -> tuple:
+        return await self._results_queue.get()
+
+    async def send(self, msg: Any, target_id: str):
+        if target_id not in self._ready_actors:
+            event = self._ready_events.setdefault(target_id, asyncio.Event())
+            await event.wait()
+        data = cloudpickle.dumps(msg)
+        await self._conn.send(data, target_id)
+
+    async def broadcast(self, msg: Any, expected: int):
+        async with self._ready_condition:
+            await self._ready_condition.wait_for(
+                lambda: len(self._ready_actors) >= expected
+            )
+        data = cloudpickle.dumps(msg)
+        for actor_id in list(self._ready_actors):
+            await self._conn.send(data, actor_id)
+
+    async def stop(self):
+        data = cloudpickle.dumps(("stop", (), None))
+        for actor_id in list(self._ready_actors):
+            await self._conn.send(data, actor_id)
+
+
 class _ActorBase(ABC):
     def __init__(self, name: str):
         self._name = name
@@ -121,9 +195,10 @@ class _ActorBase(ABC):
     @abstractmethod
     def create_handle(self, *args, **kwargs): ...
 
-    def _build_action_signatures(self) -> Dict[str, inspect.Signature]:
+    @classmethod
+    def _build_action_signatures(cls) -> Dict[str, inspect.Signature]:
         sigs = {}
-        for name, fn in self.__actions__.items():
+        for name, fn in cls.__actions__.items():
             sig = inspect.signature(fn)
             params = [p for p in sig.parameters.values() if p.name != "self"]
             sigs[name] = sig.replace(parameters=params)
@@ -202,6 +277,7 @@ class _ActorBase(ABC):
                 await self._output_queue.put((target_id, result))
             else:
                 raise ValueError("Message must be either List[Tuple] or Tuple")
+        self.logger.info("Main loop stopped.")
 
     async def on_start(self):
         pass
@@ -332,25 +408,26 @@ class PublicActor(_ActorBase):
         if asyncio.iscoroutine(result):
             await result
 
+        await self._conn.close()
+
 
 class PrivateActor(_ActorBase):
     def __init__(
         self,
         name: str,
         client_conn: ClientConnection,
-        server_conn: ServerConnection,
     ):
         super().__init__(name)
         self._conn = client_conn
-        self._server_conn = server_conn
 
-    def create_handle(self) -> AgentHandle:
-        target_id = f"{self._conn.identity}:{self._conn.secret_id}"
-        return AgentHandle(
-            self._server_conn,
-            self._build_action_signatures(),
-            default_target_id=target_id,
-        )
+    @classmethod
+    def create_handle(cls, server_conn: ServerConnection) -> PrivateActorHandle:
+        return PrivateActorHandle(server_conn, cls._build_action_signatures())
+
+    async def _signal_ready(self):
+        await asyncio.sleep(0)
+        await self._conn.send(_READY_SENTINEL)
+        self.logger.info("Ready signal sent.")
 
     async def _run(self):
         self._init_runtime()
@@ -364,11 +441,15 @@ class PrivateActor(_ActorBase):
         if asyncio.iscoroutine(result):
             await result
 
-        await asyncio.gather(self._recv(), self._send(), self._main_loop())
+        await asyncio.gather(
+            self._recv(), self._send(), self._main_loop(), self._signal_ready()
+        )
 
         result = await self.on_stop()
         if asyncio.iscoroutine(result):
             await result
+
+        await self._conn.close()
 
 
 Actor = PublicActor

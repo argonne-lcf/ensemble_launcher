@@ -14,7 +14,7 @@ from typing import Optional
 
 import cloudpickle
 
-from ensemble_launcher.comm.pipe import ClientConnection, ServerConnection
+from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import setup_logger
 
@@ -152,12 +152,11 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         model: str,
         cache_dir: str,
         client_conn: ClientConnection,
-        server_conn: ServerConnection,
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
     ):
-        PrivateActor.__init__(self, name, client_conn, server_conn)
+        PrivateActor.__init__(self, name, client_conn)
         self._init_vllm(
             model, cache_dir, tensor_parallel_size,
             use_cached_modelinfo, model_info_cache,
@@ -284,13 +283,12 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
         model: str,
         cache_dir: str,
         client_conn: ClientConnection,
-        server_conn: ServerConnection,
         port: int = 8000,
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
     ):
-        PrivateActor.__init__(self, name, client_conn, server_conn)
+        PrivateActor.__init__(self, name, client_conn)
         self._init_vllm_online(
             model, cache_dir, port, tensor_parallel_size,
             use_cached_modelinfo, model_info_cache,
@@ -522,6 +520,8 @@ class _MultiNodeVLLMMixin:
 
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
         await self.on_stop()
+        if self._conn is not None:
+            await self._conn.close()
 
     async def _recv(self):
         if self._rank == 0:
@@ -624,7 +624,6 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         model: str,
         cache_dir: str,
         client_conn: ClientConnection,
-        server_conn: ServerConnection,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
@@ -635,7 +634,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
     ):
-        PrivateActor.__init__(self, name, client_conn, server_conn)
+        PrivateActor.__init__(self, name, client_conn)
         self._init_multinode_vllm(
             model, cache_dir, ckpt_dir,
             tensor_parallel_size, pipeline_parallel_size,
