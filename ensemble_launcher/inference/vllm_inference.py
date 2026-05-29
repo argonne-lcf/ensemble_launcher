@@ -81,7 +81,12 @@ class _VLLMOfflineMixin:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
             os.environ["MASTER_ADDR"] = socket.gethostname()
-            os.environ["MASTER_PORT"] = str(10000)
+            # Each actor gets a unique VLLM_PORT based on PID so vLLM's
+            # port scanner starts from a different point per process,
+            # avoiding TOCTOU collisions in get_open_port() at scale.
+            _actor_port = 10000 + (os.getpid() % 40000)
+            os.environ["MASTER_PORT"] = str(_actor_port)
+            os.environ["VLLM_PORT"] = str(_actor_port)
             if self._use_cached_modelinfo:
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 self.logger.info(f"Reusing cache at {self._model_info_cache}")
