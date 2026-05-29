@@ -84,7 +84,7 @@ class _VLLMOfflineMixin:
             # Each actor gets a unique VLLM_PORT based on PID so vLLM's
             # port scanner starts from a different point per process,
             # avoiding TOCTOU collisions in get_open_port() at scale.
-            _actor_port = 10000 + (os.getpid() % 40000)
+            _actor_port = 1000 + (os.getpid() % 100) * 500
             os.environ["MASTER_PORT"] = str(_actor_port)
             os.environ["VLLM_PORT"] = str(_actor_port)
             if self._use_cached_modelinfo:

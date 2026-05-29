@@ -118,9 +118,8 @@ class PrivateActorHandle:
                 full_id, _, _ = decode_identity(frames[0])
                 if frames[1] == _READY_SENTINEL:
                     self._ready_actors.add(full_id)
-                    event = self._ready_events.get(full_id)
-                    if event:
-                        event.set()
+                    event = self._ready_events.setdefault(full_id, asyncio.Event())
+                    event.set()
                     async with self._ready_condition:
                         self._ready_condition.notify_all()
                 else:
@@ -141,11 +140,15 @@ class PrivateActorHandle:
         data = cloudpickle.dumps(msg)
         await self._conn.send(data, target_id)
 
-    async def broadcast(self, msg: Any, expected: int):
+    async def wait_for_ready(self, expected: int):
         async with self._ready_condition:
             await self._ready_condition.wait_for(
                 lambda: len(self._ready_actors) >= expected
             )
+
+    async def broadcast(self, msg: Any, expected: int):
+        await self.wait_for_ready(expected=expected)
+
         data = cloudpickle.dumps(msg)
         for actor_id in list(self._ready_actors):
             await self._conn.send(data, actor_id)
