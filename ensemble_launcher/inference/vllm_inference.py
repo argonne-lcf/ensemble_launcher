@@ -45,9 +45,7 @@ def _setup_vllm_file_logging(log_file: str):
             "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
         },
     }
-    cfg_path = os.path.join(
-        tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json"
-    )
+    cfg_path = os.path.join(tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json")
     with open(cfg_path, "w") as f:
         json.dump(config, f)
     os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
@@ -66,6 +64,7 @@ class _VLLMOfflineMixin:
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
+        max_model_len: int = 2048,
     ):
         self.model = model
         self.cache_dir = cache_dir
@@ -73,6 +72,7 @@ class _VLLMOfflineMixin:
         self._llm = None
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
+        self.max_model_len = max_model_len
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
 
@@ -80,10 +80,18 @@ class _VLLMOfflineMixin:
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
         if self._llm is None:
+            os.environ["MASTER_ADDR"] = socket.gethostname()
+            os.environ["MASTER_PORT"] = str(10000)
             if self._use_cached_modelinfo:
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
+                self.logger.info(f"Reusing cache at {self._model_info_cache}")
+                self.logger.info("File list in cache")
+                for root, dirs, files in os.walk(self._model_info_cache):
+                    for file in files:
+                        self.logger.info(f"{file}")
             else:
-                self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+                if self._model_info_cache is None:
+                    self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 try:
                     os.makedirs(os.environ["VLLM_CACHE_ROOT"])
@@ -91,6 +99,11 @@ class _VLLMOfflineMixin:
                 except Exception as e:
                     self.logger.error(f"Building model infos failed with error {e}")
                     raise
+            # Setup vllm logging
+            log_dir = f"{os.getcwd()}/logs/vllm"
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            _setup_vllm_file_logging(f"{log_dir}/vllm_{self._name}.log")
             from vllm import LLM
 
             snapshots = glob(
@@ -102,6 +115,7 @@ class _VLLMOfflineMixin:
                     model=snapshots[0],
                     tensor_parallel_size=self.tensor_parallel_size,
                     trust_remote_code=True,
+                    max_model_len=self.max_model_len,
                 )
             except Exception as e:
                 self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -140,8 +154,11 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
     ):
         PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
         self._init_vllm(
-            model, cache_dir, tensor_parallel_size,
-            use_cached_modelinfo, model_info_cache,
+            model,
+            cache_dir,
+            tensor_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
         )
 
 
@@ -158,8 +175,11 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
     ):
         PrivateActor.__init__(self, name, client_conn)
         self._init_vllm(
-            model, cache_dir, tensor_parallel_size,
-            use_cached_modelinfo, model_info_cache,
+            model,
+            cache_dir,
+            tensor_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
         )
 
 
@@ -201,7 +221,8 @@ class _VLLMOnlineMixin:
         if self._use_cached_modelinfo:
             os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
         else:
-            self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+            if self._model_info_cache is None:
+                self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
             os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
             try:
                 os.makedirs(os.environ["VLLM_CACHE_ROOT"])
@@ -271,8 +292,12 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
     ):
         PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
         self._init_vllm_online(
-            model, cache_dir, port, tensor_parallel_size,
-            use_cached_modelinfo, model_info_cache,
+            model,
+            cache_dir,
+            port,
+            tensor_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
         )
 
 
@@ -290,8 +315,12 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
     ):
         PrivateActor.__init__(self, name, client_conn)
         self._init_vllm_online(
-            model, cache_dir, port, tensor_parallel_size,
-            use_cached_modelinfo, model_info_cache,
+            model,
+            cache_dir,
+            port,
+            tensor_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
         )
 
 
@@ -314,6 +343,7 @@ class _MultiNodeVLLMMixin:
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        max_model_len: int = 2048,
     ):
         self._model_name = model
         self.cache_dir = cache_dir
@@ -339,6 +369,7 @@ class _MultiNodeVLLMMixin:
         self._sub_socket = None
         self._zmq_context = None
         self._llm = None
+        self.max_model_len = max_model_len
 
     async def on_start(self):
         if self.logger is None:
@@ -461,9 +492,10 @@ class _MultiNodeVLLMMixin:
             os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
         else:
             if self._rank == 0:
-                self._model_info_cache = os.path.join(
-                    self._ckpt_dir, f"vllm_cache_{uuid.uuid4().hex[:6]}"
-                )
+                if self._model_info_cache is None:
+                    self._model_info_cache = os.path.join(
+                        self._ckpt_dir, f"vllm_cache_{uuid.uuid4().hex[:6]}"
+                    )
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 try:
                     os.makedirs(self._model_info_cache)
@@ -502,6 +534,7 @@ class _MultiNodeVLLMMixin:
                 trust_remote_code=True,
                 distributed_executor_backend="external_launcher",
                 seed=1,
+                max_model_len=self.max_model_len,
             )
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -601,10 +634,17 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
     ):
         PublicActor.__init__(self, name, transport)
         self._init_multinode_vllm(
-            model, cache_dir, self.ckpt_dir,
-            tensor_parallel_size, pipeline_parallel_size,
-            use_cached_modelinfo, model_info_cache,
-            sync_location, rank_env, local_rank_env, sync_timeout,
+            model,
+            cache_dir,
+            self.ckpt_dir,
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
+            sync_location,
+            rank_env,
+            local_rank_env,
+            sync_timeout,
         )
 
     async def _setup_rank0_connection(self):
@@ -636,10 +676,17 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
     ):
         PrivateActor.__init__(self, name, client_conn)
         self._init_multinode_vllm(
-            model, cache_dir, ckpt_dir,
-            tensor_parallel_size, pipeline_parallel_size,
-            use_cached_modelinfo, model_info_cache,
-            sync_location, rank_env, local_rank_env, sync_timeout,
+            model,
+            cache_dir,
+            ckpt_dir,
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            use_cached_modelinfo,
+            model_info_cache,
+            sync_location,
+            rank_env,
+            local_rank_env,
+            sync_timeout,
         )
 
     async def _setup_rank0_connection(self):

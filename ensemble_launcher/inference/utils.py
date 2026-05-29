@@ -70,7 +70,8 @@ def _build_model_cache(logger: Logger = None) -> int:
     if not cache_root:
         return EnvironmentError("VLLM_CACHE_ROOT must be set")
 
-    logger.info(f"Using VLLM_CACHE_ROOT={cache_root}")
+    if logger is not None:
+        logger.info(f"Using VLLM_CACHE_ROOT={cache_root}")
 
     success = 0
     skipped = 0
@@ -115,8 +116,8 @@ def _build_model_cache(logger: Logger = None) -> int:
 
                 cache_path = lazy._get_cache_dir() / lazy._get_cache_filename()
                 success += 1
-                logger.info(f"[OK] {fqmod}:{cls_name}")
                 if logger is not None:
+                    logger.info(f"[OK] {fqmod}:{cls_name}")
                     logger.info(f"     -> {cache_path}")
 
             except Exception as e:
@@ -127,9 +128,13 @@ def _build_model_cache(logger: Logger = None) -> int:
                     )
                 continue
 
-    logger.info("\nSummary:")
-    logger.info(f"  success: {success}")
-    logger.info(f"  failed : {failed}")
-    logger.info(f"  skipped: {skipped}")
+    if logger is not None:
+        logger.info("\nSummary:")
+        logger.info(f"  success: {success}")
+        logger.info(f"  failed : {failed}")
+        logger.info(f"  skipped: {skipped}")
 
     return 0
+
+
+build_model_cache = _build_model_cache

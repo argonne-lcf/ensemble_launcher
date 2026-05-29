@@ -12,6 +12,7 @@ def _scatter_fn(
     chunk_size: int,
     ppn: int = 1,
     cache_modelinfo: bool = False,
+    node_local_vllm_cache: Optional[str] = None,
 ):
     from mpi4py import MPI
 
@@ -23,12 +24,9 @@ def _scatter_fn(
     sub_rank = sub_comm.rank
     is_node_lead = my_color == 0
 
-    if cache_modelinfo:
-        model_cache = node_local_cache
-    else:
-        model_cache = os.path.join(
-            node_local_cache, "hub", f"models--{model.replace('/', '--')}"
-        )
+    model_cache = os.path.join(
+        node_local_cache, "hub", f"models--{model.replace('/', '--')}"
+    )
 
     if my_rank == 0:
         regular_files = []
@@ -40,6 +38,16 @@ def _scatter_fn(
                     symlinks.append((filepath, os.readlink(filepath)))
                 else:
                     regular_files.append(filepath)
+        ###
+        if cache_modelinfo:
+            for dirpath, _, filenames in os.walk(node_local_vllm_cache):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.islink(filepath):
+                        symlinks.append((filepath, os.readlink(filepath)))
+                    else:
+                        regular_files.append(filepath)
+
         if not regular_files and not symlinks:
             print(
                 f"WARNING: No files found in {model_cache}. Nothing to sync.",
@@ -162,6 +170,8 @@ def sync_to_root(
     np: int = 16,
     logger: Logger = None,
     cache_modelinfo: bool = False,
+    vllm_cache: Optional[str] = None,
+    node_local_vllm_cache: Optional[str] = None,
 ) -> list:
 
     processes = []
@@ -188,15 +198,20 @@ def sync_to_root(
     processes.append(_dsync(src, dst))
 
     if cache_modelinfo:
+        if vllm_cache is None or node_local_vllm_cache is None:
+            if logger:
+                logger.error("Need vllm_cache and node_local_vllm_cache directories")
+            raise ValueError("Need vllm_cache and node_local_vllm_cache directories")
+
         if logger:
             logger.info("Trying to dsync model infos, torch aot compile")
 
         for dirname in ["modelinfos", "torch_aot_compile", "torch_compile_cache"]:
-            if os.path.exists(os.path.join(cache_dir, dirname)):
+            if os.path.exists(os.path.join(vllm_cache, dirname)):
                 if logger:
                     logger.info(f"Dsync {dirname}")
-                src = os.path.join(cache_dir, dirname)
-                dst = os.path.join(node_local_cache, dirname)
+                src = os.path.join(vllm_cache, dirname)
+                dst = os.path.join(node_local_vllm_cache, dirname)
                 processes.append(_dsync(src, dst))
 
     return processes
@@ -210,17 +225,28 @@ def scatter_from_root(
     chunk_size: int = 100 * 1024 * 1024,
     logger: Logger = None,
     cpu_binding: Optional[str] = None,
+    cache_modelinfo: bool = False,
+    node_local_vllm_cache: Optional[str] = None,
 ):
+    if cache_modelinfo and node_local_vllm_cache is None:
+        if logger:
+            logger.error("nodel_local_vllm_cache is needed")
+        raise ValueError("nodel_local_vllm_cache is needed")
     cmd = ["mpirun", "-np", str(nnodes * ppn), "-ppn", str(ppn)]
     if cpu_binding:
         cmd += [f"{cpu_binding}"]
 
-    cmd += [
-        sys.executable,
-        "-c",
-        f"from ensemble_launcher.inference.copy_model import _scatter_fn; "
-        f"_scatter_fn({node_local_cache!r}, {model!r}, {chunk_size!r}, {ppn!r})",
-    ]
+    cmd += [sys.executable, "-c"]
+    if cache_modelinfo:
+        cmd += [
+            f"from ensemble_launcher.inference.copy_model import _scatter_fn; "
+            f"_scatter_fn({node_local_cache!r}, {model!r}, {chunk_size!r}, {ppn!r}, {cache_modelinfo!r}, {node_local_vllm_cache!r})",
+        ]
+    else:
+        cmd += [
+            f"from ensemble_launcher.inference.copy_model import _scatter_fn; "
+            f"_scatter_fn({node_local_cache!r}, {model!r}, {chunk_size!r}, {ppn!r})",
+        ]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if logger:
         logger.info(f"Scatter_from_root: Executing {cmd}")
