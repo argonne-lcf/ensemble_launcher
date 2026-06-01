@@ -87,6 +87,7 @@ class _VLLMOfflineMixin:
             _actor_port = 1000 + (os.getpid() % 100) * 500
             os.environ["MASTER_PORT"] = str(_actor_port)
             os.environ["VLLM_PORT"] = str(_actor_port)
+            os.environ["VLLM_HOST_IP"] = socket.gethostname()
             if self._use_cached_modelinfo:
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 self.logger.info(f"Reusing cache at {self._model_info_cache}")
@@ -156,8 +157,11 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        max_workers: int = 2,
     ):
-        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
+        PublicActor.__init__(
+            self, name, transport, ckpt_dir=ckpt_dir, max_workers=max_workers
+        )
         self._init_vllm(
             model,
             cache_dir,
@@ -177,8 +181,9 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
+        max_workers: int = 2,
     ):
-        PrivateActor.__init__(self, name, client_conn)
+        PrivateActor.__init__(self, name, client_conn, max_workers=max_workers)
         self._init_vllm(
             model,
             cache_dir,
@@ -294,8 +299,9 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        **kwargs,
     ):
-        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir)
+        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir, **kwargs)
         self._init_vllm_online(
             model,
             cache_dir,
@@ -317,8 +323,9 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
+        **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn)
+        PrivateActor.__init__(self, name, client_conn, **kwargs)
         self._init_vllm_online(
             model,
             cache_dir,
@@ -636,8 +643,9 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        **kwargs,
     ):
-        PublicActor.__init__(self, name, transport)
+        PublicActor.__init__(self, name, transport, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
@@ -678,8 +686,9 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn)
+        PrivateActor.__init__(self, name, client_conn, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,

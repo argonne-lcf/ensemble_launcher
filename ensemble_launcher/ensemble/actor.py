@@ -5,6 +5,7 @@ import secrets
 import time
 import uuid
 from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, Optional, Union
 
 import cloudpickle
@@ -89,6 +90,7 @@ class PrivateActorHandle:
         self,
         conn: ServerConnection,
         actions: Dict[str, inspect.Signature],
+        flush_interval: float = 0.01,
     ):
         self._conn = conn
         self._actions = actions
@@ -96,17 +98,27 @@ class PrivateActorHandle:
         self._ready_events: Dict[str, asyncio.Event] = {}
         self._ready_condition: asyncio.Condition = asyncio.Condition()
         self._results_queue: asyncio.Queue = asyncio.Queue()
+        self._input_queue: asyncio.Queue = asyncio.Queue()
         self._recv_task = None
+        self._send_task = None
+        self._flush_interval = flush_interval
 
     async def open(self):
         await self._conn.open()
         self._recv_task = asyncio.create_task(self._recv_loop())
+        self._send_task = asyncio.create_task(self._send_loop())
 
     async def close(self):
         if self._recv_task:
             self._recv_task.cancel()
             try:
                 await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        if self._send_task:
+            self._send_task.cancel()
+            try:
+                await self._send_task
             except asyncio.CancelledError:
                 pass
         await self._conn.close()
@@ -130,6 +142,17 @@ class PrivateActorHandle:
         except Exception:
             pass
 
+    async def _send_loop(self):
+        try:
+            while True:
+                data, target_id = await self._input_queue.get()
+                await self._conn.send(data, target_id)
+                asyncio.sleep(self._flush_interval)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     async def recv(self) -> tuple:
         return await self._results_queue.get()
 
@@ -138,7 +161,7 @@ class PrivateActorHandle:
             event = self._ready_events.setdefault(target_id, asyncio.Event())
             await event.wait()
         data = cloudpickle.dumps(msg)
-        await self._conn.send(data, target_id)
+        self._input_queue.put_nowait((data, target_id))
 
     async def wait_for_ready(self, expected: int):
         async with self._ready_condition:
@@ -160,7 +183,7 @@ class PrivateActorHandle:
 
 
 class _ActorBase(ABC):
-    def __init__(self, name: str):
+    def __init__(self, name: str, max_workers: int = 2):
         self._name = name
         self._secret = secrets.token_hex(16)
         self._conn: Union[ServerConnection, ClientConnection] = None
@@ -168,6 +191,8 @@ class _ActorBase(ABC):
         self._input_queue: asyncio.Queue = None
         self._output_queue: asyncio.Queue = None
         self.logger = None
+        self._executor = None
+        self._max_workers = max_workers
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -182,6 +207,7 @@ class _ActorBase(ABC):
         self._stop = asyncio.Event()
         self._input_queue = asyncio.Queue()
         self._output_queue = asyncio.Queue()
+        self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
 
     @property
     def secret(self) -> str:
@@ -313,8 +339,9 @@ class PublicActor(_ActorBase):
         name: str,
         transport: str = "zmq",
         ckpt_dir: Optional[str] = None,
+        max_workers: int = 2,
     ):
-        super().__init__(name)
+        super().__init__(name, max_workers=max_workers)
         if ckpt_dir is None:
             ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -415,12 +442,8 @@ class PublicActor(_ActorBase):
 
 
 class PrivateActor(_ActorBase):
-    def __init__(
-        self,
-        name: str,
-        client_conn: ClientConnection,
-    ):
-        super().__init__(name)
+    def __init__(self, name: str, client_conn: ClientConnection, max_workers: int = 2):
+        super().__init__(name, max_workers=max_workers)
         self._conn = client_conn
 
     @classmethod
