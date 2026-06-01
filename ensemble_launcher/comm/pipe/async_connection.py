@@ -219,19 +219,21 @@ class AsyncZMQRouterConnection(ServerConnection):
         from zmq.asyncio import Context, Socket
 
         self._context = Context()
-        # self._context.setsockopt(zmq.IO_THREADS, 4)
+        self._context.set(zmq.IO_THREADS, 4)
         self._socket = self._context.socket(zmq.ROUTER, socket_class=Socket)
         self._socket.setsockopt(
             zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
         )
         self._socket.setsockopt(zmq.SNDHWM, 10000)
         self._socket.setsockopt(zmq.RCVHWM, 10000)
-        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)  # send heartbeat every 1s
-        self._socket.setsockopt(
-            zmq.HEARTBEAT_TIMEOUT, 60000
-        )  # consider dead after 60s no response
+        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
+        self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
         self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
         self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
 
         try:
             self._socket.bind(f"tcp://{self._address}")
@@ -348,17 +350,20 @@ class AsyncZMQDealerConnection(ClientConnection):
         from zmq.asyncio import Context, Socket
 
         self._context = Context()
+        self._context.set(zmq.IO_THREADS, 4)
         self._socket = self._context.socket(zmq.DEALER, socket_class=Socket)
         self._socket.setsockopt(
             zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
         )
         self._socket.setsockopt(zmq.SNDHWM, 10000)
         self._socket.setsockopt(zmq.RCVHWM, 10000)
-        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)  # send heartbeat every 5s
-        self._socket.setsockopt(
-            zmq.HEARTBEAT_TIMEOUT, 60000
-        )  # consider dead after 60s no response
+        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
+        self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
         self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+        self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
         self._socket.connect(f"tcp://{self._remote_address}")
         self.logger.info(f"Connected to {self.remote_address}")
         self._is_open = True

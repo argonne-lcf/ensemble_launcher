@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import logging
 import os
 import secrets
 import time
@@ -25,6 +26,8 @@ from ensemble_launcher.ensemble.ensemble import TaskKwargs
 from ensemble_launcher.logging import setup_logger
 
 _READY_SENTINEL = b"__ACTOR_READY__"
+
+_logger = logging.getLogger(__name__)
 
 
 def action(fn: Callable):
@@ -126,31 +129,37 @@ class PrivateActorHandle:
     async def _recv_loop(self):
         try:
             while True:
-                frames = await self._conn.recv()
-                full_id, _, _ = decode_identity(frames[0])
-                if frames[1] == _READY_SENTINEL:
-                    self._ready_actors.add(full_id)
-                    event = self._ready_events.setdefault(full_id, asyncio.Event())
-                    event.set()
-                    async with self._ready_condition:
-                        self._ready_condition.notify_all()
-                else:
-                    result = cloudpickle.loads(frames[1])
-                    await self._results_queue.put((full_id, result))
+                try:
+                    frames = await self._conn.recv()
+                    full_id, _, _ = decode_identity(frames[0])
+                    if frames[1] == _READY_SENTINEL:
+                        self._ready_actors.add(full_id)
+                        event = self._ready_events.setdefault(full_id, asyncio.Event())
+                        event.set()
+                        async with self._ready_condition:
+                            self._ready_condition.notify_all()
+                    else:
+                        result = cloudpickle.loads(frames[1])
+                        await self._results_queue.put((full_id, result))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    _logger.error(f"PrivateActorHandle recv error: {e}")
         except asyncio.CancelledError:
-            pass
-        except Exception:
             pass
 
     async def _send_loop(self):
         try:
             while True:
                 data, target_id = await self._input_queue.get()
-                await self._conn.send(data, target_id)
-                asyncio.sleep(self._flush_interval)
+                try:
+                    await self._conn.send(data, target_id)
+                except Exception as e:
+                    _logger.error(
+                        f"PrivateActorHandle: failed to send to {target_id}: {e}"
+                    )
+                await asyncio.sleep(self._flush_interval)
         except asyncio.CancelledError:
-            pass
-        except Exception:
             pass
 
     async def recv(self) -> tuple:
