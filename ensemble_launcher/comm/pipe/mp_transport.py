@@ -31,10 +31,14 @@ class AsyncMPTransport(AsyncTransport):
         self._client_connections: Dict[str, AsyncMPConnection] = {}
         self._pairs: Dict[str, str] = {}
 
-    def _create_server_connection(self, **kwargs) -> ServerConnection:
+    def _create_server_connection(
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
+    ) -> ServerConnection:
         raise NotImplementedError("MP connections are created via create_child_pipe")
 
-    def _create_client_connection(self, **kwargs) -> ClientConnection:
+    def _create_client_connection(
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
+    ) -> ClientConnection:
         raise NotImplementedError("MP connections are created via create_child_pipe")
 
     def create_child_pipe(
@@ -43,6 +47,7 @@ class AsyncMPTransport(AsyncTransport):
         parent_secret: str,
         child_id: str,
         child_secret: str,
+        req_res: bool = False,
     ) -> Tuple[AsyncMPConnection, AsyncMPConnection]:
         raw_a, raw_b = multiprocessing.Pipe()
         server_conn = AsyncMPConnection(
@@ -50,12 +55,14 @@ class AsyncMPTransport(AsyncTransport):
             secret_id=parent_secret,
             pipe_conn=raw_a,
             expected_remotes={child_id: child_secret},
+            req_res=req_res,
         )
         client_conn = AsyncMPConnection(
             identity=child_id,
             secret_id=child_secret,
             pipe_conn=raw_b,
             expected_remotes={parent_id: parent_secret},
+            req_res=req_res,
         )
         server_key = f"{parent_id}:{parent_secret}"
         client_key = f"{child_id}:{child_secret}"

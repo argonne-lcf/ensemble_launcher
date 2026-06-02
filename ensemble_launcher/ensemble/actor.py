@@ -91,6 +91,8 @@ class PrivateActorHandle:
         conn: ServerConnection,
         actions: Dict[str, inspect.Signature],
         flush_interval: float = 0.01,
+        send_timeout: float = 5.0,
+        retries: int = 3,
     ):
         self._conn = conn
         self._actions = actions
@@ -102,6 +104,8 @@ class PrivateActorHandle:
         self._recv_task = None
         self._send_task = None
         self._flush_interval = flush_interval
+        self._send_timeout = send_timeout
+        self._retries = retries
 
     async def open(self):
         log_dir = f"{os.getcwd()}/logs/handles"
@@ -153,7 +157,15 @@ class PrivateActorHandle:
             while True:
                 data, target_id = await self._input_queue.get()
                 try:
-                    await self._conn.send(data, target_id)
+                    for i in range(self._retries):
+                        success = await self._conn.send(
+                            data, target_id, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
+                    self.logger.warning(
+                        f"Send failed to {target_id} after {self._retries} retries"
+                    )
                 except Exception as e:
                     self.logger.error(
                         f"PrivateActorHandle: failed to send to {target_id}: {e}"
