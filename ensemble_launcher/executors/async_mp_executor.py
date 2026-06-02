@@ -1,7 +1,6 @@
 import asyncio
 import multiprocessing as mp
 import os
-import uuid
 from asyncio import Future as AsyncFuture
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
@@ -30,7 +29,11 @@ def dummy_task():
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
     def __init__(
-        self, logger: Logger, gpu_selector: str = "ZE_AFFINITY_MASK", worker_method: str = "spawn", **kwargs
+        self,
+        logger: Logger,
+        gpu_selector: str = "ZE_AFFINITY_MASK",
+        worker_method: str = "spawn",
+        **kwargs,
     ):
         self.logger = logger
         self._gpu_selector = gpu_selector
@@ -40,7 +43,9 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         if worker_method == "spawn":
             mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
-            super().__init__(mp_context=mp_context, max_workers=kwargs.get("max_workers", None))
+            super().__init__(
+                mp_context=mp_context, max_workers=kwargs.get("max_workers", None)
+            )
         else:
             super().__init__(max_workers=kwargs.get("max_workers", None))
         # super().__init__()
@@ -91,10 +96,18 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
                 run_cmd, *(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout)
             )
         else:
-            self.logger.warning(f"Can only excute either a str or a callable")
+            self.logger.warning("Can only excute either a str or a callable")
             return None
 
         return asyncio.wrap_future(future)
+
+    def shutdown(self, wait=True, **kwargs):
+        if self._processes is not None:
+            for p in self._processes.values():
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=5.0)
+        super().shutdown(wait=wait, **kwargs)
 
 
 @executor_registry.register("async_threadpool", type="async")
@@ -216,9 +229,7 @@ class AsyncLokyExecutor:
         **kwargs,
     ) -> AsyncFuture:
         if len(job_resource.nodes) > 1:
-            raise ValueError(
-                "AsyncLokyExecutor can only execute single node tasks"
-            )
+            raise ValueError("AsyncLokyExecutor can only execute single node tasks")
 
         req = job_resource.resources[0]
         if isinstance(req, NodeResourceCount):

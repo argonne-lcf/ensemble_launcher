@@ -391,9 +391,12 @@ class AsyncComm:
 
         if self._parent_conn is not None and not self._parent_conn.is_open:
             await self._parent_conn.open()
-            self.logger.info(
-                f"{self._node_info.node_id}: Connected to parent at {self.parent_address}"
-            )
+            try:
+                self.logger.info(
+                    f"{self._node_info.node_id}: Connected to parent at {self.parent_address}"
+                )
+            except Exception:
+                pass
 
         if self._parent_conn is not None:
             self.logger.info(f"My hb secret: {self._hb_parent_conn._secret_id}")
