@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import logging
 import os
 import secrets
 import time
@@ -26,8 +25,6 @@ from ensemble_launcher.ensemble.ensemble import TaskKwargs
 from ensemble_launcher.logging import setup_logger
 
 _READY_SENTINEL = b"__ACTOR_READY__"
-
-_logger = logging.getLogger(__name__)
 
 
 def action(fn: Callable):
@@ -107,6 +104,9 @@ class PrivateActorHandle:
         self._flush_interval = flush_interval
 
     async def open(self):
+        log_dir = f"{os.getcwd()}/logs/handles"
+        os.makedirs(log_dir, exist_ok=True)
+        self.logger = setup_logger(name=self._conn.identity, log_dir=log_dir)
         await self._conn.open()
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._send_task = asyncio.create_task(self._send_loop())
@@ -144,7 +144,7 @@ class PrivateActorHandle:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    _logger.error(f"PrivateActorHandle recv error: {e}")
+                    self.logger.error(f"PrivateActorHandle recv error: {e}")
         except asyncio.CancelledError:
             pass
 
@@ -155,7 +155,7 @@ class PrivateActorHandle:
                 try:
                     await self._conn.send(data, target_id)
                 except Exception as e:
-                    _logger.error(
+                    self.logger.error(
                         f"PrivateActorHandle: failed to send to {target_id}: {e}"
                     )
                 await asyncio.sleep(self._flush_interval)
@@ -212,7 +212,9 @@ class _ActorBase(ABC):
                     cls.__actions__.setdefault(attr.__action_name__, attr)
 
     def _init_runtime(self):
-        self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+        log_dir = f"{os.getcwd()}/logs/actors"
+        os.makedirs(log_dir, exist_ok=True)
+        self.logger = setup_logger(name=self._name, log_dir=log_dir)
         self._stop = asyncio.Event()
         self._input_queue = asyncio.Queue()
         self._output_queue = asyncio.Queue()
