@@ -92,7 +92,7 @@ class PrivateActorHandle:
         actions: Dict[str, inspect.Signature],
         flush_interval: float = 0.01,
         send_timeout: float = 5.0,
-        retries: int = 3,
+        send_retries: int = 3,
     ):
         self._conn = conn
         self._actions = actions
@@ -105,7 +105,7 @@ class PrivateActorHandle:
         self._send_task = None
         self._flush_interval = flush_interval
         self._send_timeout = send_timeout
-        self._retries = retries
+        self._send_retries = send_retries
 
     async def open(self):
         log_dir = f"{os.getcwd()}/logs/handles"
@@ -157,15 +157,17 @@ class PrivateActorHandle:
             while True:
                 data, target_id = await self._input_queue.get()
                 try:
-                    for i in range(self._retries):
+                    success = False
+                    for i in range(self._send_retries):
                         success = await self._conn.send(
                             data, target_id, timeout=self._send_timeout
                         )
                         if success:
                             break
-                    self.logger.warning(
-                        f"Send failed to {target_id} after {self._retries} retries"
-                    )
+                    if not success:
+                        self.logger.warning(
+                            f"Send failed to {target_id} after {self._retries} retries"
+                        )
                 except Exception as e:
                     self.logger.error(
                         f"PrivateActorHandle: failed to send to {target_id}: {e}"
@@ -204,7 +206,13 @@ class PrivateActorHandle:
 
 
 class _ActorBase(ABC):
-    def __init__(self, name: str, max_workers: int = 2):
+    def __init__(
+        self,
+        name: str,
+        max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
+    ):
         self._name = name
         self._secret = secrets.token_hex(16)
         self._conn: Union[ServerConnection, ClientConnection] = None
@@ -214,6 +222,8 @@ class _ActorBase(ABC):
         self.logger = None
         self._executor = None
         self._max_workers = max_workers
+        self._send_timeout = send_timeout
+        self._send_retries = send_retries
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -263,7 +273,7 @@ class _ActorBase(ABC):
         self.logger.info("Receive loop started.")
         while not self._stop.is_set():
             try:
-                frames = await asyncio.wait_for(self._conn.recv(), timeout=5.0)
+                frames = await self._conn.recv(timeout=5.0)
                 sender_id = self._extract_sender(frames)
                 self.logger.info(f"Received args from {sender_id}")
                 args = cloudpickle.loads(frames[1])
@@ -278,12 +288,26 @@ class _ActorBase(ABC):
                 target_id, data = await asyncio.wait_for(
                     self._output_queue.get(), timeout=5.0
                 )
-                payload = cloudpickle.dumps(data)
+                payload = cloudpickle.dumps(data) if data != _READY_SENTINEL else data
+                success = False
                 if isinstance(self._conn, ServerConnection):
-                    await self._conn.send(payload, target_id)
+                    for i in range(self._send_retries):
+                        success = await self._conn.send(
+                            payload, target_id, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
                 else:
-                    await self._conn.send(payload)
-                self.logger.info(f"Sent results to {target_id}")
+                    for i in range(self._send_retries):
+                        success = await self._conn.send(
+                            payload, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
+                if not success:
+                    self.logger.warning(f"Sending message to {target_id} failed")
+                else:
+                    self.logger.info(f"Sent results to {target_id}")
             except Exception as e:
                 self.logger.debug(f"Send failed with error: {str(e)}")
 
@@ -363,8 +387,15 @@ class PublicActor(_ActorBase):
         transport: str = "zmq",
         ckpt_dir: Optional[str] = None,
         max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
     ):
-        super().__init__(name, max_workers=max_workers)
+        super().__init__(
+            name,
+            max_workers=max_workers,
+            send_timeout=send_timeout,
+            send_retries=send_retries,
+        )
         if ckpt_dir is None:
             ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -465,18 +496,31 @@ class PublicActor(_ActorBase):
 
 
 class PrivateActor(_ActorBase):
-    def __init__(self, name: str, client_conn: ClientConnection, max_workers: int = 2):
-        super().__init__(name, max_workers=max_workers)
+    def __init__(
+        self,
+        name: str,
+        client_conn: ClientConnection,
+        max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
+    ):
+        super().__init__(
+            name,
+            max_workers=max_workers,
+            send_timeout=send_timeout,
+            send_retries=send_retries,
+        )
         self._conn = client_conn
 
     @classmethod
-    def create_handle(cls, server_conn: ServerConnection) -> PrivateActorHandle:
-        return PrivateActorHandle(server_conn, cls._build_action_signatures())
+    def create_handle(
+        cls, server_conn: ServerConnection, **kwargs
+    ) -> PrivateActorHandle:
+        return PrivateActorHandle(server_conn, cls._build_action_signatures(), **kwargs)
 
     async def _signal_ready(self):
-        await asyncio.sleep(0)
-        await self._conn.send(_READY_SENTINEL)
-        self.logger.info("Ready signal sent.")
+        await self._output_queue.put((None, _READY_SENTINEL))
+        self.logger.info("Pushed ready signal to the output queue.")
 
     async def _run(self):
         self._init_runtime()

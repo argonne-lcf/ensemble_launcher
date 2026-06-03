@@ -158,9 +158,10 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         max_workers: int = 2,
+        **kwargs,
     ):
         PublicActor.__init__(
-            self, name, transport, ckpt_dir=ckpt_dir, max_workers=max_workers
+            self, name, transport, ckpt_dir=ckpt_dir, max_workers=max_workers, **kwargs
         )
         self._init_vllm(
             model,
@@ -182,8 +183,11 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         max_workers: int = 2,
+        **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn, max_workers=max_workers)
+        PrivateActor.__init__(
+            self, name, client_conn, max_workers=max_workers, **kwargs
+        )
         self._init_vllm(
             model,
             cache_dir,
