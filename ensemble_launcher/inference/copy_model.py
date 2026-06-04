@@ -163,6 +163,47 @@ def _scatter_fn(
         )
 
 
+def distribute_model(
+    model: str,
+    cache_dir: str,
+    nnodes: int,
+    node_local_cache: str = "/tmp/model_cache",
+    sync_np: int = 16,
+    scatter_ppn: int = 1,
+    chunk_size: int = 100 * 1024 * 1024,
+    logger: Logger = None,
+    cpu_binding: Optional[str] = None,
+    cache_modelinfo: bool = False,
+    vllm_cache: Optional[str] = None,
+    node_local_vllm_cache: Optional[str] = None,
+):
+    sync_to_root(
+        model=model,
+        cache_dir=cache_dir,
+        node_local_cache=node_local_cache,
+        np=sync_np,
+        logger=logger,
+        cache_modelinfo=cache_modelinfo,
+        vllm_cache=vllm_cache,
+        node_local_vllm_cache=node_local_vllm_cache,
+    )
+    if logger:
+        logger.info("Done sync to root")
+    scatter_from_root(
+        model=model,
+        node_local_cache=node_local_cache,
+        nnodes=nnodes,
+        ppn=scatter_ppn,
+        chunk_size=chunk_size,
+        logger=logger,
+        cpu_binding=cpu_binding,
+        cache_modelinfo=cache_modelinfo,
+        node_local_vllm_cache=node_local_vllm_cache,
+    )
+    if logger:
+        logger.info("Done scatter from root")
+
+
 def sync_to_root(
     model: str,
     cache_dir: str,

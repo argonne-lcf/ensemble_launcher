@@ -39,6 +39,9 @@ def get_system_config(name="aurora"):
         raise NotImplementedError(f"unknown system {name}")
 
 
+aurora_config = get_system_config("aurora")
+
+
 class LauncherConfig(BaseModel):
     """Configuration for launcher"""
 
