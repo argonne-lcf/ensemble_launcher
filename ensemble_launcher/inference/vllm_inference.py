@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 from glob import glob
-from typing import Optional
+from typing import Dict, List, Optional, Union
 
 import cloudpickle
 
@@ -65,6 +65,7 @@ class _VLLMOfflineMixin:
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         max_model_len: int = 2048,
+        **kwargs,
     ):
         self.model = model
         self.cache_dir = cache_dir
@@ -73,6 +74,7 @@ class _VLLMOfflineMixin:
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         self.max_model_len = max_model_len
+        self.kwargs = kwargs
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
 
@@ -122,6 +124,7 @@ class _VLLMOfflineMixin:
                     tensor_parallel_size=self.tensor_parallel_size,
                     trust_remote_code=True,
                     max_model_len=self.max_model_len,
+                    **self.kwargs,
                 )
             except Exception as e:
                 self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -129,10 +132,15 @@ class _VLLMOfflineMixin:
             self.logger.info("init done!")
 
     @action
-    def generate(self, prompts="hello", temperature=0.0, max_tokens=1024):
+    def generate(
+        self,
+        prompts: Union[str, List],
+        sampling_params: Dict = {"temperature": 0.0, "max_tokens": 1024},
+        **kwargs,
+    ):
         from vllm import SamplingParams
 
-        sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+        sampling_params = SamplingParams(**sampling_params)
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -140,7 +148,7 @@ class _VLLMOfflineMixin:
         else:
             single = False
 
-        outputs = self._llm.generate(prompts, sampling_params)
+        outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
         results = [output.outputs[0].text for output in outputs]
 
         return results[0] if single else results
@@ -158,6 +166,7 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         max_workers: int = 2,
+        llm_kwargs: Dict = {"max_model_len": 2048},
         **kwargs,
     ):
         PublicActor.__init__(
@@ -169,6 +178,7 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
             tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
+            **llm_kwargs,
         )
 
 
@@ -183,6 +193,7 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         max_workers: int = 2,
+        llm_kwargs: Dict = {"max_model_len": 2048},
         **kwargs,
     ):
         PrivateActor.__init__(
@@ -194,6 +205,7 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
             tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
+            **llm_kwargs,
         )
 
 
@@ -211,6 +223,7 @@ class _VLLMOnlineMixin:
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
+        **kwargs,
     ):
         self._model_name = model
         self.cache_dir = cache_dir
@@ -221,6 +234,7 @@ class _VLLMOnlineMixin:
         self._model_info_cache = model_info_cache
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
+        self.kwargs = kwargs
 
     async def on_start(self):
         if self.logger is None:
@@ -303,6 +317,7 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        llm_kwargs: Dict = {},
         **kwargs,
     ):
         PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir, **kwargs)
@@ -313,6 +328,7 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
             tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
+            **llm_kwargs,
         )
 
 
@@ -327,6 +343,7 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
         tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
+        llm_kwargs: Dict = {},
         **kwargs,
     ):
         PrivateActor.__init__(self, name, client_conn, **kwargs)
@@ -337,6 +354,7 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
             tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
+            **llm_kwargs,
         )
 
 
@@ -360,6 +378,7 @@ class _MultiNodeVLLMMixin:
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
         max_model_len: int = 2048,
+        **kwargs,
     ):
         self._model_name = model
         self.cache_dir = cache_dir
@@ -386,6 +405,7 @@ class _MultiNodeVLLMMixin:
         self._zmq_context = None
         self._llm = None
         self.max_model_len = max_model_len
+        self.kwargs = kwargs
 
     async def on_start(self):
         if self.logger is None:
@@ -551,6 +571,7 @@ class _MultiNodeVLLMMixin:
                 distributed_executor_backend="external_launcher",
                 seed=1,
                 max_model_len=self.max_model_len,
+                **self.kwargs,
             )
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -615,10 +636,15 @@ class _MultiNodeVLLMMixin:
             self._zmq_context.term()
 
     @action
-    def generate(self, prompts="hello", temperature=0.0, max_tokens=1024):
+    def generate(
+        self,
+        prompts: Union[str, List[str]],
+        sampling_kwargs: Dict = {"temperature": 0.0, "max_tokens": 1024},
+        **kwargs,
+    ):
         from vllm import SamplingParams
 
-        sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+        sampling_params = SamplingParams(**sampling_kwargs)
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -626,7 +652,7 @@ class _MultiNodeVLLMMixin:
         else:
             single = False
 
-        outputs = self._llm.generate(prompts, sampling_params)
+        outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
         results = [output.outputs[0].text for output in outputs]
 
         return results[0] if single else results
@@ -647,6 +673,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        llm_kwargs: Dict = {"max_model_len": 2048},
         **kwargs,
     ):
         PublicActor.__init__(self, name, transport, **kwargs)
@@ -662,6 +689,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
             rank_env,
             local_rank_env,
             sync_timeout,
+            **llm_kwargs,
         )
 
     async def _setup_rank0_connection(self):
@@ -690,6 +718,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        llm_kwargs: Dict = {"max_model_len": 2048},
         **kwargs,
     ):
         PrivateActor.__init__(self, name, client_conn, **kwargs)
@@ -705,6 +734,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
             rank_env,
             local_rank_env,
             sync_timeout,
+            **llm_kwargs,
         )
 
     async def _setup_rank0_connection(self):
