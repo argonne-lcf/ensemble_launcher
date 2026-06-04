@@ -93,9 +93,11 @@ class PrivateActorHandle:
         flush_interval: float = 0.01,
         send_timeout: float = 5.0,
         send_retries: int = 3,
+        default_target_id: Optional[str] = None,
     ):
         self._conn = conn
         self._actions = actions
+        self._default_target_id = default_target_id
         self._ready_actors: set = set()
         self._ready_events: Dict[str, asyncio.Event] = {}
         self._ready_condition: asyncio.Condition = asyncio.Condition()
@@ -106,6 +108,41 @@ class PrivateActorHandle:
         self._flush_interval = flush_interval
         self._send_timeout = send_timeout
         self._send_retries = send_retries
+
+    def __getattr__(self, name):
+        _actions = self.__dict__.get("_actions")
+        if _actions is not None and name in _actions:
+            sig = _actions[name]
+
+            async def proxy(*args, actor_id: Optional[str] = None, **kwargs):
+                tid = actor_id or self._default_target_id
+                if tid is None:
+                    raise ValueError(
+                        f"actor_id required for {name}() (no default_target_id set)"
+                    )
+                await self.send((name, args, kwargs), target_id=tid)
+                return await self.recv()
+
+            params = list(sig.parameters.values())
+            params.append(
+                inspect.Parameter(
+                    "actor_id",
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=None,
+                    annotation=Optional[str],
+                )
+            )
+            proxy.__name__ = name
+            proxy.__qualname__ = name
+            proxy.__signature__ = sig.replace(parameters=params)
+            proxy.__annotations__ = {
+                k: v.annotation
+                for k, v in sig.parameters.items()
+                if v.annotation is not inspect.Parameter.empty
+            }
+            return proxy
+
+        raise AttributeError(f"No attribute named {name}")
 
     async def open(self):
         log_dir = f"{os.getcwd()}/logs/handles"
@@ -350,7 +387,11 @@ class _ActorBase(ABC):
                 except Exception as e:
                     self.logger.error(f"Invoke failed with error: {e}")
                     raise e
-                await self._output_queue.put((target_id, result))
+                if inspect.isasyncgen(result):
+                    async for item in result:
+                        await self._output_queue.put((target_id, item))
+                else:
+                    await self._output_queue.put((target_id, result))
             else:
                 raise ValueError("Message must be either List[Tuple] or Tuple")
         self.logger.info("Main loop stopped.")
@@ -514,9 +555,17 @@ class PrivateActor(_ActorBase):
 
     @classmethod
     def create_handle(
-        cls, server_conn: ServerConnection, **kwargs
+        cls,
+        server_conn: ServerConnection,
+        default_target_id: Optional[str] = None,
+        **kwargs,
     ) -> PrivateActorHandle:
-        return PrivateActorHandle(server_conn, cls._build_action_signatures(), **kwargs)
+        return PrivateActorHandle(
+            server_conn,
+            cls._build_action_signatures(),
+            default_target_id=default_target_id,
+            **kwargs,
+        )
 
     async def _signal_ready(self):
         await self._output_queue.put((None, _READY_SENTINEL))
