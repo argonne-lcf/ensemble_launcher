@@ -28,6 +28,7 @@ class ActorPool(PrivateActor):
         child_send_timeout: float = 5.0,
         child_send_retries: int = 3,
         submit_to: str = "global",
+        child_ready_timeout: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(name, client_conn, **kwargs)
@@ -44,6 +45,7 @@ class ActorPool(PrivateActor):
         self._req_res = req_res
         self._child_send_timeout = child_send_timeout
         self._child_send_retries = child_send_retries
+        self._child_ready_timeout = child_ready_timeout
 
         if isinstance(actor_kwargs, dict):
             self._actor_kwargs_list = [dict(actor_kwargs) for _ in range(n_actors)]
@@ -64,60 +66,70 @@ class ActorPool(PrivateActor):
         self._cluster_client = None
 
     async def on_start(self):
-        transport_entry = transport_registry.get(self._child_transport_name)
-        transport = transport_entry["transport"]()
-        server_id = f"{self._name}_pool"
-        self._server_secret = secrets.token_hex(16)
+        try:
+            transport_entry = transport_registry.get(self._child_transport_name)
+            transport = transport_entry["transport"]()
+            server_id = f"{self._name}_pool"
+            self._server_secret = secrets.token_hex(16)
 
-        actors = []
-        tasks = []
-        server_conn = None
+            actors = []
+            tasks = []
+            server_conn = None
 
-        for i in range(self._n_children):
-            akw = dict(self._actor_kwargs_list[i])
-            actor_name = akw.pop("name", f"{self._name}-child-{i}")
-            self._child_names.append(actor_name)
+            for i in range(self._n_children):
+                akw = dict(self._actor_kwargs_list[i])
+                actor_name = akw.pop("name", f"{self._name}-child-{i}")
+                self._child_names.append(actor_name)
 
-            server, client = transport.create_child_pipe(
-                server_id,
-                self._server_secret,
-                actor_name,
-                self._server_secret,
-                req_res=self._req_res,
+                server, client = transport.create_child_pipe(
+                    server_id,
+                    self._server_secret,
+                    actor_name,
+                    self._server_secret,
+                    req_res=self._req_res,
+                )
+                if server_conn is None:
+                    server_conn = server
+
+                akw["client_conn"] = client
+                akw["name"] = actor_name
+                actor = self._actor_class_list[i](**akw)
+                actors.append(actor)
+
+                tkw = dict(self._task_kwargs_list[i])
+                task_id = tkw.pop("task_id", actor_name)
+                nnodes = tkw.pop("nnodes")
+                ppn = tkw.pop("ppn")
+                task = actor.create_task(task_id=task_id, nnodes=nnodes, ppn=ppn, **tkw)
+                tasks.append(task)
+
+            from ensemble_launcher.orchestrator import ClusterClient  # noqa: E402
+
+            self._cluster_client = ClusterClient(
+                node_id=self._submit_to,
+                checkpoint_dir=self._checkpoint_dir,
+                checkpoint_timeout=self._checkpoint_timeout,
             )
-            if server_conn is None:
-                server_conn = server
+            self._cluster_client.__enter__()
+            self._child_futures = [self._cluster_client.submit(t) for t in tasks]
 
-            akw["client_conn"] = client
-            akw["name"] = actor_name
-            actor = self._actor_class_list[i](**akw)
-            actors.append(actor)
+            self._child_handle = PrivateActor.create_handle(
+                server_conn,
+                send_timeout=self._child_send_timeout,
+                send_retries=self._child_send_retries,
+            )
+            await self._child_handle.open()
 
-            tkw = dict(self._task_kwargs_list[i])
-            task_id = tkw.pop("task_id", actor_name)
-            nnodes = tkw.pop("nnodes")
-            ppn = tkw.pop("ppn")
-            task = actor.create_task(task_id=task_id, nnodes=nnodes, ppn=ppn, **tkw)
-            tasks.append(task)
-
-        from ensemble_launcher.orchestrator import ClusterClient  # noqa: E402
-
-        self._cluster_client = ClusterClient(
-            node_id=self._submit_to,
-            checkpoint_dir=self._checkpoint_dir,
-            checkpoint_timeout=self._checkpoint_timeout,
-        )
-        self._cluster_client.__enter__()
-        self._child_futures = [self._cluster_client.submit(t) for t in tasks]
-
-        self._child_handle = PrivateActor.create_handle(
-            server_conn,
-            send_timeout=self._child_send_timeout,
-            send_retries=self._child_send_retries,
-        )
-        await self._child_handle.open()
-        await self._child_handle.wait_for_ready(expected=self._n_children)
-        self.logger.info(f"ActorPool '{self._name}': {self._n_children} children ready")
+            await self._child_handle.wait_for_ready(
+                expected=self._n_children, timeout=self._child_ready_timeout
+            )
+            self.logger.info(
+                f"ActorPool '{self._name}': {self._n_children} children ready"
+            )
+        except Exception as e:
+            await self._child_handle.stop()
+            self.logger.error(f"on_start failed with Exception {e}")
+            raise e
 
     @action
     async def invoke(self, actor_index: int, msg: Tuple):

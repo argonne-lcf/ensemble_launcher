@@ -6,7 +6,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Set, Union
 
 import cloudpickle
 from typing_extensions import Unpack
@@ -124,14 +124,25 @@ class PrivateActorHandle:
                 return await self.recv()
 
             params = list(sig.parameters.values())
-            params.append(
-                inspect.Parameter(
-                    "actor_id",
-                    inspect.Parameter.KEYWORD_ONLY,
-                    default=None,
-                    annotation=Optional[str],
+            if params[-1].kind == inspect.Parameter.VAR_KEYWORD:
+                params.insert(
+                    -1,
+                    inspect.Parameter(
+                        "actor_id",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default=None,
+                        annotation=Optional[str],
+                    ),
                 )
-            )
+            else:
+                params.append(
+                    inspect.Parameter(
+                        "actor_id",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default=None,
+                        annotation=Optional[str],
+                    )
+                )
             proxy.__name__ = name
             proxy.__qualname__ = name
             proxy.__signature__ = sig.replace(parameters=params)
@@ -143,6 +154,10 @@ class PrivateActorHandle:
             return proxy
 
         raise AttributeError(f"No attribute named {name}")
+
+    @property
+    def ready_actors(self) -> Set:
+        return self._ready_actors
 
     async def open(self):
         log_dir = f"{os.getcwd()}/logs/handles"
@@ -223,11 +238,24 @@ class PrivateActorHandle:
         data = cloudpickle.dumps(msg)
         self._input_queue.put_nowait((data, target_id))
 
-    async def wait_for_ready(self, expected: int):
-        async with self._ready_condition:
-            await self._ready_condition.wait_for(
-                lambda: len(self._ready_actors) >= expected
-            )
+    async def wait_for_ready(self, expected: int, timeout: Optional[float] = None):
+        # Define the core waiting logic
+        async def _wait_for_condition():
+            async with self._ready_condition:
+                await self._ready_condition.wait_for(
+                    lambda: len(self._ready_actors) >= expected
+                )
+
+        if timeout is not None:
+            try:
+                await asyncio.wait_for(_wait_for_condition(), timeout=timeout)
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    f"Only {len(self._ready_actors)}/{expected} ready after {timeout}s"
+                )
+                raise asyncio.TimeoutError
+        else:
+            await _wait_for_condition()
 
     async def broadcast(self, msg: Any, expected: int):
         await self.wait_for_ready(expected=expected)

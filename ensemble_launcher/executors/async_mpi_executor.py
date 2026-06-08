@@ -266,7 +266,7 @@ class AsyncMPIExecutor(Executor):
 
     async def write_file_to_nodes(
         self, path: str, content: str, nodes: List[str], executable: bool = False
-    ) -> None:
+    ) -> bool:
         """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
         cfg = self._mpi_config
 
@@ -323,8 +323,21 @@ class AsyncMPIExecutor(Executor):
             cmd = base_cmd + ["python", "-c", setup_code]
             self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
 
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
+            for retry in range(3):
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _, std_err = await proc.communicate()
+                if proc.returncode != 0:
+                    self.logger.warning(
+                        f"Copying chunk {i} failed!! retrying {retry + 1}/3"
+                    )
+                    self.logger.warning(f"stderr: {std_err.decode()}")
+                else:
+                    break
+            if proc.returncode != 0:
+                self.logger.warning("Copying file failed after 3 retries!")
+                return False
 
         if executable:
             chmod_code = (
@@ -335,8 +348,23 @@ class AsyncMPIExecutor(Executor):
             cmd = base_cmd + ["python", "-c", chmod_code]
             self.logger.debug(f"Executing chmod for {path}")
 
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
+            for retry in range(3):
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    self.logger.warning(
+                        f"Making executable failed. retrying {retry + 1}/3"
+                    )
+                    self.logger.warning(f"stderr: {std_err.decode()}")
+                else:
+                    break
+            if proc.returncode != 0:
+                self.logger.warning("Making executable failed after 3 retries!")
+                return False
+
+        return True
 
     async def _subprocess_task(
         self,

@@ -4,10 +4,14 @@ import importlib
 import inspect
 import os
 import pkgutil
+import random
+import socket
+import uuid
+from glob import glob
 from logging import Logger
 from pathlib import Path
 from types import ModuleType
-from typing import Iterable, Type
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 
 
 def _build_model_cache(logger: Logger = None) -> int:
@@ -138,3 +142,62 @@ def _build_model_cache(logger: Logger = None) -> int:
 
 
 build_model_cache = _build_model_cache
+
+
+def find_free_port(
+    port_range: Tuple[int, int], host: str = "127.0.0.1"
+) -> Optional[int]:
+    """
+    Attempts to find a free port within the given range by binding to it.
+    Checks ports in a random order to reduce collisions between concurrent startups.
+    """
+    # Create a list of all ports in the range and shuffle them
+    ports_to_check = list(range(port_range[0], port_range[1]))
+    random.shuffle(ports_to_check)
+
+    for port in ports_to_check:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                continue
+
+    return None
+
+
+def call_llm(
+    model: str,
+    prompts: List,
+    tensor_parallel_size: int = 1,
+    llm_kwargs: Dict[str, Any] = {
+        "max_model_len": 2048,
+        "enforce_eager": True,
+        "trust_remote_code": True,
+    },
+    sampling_kwargs: Dict = {"temperature": 0.0, "max_tokens": 1024},
+):
+
+    _actor_port = 10000 + (os.getpid() % 100) * 200
+    _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
+    os.environ["MASTER_PORT"] = str(_actor_port) if _actor_port is not None else "0"
+    os.environ["VLLM_PORT"] = str(_actor_port) if _actor_port is not None else "0"
+    os.environ["VLLM_HOST_IP"] = "localhost"
+    os.environ["VLLM_CACHE_ROOT"] = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+    os.makedirs(os.environ["VLLM_CACHE_ROOT"])
+    build_model_cache()
+
+    from vllm import LLM, SamplingParams
+
+    snapshots = glob(
+        f"/tmp/model_cache/hub/models--{model.replace('/', '--')}/snapshots/*"
+    )
+
+    llm = LLM(
+        model=snapshots[0], tensor_parallel_size=tensor_parallel_size, **llm_kwargs
+    )
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+
+    return outputs

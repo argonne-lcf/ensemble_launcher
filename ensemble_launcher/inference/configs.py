@@ -16,7 +16,7 @@ def default_inference_launcher_config(
         ),
         mpi_config=MPIConfig(flavor="mpich", cpu_bind_method="none"),
         cluster=True,
-        worker_logs=True,
+        worker_logs=False,
         master_logs=True,
         return_stdout=True,
         checkpoint_dir=checkpoint_dir,

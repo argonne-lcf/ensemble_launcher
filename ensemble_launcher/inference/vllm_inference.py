@@ -18,7 +18,7 @@ from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import setup_logger
 
-from .utils import _build_model_cache
+from .utils import _build_model_cache, find_free_port
 
 
 def _setup_vllm_file_logging(log_file: str):
@@ -81,15 +81,23 @@ class _VLLMOfflineMixin:
     async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+        self.logger.info(
+            f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
+        )
         if self._llm is None:
-            os.environ["MASTER_ADDR"] = socket.gethostname()
+            os.environ["MASTER_ADDR"] = "localhost"
             # Each actor gets a unique VLLM_PORT based on PID so vLLM's
             # port scanner starts from a different point per process,
             # avoiding TOCTOU collisions in get_open_port() at scale.
-            _actor_port = 1000 + (os.getpid() % 100) * 500
-            os.environ["MASTER_PORT"] = str(_actor_port)
-            os.environ["VLLM_PORT"] = str(_actor_port)
-            os.environ["VLLM_HOST_IP"] = socket.gethostname()
+            _actor_port = 10000 + (os.getpid() % 100) * 200
+            _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
+            os.environ["MASTER_PORT"] = (
+                str(_actor_port) if _actor_port is not None else "0"
+            )
+            os.environ["VLLM_PORT"] = (
+                str(_actor_port) if _actor_port is not None else "0"
+            )
+            os.environ["VLLM_HOST_IP"] = "localhost"
             if self._use_cached_modelinfo:
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 self.logger.info(f"Reusing cache at {self._model_info_cache}")
@@ -440,7 +448,10 @@ class _MultiNodeVLLMMixin:
             self._pub_socket = self._zmq_context.socket(
                 zmq.PUB, socket_class=AsyncSocket
             )
-            pub_port = random.randint(30000, 40000)
+            pub_port = find_free_port((10000, 30000), host=hostname)
+            if pub_port is None:
+                pub_port = "0"
+                self.logger.warning("Couldn't find any free port, using 0")
             pub_address = f"{hostname}:{pub_port}"
             max_attempts = 10
             for attempt in range(max_attempts):
