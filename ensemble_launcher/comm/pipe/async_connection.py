@@ -3,7 +3,7 @@ import os
 import random
 import threading
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Optional, Type, TypeVar
+from typing import Callable, Dict, List, Optional, Type, TypeVar, Union
 
 from pydantic import BaseModel, Field
 
@@ -120,14 +120,14 @@ class AsyncConnection(ABC):
                             f"Received ACK for unknown msg_id={msg_id} from {sender_id}"
                         )
                 elif self._req_res:
-                    msg_id_bytes = frames[-2]
+                    msg_id_bytes = frames[1]
                     sender_full_id = frames[0].decode()
                     await self._raw_send(
                         _ACK,
                         msg_id=int.from_bytes(msg_id_bytes, "big"),
                         target_id=sender_full_id,
                     )
-                    await self._msg_queue.put([frames[0], frames[-1]])
+                    await self._msg_queue.put([frames[0]] + frames[2:])
                 else:
                     await self._msg_queue.put(frames)
 
@@ -144,7 +144,7 @@ class AsyncConnection(ABC):
         return await asyncio.wait_for(self._raw_recv(), timeout=timeout)
 
     async def send(
-        self, msg: bytes, target_id: Optional[str] = None, timeout: float = 5.0
+        self, msg: Union[bytes, List[bytes]], target_id: Optional[str] = None, timeout: float = 5.0
     ) -> bool:
         self._msg_counter += 1
 
@@ -422,24 +422,36 @@ class AsyncZMQRouterConnection(ServerConnection):
 
     async def _raw_send(
         self,
-        data: bytes,
+        data: Union[bytes, List[bytes]],
         msg_id: Optional[int] = None,
         target_id: Optional[str] = None,
     ) -> bool:
+        """Send frames via ZMQ Router.
+
+        Sends: [target_id, identity_frame, msg_id(8B)?, *data_frames]
+        """
         identity_frame = f"{self._identity}:{self._secret_id}".encode()
         if msg_id is not None:
             frames = [
                 target_id.encode(),
                 identity_frame,
                 msg_id.to_bytes(8, "big"),
-                data,
             ]
         else:
-            frames = [target_id.encode(), identity_frame, data]
+            frames = [target_id.encode(), identity_frame]
+        if isinstance(data, list):
+            frames.extend(data)
+        else:
+            frames.append(data)
         await self._socket.send_multipart(frames)
         return True
 
     async def _raw_recv(self) -> List[bytes]:
+        """Receive frames via ZMQ Router.
+
+        Returns: [dealer_routing_id, msg_id(8B)?, *data_frames]
+        ZMQ prepends the dealer's routing id automatically.
+        """
         return await self._socket.recv_multipart()
 
     def get_state(self) -> AsyncZMQRouterConnectionState:
@@ -533,18 +545,31 @@ class AsyncZMQDealerConnection(ClientConnection):
 
     async def _raw_send(
         self,
-        data: bytes,
+        data: Union[bytes, List[bytes]],
         msg_id: Optional[int] = None,
         target_id: Optional[str] = None,
     ) -> bool:
+        """Send frames via ZMQ Dealer.
+
+        Sends: [msg_id(8B)?, *data_frames]
+        """
         if msg_id is not None:
-            frames = [msg_id.to_bytes(8, "big"), data]
+            frames = [msg_id.to_bytes(8, "big")]
         else:
-            frames = [data]
+            frames = []
+        if isinstance(data, list):
+            frames.extend(data)
+        else:
+            frames.append(data)
         await self._socket.send_multipart(frames)
         return True
 
     async def _raw_recv(self) -> List[bytes]:
+        """Receive frames via ZMQ Dealer.
+
+        Returns: [identity_frame, msg_id(8B)?, *data_frames]
+        ZMQ strips the routing id; the first frame is the sender's identity.
+        """
         return await self._socket.recv_multipart()
 
     def get_state(self) -> AsyncZMQDealerConnectionState:

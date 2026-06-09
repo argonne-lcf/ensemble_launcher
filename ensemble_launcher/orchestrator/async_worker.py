@@ -530,7 +530,7 @@ class AsyncWorker(Node):
                 )
             )
             task_update = await self._comm.recv_message_from_parent(
-                TaskUpdate, timeout=5.0
+                TaskUpdate, timeout=5.0, unpack=True
             )
             if task_update is not None:
                 self.logger.info(
@@ -730,6 +730,9 @@ class AsyncWorker(Node):
                 continue
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
+                await asyncio.get_running_loop().run_in_executor(
+                    None, msg.unpack
+                )
                 self._update_tasks(msg, client_id=client_id)
 
     async def _parent_ready_monitor(self) -> None:
@@ -767,7 +770,7 @@ class AsyncWorker(Node):
         while not self._stop_task_update.is_set():
             try:
                 task_update = await self._comm.recv_message_from_parent(
-                    TaskUpdate, block=True
+                    TaskUpdate, block=True, unpack=True
                 )
                 if task_update is not None:
                     self._update_tasks(task_update)

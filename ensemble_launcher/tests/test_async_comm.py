@@ -75,7 +75,7 @@ def _node_worker(
             await comm.sync_heartbeat_with_child(child_id)
 
             recv_result = await comm.recv_message_from_child(
-                Result, child_id=child_id, block=True
+                Result, child_id=child_id, block=True, unpack=True
             )
 
             send_result.data.extend(recv_result.data)
@@ -183,9 +183,9 @@ async def test_comm_state_roundtrip_zmq():
 
 
 if __name__ == "__main__":
-    # msgs = test_zmq_comm()
-    # print("zmq done")
-    # msgs = asyncio.run(test_comm_state_roundtrip_zmq())
-    # print("roundtrip zmq done")
+    msgs = test_zmq_comm()
+    print("zmq done")
+    msgs = asyncio.run(test_comm_state_roundtrip_zmq())
+    print("roundtrip zmq done")
     msgs = test_mp_comm()
     print("mp done")

@@ -7,7 +7,6 @@ from asyncio import Queue
 from logging import Logger
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
-import cloudpickle
 from pydantic import BaseModel, SerializeAsAny
 
 from ensemble_launcher.profiling import EventRegistry, get_registry
@@ -704,7 +703,11 @@ class AsyncComm:
         self, raw_data: list, loop: asyncio.AbstractEventLoop, parent_id: str
     ) -> None:
         try:
-            msg = cloudpickle.loads(raw_data[1])
+            data_frames = raw_data[1:]
+            if len(data_frames) == 1:
+                msg = Message.from_bytes(data_frames[0])
+            else:
+                msg = Message.from_byte_array(data_frames)
             self._cache[parent_id].put_nowait(msg)
             self.logger.debug(
                 f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}"
@@ -717,14 +720,17 @@ class AsyncComm:
     async def _deserialize_and_dispatch_child(self, raw_data: list) -> None:
         full_id, sender_id, _ = _decode_identity(raw_data[0])
         try:
+            data_frames = raw_data[1:]
+            if len(data_frames) == 1:
+                msg = Message.from_bytes(data_frames[0])
+            else:
+                msg = Message.from_byte_array(data_frames)
             if sender_id.startswith("client-"):
-                msg = cloudpickle.loads(raw_data[1])
                 self._client_queue.put_nowait((full_id, msg))
                 self.logger.debug(
                     f"{self._node_info.node_id}: Queued client message from {full_id}: {type(msg).__name__}"
                 )
                 return
-            msg = cloudpickle.loads(raw_data[1])
             self._cache[sender_id].put_nowait(msg)
             self.logger.debug(
                 f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
@@ -793,7 +799,7 @@ class AsyncComm:
             )
             return False
         try:
-            await self._parent_conn.send(cloudpickle.dumps(msg))
+            await self._parent_conn.send(msg.to_byte_array())
             self.logger.debug(
                 f"{self._node_info.node_id}: Sent message to parent: {type(msg).__name__}"
             )
@@ -805,15 +811,23 @@ class AsyncComm:
             return False
 
     async def recv_message_from_parent(
-        self, cls: Type[Message], block: bool = False, timeout: Optional[float] = None
+        self,
+        cls: Type[Message],
+        block: bool = False,
+        timeout: Optional[float] = None,
+        unpack: bool = False,
     ) -> Message | None:
         parent_id = self._node_info.parent_id
         if parent_id is None or parent_id not in self._cache:
             self.logger.warning("No parent available to receive message from.")
             return None
         if block is False and timeout is None:
-            return self._cache[parent_id].get_nowait(cls)
-        return await self._cache[parent_id].get(cls, timeout=timeout)
+            msg = self._cache[parent_id].get_nowait(cls)
+        else:
+            msg = await self._cache[parent_id].get(cls, timeout=timeout)
+        if msg is not None and unpack:
+            await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
+        return msg
 
     async def send_message_to_child(self, child_id: str, msg: Message) -> bool:
         if (
@@ -825,7 +839,7 @@ class AsyncComm:
             )
             raise RuntimeError(f"No connection to child {child_id}")
         try:
-            packed = cloudpickle.dumps(msg)
+            packed = msg.to_byte_array()
             conn = self._data_transport.get_server_connection(
                 self._node_info.node_id, self._node_info.secret_id
             )
@@ -844,7 +858,7 @@ class AsyncComm:
             return True
         except Exception as e:
             self.logger.warning(
-                f"{self._node_info.node_id}: hello Sending message to child {child_id} failed with {e}"
+                f"{self._node_info.node_id}: Sending message to child {child_id} failed with {e}"
             )
             return False
 
@@ -854,6 +868,7 @@ class AsyncComm:
         child_id: str,
         block: bool = False,
         timeout: Optional[float] = None,
+        unpack: bool = False,
     ) -> Message | None:
         if child_id not in self._cache:
             self.logger.warning(
@@ -861,8 +876,12 @@ class AsyncComm:
             )
             return None
         if block is False and timeout is None:
-            return self._cache[child_id].get_nowait(cls)
-        return await self._cache[child_id].get(cls, timeout=timeout)
+            msg = self._cache[child_id].get_nowait(cls)
+        else:
+            msg = await self._cache[child_id].get(cls, timeout=timeout)
+        if msg is not None and unpack:
+            await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
+        return msg
 
     async def recv_client_message(
         self, timeout: Optional[float] = None

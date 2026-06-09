@@ -3,10 +3,22 @@ from __future__ import annotations
 import asyncio
 import enum
 import os
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
+import struct
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
+import cloudpickle
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 if TYPE_CHECKING:
     from ensemble_launcher.scheduler.resource import JobResource
@@ -20,18 +32,21 @@ class TaskStatus(enum.Enum):
     SUCCESS = "success"
 
 
+_DEEP_FIELDS = ("executable", "args", "kwargs", "env", "result")
+
+
 class Task(BaseModel):
     task_id: str
     nnodes: int
     ppn: int
-    executable: Union[str, Callable]
+    executable: Union[str, Callable] = None
     ngpus_per_process: Union[int, float] = 0
     args: Tuple = Field(default_factory=tuple)
     kwargs: Dict = Field(default_factory=dict)
     env: Dict = Field(default_factory=dict)
     status: TaskStatus = TaskStatus.NOT_READY
     estimated_runtime: float = 0.0
-    exception: Optional[str] = None  # Store exception message as string
+    exception: Optional[str] = None
     result: Optional[Any] = None
     cpu_affinity: List[int] = Field(default_factory=list)
     gpu_affinity: List[Union[int, str]] = Field(default_factory=list)
@@ -42,6 +57,77 @@ class Task(BaseModel):
     tag: Optional[str] = None
     stdout_file: Optional[str] = None
     stderr_file: Optional[str] = None
+
+    _packed: bool = PrivateAttr(default=False)
+    _raw_deep: Optional[bytes] = PrivateAttr(default=None)
+
+    # ------------------------------------------------------------------ #
+    #  pack / unpack                                                      #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def is_packed(self) -> bool:
+        return self._packed
+
+    def _check_unpacked(self, field: str) -> None:
+        if self._packed:
+            raise RuntimeError(
+                f"Task.{field} not accessible in packed state — call unpack() first"
+            )
+
+    def pack(self) -> Task:
+        if self._packed:
+            return self
+        self._raw_deep = cloudpickle.dumps(
+            {f: getattr(self, f) for f in _DEEP_FIELDS}
+        )
+        for f in _DEEP_FIELDS:
+            object.__setattr__(self, f, None)
+        self._packed = True
+        return self
+
+    def unpack(self) -> None:
+        if not self._packed:
+            return
+        deep = cloudpickle.loads(self._raw_deep)
+        for f in _DEEP_FIELDS:
+            object.__setattr__(self, f, deep[f])
+        self._raw_deep = None
+        self._packed = False
+
+    # ------------------------------------------------------------------ #
+    #  to_bytes / from_bytes                                              #
+    # ------------------------------------------------------------------ #
+
+    def to_byte_array(self) -> list:
+        self.pack()
+        shallow = cloudpickle.dumps(self.__dict__.copy())
+        header = struct.pack("!I", len(shallow))
+        return [header, shallow, self._raw_deep]
+
+    @classmethod
+    def from_byte_array(cls, frames: list) -> Task:
+        shallow_dict = cloudpickle.loads(frames[1])
+        deep_blob = frames[2]
+        task = cls.__new__(cls)
+        object.__setattr__(task, "__dict__", shallow_dict)
+        object.__setattr__(task, "__pydantic_fields_set__", set())
+        task.__pydantic_private__ = {"_packed": True, "_raw_deep": deep_blob}
+        return task
+
+    def to_bytes(self) -> bytes:
+        return b"".join(self.to_byte_array())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Task:
+        (shallow_len,) = struct.unpack_from("!I", data, 0)
+        shallow_dict = cloudpickle.loads(data[4 : 4 + shallow_len])
+        deep_blob = data[4 + shallow_len :]
+        task = cls.__new__(cls)
+        object.__setattr__(task, "__dict__", shallow_dict)
+        object.__setattr__(task, "__pydantic_fields_set__", set())
+        task.__pydantic_private__ = {"_packed": True, "_raw_deep": deep_blob}
+        return task
 
     def get_resource_requirements(self) -> "JobResource":
         """Build JobResource requirements from this Task."""

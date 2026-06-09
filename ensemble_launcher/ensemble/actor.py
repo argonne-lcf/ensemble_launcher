@@ -124,7 +124,7 @@ class PrivateActorHandle:
                 return await self.recv()
 
             params = list(sig.parameters.values())
-            if params[-1].kind == inspect.Parameter.VAR_KEYWORD:
+            if len(params) > 0 and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
                 params.insert(
                     -1,
                     inspect.Parameter(

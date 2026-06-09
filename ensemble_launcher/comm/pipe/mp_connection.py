@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from .async_connection import (
     ServerConnection,
@@ -47,19 +47,29 @@ class AsyncMPConnection(ServerConnection):
 
     async def _raw_send(
         self,
-        data: bytes,
+        data: Union[bytes, List[bytes]],
         msg_id: Optional[int] = None,
         target_id: Optional[str] = None,
     ) -> bool:
+        """Send frames via multiprocessing pipe.
+
+        Data frames are joined into a single blob before sending.
+        Sends: [identity_frame, msg_id(8B)?, blob]
+        """
+        blob = b"".join(data) if isinstance(data, list) else data
         if msg_id is not None:
-            frames = [self._identity_frame, msg_id.to_bytes(8, "big"), data]
+            frames = [self._identity_frame, msg_id.to_bytes(8, "big"), blob]
         else:
-            frames = [self._identity_frame, data]
+            frames = [self._identity_frame, blob]
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conn.send, frames)
         return True
 
     async def _raw_recv(self) -> List[bytes]:
+        """Receive frames via multiprocessing pipe.
+
+        Returns: [identity_frame, msg_id(8B)?, blob]
+        """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._conn.recv)
 

@@ -1970,13 +1970,16 @@ class AsyncMaster(Node):
         finally:
             await self.stop()
 
-        # Return aggregated results
         result_batch = ResultBatch(sender=self.node_id)
         for r in self._batch_streaming_results:
             result_batch.add_result(r)
         for child_results in self._results.values():
             for rb in child_results:
                 result_batch += rb
+        if self.level == 0:
+            loop = asyncio.get_running_loop()
+            for r in result_batch.data:
+                await loop.run_in_executor(None, r.unpack)
         return result_batch
 
     def create_an_event_loop(self) -> None:
