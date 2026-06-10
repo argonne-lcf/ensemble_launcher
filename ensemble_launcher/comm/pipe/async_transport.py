@@ -45,7 +45,7 @@ class AsyncTransport(ABC):
     ) -> Optional[ServerConnection]:
         key = f"{identity}:{secret_id}"
         conn = self._server_connections.get(key)
-        if conn is None and kwargs:
+        if conn is None:
             conn = self._create_server_connection(
                 identity, secret_id, req_res=req_res, **kwargs
             )
@@ -140,6 +140,7 @@ class AsyncZMQTransport(AsyncTransport):
     ) -> AsyncZMQRouterConnection:
         key = f"{identity}:{secret_id}"
         router = self._server_connections.get(key, None)
+
         if router is None:
             address = (
                 kwargs.get("address")

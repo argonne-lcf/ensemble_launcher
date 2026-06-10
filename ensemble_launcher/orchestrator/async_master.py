@@ -379,8 +379,8 @@ class AsyncMaster(Node):
         self._child_objs[child_id] = child
         self.add_child(child_id, child.info())
         child.set_parent(self.info())
-        await self._comm.update_node_info(self.info())
-        child_data_conn, child_hb_conn = self._comm.create_child_pipe(
+        self._comm.update_node_info(self.info())
+        child_data_conn, child_hb_conn = await self._comm.create_child_pipe(
             child_id=child.info().node_id, child_secret_id=child.info().secret_id
         )
         child.parent_data_conn = child_data_conn
@@ -728,7 +728,7 @@ class AsyncMaster(Node):
         # await self._restore_comm_state()
 
         # Start parent comm end point monitor
-        await self._comm.start_monitors(parent_only=True)
+        await self._comm.start_monitors()
 
         # Receive node update from parent if it has a parent
         self.logger.info("Syncing with parent")
@@ -790,9 +790,6 @@ class AsyncMaster(Node):
             )
         for child_id, child in children.items():
             await self._init_child(child_id, child)
-
-        # Start the shared comm monitor for all child sockets (idempotent).
-        await self._comm.start_monitors(children_only=True)
 
         # Launch and sync children, retrying failures up to 2 times
         children_names = self._scheduler.children_names
@@ -887,7 +884,7 @@ class AsyncMaster(Node):
         )
 
         ## Don't restore the node_info. This will be updated once the scheduler is end
-        await self._comm.update_node_info(self.info())
+        self._comm.update_node_info(self.info())
         self.logger.info(
             f"{self._secret_id}, {self._comm._node_info.secret_id}, {self.info().secret_id}"
         )
@@ -1069,6 +1066,7 @@ class AsyncMaster(Node):
             None if successful, Result object with exception if failed
         """
         # Sync heartbeat with child
+        self.logger.debug(f"Syncing with child {child_id}")
         if not await self._comm.sync_heartbeat_with_child(
             child_id=child_id, timeout=600.0
         ):
@@ -1108,6 +1106,7 @@ class AsyncMaster(Node):
             # Create node update
             node_update = self._build_init_node_update(child_id)
 
+            self.logger.debug(f"Built NodeUpdate for child {child_id}")
             ##Task update handled by the seperate tast request monitor
 
             # Add sync task
@@ -1767,7 +1766,7 @@ class AsyncMaster(Node):
         self._routed_task_ids.pop(child_id, None)
         self._iresult_q.pop(child_id, None)
         self._itask_q.pop(child_id, None)
-        await self._comm.update_node_info(self.info())
+        self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
         """Gracefully shut down the master in a fixed teardown order.
@@ -1970,6 +1969,7 @@ class AsyncMaster(Node):
         finally:
             await self.stop()
 
+        # Return aggregated results
         result_batch = ResultBatch(sender=self.node_id)
         for r in self._batch_streaming_results:
             result_batch.add_result(r)
@@ -1977,9 +1977,7 @@ class AsyncMaster(Node):
             for rb in child_results:
                 result_batch += rb
         if self.level == 0:
-            loop = asyncio.get_running_loop()
-            for r in result_batch.data:
-                await loop.run_in_executor(None, r.unpack)
+            result_batch.unpack()
         return result_batch
 
     def create_an_event_loop(self) -> None:

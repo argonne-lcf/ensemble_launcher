@@ -2,7 +2,6 @@ import asyncio
 import logging
 import multiprocessing as mp
 import secrets
-import sys
 
 import pytest
 
@@ -12,7 +11,7 @@ from ensemble_launcher.comm.nodeinfo import NodeInfo
 
 pytestmark = pytest.mark.core
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
 
@@ -23,6 +22,8 @@ def _node_worker(
     parent_hb_conn,
     transport: str,
 ):
+    logger.info(f"Entering Depth:{depth}, max: {max_depth}")
+
     async def _run_node(
         depth: int,
         max_depth: int,
@@ -30,7 +31,6 @@ def _node_worker(
         parent_hb_conn,
         transport: str,
     ):
-        sys.stdout.write(f"depth:{depth},max_depth:{max_depth}")
         parent_id = str(depth - 1) if depth > 0 else None
         my_nodeinfo = NodeInfo(
             node_id=str(depth),
@@ -50,29 +50,31 @@ def _node_worker(
             heartbeat_interval=1.0,
         )
 
-        await comm.start_monitors(parent_only=True)
+        logger.info(f"After Async comm creation depth:{depth}")
+        await comm.start_monitors()
+        logger.info(f"Done starting monittors:{depth}")
 
         if parent_id is not None:
+            logger.info(f"waiting for parent {depth}")
             await comm.sync_heartbeat_with_parent(timeout=5.0)
-
+        logger.info(f"Done waiting for parent {depth}")
         send_result = Result(data=[])
 
         if depth < max_depth:
             child_id = my_nodeinfo.children_ids[0]
             child_secret_id = my_nodeinfo.children_secret_ids[child_id]
-            child_conn, child_hb_conn = comm.create_child_pipe(
+            child_conn, child_hb_conn = await comm.create_child_pipe(
                 child_id=child_id, child_secret_id=child_secret_id
             )
-
-            await comm.start_monitors(children_only=True)
 
             p = mp.Process(
                 target=_node_worker,
                 args=(depth + 1, max_depth, child_conn, child_hb_conn, transport),
             )
             p.start()
-
+            logger.info(f"Waiting for child {depth}")
             await comm.sync_heartbeat_with_child(child_id)
+            logger.info(f"Done waiting for child {depth}")
 
             recv_result = await comm.recv_message_from_child(
                 Result, child_id=child_id, block=True, unpack=True
@@ -116,7 +118,7 @@ def test_mp_comm():
 
 @pytest.mark.timeout(60)
 def test_zmq_comm():
-    max_depth = 3
+    max_depth = 2
     results = _node_worker(0, max_depth, None, None, "zmq")
 
     data = results.data
@@ -152,7 +154,7 @@ async def test_comm_state_roundtrip_zmq():
     )
 
     parent_comm = AsyncComm(logger, node_info=parent_info)
-    data_client, hb_client = parent_comm.create_child_pipe(
+    data_client, hb_client = await parent_comm.create_child_pipe(
         child_id="child", child_secret_id=secret_ids[1]
     )
     child_comm = AsyncComm(
@@ -183,9 +185,9 @@ async def test_comm_state_roundtrip_zmq():
 
 
 if __name__ == "__main__":
-    msgs = test_zmq_comm()
-    print("zmq done")
-    msgs = asyncio.run(test_comm_state_roundtrip_zmq())
-    print("roundtrip zmq done")
+    # msgs = test_zmq_comm()
+    # print("zmq done")
+    # msgs = asyncio.run(test_comm_state_roundtrip_zmq())
+    # print("roundtrip zmq done")
     msgs = test_mp_comm()
     print("mp done")

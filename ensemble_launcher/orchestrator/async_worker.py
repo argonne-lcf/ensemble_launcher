@@ -275,7 +275,7 @@ class AsyncWorker(Node):
 
         # We need to create pipe so that a server connection is create and
         #  client could connect to the child too
-        self._comm.create_child_pipe(
+        await self._comm.create_child_pipe(
             child_id="child0", child_secret_id=secrets.token_hex(16)
         )
 
@@ -730,9 +730,7 @@ class AsyncWorker(Node):
                 continue
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
-                await asyncio.get_running_loop().run_in_executor(
-                    None, msg.unpack
-                )
+                await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
                 self._update_tasks(msg, client_id=client_id)
 
     async def _parent_ready_monitor(self) -> None:

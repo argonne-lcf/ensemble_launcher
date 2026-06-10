@@ -3,6 +3,8 @@ import logging
 import socket
 
 import pytest
+from utils import echo, echo_stdout
+
 from ensemble_launcher.config import (
     LauncherConfig,
     MPIConfig,
@@ -15,8 +17,6 @@ from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceList,
 )
-
-from utils import echo, echo_stdout
 
 pytestmark = pytest.mark.core
 
@@ -46,7 +46,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             policy_config=PolicyConfig(nlevels=nlevels),
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
-            log_level=logging.INFO,
+            log_level=logging.DEBUG,
             heartbeat_interval=1.0,
             heartbeat_dead_threshold=5.0,
             master_logs=True,
@@ -118,7 +118,7 @@ async def test_async_mpi_master(nlevels=1):
 if __name__ == "__main__":
     print("Testing Async Master with ProcessPool Executor for 1 task per core")
     asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
-    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
-    asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
-    print("Testing Async Master with MPI Executor")
-    asyncio.run(test_async_mpi_master(nlevels=3))
+    # print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
+    # asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
+    # print("Testing Async Master with MPI Executor")
+    # asyncio.run(test_async_mpi_master(nlevels=3))

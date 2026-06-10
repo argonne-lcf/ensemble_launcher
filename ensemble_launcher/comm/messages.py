@@ -235,10 +235,18 @@ class ResultBatch(Message):
         if not isinstance(other, ResultBatch):
             raise TypeError(
                 f"Cannot add ResultBatch and {type(other)}"
-            )  # Should raise, not return
-        return ResultBatch(
+            )
+        packed = self._packed or other._packed
+        if packed:
+            if not self._packed:
+                self.pack()
+            if not other._packed:
+                other.pack()
+        new = ResultBatch(
             sender=self.sender, receiver=self.receiver, data=self.data + other.data
         )
+        new._packed = packed
+        return new
 
     def __radd__(self, other) -> "ResultBatch":
         return self.__add__(other)
@@ -351,10 +359,18 @@ class IResultBatch(Message):
         if not isinstance(other, ResultBatch):
             raise TypeError(
                 f"Cannot add ResultBatch and {type(other)}"
-            )  # Should raise, not return
-        return ResultBatch(
+            )
+        packed = self._packed or other._packed
+        if packed:
+            if not self._packed:
+                self.pack()
+            if not other._packed:
+                other.pack()
+        new = ResultBatch(
             sender=self.sender, receiver=self.receiver, data=self.data + other.data
         )
+        new._packed = packed
+        return new
 
     def __radd__(self, other) -> "ResultBatch":
         return self.__add__(other)
