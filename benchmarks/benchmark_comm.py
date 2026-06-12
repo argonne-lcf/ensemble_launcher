@@ -191,7 +191,10 @@ async def main(
         remote_node = nodes[1]
         logger.info(f"Launching children on remote node: {remote_node}")
 
-        executor = AsyncMPIExecutor(mpi_config=MPIConfig(), return_stdout=True)
+        executor = AsyncMPIExecutor(
+            mpi_config=MPIConfig(flavor="mpich", cpu_bind_flag=""),
+            return_stdout=True,
+        )
         for i in range(num_children):
             child_id = f"child-{i}"
             data_conn, hb_conn = child_conns[child_id]

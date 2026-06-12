@@ -10,6 +10,8 @@ from asyncio import Future as AsyncFuture
 from concurrent.futures import Executor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import cloudpickle
+
 from ensemble_launcher.config import MPIConfig
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
 
@@ -17,10 +19,39 @@ from .utils import (
     executor_registry,
     gen_affinity_bash_script_1,
     gen_affinity_bash_script_2,
-    generate_python_exec_command,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_python_exec_command(
+    tmp_fname: str,
+    node_local: bool = False,
+) -> str:
+    """
+    Generates a Python command string that deserializes and executes a given function with arguments.
+    The returned string can be run using `python -c "<command>"`.
+    """
+    if node_local:
+        script = [
+            "import cloudpickle",
+            "import base64",
+            f"f = open('{tmp_fname}', 'r')",
+            "task_str = f.read()",
+            "f.close()",
+            "task_bytes=base64.b64decode(task_str)",
+            "fn, args, kwargs = cloudpickle.loads(task_bytes)",
+            "fn(*args, **kwargs)",
+        ]
+    else:
+        script = [
+            "import cloudpickle",
+            f"f = open('{tmp_fname}', 'rb')",
+            "fn, args, kwargs = cloudpickle.load(f)",
+            "f.close()",
+            "fn(*args, **kwargs)",
+        ]
+    return ";".join(script)
 
 
 @executor_registry.register("async_mpi", type="async")
@@ -201,9 +232,46 @@ class AsyncMPIExecutor(Executor):
         run_dir: str = os.getcwd(),
         stdout_file: Optional[str] = None,
         stderr_file: Optional[str] = None,
-    ) -> AsyncFuture:
-        # task is a str command
+    ):
         task_id = str(uuid.uuid4())
+        asyncio_task = asyncio.create_task(
+            self.asubmit(
+                job_resource=job_resource,
+                task=task,
+                task_args=task_args,
+                task_kwargs=task_kwargs,
+                env=env,
+                mpi_args=mpi_args,
+                mpi_kwargs=mpi_kwargs,
+                serial_launch=serial_launch,
+                run_dir=run_dir,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                task_id=task_id,
+            )
+        )
+        self._tasks[task_id] = asyncio_task
+        asyncio_task.add_done_callback(lambda _: self._tasks.pop(task_id, None))
+        return asyncio_task
+
+    async def asubmit(
+        self,
+        job_resource: JobResource,
+        task: Union[str, Callable, List],
+        task_args: Tuple = (),
+        task_kwargs: Dict[str, Any] = {},
+        env: Dict[str, Any] = {},
+        mpi_args: Tuple = (),
+        mpi_kwargs: Dict[str, Any] = {},
+        serial_launch: bool = False,
+        run_dir: str = os.getcwd(),
+        stdout_file: Optional[str] = None,
+        stderr_file: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> AsyncFuture:
+        if task_id is None:
+            # task is a str command
+            task_id = str(uuid.uuid4())
 
         resource_pinning_cmd, resource_pinning_env, setup_files = (
             self._build_resource_cmd(task_id, job_resource)
@@ -216,11 +284,28 @@ class AsyncMPIExecutor(Executor):
 
         if callable(task):
             tmp_fname = os.path.join(self.tmp_dir, f"callable_{task_id}.pkl")
-            task_cmd = [
-                "python",
-                "-c",
-                generate_python_exec_command(task, task_args, task_kwargs, tmp_fname),
-            ]
+            if tmp_fname.startswith("/tmp"):
+                # Write file to /tmp
+                task_str = base64.b64encode(
+                    cloudpickle.dumps((task, task_args, task_kwargs))
+                ).decode("utf-8")
+                await self.write_file_to_nodes(
+                    tmp_fname, content=task_str, nodes=job_resource.nodes, encoded=True
+                )
+                task_cmd = [
+                    "python",
+                    "-c",
+                    _generate_python_exec_command(tmp_fname, node_local=True),
+                ]
+            else:
+                ## Write the file to pfs
+                with open(tmp_fname, "wb") as f:
+                    cloudpickle.dump((task, task_args, task_kwargs), f)
+                task_cmd = [
+                    "python",
+                    "-c",
+                    _generate_python_exec_command(tmp_fname),
+                ]
         elif isinstance(task, str):
             task_cmd = [s.strip() for s in task.split()]
         elif isinstance(task, List):
@@ -247,25 +332,26 @@ class AsyncMPIExecutor(Executor):
         merged_env.update(resource_pinning_env)
         merged_env.update(env)
 
-        asyncio_task = asyncio.create_task(
-            self._subprocess_task(
-                task_id,
-                cmd,
-                merged_env,
-                nodes=job_resource.nodes,
-                setup_files=setup_files,
-                run_dir=run_dir,
-                stdout_file=stdout_file,
-                stderr_file=stderr_file,
-            )
+        result = await self._subprocess_task(
+            task_id,
+            cmd,
+            merged_env,
+            nodes=job_resource.nodes,
+            setup_files=setup_files,
+            run_dir=run_dir,
+            stdout_file=stdout_file,
+            stderr_file=stderr_file,
         )
-        self._tasks[task_id] = asyncio_task
-        asyncio_task.add_done_callback(lambda _: self._tasks.pop(task_id, None))
 
-        return asyncio_task
+        return result
 
     async def write_file_to_nodes(
-        self, path: str, content: str, nodes: List[str], executable: bool = False
+        self,
+        path: str,
+        content: str,
+        nodes: List[str],
+        executable: bool = False,
+        encoded: bool = False,
     ) -> bool:
         """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
         cfg = self._mpi_config
@@ -309,16 +395,25 @@ class AsyncMPIExecutor(Executor):
 
         for i, chunk in enumerate(chunks):
             mode = "w" if i == 0 else "a"
-            encoded_chunk = base64.b64encode(chunk.encode("utf-8")).decode("utf-8")
+            if encoded:
+                setup_code = (
+                    "import base64, os\n"
+                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
+                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+                    f"with open(p, '{mode}') as f:\n"
+                    f"    f.write('{chunk}')\n"
+                )
+            else:
+                encoded_chunk = base64.b64encode(chunk.encode("utf-8")).decode("utf-8")
 
-            # Base64 payload sidesteps all remote Bash parsing, quoting, and newline mangling.
-            setup_code = (
-                "import base64, os\n"
-                f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
-                f"with open(p, '{mode}') as f:\n"
-                f"    f.write(base64.b64decode('{encoded_chunk}').decode('utf-8'))\n"
-            )
+                # Base64 payload sidesteps all remote Bash parsing, quoting, and newline mangling.
+                setup_code = (
+                    "import base64, os\n"
+                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
+                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+                    f"with open(p, '{mode}') as f:\n"
+                    f"    f.write(base64.b64decode('{encoded_chunk}').decode('utf-8'))\n"
+                )
 
             cmd = base_cmd + ["python", "-c", setup_code]
             self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
