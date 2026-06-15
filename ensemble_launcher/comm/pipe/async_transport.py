@@ -127,11 +127,12 @@ class AsyncZMQTransportState(AsyncTransportState):
 class AsyncZMQTransport(AsyncTransport):
     transport_type: str = "zmq"
 
-    def __init__(self):
+    def __init__(self, lightweight: bool = False):
         super().__init__()
         hn = socket.gethostname()
         hostname = "localhost" if "local" in hn else hn
         self._hostname = hostname
+        self._lightweight = lightweight
         self._server_connections: Dict[str, AsyncZMQRouterConnection] = {}
         self._client_connections: Dict[str, AsyncZMQDealerConnection] = {}
 
@@ -153,6 +154,7 @@ class AsyncZMQTransport(AsyncTransport):
                 address=address,
                 req_res=req_res,
                 expected_remotes=expected_remotes,
+                lightweight=self._lightweight,
             )
             self._server_connections[key] = router
         return router
@@ -171,6 +173,7 @@ class AsyncZMQTransport(AsyncTransport):
                 remote_address=remote_address,
                 remote_identity=kwargs.get("remote_identity"),
                 remote_secret_id=kwargs.get("remote_secret_id"),
+                lightweight=self._lightweight,
             )
             self._client_connections[key] = dealer
         return dealer

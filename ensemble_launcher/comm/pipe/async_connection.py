@@ -337,6 +337,7 @@ class ClientConnection(AsyncConnection):
 class AsyncZMQRouterConnectionState(ServerConnectionState):
     transport_type: str = "zmq"
     address: str
+    lightweight: bool = False
 
 
 class AsyncZMQRouterConnection(ServerConnection):
@@ -349,6 +350,7 @@ class AsyncZMQRouterConnection(ServerConnection):
         address: str,
         expected_remotes: Optional[Dict[str, str]] = None,
         req_res: bool = False,
+        lightweight: bool = False,
     ):
         super().__init__(
             identity=identity,
@@ -357,6 +359,7 @@ class AsyncZMQRouterConnection(ServerConnection):
             req_res=req_res,
         )
         self._address = address
+        self._lightweight = lightweight
         self._context = None
         self._socket = None
 
@@ -369,21 +372,28 @@ class AsyncZMQRouterConnection(ServerConnection):
         from zmq.asyncio import Context, Socket
 
         self._context = Context()
-        self._context.set(zmq.IO_THREADS, 4)
         self._socket = self._context.socket(zmq.ROUTER, socket_class=Socket)
         self._socket.setsockopt(
             zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
         )
-        self._socket.setsockopt(zmq.SNDHWM, 10000)
-        self._socket.setsockopt(zmq.RCVHWM, 10000)
-        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
-        self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
-        self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
-        self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+
+        if self._lightweight:
+            self._context.set(zmq.IO_THREADS, 1)
+            self._socket.setsockopt(zmq.SNDHWM, 100)
+            self._socket.setsockopt(zmq.RCVHWM, 100)
+            self._socket.setsockopt(zmq.SNDTIMEO, 100)
+        else:
+            self._context.set(zmq.IO_THREADS, 4)
+            self._socket.setsockopt(zmq.SNDHWM, 10000)
+            self._socket.setsockopt(zmq.RCVHWM, 10000)
+            self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
+            self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
+            self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
+            self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
 
         try:
             self._socket.bind(f"tcp://{self._address}")
@@ -443,7 +453,12 @@ class AsyncZMQRouterConnection(ServerConnection):
             frames.extend(data)
         else:
             frames.append(data)
-        await self._socket.send_multipart(frames)
+        try:
+            await self._socket.send_multipart(frames)
+        except Exception:
+            if self._lightweight:
+                return False
+            raise
         return True
 
     async def _raw_recv(self) -> List[bytes]:
@@ -461,6 +476,7 @@ class AsyncZMQRouterConnection(ServerConnection):
             address=self._address,
             expected_remotes=self.expected_remotes,
             req_res=self._req_res,
+            lightweight=self._lightweight,
         )
 
     @classmethod
@@ -473,6 +489,7 @@ class AsyncZMQRouterConnection(ServerConnection):
             address=state.address,
             expected_remotes=state.expected_remotes,
             req_res=state.req_res,
+            lightweight=state.lightweight,
         )
 
 
@@ -484,6 +501,7 @@ class AsyncZMQRouterConnection(ServerConnection):
 class AsyncZMQDealerConnectionState(ClientConnectionState):
     transport_type: str = "zmq"
     remote_address: str
+    lightweight: bool = False
 
 
 class AsyncZMQDealerConnection(ClientConnection):
@@ -497,6 +515,7 @@ class AsyncZMQDealerConnection(ClientConnection):
         remote_identity: Optional[str] = None,
         remote_secret_id: Optional[str] = None,
         req_res: bool = False,
+        lightweight: bool = False,
     ):
         super().__init__(
             identity=identity,
@@ -506,6 +525,7 @@ class AsyncZMQDealerConnection(ClientConnection):
             req_res=req_res,
         )
         self._remote_address = remote_address
+        self._lightweight = lightweight
         self._context = None
         self._socket = None
 
@@ -518,20 +538,27 @@ class AsyncZMQDealerConnection(ClientConnection):
         from zmq.asyncio import Context, Socket
 
         self._context = Context()
-        self._context.set(zmq.IO_THREADS, 4)
         self._socket = self._context.socket(zmq.DEALER, socket_class=Socket)
         self._socket.setsockopt(
             zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
         )
-        self._socket.setsockopt(zmq.SNDHWM, 10000)
-        self._socket.setsockopt(zmq.RCVHWM, 10000)
-        self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
-        self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
-        self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+
+        if self._lightweight:
+            self._context.set(zmq.IO_THREADS, 1)
+            self._socket.setsockopt(zmq.SNDHWM, 100)
+            self._socket.setsockopt(zmq.RCVHWM, 100)
+        else:
+            self._context.set(zmq.IO_THREADS, 4)
+            self._socket.setsockopt(zmq.SNDHWM, 10000)
+            self._socket.setsockopt(zmq.RCVHWM, 10000)
+            self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
+            self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
+            self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+
         self._socket.connect(f"tcp://{self._remote_address}")
         self.logger.info(f"Connected to {self.remote_address}")
 
@@ -580,6 +607,7 @@ class AsyncZMQDealerConnection(ClientConnection):
             remote_identity=self._remote_identity,
             remote_secret_id=self._remote_secret_id,
             req_res=self._req_res,
+            lightweight=self._lightweight,
         )
 
     @classmethod
@@ -593,4 +621,5 @@ class AsyncZMQDealerConnection(ClientConnection):
             remote_identity=state.remote_identity,
             remote_secret_id=state.remote_secret_id,
             req_res=state.req_res,
+            lightweight=state.lightweight,
         )

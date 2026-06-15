@@ -211,7 +211,10 @@ class AsyncComm:
             )
         transport_cls = entry["transport"]
         self._data_transport: AsyncTransport = transport_cls()
-        self._hb_transport: AsyncTransport = transport_cls()
+        try:
+            self._hb_transport: AsyncTransport = transport_cls(lightweight=True)
+        except TypeError:
+            self._hb_transport: AsyncTransport = transport_cls()
 
         self._recv_queue: asyncio.Queue = asyncio.Queue()
         self._recv_tasks: Dict[int, asyncio.Task] = {}

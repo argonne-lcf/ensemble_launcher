@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 import queue
 import random
@@ -50,9 +49,10 @@ class HeartBeatProcess:
                 self._children[child_id] = None
                 self._children_secrets[child_id] = child_secret
 
-        self._hb_recv_queue: Optional[asyncio.Queue] = None
+        self._child_queues: Dict[str, asyncio.Queue] = {}
+        self._child_tasks: Dict[str, asyncio.Task] = {}
         self._stop: Optional[asyncio.Event] = None
-        self._recv_tasks: Dict[int, asyncio.Task] = {}
+        self._tasks: List[asyncio.Task] = []
         self._last_parent_hb_time: Optional[float] = None
         self._parent_ready_sent = False
 
@@ -68,7 +68,9 @@ class HeartBeatProcess:
     def __call__(self):
         self._setup_logger()
         self._parent_pid = os.getppid()
-        self.logger.info(f"{self._node_id}: HB process started (pid={os.getpid()}, parent_pid={self._parent_pid})")
+        self.logger.info(
+            f"{self._node_id}: HB process started (pid={os.getpid()}, parent_pid={self._parent_pid})"
+        )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -77,11 +79,19 @@ class HeartBeatProcess:
             loop.close()
         self.logger.info(f"{self._node_id}: HB process exiting")
 
+    def _start_child_dispatch(self, child_id: str):
+        q = asyncio.Queue()
+        self._child_queues[child_id] = q
+        task = asyncio.create_task(self._child_dispatch_loop(child_id))
+        self._child_tasks[child_id] = task
+        self._tasks.append(task)
+
     async def _run(self):
         self._stop = asyncio.Event()
-        self._hb_recv_queue = asyncio.Queue()
 
-        self.logger.info(f"{self._node_id}: HB opening {len(self._hb_server_conns)} server conn(s)")
+        self.logger.info(
+            f"{self._node_id}: HB opening {len(self._hb_server_conns)} server conn(s)"
+        )
         for conn in self._hb_server_conns:
             if not conn.is_open:
                 await conn.open()
@@ -98,29 +108,27 @@ class HeartBeatProcess:
             await self._hb_parent_conn.open()
             self.logger.info(f"{self._node_id}: HB parent conn opened")
 
-        tasks = []
-
         if self._hb_parent_conn is not None:
-            tasks.append(asyncio.create_task(self._parent_hb_loop()))
+            self._tasks.append(asyncio.create_task(self._parent_hb_loop()))
 
         for conn in self._hb_server_conns:
-            task = asyncio.create_task(self._hb_recv_loop(conn))
-            self._recv_tasks[id(conn)] = task
-            tasks.append(task)
+            self._tasks.append(asyncio.create_task(self._hb_recv_loop(conn)))
 
-        tasks.append(asyncio.create_task(self._dispatch_loop()))
-        tasks.append(asyncio.create_task(self._dead_check_loop()))
-        tasks.append(asyncio.create_task(self._control_loop()))
-        tasks.append(asyncio.create_task(self._parent_alive_check_loop()))
+        for child_id in self._children:
+            self._start_child_dispatch(child_id)
+
+        self._tasks.append(asyncio.create_task(self._dead_check_loop()))
+        self._tasks.append(asyncio.create_task(self._control_loop()))
+        self._tasks.append(asyncio.create_task(self._parent_alive_check_loop()))
 
         self.logger.info(f"{self._node_id}: HB all tasks started, waiting for stop")
         await self._stop.wait()
         self.logger.info(f"{self._node_id}: HB stop received, cleaning up")
 
-        for t in tasks:
+        for t in self._tasks:
             if not t.done():
                 t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
         for conn in self._hb_server_conns:
             if conn.is_open:
@@ -135,19 +143,20 @@ class HeartBeatProcess:
         try:
             while not self._stop.is_set():
                 try:
-                    self.logger.info(f"{self._node_id}: HB sending ping to parent")
                     await conn.send(_HB_PING)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    self.logger.warning(f"{self._node_id}: HB send to parent error: {e}")
+                    self.logger.warning(
+                        f"{self._node_id}: HB send to parent error: {e}"
+                    )
 
                 try:
-                    raw = await asyncio.wait_for(conn.recv(), timeout=1.0)
+                    raw = await asyncio.wait_for(
+                        conn.recv(), timeout=self._heartbeat_interval
+                    )
                     if raw is not None and len(raw) >= 2 and raw[1] == _HB_PING:
-                        self.logger.info(f"{self._node_id}: HB ping received from parent")
                         if not self._parent_ready_sent:
-                            self.logger.info(f"{self._node_id}: HB first pong from parent, sending ready_parent")
                             self._notify_queue.put(("ready_parent",))
                             self._parent_ready_sent = True
                         self._last_parent_hb_time = time.time()
@@ -156,7 +165,9 @@ class HeartBeatProcess:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    self.logger.warning(f"{self._node_id}: HB recv from parent error: {e}")
+                    self.logger.warning(
+                        f"{self._node_id}: HB recv from parent error: {e}"
+                    )
 
                 elapsed = time.time() - self._last_parent_hb_time
                 if elapsed > self._heartbeat_dead_threshold:
@@ -176,8 +187,9 @@ class HeartBeatProcess:
         try:
             while not self._stop.is_set():
                 try:
-                    raw = await conn.recv()
-                    self._hb_recv_queue.put_nowait(raw)
+                    parts = await conn.recv()
+                    full_id, sender_id, _ = _decode_identity(parts[0])
+                    self._child_queues[sender_id].put_nowait((full_id, conn))
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -185,39 +197,31 @@ class HeartBeatProcess:
         except asyncio.CancelledError:
             pass
 
-    async def _dispatch_loop(self):
-        self.logger.info(f"{self._node_id}: HB dispatch loop started, known children: {list(self._children.keys())}")
+    async def _child_dispatch_loop(self, child_id: str):
+        self.logger.info(f"{self._node_id}: HB child dispatch loop started for {child_id}")
+        q = self._child_queues[child_id]
         try:
             while not self._stop.is_set():
                 try:
-                    parts = await self._hb_recv_queue.get()
-                    full_id, sender_id, _ = _decode_identity(parts[0])
+                    full_id, conn = await q.get()
 
-                    if sender_id not in self._children:
-                        self.logger.warning(
-                            f"{self._node_id}: HB from unknown child {sender_id}, ignoring (known: {list(self._children.keys())})"
-                        )
-                        continue
+                    first_ping = self._children[child_id] is None
+                    self._children[child_id] = time.perf_counter()
 
-                    first_ping = self._children[sender_id] is None
-                    self._children[sender_id] = time.time()
-                    self.logger.info(f"{self._node_id}: HB ping received from child {sender_id}")
+                    await conn.send(_HB_PING, full_id)
 
                     if first_ping:
-                        self.logger.info(f"{self._node_id}: HB first ping from child {sender_id}, sending ready_child")
-                        self._notify_queue.put(("ready_child", sender_id))
+                        self.logger.info(
+                            f"{self._node_id}: HB first ping from child {child_id}, sending ready_child"
+                        )
+                        self._notify_queue.put(("ready_child", child_id))
 
-                    for conn in self._hb_server_conns:
-                        try:
-                            self.logger.info(f"{self._node_id}: HB sending pong to child {sender_id}")
-                            await conn.send(_HB_PING, full_id)
-                            break
-                        except Exception:
-                            continue
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    self.logger.warning(f"{self._node_id}: HB dispatch error: {e}")
+                    self.logger.warning(
+                        f"{self._node_id}: HB child dispatch error for {child_id}: {e}"
+                    )
         except asyncio.CancelledError:
             pass
 
@@ -226,7 +230,7 @@ class HeartBeatProcess:
             while not self._stop.is_set():
                 jitter = self._heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
                 await asyncio.sleep(jitter)
-                now = time.time()
+                now = time.perf_counter()
                 for child_id, last in list(self._children.items()):
                     if last is not None:
                         elapsed = now - last
@@ -278,6 +282,7 @@ class HeartBeatProcess:
                     self._children_secrets[child_id] = child_secret
                     for conn in self._hb_server_conns:
                         conn.add_expected_remote(child_id, child_secret)
+                    self._start_child_dispatch(child_id)
                     self.logger.info(f"{self._node_id}: HB added child {child_id}")
                 elif kind == "remove_child":
                     child_id = msg[1]
@@ -285,6 +290,10 @@ class HeartBeatProcess:
                     self._children_secrets.pop(child_id, None)
                     for conn in self._hb_server_conns:
                         conn.remove_expected_remote(child_id)
+                    task = self._child_tasks.pop(child_id, None)
+                    if task and not task.done():
+                        task.cancel()
+                    self._child_queues.pop(child_id, None)
                     self.logger.info(f"{self._node_id}: HB removed child {child_id}")
                 elif kind == "add_server_connection":
                     conn = msg[1]
@@ -295,7 +304,9 @@ class HeartBeatProcess:
                         conn.add_expected_remote(child_id, child_secret)
                     self._hb_server_conns.append(conn)
                     task = asyncio.create_task(self._hb_recv_loop(conn))
-                    self._recv_tasks[id(conn)] = task
-                    self.logger.info(f"{self._node_id}: HB added server conn {conn.address}")
+                    self._tasks.append(task)
+                    self.logger.info(
+                        f"{self._node_id}: HB added server conn {conn.address}"
+                    )
         except asyncio.CancelledError:
             pass
