@@ -42,6 +42,8 @@ async def _child_async(
     data_conn,
     hb_conn,
     skip_child_monitors=False,
+    heartbeat_interval=1.0,
+    heartbeat_dead_threshold=30.0,
 ):
     child_id = f"child-{child_idx}"
     my_node_info = NodeInfo(
@@ -57,6 +59,8 @@ async def _child_async(
             parent_conn=data_conn,
             hb_parent_conn=hb_conn,
             skip_hb=skip_child_monitors,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_dead_threshold=heartbeat_dead_threshold,
         )
     except Exception:
         comm = AsyncComm(
@@ -101,6 +105,8 @@ def child_main(
     data_conn,
     hb_conn,
     skip_child_monitors=False,
+    heartbeat_interval=1.0,
+    heartbeat_dead_threshold=30.0,
 ):
     asyncio.run(
         _child_async(
@@ -111,6 +117,8 @@ def child_main(
             data_conn,
             hb_conn,
             skip_child_monitors,
+            heartbeat_interval,
+            heartbeat_dead_threshold,
         )
     )
 
@@ -121,7 +129,8 @@ async def busy_wait(duration):
     blob = cloudpickle.dumps(os.urandom(1_000_000_000))
     start = time.perf_counter()
     while time.perf_counter() - start < duration:
-        cloudpickle.loads(blob)
+        # cloudpickle.loads(blob)
+        pass
 
 
 async def main(
@@ -165,8 +174,6 @@ async def main(
 
     await comm.start_monitors(children_only=True)
 
-    # busy_wait_task = asyncio.create_task(busy_wait(duration))
-
     processes = {}
     mpi_tasks = {}
 
@@ -195,7 +202,7 @@ async def main(
             task = executor.submit(
                 job_resource=job_resource,
                 task=child_main,
-                task_args=(i, mps, duration, payload_size, data_conn, hb_conn),
+                task_args=(i, mps, duration, payload_size, data_conn, hb_conn, False, hb_interval, hb_threshold),
             )
             mpi_tasks[child_id] = task
     else:
@@ -212,6 +219,8 @@ async def main(
                     data_conn,
                     hb_conn,
                     skip_child_monitors,
+                    hb_interval,
+                    hb_threshold,
                 ),
             )
             p.start()
@@ -229,6 +238,8 @@ async def main(
                     logger.error(f"Failed to sync heartbeat with {child_id}")
                     success = False
             logger.info(f"Synced heartbeat with all {num_children} children")
+
+        # busy_wait_task = asyncio.create_task(busy_wait(duration))
 
         payload = _make_payload(payload_size)
         end = time.monotonic() + duration
