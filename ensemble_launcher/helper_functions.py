@@ -62,9 +62,13 @@ def get_gpus() -> list[int | float]:
                 gpus.append(str_to_num(gpu))
         else:
             output = check_output(["xpu-smi", "discovery"], stderr=DEVNULL).decode("utf-8").splitlines()
+            gpu_card = 0
+            for line in output:
+                if "SOC UUID:" in line:
+                    gpu_card += 1
             hierarchy_mode = os.environ.get("ZE_FLAT_DEVICE_HIERARCHY", "FLAT")
             gpus = []
-            for i in range(len(output)):
+            for i in range(gpu_card):
                 if hierarchy_mode == "FLAT":
                     gpus.append(i * 2)
                     gpus.append(i * 2 + 1)
