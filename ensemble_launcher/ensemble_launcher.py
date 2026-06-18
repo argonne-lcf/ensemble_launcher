@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 from typing import Dict, List, Optional, Union
+import time
 
 from ensemble_launcher.orchestrator import (
     AsyncMaster,
@@ -181,10 +182,11 @@ class EnsembleLauncher:
             raise
         return results
 
-    def start(self):
+    def start(self, wait_time: int = 1):
         """Start the launcher in a separate process."""
         self._launcher_process = multiprocessing.Process(target=self.run)
         self._launcher_process.start()
+        time.sleep(wait_time)
 
     def stop(self):
         """Stop the launcher, terminating child processes if needed."""
