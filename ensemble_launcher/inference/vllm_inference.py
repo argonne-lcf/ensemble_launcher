@@ -16,7 +16,7 @@ import cloudpickle
 
 from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
-from ensemble_launcher.logging import setup_logger
+from ensemble_launcher.logging import get_log_dir, setup_logger
 
 from .utils import _build_model_cache, find_free_port
 
@@ -80,7 +80,7 @@ class _VLLMOfflineMixin:
 
     async def on_start(self):
         if self.logger is None:
-            self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+            self.logger = setup_logger(name=self._name)
         self.logger.info(
             f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
         )
@@ -116,10 +116,9 @@ class _VLLMOfflineMixin:
                     self.logger.error(f"Building model infos failed with error {e}")
                     raise
             # Setup vllm logging
-            log_dir = f"{os.getcwd()}/logs/vllm"
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
-            _setup_vllm_file_logging(f"{log_dir}/vllm_{self._name}.log")
+            vllm_log_dir = get_log_dir("vllm")
+            os.makedirs(vllm_log_dir, exist_ok=True)
+            _setup_vllm_file_logging(f"{vllm_log_dir}/vllm_{self._name}.log")
             from vllm import LLM
 
             snapshots = glob(
@@ -246,7 +245,7 @@ class _VLLMOnlineMixin:
 
     async def on_start(self):
         if self.logger is None:
-            self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+            self.logger = setup_logger(name=self._name)
         script_path = os.path.join(os.path.dirname(__file__), "start_vllm_server.sh")
         self._hostname = (
             socket.gethostname()
@@ -417,7 +416,7 @@ class _MultiNodeVLLMMixin:
 
     async def on_start(self):
         if self.logger is None:
-            self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+            self.logger = setup_logger(name=self._name)
 
         os.environ["TMPDIR"] = "/tmp"
 
@@ -526,8 +525,7 @@ class _MultiNodeVLLMMixin:
             ),
         )
 
-        log_dir = f"{os.getcwd()}/logs"
-        _setup_vllm_file_logging(f"{log_dir}/vllm_{self._name}_rank{self._rank}.log")
+        _setup_vllm_file_logging(f"{get_log_dir()}/vllm_{self._name}_rank{self._rank}.log")
         from vllm import LLM, envs  # isort: skip
         import torch  # isort: skip
 

@@ -160,9 +160,7 @@ class PrivateActorHandle:
         return self._ready_actors
 
     async def open(self):
-        log_dir = f"{os.getcwd()}/logs/handles"
-        os.makedirs(log_dir, exist_ok=True)
-        self.logger = setup_logger(name=self._conn.identity, log_dir=log_dir)
+        self.logger = setup_logger(name=self._conn.identity, subdir="handles")
         await self._conn.open()
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._send_task = asyncio.create_task(self._send_loop())
@@ -299,9 +297,7 @@ class _ActorBase(ABC):
                     cls.__actions__.setdefault(attr.__action_name__, attr)
 
     def _init_runtime(self):
-        log_dir = f"{os.getcwd()}/logs/actors"
-        os.makedirs(log_dir, exist_ok=True)
-        self.logger = setup_logger(name=self._name, log_dir=log_dir)
+        self.logger = setup_logger(name=self._name, subdir="actors")
         self._stop = asyncio.Event()
         self._input_queue = asyncio.Queue()
         self._output_queue = asyncio.Queue()

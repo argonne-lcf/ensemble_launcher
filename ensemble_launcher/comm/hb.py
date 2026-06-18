@@ -62,7 +62,6 @@ class HeartBeatProcess:
         self.logger = setup_logger(
             name=f"hb.{self._node_id}",
             node_id=f"hb-{self._node_id}",
-            log_dir="logs",
         )
 
     def __call__(self):

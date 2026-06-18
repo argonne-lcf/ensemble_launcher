@@ -195,13 +195,9 @@ class AsyncWorker(Node):
 
     def _setup_logger(self) -> None:
         """Configure the logger, optionally writing to a per-worker log file."""
-        log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir)
-            if self._config.worker_logs
-            else None
-        )
         self.logger = setup_logger(
-            __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
+            __name__, self.node_id, level=self._config.log_level,
+            log_to_file=self._config.worker_logs,
         )
 
     def _create_comm(self) -> None:
@@ -361,7 +357,6 @@ class AsyncWorker(Node):
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
-        kwargs["log_dir"] = self._config.log_dir
 
         ##Async mpi specific options
         kwargs["mpi_config"] = self._config.mpi_config

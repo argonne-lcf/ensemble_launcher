@@ -49,7 +49,7 @@ class ELFastMCP(FastMCP):
         self._checkpoint_dir = checkpoint_dir
         self._node_id = node_id
         self._client: Optional[ClusterClient] = None
-        self.logger = setup_logger("mcp_interface", log_dir=f"{os.getcwd()}/logs")
+        self.logger = setup_logger("mcp_interface")
 
     def ensemble_tool(
         self,

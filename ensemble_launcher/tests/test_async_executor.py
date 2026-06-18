@@ -27,7 +27,7 @@ async def test_async_mpi_pool():
         resources=[NodeResourceList(cpus=(1,))], nodes=[socket.gethostname()]
     )
 
-    logger = setup_logger(name="test_mpi_pool", log_dir="logs")
+    logger = setup_logger(name="test_mpi_pool")
     exec = AsyncMPIPoolExecutor(
         logger, cpu_to_pid=cpu_to_pid, mpi_info=mpi_info, mpi_config=mpi_config
     )

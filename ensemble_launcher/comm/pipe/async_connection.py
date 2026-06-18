@@ -77,10 +77,9 @@ class AsyncConnection(ABC):
         self._msg_queue = asyncio.Queue()
         self._ack_futures = {}
         self._close = asyncio.Event()
-        os.makedirs(f"{os.getcwd()}/logs/connections", exist_ok=True)
         self.logger = setup_logger(
             name=f"connection-{self.identity}",
-            log_dir=f"{os.getcwd()}/logs/connections",
+            subdir="connections",
         )
         await self._raw_open()
         self._is_open = True

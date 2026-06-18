@@ -227,13 +227,9 @@ class AsyncMaster(Node):
 
     def _setup_logger(self) -> None:
         """Configure the logger for this master, optionally writing to a per-node log file."""
-        log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir)
-            if self._config.master_logs
-            else None
-        )
         self.logger = setup_logger(
-            __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
+            __name__, self.node_id, level=self._config.log_level,
+            log_to_file=self._config.master_logs,
         )
 
     def _create_comm(self) -> None:

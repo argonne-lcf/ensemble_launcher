@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import multiprocessing
+import os
 from typing import Dict, List, Optional, Union
 
 from ensemble_launcher.orchestrator import (
@@ -54,7 +55,7 @@ class EnsembleLauncher:
             logger.info(f"Found {len(self.nodes)} nodes for execution.")
 
         if len(self.nodes) == 0:
-            raise ValueError(f"No compute nodes to execute tasks")
+            raise ValueError("No compute nodes to execute tasks")
         # analyze the tasks to get launcher parameters like
         # - task_executor_name
         # - number of levels
@@ -113,6 +114,10 @@ class EnsembleLauncher:
                 master_logs=True,
                 worker_logs=True,
             )
+
+        os.environ["EL_LOGDIR"] = os.path.join(
+            os.getcwd(), self.launcher_config.log_dir
+        )
 
         logger.info(f"LauncherConfig: {self.launcher_config}")
 

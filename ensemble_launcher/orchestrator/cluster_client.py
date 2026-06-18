@@ -199,7 +199,6 @@ class ClusterClient:
         node_id: str = "global",
         client_id: Optional[str] = None,
         n_workers: int = 1,
-        log_dir: str = "logs",
         log_level: int = logging.INFO,
         checkpoint_timeout: float = 60.0,
         task_buffer_size: int = 10000,
@@ -215,9 +214,6 @@ class ClusterClient:
                                  that node.
             client_id:           Optional client identity string; auto-generated if omitted.
             n_workers:           Number of parallel send/recv pipelines (default 1).
-            log_dir:             Directory for log files.  When provided a file
-                                 ``{log_dir}/{client_id}.log`` is created.  When
-                                 ``None`` (default) logging goes to the root handler.
             log_level:           Logging level (default ``logging.INFO``).
             checkpoint_timeout:  Seconds to wait for checkpoint files to appear before
                                  raising ``TimeoutError`` (default 60).  Useful when the
@@ -239,7 +235,7 @@ class ClusterClient:
         self._flush_stop_event = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self.logger = setup_logger(
-            __name__, self._client_id, log_dir=log_dir, level=log_level
+            __name__, self._client_id, level=log_level,
         )
         self._node_id = None
 

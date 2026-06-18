@@ -5,24 +5,34 @@ import os
 from typing import Optional
 
 
+def get_log_dir(subdir: Optional[str] = None) -> str:
+    """Return the resolved log directory.
+
+    Checks ``EL_LOGDIR`` env var first, then defaults to ``<cwd>/logs``.
+    """
+    base = os.environ.get("EL_LOGDIR", os.path.join(os.getcwd(), "logs"))
+    return os.path.join(base, subdir) if subdir else base
+
+
 def setup_logger(
     name: str,
     node_id: Optional[str] = None,
-    log_dir: Optional[str] = None,
     level: int = logging.INFO,
+    log_to_file: bool = True,
+    subdir: Optional[str] = None,
 ) -> logging.Logger:
     """Create and configure a logger for an orchestrator node.
 
     Args:
-        name:    Logger name (typically ``__name__`` of the calling module).
-        node_id: Optional node identifier appended to the logger name.
-                 When provided the logger is named ``{name}.{node_id}``.
-        log_dir: If provided, a ``FileHandler`` writing to
-                 ``{log_dir}/{node_id}.log`` (or ``{log_dir}/{name}.log``
-                 when *node_id* is ``None``) is attached.  The directory is
-                 created if it does not exist.  When ``None`` the logger uses
-                 whatever root handlers are already configured.
-        level:   Logging level (default ``logging.INFO``).
+        name:        Logger name (typically ``__name__`` of the calling module).
+        node_id:     Optional node identifier appended to the logger name.
+                     When provided the logger is named ``{name}.{node_id}``.
+        level:       Logging level (default ``logging.INFO``).
+        log_to_file: When ``True`` (default), a ``FileHandler`` is attached
+                     using the directory resolved by :func:`get_log_dir`.
+                     When ``False`` a ``NullHandler`` is used instead.
+        subdir:      Optional subdirectory under the log root
+                     (e.g. ``"actors"``, ``"connections"``).
 
     Returns:
         A configured :class:`logging.Logger` instance.
@@ -31,7 +41,8 @@ def setup_logger(
     logger = logging.getLogger(logger_name)
     logger.setLevel(level)
 
-    if log_dir is not None:
+    if log_to_file:
+        log_dir = get_log_dir(subdir)
         os.makedirs(log_dir, exist_ok=True)
         file_stem = node_id if node_id else name.split(".")[-1]
         # Replace characters that are invalid in file names on some systems
