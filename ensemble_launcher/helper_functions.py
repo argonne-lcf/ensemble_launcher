@@ -37,7 +37,7 @@ def str_to_num(s: str) -> int | float:
 
 
 def get_gpus() -> list[int | float]:
-    """Get the number of GPUs available on the system node
+    """Get the list of GPUs available on the system node
     """
     # NVIDIA
     try:
