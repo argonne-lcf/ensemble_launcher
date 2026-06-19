@@ -124,7 +124,11 @@ class _VLLMOfflineMixin:
             snapshots = glob(
                 f"{self.cache_dir}/hub/models--{self.model.replace('/', '--')}/snapshots/*"
             )
-            self.logger.info(f"model: {snapshots[0]}")
+            if len(snapshots) > 0:
+                self.logger.info(f"model: {snapshots[0]}")
+            else:
+                self.logger.error("No snapshots found.")
+                raise RuntimeError("No snapshots found.")
             try:
                 self._llm = LLM(
                     model=snapshots[0],
@@ -525,7 +529,9 @@ class _MultiNodeVLLMMixin:
             ),
         )
 
-        _setup_vllm_file_logging(f"{get_log_dir()}/vllm_{self._name}_rank{self._rank}.log")
+        _setup_vllm_file_logging(
+            f"{get_log_dir()}/vllm_{self._name}_rank{self._rank}.log"
+        )
         from vllm import LLM, envs  # isort: skip
         import torch  # isort: skip
 
