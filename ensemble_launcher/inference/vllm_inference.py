@@ -127,7 +127,7 @@ class _VLLMOfflineMixin:
             if len(snapshots) > 0:
                 self.logger.info(f"model: {snapshots[0]}")
             else:
-                self.logger.error("No snapshots found.")
+                self.logger.error(f"No snapshots found in {self.cache_dir}/hub.")
                 raise RuntimeError("No snapshots found.")
             try:
                 self._llm = LLM(
