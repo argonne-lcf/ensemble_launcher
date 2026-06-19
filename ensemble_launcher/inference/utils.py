@@ -12,6 +12,7 @@ from logging import Logger
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
+from time import perf_counter
 
 
 def _build_model_cache(logger: Logger = None) -> int:
@@ -168,18 +169,27 @@ def find_free_port(
 
 def call_llm(
     model: str,
+    model_path: str,
     prompts: List,
-    tensor_parallel_size: int = 1,
     llm_kwargs: Dict[str, Any] = {
+        "tensor_parallel_size": 1,
         "max_model_len": 2048,
         "enforce_eager": True,
         "trust_remote_code": True,
+        "dtype": "bloaft16",
+        "gpu_memory_utilization": 0.90,
+        "max_num_seqs": 1, # batch size
     },
-    sampling_kwargs: Dict = {"temperature": 0.0, "max_tokens": 1024},
+    sampling_kwargs: Dict[str, Any] = {
+        "temperature": 0.0, 
+        "max_tokens": 1024,
+    },
 ):
+    start = perf_counter()
 
     _actor_port = 10000 + (os.getpid() % 100) * 200
     _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
+    os.environ["HF_HOME"] = model_path
     os.environ["MASTER_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_HOST_IP"] = "localhost"
@@ -189,15 +199,21 @@ def call_llm(
 
     from vllm import LLM, SamplingParams
 
-    snapshots = glob(
-        f"/tmp/model_cache/hub/models--{model.replace('/', '--')}/snapshots/*"
-    )
-
-    llm = LLM(
-        model=snapshots[0], tensor_parallel_size=tensor_parallel_size, **llm_kwargs
-    )
-
     sampling_params = SamplingParams(**sampling_kwargs)
-    outputs = llm.generate(prompts, sampling_params=sampling_params)
 
-    return outputs
+    tic = perf_counter()
+    llm = LLM(model=model, **llm_kwargs)
+    init_time = perf_counter() - tic
+
+    tic = perf_counter()
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    inf_time = perf_counter() - tic
+
+    tot_time = perf_counter() - start
+
+    return {
+        "responses": outputs,
+        "total_time": tot_time, 
+        "initialization_time": init_time,
+        "inference_time": inf_time
+    }
