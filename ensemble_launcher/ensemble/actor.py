@@ -262,10 +262,11 @@ class PrivateActorHandle:
         for actor_id in list(self._ready_actors):
             await self._conn.send(data, actor_id)
 
-    async def stop(self):
+    async def stop(self, timeout: float = 10.0):
         data = cloudpickle.dumps(("stop", (), None))
         for actor_id in list(self._ready_actors):
             await self._conn.send(data, actor_id)
+        await asyncio.sleep(timeout)
 
 
 class _ActorBase(ABC):
@@ -536,7 +537,7 @@ class PublicActor(_ActorBase):
     async def _run(self):
         self._init_runtime()
 
-        result = await self.on_start()
+        await self.on_start()
 
         self._start_transport()
         await self._conn.open()
@@ -548,14 +549,9 @@ class PublicActor(_ActorBase):
 
         self.logger.info("Done opening the server!")
 
-        if asyncio.iscoroutine(result):
-            await result
-
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
 
-        result = await self.on_stop()
-        if asyncio.iscoroutine(result):
-            await result
+        await self.on_stop()
 
         await self._conn.close()
 
@@ -598,22 +594,17 @@ class PrivateActor(_ActorBase):
     async def _run(self):
         self._init_runtime()
 
-        result = await self.on_start()
+        await self.on_start()
 
         await self._conn.open()
 
         self.logger.info("Connected to server, ready!")
 
-        if asyncio.iscoroutine(result):
-            await result
-
         await asyncio.gather(
             self._recv(), self._send(), self._main_loop(), self._signal_ready()
         )
 
-        result = await self.on_stop()
-        if asyncio.iscoroutine(result):
-            await result
+        await self.on_stop()
 
         await self._conn.close()
 

@@ -101,10 +101,10 @@ class _VLLMOfflineMixin:
             if self._use_cached_modelinfo:
                 os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
                 self.logger.info(f"Reusing cache at {self._model_info_cache}")
-                self.logger.info("File list in cache")
+                self.logger.debug("File list in cache")
                 for root, dirs, files in os.walk(self._model_info_cache):
                     for file in files:
-                        self.logger.info(f"{file}")
+                        self.logger.debug(f"{file}")
             else:
                 if self._model_info_cache is None:
                     self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"

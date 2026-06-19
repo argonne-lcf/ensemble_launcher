@@ -177,8 +177,10 @@ class ActorPool(PrivateActor):
         return list(self._child_names)
 
     async def on_stop(self):
+        self.logger.info("In on stop")
         if self._child_handle:
             try:
+                self.logger.info(f"Broadcasting stop to {self._n_children} children")
                 await self._child_handle.broadcast(
                     ("stop", (), None), expected=self._n_children
                 )
