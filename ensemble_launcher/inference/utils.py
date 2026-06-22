@@ -73,7 +73,20 @@ def _build_model_cache(logger: Logger = None) -> int:
 
     cache_root = os.environ.get("VLLM_CACHE_ROOT")
     if not cache_root:
-        return EnvironmentError("VLLM_CACHE_ROOT must be set")
+        cache_root = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+        os.environ["VLLM_CACHE_ROOT"] = cache_root
+        os.makedirs(cache_root, exist_ok=True)
+        if logger is not None:
+            logger.info(f"VLLM_CACHE_ROOT not set; created {cache_root}")
+
+    modelinfo_dir = os.path.join(cache_root, "modelinfo")
+    if os.path.isdir(modelinfo_dir):
+        if logger is not None:
+            logger.info(
+                f"Found existing modelinfo cache at {modelinfo_dir}; "
+                "skipping build"
+            )
+        return 0
 
     if logger is not None:
         logger.info(f"Using VLLM_CACHE_ROOT={cache_root}")
