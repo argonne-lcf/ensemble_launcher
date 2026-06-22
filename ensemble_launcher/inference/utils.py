@@ -171,21 +171,26 @@ def call_llm(
     model: str,
     model_path: str,
     prompts: List,
-    llm_kwargs: Dict[str, Any] = {
+    llm_kwargs: Optional[Dict[str, Any]] = None,
+    sampling_kwargs: Optional[Dict[str, Any]] = None,
+):
+    start = perf_counter()
+
+    default_llm_kwargs = {
         "tensor_parallel_size": 1,
         "max_model_len": 2048,
         "enforce_eager": True,
         "trust_remote_code": True,
-        "dtype": "bloaft16",
+        "dtype": "bfloat16",
         "gpu_memory_utilization": 0.90,
-        "max_num_seqs": 1, # batch size
-    },
-    sampling_kwargs: Dict[str, Any] = {
-        "temperature": 0.0, 
+        "max_num_seqs": 1,
+    }
+    default_sampling_kwargs = {
+        "temperature": 0.0,
         "max_tokens": 1024,
-    },
-):
-    start = perf_counter()
+    }
+    llm_kwargs = {**default_llm_kwargs, **(llm_kwargs or {})}
+    sampling_kwargs = {**default_sampling_kwargs, **(sampling_kwargs or {})}
 
     _actor_port = 10000 + (os.getpid() % 100) * 200
     _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
