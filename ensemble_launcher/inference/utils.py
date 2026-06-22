@@ -193,8 +193,8 @@ def call_llm(
     os.environ["MASTER_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_HOST_IP"] = "localhost"
-    os.environ["VLLM_CACHE_ROOT"] = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
-    os.makedirs(os.environ["VLLM_CACHE_ROOT"])
+    os.environ["TMPDIR"] = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+    os.makedirs(os.environ["TMPDIR"], exist_ok=True)
     build_model_cache()
 
     from vllm import LLM, SamplingParams
