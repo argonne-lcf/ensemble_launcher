@@ -1,6 +1,5 @@
 import os
 import socket
-from typing import Dict, List, Optional, Any
 from ensemble_launcher.comm import Result
 import json
 from subprocess import check_output, DEVNULL
@@ -36,7 +35,7 @@ def str_to_num(s: str) -> int | float:
             raise ValueError("GPU mask needs to take ints or floats as the GPU IDs.") from None
 
 
-def get_gpus() -> list[int | float]:
+def get_gpus() -> tuple[list[int | float], str]:
     """Get the list of GPUs available on the system node
     """
     # NVIDIA
@@ -49,7 +48,7 @@ def get_gpus() -> list[int | float]:
         else:
             output = check_output(["nvidia-smi", "-L"], stderr=DEVNULL).decode("utf-8").splitlines()
             gpus = list(range(len(output)))
-        return gpus
+        return gpus, "nvidia"
     except:
         pass
 
@@ -75,11 +74,11 @@ def get_gpus() -> list[int | float]:
                 elif hierarchy_mode == "COMPOSITE":
                     gpus.append(i + 0.0)
                     gpus.append(i + 0.1)
-        return gpus
+        return gpus, "intel"
     except:
         pass
 
-    return []
+    return [], ""
 
 
 def write_results_to_json(results: Result, fname: str = "./results.json"):
