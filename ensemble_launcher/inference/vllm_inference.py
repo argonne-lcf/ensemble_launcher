@@ -18,37 +18,7 @@ from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import get_log_dir, setup_logger
 
-from .utils import _build_model_cache, find_free_port
-
-
-def _setup_vllm_file_logging(log_file: str):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    config = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "vllm": {
-                "class": "vllm.logging_utils.NewLineFormatter",
-                "datefmt": "%m-%d %H:%M:%S",
-                "format": "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] %(message)s",
-            }
-        },
-        "handlers": {
-            "vllm": {
-                "class": "logging.FileHandler",
-                "formatter": "vllm",
-                "level": "INFO",
-                "filename": log_file,
-            }
-        },
-        "loggers": {
-            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
-        },
-    }
-    cfg_path = os.path.join(tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json")
-    with open(cfg_path, "w") as f:
-        json.dump(config, f)
-    os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
+from .utils import _build_model_cache, find_free_port, _setup_vllm_file_logging
 
 
 # ---------------------------------------------------------------------------

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import pkgutil
 import random
 import socket
+import tempfile
 import uuid
 from glob import glob
 from logging import Logger
@@ -14,6 +16,36 @@ from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 from time import perf_counter
 
+def _setup_vllm_file_logging(log_file: str):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "vllm": {
+                "class": "vllm.logging_utils.NewLineFormatter",
+                "datefmt": "%m-%d %H:%M:%S",
+                "format": "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] %(message)s",
+            }
+        },
+        "handlers": {
+            "vllm": {
+                "class": "logging.FileHandler",
+                "formatter": "vllm",
+                "level": "INFO",
+                "filename": log_file,
+            }
+        },
+        "loggers": {
+            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
+        },
+    }
+    cfg_path = os.path.join(tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json")
+    with open(cfg_path, "w") as f:
+        json.dump(config, f)
+    os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
+
+setup_vllm_file_logging = _setup_vllm_file_logging
 
 def _build_model_cache(logger: Logger = None) -> int:
     """
@@ -184,6 +216,7 @@ def call_llm(
     model: str,
     model_path: str,
     prompts: List,
+    log_file_path: Optional[str] = None,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     sampling_kwargs: Optional[Dict[str, Any]] = None,
 ):
@@ -215,6 +248,9 @@ def call_llm(
     os.makedirs(os.environ["TMPDIR"], exist_ok=True)
     build_model_cache()
 
+    if log_file_path is not None:
+        setup_vllm_file_logging(log_file=log_file_path)
+        
     from vllm import LLM, SamplingParams
 
     sampling_params = SamplingParams(**sampling_kwargs)
