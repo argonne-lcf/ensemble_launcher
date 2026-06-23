@@ -61,19 +61,15 @@ class _VLLMOfflineMixin:
         self,
         model: str,
         cache_dir: str,
-        tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        max_model_len: int = 2048,
         **kwargs,
     ):
         self.model = model
         self.cache_dir = cache_dir
-        self.tensor_parallel_size = tensor_parallel_size
         self._llm = None
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
-        self.max_model_len = max_model_len
         self.kwargs = kwargs
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
@@ -132,9 +128,7 @@ class _VLLMOfflineMixin:
             try:
                 self._llm = LLM(
                     model=snapshots[0],
-                    tensor_parallel_size=self.tensor_parallel_size,
                     trust_remote_code=True,
-                    max_model_len=self.max_model_len,
                     **self.kwargs,
                 )
             except Exception as e:
@@ -171,13 +165,12 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         name: str,
         model: str,
         cache_dir: str,
-        tensor_parallel_size: int = 1,
         transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         max_workers: int = 2,
-        llm_kwargs: Dict = {"max_model_len": 2048},
+        llm_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         PublicActor.__init__(
@@ -186,10 +179,9 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         self._init_vllm(
             model,
             cache_dir,
-            tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
-            **llm_kwargs,
+            **(llm_kwargs or {}),
         )
 
 
@@ -200,11 +192,10 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         model: str,
         cache_dir: str,
         client_conn: ClientConnection,
-        tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         max_workers: int = 2,
-        llm_kwargs: Dict = {"max_model_len": 2048},
+        llm_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         PrivateActor.__init__(
@@ -213,10 +204,9 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         self._init_vllm(
             model,
             cache_dir,
-            tensor_parallel_size,
             use_cached_modelinfo,
             model_info_cache,
-            **llm_kwargs,
+            **(llm_kwargs or {}),
         )
 
 
