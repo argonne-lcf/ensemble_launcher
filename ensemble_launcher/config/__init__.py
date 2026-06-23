@@ -3,6 +3,7 @@ from .config import (
     PolicyConfig,
     SystemConfig,
     aurora_config,
+    polaris_config,
     get_system_config,
 )
 from .mpi_config import MPIConfig
@@ -13,5 +14,6 @@ __all__ = [
     "SystemConfig",
     "MPIConfig",
     "aurora_config",
+    "polaris_config",
     "get_system_config",
 ]
