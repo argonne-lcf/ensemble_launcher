@@ -191,11 +191,13 @@ def call_llm(
 
     default_llm_kwargs = {
         "tensor_parallel_size": 1,
-        "max_model_len": 2048,
+        "max_model_len": 8192,
         "enforce_eager": True,
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "gpu_memory_utilization": 0.90,
+        "max_num_seqs": 1,
+        "disable_custom_all_reduce": True,
         "max_num_seqs": 1,
     }
     default_sampling_kwargs = {
