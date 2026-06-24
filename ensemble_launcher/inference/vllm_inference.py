@@ -340,22 +340,19 @@ class _MultiNodeVLLMMixin:
         model: str,
         cache_dir: str,
         ckpt_dir: str,
-        tensor_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         sync_location: str = f"file://file_{uuid.uuid4().hex}",
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
-        max_model_len: int = 2048,
-        **kwargs,
+        llm_kwargs: Optional[Dict] = None,
     ):
         self._model_name = model
         self.cache_dir = cache_dir
         self._ckpt_dir = ckpt_dir
-        self.tensor_parallel_size = tensor_parallel_size
-        self.pipeline_parallel_size = pipeline_parallel_size
+        self.tensor_parallel_size = llm_kwargs.get("tensor_parallel_size",1) if llm_kwargs is not None else {}
+        self.pipeline_parallel_size = llm_kwargs.get("pipeline_parallel_size",1) if llm_kwargs is not None else {}
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         if self._use_cached_modelinfo:
@@ -375,8 +372,7 @@ class _MultiNodeVLLMMixin:
         self._sub_socket = None
         self._zmq_context = None
         self._llm = None
-        self.max_model_len = max_model_len
-        self.kwargs = kwargs
+        self.llm_kwargs = llm_kwargs
 
     async def on_start(self):
         if self.logger is None:
@@ -540,13 +536,10 @@ class _MultiNodeVLLMMixin:
         try:
             self._llm = LLM(
                 model=snapshots[0],
-                tensor_parallel_size=self.tensor_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
                 trust_remote_code=True,
                 distributed_executor_backend="external_launcher",
                 seed=1,
-                max_model_len=self.max_model_len,
-                **self.kwargs,
+                **self.llm_kwargs,
             )
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -639,8 +632,6 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         name: str,
         model: str,
         cache_dir: str,
-        tensor_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
         transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
@@ -648,7 +639,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
-        llm_kwargs: Dict = {"max_model_len": 2048},
+        llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
         **kwargs,
     ):
         PublicActor.__init__(self, name, transport, **kwargs)
@@ -656,15 +647,13 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
             model,
             cache_dir,
             self.ckpt_dir,
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            use_cached_modelinfo,
-            model_info_cache,
-            sync_location,
-            rank_env,
-            local_rank_env,
-            sync_timeout,
-            **llm_kwargs,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            sync_location=sync_location,
+            rank_env=rank_env,
+            local_rank_env=local_rank_env,
+            sync_timeout=sync_timeout,
+            llm_kwargs=llm_kwargs,
         )
 
     async def _setup_rank0_connection(self):
@@ -685,15 +674,13 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         cache_dir: str,
         client_conn: ClientConnection,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
-        tensor_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         sync_location: str = f"file://file_{uuid.uuid4().hex}",
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
-        llm_kwargs: Dict = {"max_model_len": 2048},
+        llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
         **kwargs,
     ):
         PrivateActor.__init__(self, name, client_conn, **kwargs)
@@ -701,15 +688,13 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
             model,
             cache_dir,
             ckpt_dir,
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            use_cached_modelinfo,
-            model_info_cache,
-            sync_location,
-            rank_env,
-            local_rank_env,
-            sync_timeout,
-            **llm_kwargs,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            sync_location=sync_location,
+            rank_env=rank_env,
+            local_rank_env=local_rank_env,
+            sync_timeout=sync_timeout,
+            llm_kwargs=llm_kwargs,
         )
 
     async def _setup_rank0_connection(self):
