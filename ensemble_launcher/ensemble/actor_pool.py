@@ -127,7 +127,8 @@ class ActorPool(PrivateActor):
                 f"ActorPool '{self._name}': {self._n_children} children ready"
             )
         except Exception as e:
-            await self._child_handle.stop()
+            if self._child_handle is not None:
+                await self._child_handle.stop()
             self.logger.error(f"on_start failed with Exception {e}")
             raise e
 

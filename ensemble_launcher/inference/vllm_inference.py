@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 from glob import glob
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import cloudpickle
 
@@ -18,37 +18,7 @@ from ensemble_launcher.comm.pipe import ClientConnection
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import get_log_dir, setup_logger
 
-from .utils import _build_model_cache, find_free_port
-
-
-def _setup_vllm_file_logging(log_file: str):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    config = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "vllm": {
-                "class": "vllm.logging_utils.NewLineFormatter",
-                "datefmt": "%m-%d %H:%M:%S",
-                "format": "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] %(message)s",
-            }
-        },
-        "handlers": {
-            "vllm": {
-                "class": "logging.FileHandler",
-                "formatter": "vllm",
-                "level": "INFO",
-                "filename": log_file,
-            }
-        },
-        "loggers": {
-            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
-        },
-    }
-    cfg_path = os.path.join(tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json")
-    with open(cfg_path, "w") as f:
-        json.dump(config, f)
-    os.environ["VLLM_LOGGING_CONFIG_PATH"] = cfg_path
+from .utils import _build_model_cache, find_free_port, _setup_vllm_file_logging
 
 
 # ---------------------------------------------------------------------------
@@ -63,14 +33,14 @@ class _VLLMOfflineMixin:
         cache_dir: str,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        **kwargs,
+        llm_kwargs: Dict[str, Any] = {},
     ):
         self.model = model
         self.cache_dir = cache_dir
         self._llm = None
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
-        self.kwargs = kwargs
+        self.llm_kwargs = llm_kwargs
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
 
@@ -129,7 +99,7 @@ class _VLLMOfflineMixin:
                 self._llm = LLM(
                     model=snapshots[0],
                     trust_remote_code=True,
-                    **self.kwargs,
+                    **self.llm_kwargs,
                 )
             except Exception as e:
                 self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -170,7 +140,7 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         max_workers: int = 2,
-        llm_kwargs: Optional[Dict] = None,
+        llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1,},
         **kwargs,
     ):
         PublicActor.__init__(
@@ -179,9 +149,9 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         self._init_vllm(
             model,
             cache_dir,
-            use_cached_modelinfo,
-            model_info_cache,
-            **(llm_kwargs or {}),
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            llm_kwargs = llm_kwargs,
         )
 
 
@@ -195,7 +165,7 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         max_workers: int = 2,
-        llm_kwargs: Optional[Dict] = None,
+        llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size" : 1,},
         **kwargs,
     ):
         PrivateActor.__init__(
@@ -204,9 +174,9 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         self._init_vllm(
             model,
             cache_dir,
-            use_cached_modelinfo,
-            model_info_cache,
-            **(llm_kwargs or {}),
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            llm_kwargs=llm_kwargs,
         )
 
 
