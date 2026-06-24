@@ -208,11 +208,15 @@ def call_llm(
     _actor_port = 10000 + (os.getpid() % 100) * 200
     _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
     os.environ["HF_HOME"] = model_path
-    os.environ["MASTER_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_PORT"] = str(_actor_port) if _actor_port is not None else "0"
     os.environ["VLLM_HOST_IP"] = "localhost"
-    os.environ["TMPDIR"] = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
-    os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(_actor_port) if _actor_port is not None else "0"
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = str(llm_kwargs["tensor_parallel_size"])
+    tmp_dir = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.environ["TMPDIR"] = tmp_dir
     build_model_cache()
 
     from vllm import LLM, SamplingParams
