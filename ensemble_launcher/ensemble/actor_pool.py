@@ -1,5 +1,5 @@
 import secrets
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 from ensemble_launcher.comm.pipe import ClientConnection, transport_registry
 from ensemble_launcher.ensemble.actor import PrivateActor, PrivateActorHandle, action
@@ -17,7 +17,7 @@ class ActorPool(PrivateActor):
         self,
         name: str,
         client_conn: ClientConnection,
-        actor_class: Union[Type[PrivateActor], List[Type[PrivateActor]]],
+        actor_class: Type[PrivateActor],
         n_actors: int,
         actor_kwargs: Union[Dict[str, Any], List[Dict[str, Any]]],
         task_kwargs: Union[Dict[str, Any], List[Dict[str, Any]]],
@@ -32,11 +32,7 @@ class ActorPool(PrivateActor):
         **kwargs,
     ):
         super().__init__(name, client_conn, **kwargs)
-        if isinstance(actor_class, list):
-            assert len(actor_class) == n_actors
-            self._actor_class_list = list(actor_class)
-        else:
-            self._actor_class_list = [actor_class] * n_actors
+        self._actor_class = actor_class
         self._n_children = n_actors
         self._checkpoint_dir = checkpoint_dir
         self._checkpoint_timeout = checkpoint_timeout
@@ -93,7 +89,7 @@ class ActorPool(PrivateActor):
 
                 akw["client_conn"] = client
                 akw["name"] = actor_name
-                actor = self._actor_class_list[i](**akw)
+                actor = self._actor_class(**akw)
                 actors.append(actor)
 
                 tkw = dict(self._task_kwargs_list[i])
@@ -116,7 +112,7 @@ class ActorPool(PrivateActor):
 
             self.logger.info(f"submitted {len(tasks)} tasks")
 
-            self._child_handle = PrivateActor.create_handle(
+            self._child_handle = self._actor_class.create_handle(
                 server_conn,
                 send_timeout=self._child_send_timeout,
                 send_retries=self._child_send_retries,
@@ -139,41 +135,43 @@ class ActorPool(PrivateActor):
             raise e
 
     @action
-    async def invoke(self, actor_index: int, msg: Tuple):
+    async def invoke_children(self, actor_index: int, action_name: str, args: tuple = (), kwargs: dict = None):
         target_id = f"{self._child_names[actor_index]}:{self._server_secret}"
-        await self._child_handle.send(msg, target_id=target_id)
-        _, result = await self._child_handle.recv()
+        self.logger.info(f"Inside invoke children {actor_index}, {action_name}, {args}")
+        try:
+            await self._child_handle.send((action_name, args, kwargs), target_id=target_id)
+            result = await self._child_handle.recv(action_name)
+        except Exception as e:
+            self.logger.error(f"Invoking child failed with error: {e}")
+
         return result
 
     @action
-    async def invoke_all(self, msgs: Union[Tuple, List[Tuple]]):
-        if isinstance(msgs, tuple):
-            for i in range(self._n_children):
-                target_id = f"{self._child_names[i]}:{self._server_secret}"
-                await self._child_handle.send(msgs, target_id=target_id)
-        else:
-            for i in range(self._n_children):
-                target_id = f"{self._child_names[i]}:{self._server_secret}"
-                await self._child_handle.send(msgs[i], target_id=target_id)
+    async def invoke_all_children(self, action_name: str, args_list: Union[tuple, List[tuple]], kwargs_list: Union[dict, List[dict]] = None):
+        for i in range(self._n_children):
+            target_id = f"{self._child_names[i]}:{self._server_secret}"
+            a = args_list if isinstance(args_list, tuple) else args_list[i]
+            k = kwargs_list if not isinstance(kwargs_list, list) else kwargs_list[i]
+            await self._child_handle.send((action_name, a, k), target_id=target_id)
         results = []
         for _ in range(self._n_children):
-            _, result = await self._child_handle.recv()
+            result = await self._child_handle.recv(action_name)
             results.append(result)
         return results
 
-    @action
-    async def invoke_all_stream(self, msgs: Union[Tuple, List[Tuple]]):
-        if isinstance(msgs, tuple):
-            for i in range(self._n_children):
-                target_id = f"{self._child_names[i]}:{self._server_secret}"
-                await self._child_handle.send(msgs, target_id=target_id)
-        else:
-            for i in range(self._n_children):
-                target_id = f"{self._child_names[i]}:{self._server_secret}"
-                await self._child_handle.send(msgs[i], target_id=target_id)
-        for _ in range(self._n_children):
-            _, result = await self._child_handle.recv()
-            yield result
+    # @action
+    # async def invoke_all_stream(self, msgs: Union[Tuple, List[Tuple]]):
+    #     if isinstance(msgs, tuple):
+    #         for i in range(self._n_children):
+    #             target_id = f"{self._child_names[i]}:{self._server_secret}"
+    #             await self._child_handle.send(msgs, target_id=target_id)
+    #     else:
+    #         for i in range(self._n_children):
+    #             target_id = f"{self._child_names[i]}:{self._server_secret}"
+    #             await self._child_handle.send(msgs[i], target_id=target_id)
+    #     for _ in range(self._n_children):
+    #         _, result = await self._child_handle.recv()
+    #         yield result
 
     @action
     def get_n_actors(self) -> int:
