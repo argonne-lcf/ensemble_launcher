@@ -342,7 +342,7 @@ class _MultiNodeVLLMMixin:
         ckpt_dir: str,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        sync_location: str = f"file://file_{uuid.uuid4().hex}",
+        sync_location: Optional[str] = None,
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
@@ -360,6 +360,10 @@ class _MultiNodeVLLMMixin:
         self.rank_env = rank_env
         self.local_rank_env = local_rank_env
         self.sync_timeout = sync_timeout
+        
+        if sync_location is None:
+            sync_location = f"file://file_{uuid.uuid4().hex}"
+
         if sync_location.startswith("file://"):
             self.sync_location = os.path.join(
                 self._ckpt_dir, sync_location.replace("file://", "")
@@ -428,19 +432,28 @@ class _MultiNodeVLLMMixin:
                         raise
             self.logger.info(f"PUB socket bound to {pub_address}")
 
-            with tempfile.NamedTemporaryFile(
-                mode="w", dir=self._ckpt_dir, delete=False
-            ) as temp:
-                temp.write(
-                    f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}\n"
-                    f"{pub_address}\n"
-                )
-                temp.flush()
-                os.fsync(temp.fileno())
-                temp_path = temp.name
+            self.logger.info(f"Sync location: {self.sync_location}")
+            try:
+                os.makedirs(self._ckpt_dir, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", dir=self._ckpt_dir, delete=False
+                ) as temp:
+                    temp.write(
+                        f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}\n"
+                        f"{pub_address}\n"
+                    )
+                    temp.flush()
+                    os.fsync(temp.fileno())
+                    temp_path = temp.name
+            except Exception as e:
+                self.logger.error(f"Writing temp file failed with exception {e}")
+                raise e
+            
             try:
                 os.replace(temp_path, self.sync_location)
-            except Exception:
+                self.logger.info(f"Wrote the sync file to {self.sync_location}")
+            except Exception as e:
+                self.logger.error(f"os.replace failed with error: {e}")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
                 raise
@@ -485,8 +498,10 @@ class _MultiNodeVLLMMixin:
             ),
         )
 
+        vllm_log_dir = get_log_dir("vllm")
+        os.makedirs(vllm_log_dir, exist_ok=True)
         _setup_vllm_file_logging(
-            f"{get_log_dir()}/vllm_{self._name}_rank{self._rank}.log"
+            f"{vllm_log_dir}/vllm_{self._name}_rank{self._rank}.log"
         )
         from vllm import LLM, envs  # isort: skip
         import torch  # isort: skip
@@ -556,7 +571,7 @@ class _MultiNodeVLLMMixin:
         if self._rank == 0:
             await self._setup_rank0_connection()
 
-        await asyncio.gather(self._recv(), self._send(), self._main_loop())
+        await asyncio.gather(self._recv(), self._send(), self._main_loop(), self._signal_ready())
         await self.on_stop()
         if self._conn is not None:
             await self._conn.close()
@@ -607,12 +622,12 @@ class _MultiNodeVLLMMixin:
     def generate(
         self,
         prompts: Union[str, List[str]],
-        sampling_kwargs: Dict = {"temperature": 0.0, "max_tokens": 1024},
+        sampling_params: Dict = {"temperature": 0.0, "max_tokens": 1024},
         **kwargs,
     ):
         from vllm import SamplingParams
 
-        sampling_params = SamplingParams(**sampling_kwargs)
+        sampling_params = SamplingParams(**sampling_params)
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -635,7 +650,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        sync_location: str = f"file://file_{uuid.uuid4().hex}",
+        sync_location: Optional[str] = None,
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
@@ -676,7 +691,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        sync_location: str = f"file://file_{uuid.uuid4().hex}",
+        sync_location: Optional[str] = None,
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
