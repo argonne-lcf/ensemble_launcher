@@ -322,6 +322,7 @@ class _ActorBase(ABC):
         self,
         name: str,
         max_workers: int = 1,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -339,6 +340,7 @@ class _ActorBase(ABC):
         self._send_retries = send_retries
         self._free_slots = None
         self._running_tasks = None
+        self._run_in_executor = run_in_executor
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -451,9 +453,12 @@ class _ActorBase(ABC):
                 self.logger.warning("Actors don't support async generators yet.")
                 result = None
             else:
-                result = await self._loop.run_in_executor(
-                    self._sync_executor, partial(act, self, *args, **(kwargs or {}))
-                )
+                if self._run_in_executor:
+                    result = await self._loop.run_in_executor(
+                        self._sync_executor, partial(act, self, *args, **(kwargs or {}))
+                    )
+                else:
+                    result = act(self, *args, **(kwargs or {}))
             return result
 
         async with self._free_slots:
@@ -529,6 +534,7 @@ class PublicActor(_ActorBase):
         transport: str = "zmq",
         ckpt_dir: Optional[str] = None,
         max_workers: int = 2,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -537,6 +543,7 @@ class PublicActor(_ActorBase):
             max_workers=max_workers,
             send_timeout=send_timeout,
             send_retries=send_retries,
+            run_in_executor=run_in_executor,
         )
         if ckpt_dir is None:
             ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
@@ -638,6 +645,7 @@ class PrivateActor(_ActorBase):
         name: str,
         client_conn: ClientConnection,
         max_workers: int = 2,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -646,6 +654,7 @@ class PrivateActor(_ActorBase):
             max_workers=max_workers,
             send_timeout=send_timeout,
             send_retries=send_retries,
+            run_in_executor=run_in_executor,
         )
         self._conn = client_conn
 

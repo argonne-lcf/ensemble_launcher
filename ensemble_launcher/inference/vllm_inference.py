@@ -139,12 +139,11 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
-        max_workers: int = 2,
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1,},
         **kwargs,
     ):
         PublicActor.__init__(
-            self, name, transport, ckpt_dir=ckpt_dir, max_workers=max_workers, **kwargs
+            self, name, transport, ckpt_dir=ckpt_dir, max_workers=1, run_in_executor=False, **kwargs
         )
         self._init_vllm(
             model,
@@ -164,12 +163,11 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         client_conn: ClientConnection,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        max_workers: int = 2,
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size" : 1,},
         **kwargs,
     ):
         PrivateActor.__init__(
-            self, name, client_conn, max_workers=max_workers, **kwargs
+            self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs
         )
         self._init_vllm(
             model,
@@ -291,7 +289,7 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
         llm_kwargs: Dict = {},
         **kwargs,
     ):
-        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir, **kwargs)
+        PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir, max_workers=1, run_in_executor=False, **kwargs)
         self._init_vllm_online(
             model,
             cache_dir,
@@ -317,7 +315,7 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
         llm_kwargs: Dict = {},
         **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn, **kwargs)
+        PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
         self._init_vllm_online(
             model,
             cache_dir,
@@ -677,7 +675,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
         **kwargs,
     ):
-        PublicActor.__init__(self, name, transport, **kwargs)
+        PublicActor.__init__(self, name, transport, max_workers=1, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
@@ -720,7 +718,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         gpu_selector: str = "ZE_AFFINITY_MASK",
         **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn, **kwargs)
+        PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
