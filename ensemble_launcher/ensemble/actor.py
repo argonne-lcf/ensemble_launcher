@@ -79,10 +79,18 @@ class ActorHandle:
         return await self._cache[action_name].get()
 
     async def open(self):
-        self._cache: Dict[str, asyncio.Queue] = {name: asyncio.Queue() for name in self._actions.keys()}    
-        self._stop_event = asyncio.Event()
-        await self._conn.open()
-        self._recv_task = asyncio.create_task(self._recv_loop())
+        self.logger = setup_logger(name=self._conn.identity, subdir="handles")
+        try:
+            self._cache: Dict[str, asyncio.Queue] = {name: asyncio.Queue() for name in self._actions.keys()}    
+            self._stop_event = asyncio.Event()
+            self.logger.info("Wainting to open connection")
+            await self._conn.open()
+            self.logger.info("Opened connection")
+            self._recv_task = asyncio.create_task(self._recv_loop())
+            self.logger.info("Successfully opened the handle")
+        except Exception as e:
+            self.logger.error(f"Opening the handle failed with error {e}")
+            raise e
     
     async def close(self):
         self._stop_event.set()
@@ -434,7 +442,7 @@ class _ActorBase(ABC):
     async def _invoke(self, target_id: str, msg: Union[List, Tuple]):
         async def _execute(action_name, args, kwargs):
             act = self.__actions__.get(action_name)
-            self.logger.info(f"Invoking {action_name} with {args} {kwargs}")
+            self.logger.info(f"Invoking {action_name}")
             if inspect.iscoroutinefunction(act):
                 result = await act(self, *args, **(kwargs or {}))
             elif inspect.isasyncgenfunction(act):

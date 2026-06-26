@@ -548,6 +548,10 @@ class _MultiNodeVLLMMixin:
         snapshots = glob(
             f"{self.cache_dir}/hub/models--{self._model_name.replace('/', '--')}/snapshots/*"
         )
+        if len(snapshots) == 0:
+            self.logger.error(f"No snapshots found in {self.cache_dir}")
+            raise RuntimeError
+        
         self.logger.info(f"model: {snapshots[0]}")
         self.logger.info(f"VLLM_CACHE_ROOT:{envs.VLLM_CACHE_ROOT}")
         self.logger.info(
@@ -576,7 +580,12 @@ class _MultiNodeVLLMMixin:
         if self._rank == 0:
             await self._setup_rank0_connection()
 
-        await asyncio.gather(self._recv(), self._send(), self._main_loop(), self._signal_ready())
+        signal_ready = getattr(self, "_signal_ready", None)
+        if callable(signal_ready):
+            asyncio.create_task(self._signal_ready())
+
+        await asyncio.gather(self._recv(), self._send(), self._main_loop())
+
         await self.on_stop()
         if self._conn is not None:
             await self._conn.close()
@@ -639,11 +648,16 @@ class _MultiNodeVLLMMixin:
             single = True
         else:
             single = False
+        self.logger.info(f"Invoking llm with {prompts} {sampling_params} {kwargs}")
+        try:
+            outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
+            results = [output.outputs[0].text for output in outputs]
 
-        outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
-        results = [output.outputs[0].text for output in outputs]
+            self.logger.info(f"Obtained result: {results}")
 
-        return results[0] if single else results
+            return results[0] if single else results
+        except Exception as e:
+            self.logger.error(f"LLM generate failed with exception: {e}")
 
 
 class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
