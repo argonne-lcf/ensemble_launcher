@@ -37,7 +37,7 @@ class _VLLMOfflineMixin:
     ):
         self.model = model
         self.cache_dir = cache_dir
-        self._llm = None
+        self._engine = None
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         self.llm_kwargs = llm_kwargs
@@ -50,11 +50,8 @@ class _VLLMOfflineMixin:
         self.logger.info(
             f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
         )
-        if self._llm is None:
+        if self._engine is None:
             os.environ["MASTER_ADDR"] = "localhost"
-            # Each actor gets a unique VLLM_PORT based on PID so vLLM's
-            # port scanner starts from a different point per process,
-            # avoiding TOCTOU collisions in get_open_port() at scale.
             _actor_port = 10000 + (os.getpid() % 100) * 200
             _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
             os.environ["MASTER_PORT"] = (
@@ -81,11 +78,11 @@ class _VLLMOfflineMixin:
                 except Exception as e:
                     self.logger.error(f"Building model infos failed with error {e}")
                     raise
-            # Setup vllm logging
             vllm_log_dir = get_log_dir("vllm")
             os.makedirs(vllm_log_dir, exist_ok=True)
             _setup_vllm_file_logging(f"{vllm_log_dir}/vllm_{self._name}.log")
-            from vllm import LLM
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.engine.async_llm_engine import AsyncLLMEngine
 
             snapshots = glob(
                 f"{self.cache_dir}/hub/models--{self.model.replace('/', '--')}/snapshots/*"
@@ -96,26 +93,31 @@ class _VLLMOfflineMixin:
                 self.logger.error(f"No snapshots found in {self.cache_dir}/hub.")
                 raise RuntimeError("No snapshots found.")
             try:
-                self._llm = LLM(
+                engine_args = AsyncEngineArgs(
                     model=snapshots[0],
                     trust_remote_code=True,
                     **self.llm_kwargs,
                 )
+                self._engine = AsyncLLMEngine.from_engine_args(engine_args)
             except Exception as e:
                 self.logger.error(f"Starting LLM failed with Exception: {e}")
                 raise RuntimeError(str(e))
             self.logger.info("init done!")
 
     @action
-    def generate(
+    async def generate(
         self,
         prompts: Union[str, List],
         sampling_params: Dict = {"temperature": 0.0, "max_tokens": 1024},
         **kwargs,
     ):
         from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+        from vllm.utils import random_uuid
 
-        sampling_params = SamplingParams(**sampling_params)
+        sp = SamplingParams(
+            **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
+        )
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -123,10 +125,20 @@ class _VLLMOfflineMixin:
         else:
             single = False
 
-        outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
-        results = [output.outputs[0].text for output in outputs]
+        async def _single_generate(prompt):
+            final = None
+            async for out in self._engine.generate(
+                prompt, sp, request_id=random_uuid()
+            ):
+                final = out
+            return final.outputs[0].text
 
-        return results[0] if single else results
+        results = await asyncio.gather(*[_single_generate(p) for p in prompts])
+        return results[0] if single else list(results)
+
+    async def on_stop(self):
+        if self._engine is not None:
+            self._engine.shutdown()
 
 
 class VLLMInference(_VLLMOfflineMixin, PublicActor):
@@ -374,7 +386,7 @@ class _MultiNodeVLLMMixin:
         self._pub_socket = None
         self._sub_socket = None
         self._zmq_context = None
-        self._llm = None
+        self._engine = None
         self.llm_kwargs = llm_kwargs
         self.gpu_selector = gpu_selector
 
@@ -506,7 +518,9 @@ class _MultiNodeVLLMMixin:
         _setup_vllm_file_logging(
             f"{vllm_log_dir}/vllm_{self._name}_rank{self._rank}.log"
         )
-        from vllm import LLM, envs  # isort: skip
+        from vllm.engine.arg_utils import AsyncEngineArgs  # isort: skip
+        from vllm.engine.async_llm_engine import AsyncLLMEngine  # isort: skip
+        import vllm.envs as envs  # isort: skip
         import torch  # isort: skip
 
         torch.xpu.set_device(self._local_rank)
@@ -549,20 +563,21 @@ class _MultiNodeVLLMMixin:
         if len(snapshots) == 0:
             self.logger.error(f"No snapshots found in {self.cache_dir}")
             raise RuntimeError
-        
+
         self.logger.info(f"model: {snapshots[0]}")
         self.logger.info(f"VLLM_CACHE_ROOT:{envs.VLLM_CACHE_ROOT}")
         self.logger.info(
             f"{self._rank},{self._local_rank},{os.environ[self.gpu_selector]}"
         )
         try:
-            self._llm = LLM(
+            engine_args = AsyncEngineArgs(
                 model=snapshots[0],
                 trust_remote_code=True,
                 distributed_executor_backend="external_launcher",
                 seed=1,
                 **self.llm_kwargs,
             )
+            self._engine = AsyncLLMEngine.from_engine_args(engine_args)
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
             raise RuntimeError(str(e))
@@ -623,6 +638,8 @@ class _MultiNodeVLLMMixin:
                     pass
 
     async def on_stop(self):
+        if self._engine is not None:
+            self._engine.shutdown()
         if self._pub_socket is not None:
             self._pub_socket.close()
         if self._sub_socket is not None:
@@ -631,31 +648,44 @@ class _MultiNodeVLLMMixin:
             self._zmq_context.term()
 
     @action
-    def generate(
+    async def generate(
         self,
         prompts: Union[str, List[str]],
         sampling_params: Dict = {"temperature": 0.0, "max_tokens": 1024},
         **kwargs,
     ):
         from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+        from vllm.utils import random_uuid
 
-        sampling_params = SamplingParams(**sampling_params)
+        sp = SamplingParams(
+            **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
+        )
 
         if isinstance(prompts, str):
             prompts = [prompts]
             single = True
         else:
             single = False
-        self.logger.info(f"Invoking llm with {prompts} {sampling_params} {kwargs}")
+
+        self.logger.info(f"Invoking engine with {prompts} {sp} {kwargs}")
         try:
-            outputs = self._llm.generate(prompts, sampling_params=sampling_params, **kwargs)
-            results = [output.outputs[0].text for output in outputs]
+            async def _single_generate(prompt):
+                final = None
+                async for out in self._engine.generate(
+                    prompt, sp, request_id=random_uuid()
+                ):
+                    final = out
+                return final.outputs[0].text
+
+            results = await asyncio.gather(*[_single_generate(p) for p in prompts])
+            results = list(results)
 
             self.logger.info(f"Obtained result: {results}")
 
             return results[0] if single else results
         except Exception as e:
-            self.logger.error(f"LLM generate failed with exception: {e}")
+            self.logger.error(f"Engine generate failed with exception: {e}")
 
 
 class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
