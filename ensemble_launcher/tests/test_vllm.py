@@ -77,7 +77,6 @@ async def test_offline_inference():
             transport="zmq",
             model=model,
             cache_dir=model_cache,
-            tensor_parallel_size=1,
             ckpt_dir=actor_ckpt,
         )
         task = actor.create_task(
@@ -323,7 +322,6 @@ async def test_private_offline_inference():
             model=model,
             cache_dir=model_cache,
             client_conn=client,
-            tensor_parallel_size=1,
         )
         task = actor.create_task(
             actor_id,
@@ -339,11 +337,11 @@ async def test_private_offline_inference():
 
             logger.info("Opening transport connection")
             await handle.open()
+            await handle.wait_for_ready(expected=1)
 
             target_id = f"{actor_id}:{secret}"
             logger.info("Sending inference request")
-            await handle.send(("generate", ("hello",), None), target_id=target_id)
-            sender_id, result = await asyncio.wait_for(handle.recv(), timeout=120)
+            result = await asyncio.wait_for(handle.generate("hello",actor_id=target_id), timeout=120)
             logger.info("Inference result: %s", result)
 
     except Exception:
