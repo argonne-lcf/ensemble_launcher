@@ -24,6 +24,16 @@ from .utils import _build_model_cache, _setup_vllm_file_logging
 # ---------------------------------------------------------------------------
 # Mixin 1: Offline (in-process) vLLM inference
 # ---------------------------------------------------------------------------
+# Two engine backends via async_engine flag:
+#   False (default) — sync LLM with InprocClient. All prompts are added to
+#       the engine core before stepping, so batch prefill runs in one GPU
+#       kernel. Best throughput for batch workloads.
+#   True — AsyncLLMEngine with AsyncMPClient (separate process + ZMQ).
+#       Supports concurrent generate() calls (max_workers > 1), but the
+#       engine core's busy loop steps on the first ZMQ arrival, causing
+#       batch fragmentation (prompts prefill in small groups instead of
+#       one large batch).
+# ---------------------------------------------------------------------------
 
 
 class _VLLMOfflineMixin:
@@ -34,10 +44,12 @@ class _VLLMOfflineMixin:
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         llm_kwargs: Dict[str, Any] = {},
+        async_engine: bool = False,
     ):
         self.model = model
         self.cache_dir = cache_dir
         self._engine = None
+        self._async_engine = async_engine
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         self.llm_kwargs = llm_kwargs
@@ -81,8 +93,6 @@ class _VLLMOfflineMixin:
             vllm_log_dir = get_log_dir("vllm")
             os.makedirs(vllm_log_dir, exist_ok=True)
             _setup_vllm_file_logging(f"{vllm_log_dir}/vllm_{self._name}.log")
-            from vllm.engine.arg_utils import AsyncEngineArgs
-            from vllm.engine.async_llm_engine import AsyncLLMEngine
 
             snapshots = glob(
                 f"{self.cache_dir}/hub/models--{self.model.replace('/', '--')}/snapshots/*"
@@ -93,12 +103,24 @@ class _VLLMOfflineMixin:
                 self.logger.error(f"No snapshots found in {self.cache_dir}/hub.")
                 raise RuntimeError("No snapshots found.")
             try:
-                engine_args = AsyncEngineArgs(
-                    model=snapshots[0],
-                    trust_remote_code=True,
-                    **self.llm_kwargs,
-                )
-                self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+                if self._async_engine:
+                    from vllm.engine.arg_utils import AsyncEngineArgs
+                    from vllm.engine.async_llm_engine import AsyncLLMEngine
+
+                    engine_args = AsyncEngineArgs(
+                        model=snapshots[0],
+                        trust_remote_code=True,
+                        **self.llm_kwargs,
+                    )
+                    self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+                else:
+                    from vllm import LLM
+
+                    self._engine = LLM(
+                        model=snapshots[0],
+                        trust_remote_code=True,
+                        **self.llm_kwargs,
+                    )
             except Exception as e:
                 self.logger.error(f"Starting LLM failed with Exception: {e}")
                 raise RuntimeError(str(e))
@@ -112,12 +134,6 @@ class _VLLMOfflineMixin:
         **kwargs,
     ):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
-        from vllm.utils import random_uuid
-
-        sp = SamplingParams(
-            **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
-        )
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -125,20 +141,38 @@ class _VLLMOfflineMixin:
         else:
             single = False
 
-        async def _single_generate(prompt):
-            final = None
-            async for out in self._engine.generate(
-                prompt, sp, request_id=random_uuid()
-            ):
-                final = out
-            return final.outputs[0].text
+        if self._async_engine:
+            from vllm.sampling_params import RequestOutputKind
+            from vllm.utils import random_uuid
 
-        results = await asyncio.gather(*[_single_generate(p) for p in prompts])
+            sp = SamplingParams(
+                **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
+            )
+
+            async def _single_generate(prompt):
+                final = None
+                async for out in self._engine.generate(
+                    prompt, sp, request_id=random_uuid()
+                ):
+                    final = out
+                return final.outputs[0].text
+
+            results = await asyncio.gather(*[_single_generate(p) for p in prompts])
+        else:
+            sp = SamplingParams(**sampling_params)
+            outputs = self._engine.generate(prompts, sampling_params=sp, **kwargs)
+            results = [output.outputs[0].text for output in outputs]
+
         return results[0] if single else list(results)
 
     async def on_stop(self):
         if self._engine is not None:
-            self._engine.shutdown()
+            if self._async_engine:
+                self._engine.shutdown()
+            else:
+                self._engine.llm_engine.engine_core.shutdown()
+                del self._engine
+                self._engine = None
 
 
 class VLLMInference(_VLLMOfflineMixin, PublicActor):
@@ -152,17 +186,24 @@ class VLLMInference(_VLLMOfflineMixin, PublicActor):
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1,},
+        async_engine: bool = False,
+        max_workers: int = 1,
         **kwargs,
     ):
+        if async_engine:
+            _max_workers = max_workers
+        else:
+            _max_workers = 1
         PublicActor.__init__(
-            self, name, transport, ckpt_dir=ckpt_dir, max_workers=1, run_in_executor=False, **kwargs
+            self, name, transport, ckpt_dir=ckpt_dir, max_workers=_max_workers, run_in_executor=False, **kwargs
         )
         self._init_vllm(
             model,
             cache_dir,
             use_cached_modelinfo=use_cached_modelinfo,
             model_info_cache=model_info_cache,
-            llm_kwargs = llm_kwargs,
+            llm_kwargs=llm_kwargs,
+            async_engine=async_engine,
         )
 
 
@@ -176,10 +217,16 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size" : 1,},
+        async_engine: bool = False,
+        max_workers: int = 1,
         **kwargs,
     ):
+        if async_engine:
+            _max_workers = max_workers
+        else:
+            _max_workers = 1
         PrivateActor.__init__(
-            self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs
+            self, name, client_conn, max_workers=_max_workers, run_in_executor=False, **kwargs
         )
         self._init_vllm(
             model,
@@ -187,6 +234,7 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
             use_cached_modelinfo=use_cached_modelinfo,
             model_info_cache=model_info_cache,
             llm_kwargs=llm_kwargs,
+            async_engine=async_engine,
         )
 
 
@@ -357,13 +405,14 @@ class _MultiNodeVLLMMixin:
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
         llm_kwargs: Optional[Dict] = None,
-        gpu_selector: str = "ZE_AFFINITY_MASK",
+        async_engine: bool = False,
     ):
         self._model_name = model
         self.cache_dir = cache_dir
         self._ckpt_dir = ckpt_dir
         self.tensor_parallel_size = llm_kwargs.get("tensor_parallel_size",1) if llm_kwargs is not None else {}
         self.pipeline_parallel_size = llm_kwargs.get("pipeline_parallel_size",1) if llm_kwargs is not None else {}
+        self._async_engine = async_engine
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         if self._use_cached_modelinfo:
@@ -371,7 +420,7 @@ class _MultiNodeVLLMMixin:
         self.rank_env = rank_env
         self.local_rank_env = local_rank_env
         self.sync_timeout = sync_timeout
-        
+
         if sync_location is None:
             sync_location = f"file://file_{uuid.uuid4().hex}"
 
@@ -518,8 +567,6 @@ class _MultiNodeVLLMMixin:
         _setup_vllm_file_logging(
             f"{vllm_log_dir}/vllm_{self._name}_rank{self._rank}.log"
         )
-        from vllm.engine.arg_utils import AsyncEngineArgs  # isort: skip
-        from vllm.engine.async_llm_engine import AsyncLLMEngine  # isort: skip
         import vllm.envs as envs  # isort: skip
         import torch  # isort: skip
 
@@ -570,14 +617,28 @@ class _MultiNodeVLLMMixin:
             f"{self._rank},{self._local_rank},{os.environ[self.gpu_selector]}"
         )
         try:
-            engine_args = AsyncEngineArgs(
-                model=snapshots[0],
-                trust_remote_code=True,
-                distributed_executor_backend="external_launcher",
-                seed=1,
-                **self.llm_kwargs,
-            )
-            self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+            if self._async_engine:
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.engine.async_llm_engine import AsyncLLMEngine
+
+                engine_args = AsyncEngineArgs(
+                    model=snapshots[0],
+                    trust_remote_code=True,
+                    distributed_executor_backend="external_launcher",
+                    seed=1,
+                    **self.llm_kwargs,
+                )
+                self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+            else:
+                from vllm import LLM
+
+                self._engine = LLM(
+                    model=snapshots[0],
+                    trust_remote_code=True,
+                    distributed_executor_backend="external_launcher",
+                    seed=1,
+                    **self.llm_kwargs,
+                )
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
             raise RuntimeError(str(e))
@@ -639,7 +700,12 @@ class _MultiNodeVLLMMixin:
 
     async def on_stop(self):
         if self._engine is not None:
-            self._engine.shutdown()
+            if self._async_engine:
+                self._engine.shutdown()
+            else:
+                self._engine.llm_engine.engine_core.shutdown()
+                del self._engine
+                self._engine = None
         if self._pub_socket is not None:
             self._pub_socket.close()
         if self._sub_socket is not None:
@@ -655,12 +721,6 @@ class _MultiNodeVLLMMixin:
         **kwargs,
     ):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
-        from vllm.utils import random_uuid
-
-        sp = SamplingParams(
-            **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
-        )
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -668,18 +728,30 @@ class _MultiNodeVLLMMixin:
         else:
             single = False
 
-        self.logger.info(f"Invoking engine with {prompts} {sp} {kwargs}")
+        self.logger.info(f"Invoking engine with {prompts} {sampling_params} {kwargs}")
         try:
-            async def _single_generate(prompt):
-                final = None
-                async for out in self._engine.generate(
-                    prompt, sp, request_id=random_uuid()
-                ):
-                    final = out
-                return final.outputs[0].text
+            if self._async_engine:
+                from vllm.sampling_params import RequestOutputKind
+                from vllm.utils import random_uuid
 
-            results = await asyncio.gather(*[_single_generate(p) for p in prompts])
-            results = list(results)
+                sp = SamplingParams(
+                    **sampling_params, output_kind=RequestOutputKind.FINAL_ONLY
+                )
+
+                async def _single_generate(prompt):
+                    final = None
+                    async for out in self._engine.generate(
+                        prompt, sp, request_id=random_uuid()
+                    ):
+                        final = out
+                    return final.outputs[0].text
+
+                results = await asyncio.gather(*[_single_generate(p) for p in prompts])
+                results = list(results)
+            else:
+                sp = SamplingParams(**sampling_params)
+                outputs = self._engine.generate(prompts, sampling_params=sp, **kwargs)
+                results = [output.outputs[0].text for output in outputs]
 
             self.logger.info(f"Obtained result: {results}")
 
@@ -703,9 +775,15 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         sync_timeout: float = 60,
         gpu_selector: str = "ZE_AFFINITY_MASK",
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
+        async_engine: bool = False,
+        max_workers: int = 1,
         **kwargs,
     ):
-        PublicActor.__init__(self, name, transport, max_workers=1, run_in_executor=False, **kwargs)
+        if async_engine:
+            _max_workers = max_workers
+        else:
+            _max_workers = 1
+        PublicActor.__init__(self, name, transport, max_workers=_max_workers, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
@@ -717,7 +795,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
             local_rank_env=local_rank_env,
             sync_timeout=sync_timeout,
             llm_kwargs=llm_kwargs,
-            gpu_selector=gpu_selector,
+            async_engine=async_engine,
         )
 
     async def _setup_rank0_connection(self):
@@ -745,10 +823,15 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
-        gpu_selector: str = "ZE_AFFINITY_MASK",
+        async_engine: bool = False,
+        max_workers: int = 1,
         **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
+        if async_engine:
+            _max_workers = max_workers
+        else:
+            _max_workers = 1
+        PrivateActor.__init__(self, name, client_conn, max_workers=_max_workers, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
@@ -760,7 +843,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
             local_rank_env=local_rank_env,
             sync_timeout=sync_timeout,
             llm_kwargs=llm_kwargs,
-            gpu_selector=gpu_selector,
+            async_engine=async_engine,
         )
 
     async def _setup_rank0_connection(self):
