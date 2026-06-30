@@ -14,11 +14,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import cloudpickle
 
-from ensemble_launcher.comm.pipe import ClientConnection, get_hsn_ip_cli
+from ensemble_launcher.comm.pipe import ClientConnection, get_hsn_ip_cli, find_free_port
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import get_log_dir, setup_logger
 
-from .utils import _build_model_cache, find_free_port, _setup_vllm_file_logging
+from .utils import _build_model_cache, _setup_vllm_file_logging
 
 
 # ---------------------------------------------------------------------------
