@@ -103,6 +103,7 @@ class ActorPool(PrivateActor):
                 task = actor.create_task(task_id=task_id, nnodes=nnodes, ppn=ppn, **tkw)
                 tasks.append(task)
 
+            self.logger.info(f"created {len(tasks)} tasks")
             from ensemble_launcher.orchestrator import ClusterClient  # noqa: E402
 
             self._cluster_client = ClusterClient(
@@ -112,6 +113,8 @@ class ActorPool(PrivateActor):
             )
             self._cluster_client.__enter__()
             self._child_futures = [self._cluster_client.submit(t) for t in tasks]
+
+            self.logger.info(f"submitted {len(tasks)} tasks")
 
             self._child_handle = PrivateActor.create_handle(
                 server_conn,
@@ -127,6 +130,9 @@ class ActorPool(PrivateActor):
                 f"ActorPool '{self._name}': {self._n_children} children ready"
             )
         except Exception as e:
+            for cid, future in enumerate(self._child_futures):
+                if future.done() and future.exception() is not None:
+                    self.logger.error(f"child {cid} failed with exception {future.exception()}")
             if self._child_handle is not None:
                 await self._child_handle.stop()
             self.logger.error(f"on_start failed with Exception {e}")

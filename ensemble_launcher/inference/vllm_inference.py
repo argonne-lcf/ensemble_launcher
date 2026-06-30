@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import cloudpickle
 
-from ensemble_launcher.comm.pipe import ClientConnection
+from ensemble_launcher.comm.pipe import ClientConnection, get_hsn_ip_cli
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
 from ensemble_launcher.logging import get_log_dir, setup_logger
 
@@ -347,6 +347,7 @@ class _MultiNodeVLLMMixin:
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
         llm_kwargs: Optional[Dict] = None,
+        gpu_selector: str = "ZE_AFFINITY_MASK",
     ):
         self._model_name = model
         self.cache_dir = cache_dir
@@ -377,6 +378,7 @@ class _MultiNodeVLLMMixin:
         self._zmq_context = None
         self._llm = None
         self.llm_kwargs = llm_kwargs
+        self.gpu_selector = gpu_selector
 
     async def on_start(self):
         if self.logger is None:
@@ -401,7 +403,7 @@ class _MultiNodeVLLMMixin:
         from zmq.asyncio import Context as AsyncContext
         from zmq.asyncio import Socket as AsyncSocket
 
-        hostname = socket.gethostname()
+        hostname = get_hsn_ip_cli() or socket.gethostname()
 
         if self._rank == 0:
             os.environ["MASTER_ADDR"] = hostname
@@ -489,14 +491,17 @@ class _MultiNodeVLLMMixin:
         os.environ["WORLD_SIZE"] = str(
             self.tensor_parallel_size * self.pipeline_parallel_size
         )
-        os.environ.pop("ZE_AFFINITY_MASK", None)
-        os.environ["ZE_AFFINITY_MASK"] = os.environ.get(
-            f"AVAILABLE_GPUS_{hostname}",
+        self.logger.info("after setting local rank")
+        os.environ.pop(self.gpu_selector, None)
+        os.environ[self.gpu_selector] = os.environ.get(
+            f"AVAILABLE_GPUS_{socket.gethostname()}",
             os.environ.get(
                 "AVAILABLE_GPUS",
                 ",".join(map(str, list(range(self.tensor_parallel_size)))),
             ),
         )
+
+        self.logger.info(f"{self.gpu_selector}: {os.environ[self.gpu_selector]}")
 
         vllm_log_dir = get_log_dir("vllm")
         os.makedirs(vllm_log_dir, exist_ok=True)
@@ -546,7 +551,7 @@ class _MultiNodeVLLMMixin:
         self.logger.info(f"model: {snapshots[0]}")
         self.logger.info(f"VLLM_CACHE_ROOT:{envs.VLLM_CACHE_ROOT}")
         self.logger.info(
-            f"{self._rank},{self._local_rank},{os.environ['ZE_AFFINITY_MASK']}"
+            f"{self._rank},{self._local_rank},{os.environ[self.gpu_selector]}"
         )
         try:
             self._llm = LLM(
@@ -654,6 +659,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
         rank_env: str = "PALS_RANKID",
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
+        gpu_selector: str = "ZE_AFFINITY_MASK",
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
         **kwargs,
     ):
@@ -669,6 +675,7 @@ class MultiNodeVLLMInference(_MultiNodeVLLMMixin, PublicActor):
             local_rank_env=local_rank_env,
             sync_timeout=sync_timeout,
             llm_kwargs=llm_kwargs,
+            gpu_selector=gpu_selector,
         )
 
     async def _setup_rank0_connection(self):
@@ -696,6 +703,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
         local_rank_env: str = "PALS_LOCAL_RANKID",
         sync_timeout: float = 60,
         llm_kwargs: Dict = {"max_model_len": 2048, "tensor_parallel_size": 1, "pipeline_parallel_size":1},
+        gpu_selector: str = "ZE_AFFINITY_MASK",
         **kwargs,
     ):
         PrivateActor.__init__(self, name, client_conn, **kwargs)
@@ -710,6 +718,7 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
             local_rank_env=local_rank_env,
             sync_timeout=sync_timeout,
             llm_kwargs=llm_kwargs,
+            gpu_selector=gpu_selector,
         )
 
     async def _setup_rank0_connection(self):

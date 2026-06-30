@@ -1,5 +1,7 @@
 import random
+import re
 import socket
+import subprocess
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
@@ -18,6 +20,26 @@ from .async_connection import (
 from .registry import transport_registry
 
 T = TypeVar("T", bound="AsyncTransportState")
+
+def get_hsn_ip_cli(ifname="hsn0")->Optional[str]:
+    """
+    Retrieves the IPv4 address by parsing the standard Linux `ip` command.
+    """
+    try:
+        # Run: ip -4 addr show hsn0
+        output = subprocess.check_output(
+            ["ip", "-4", "addr", "show", ifname],
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8')
+
+        # Regex to match the first IPv4 address in the output
+        match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', output)
+        if match:
+            return match.group(1)
+
+    except subprocess.CalledProcessError:
+        pass # Interface doesn't exist or command failed
+
 
 
 class AsyncTransportState(BaseModel):
@@ -129,7 +151,7 @@ class AsyncZMQTransport(AsyncTransport):
 
     def __init__(self, lightweight: bool = False):
         super().__init__()
-        hn = socket.gethostname()
+        hn = get_hsn_ip_cli() or socket.gethostname()
         hostname = "localhost" if "local" in hn else hn
         self._hostname = hostname
         self._lightweight = lightweight

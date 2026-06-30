@@ -5,6 +5,7 @@ import socket
 import pytest
 from utils import echo, echo_stdout
 
+from ensemble_launcher.helper_functions import get_nodes
 from ensemble_launcher.config import (
     LauncherConfig,
     MPIConfig,
@@ -78,23 +79,24 @@ async def test_async_mpi_master(nlevels=1):
             args=(f"task-{i}",),
         )
 
-    nodes = [socket.gethostname()]
+    nodes = get_nodes()
     sys_info = NodeResourceList.from_config(
         SystemConfig(name="local", cpus=list(range(1, 13)), ncpus=12)
     )
-    job_resource = JobResource(resources=[sys_info], nodes=nodes)
+    job_resource = JobResource(resources=[sys_info] * len(nodes), nodes=nodes)
 
     m = AsyncMaster(
         "test",
         LauncherConfig(
             return_stdout=True,
             comm_name="async_zmq",
-            policy_config=PolicyConfig(nlevels=nlevels),
+            child_scheduler_policy="simple_split_children_policy",
+            policy_config=PolicyConfig(nlevels=nlevels,nchildren=2),
             child_executor_name="async_mpi",
-            task_executor_name="async_mpi",
+            task_executor_name="async_processpool",
             log_level=logging.INFO,
             mpi_config=MPIConfig(flavor="test"),
-            sequential_child_launch=True,
+            sequential_child_launch=False,
             heartbeat_interval=0.1,
             heartbeat_dead_threshold=5.0,
             master_logs=True,
@@ -116,9 +118,9 @@ async def test_async_mpi_master(nlevels=1):
 
 
 if __name__ == "__main__":
-    print("Testing Async Master with ProcessPool Executor for 1 task per core")
-    asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
+    #print("Testing Async Master with ProcessPool Executor for 1 task per core")
+    #asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
     # print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
     # asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
-    # print("Testing Async Master with MPI Executor")
-    # asyncio.run(test_async_mpi_master(nlevels=3))
+    print("Testing Async Master with MPI Executor")
+    asyncio.run(test_async_mpi_master(nlevels=3))

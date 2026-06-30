@@ -363,6 +363,7 @@ class AsyncMaster(Node):
         self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
         target_ids = set(self._scheduler.child_assignments.keys()) - existing_ids
+        self.logger.info(f"{self._scheduler.child_assignments}")
         return self._instantiate_children(include_tasks, target_ids)
 
     async def _init_child(self, child_id: str, child: Node) -> None:
@@ -476,6 +477,7 @@ class AsyncMaster(Node):
         if self._config.child_executor_name == "async_mpi":
             child_nodes = child_obj.init_nodes
             head_node = child_nodes.nodes[0]
+            self.logger.info(f"head node: {head_node}")
 
             # Serialize child object
             child_dict = child_obj.asdict()
@@ -664,6 +666,7 @@ class AsyncMaster(Node):
                 if cb is not None:
                     future.add_done_callback(cb)
             else:
+                self.logger.info("Launching children in serial")
                 ##launch children in parallel using gather
                 launch_tasks = [
                     self._launch_child(child_name, child_obj, child_idx)
