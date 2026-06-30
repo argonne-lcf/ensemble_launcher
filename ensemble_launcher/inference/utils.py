@@ -5,16 +5,15 @@ import inspect
 import json
 import os
 import pkgutil
-import random
-import socket
 import tempfile
 import uuid
-from glob import glob
 from logging import Logger
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any, Dict, Iterable, List, Optional, Type
 from time import perf_counter
+
+from ensemble_launcher.comm.pipe import find_free_port
 
 def _setup_vllm_file_logging(log_file: str):
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -188,29 +187,6 @@ def _build_model_cache(logger: Logger = None) -> int:
 
 
 build_model_cache = _build_model_cache
-
-
-def find_free_port(
-    port_range: Tuple[int, int], host: str = "127.0.0.1"
-) -> Optional[int]:
-    """
-    Attempts to find a free port within the given range by binding to it.
-    Checks ports in a random order to reduce collisions between concurrent startups.
-    """
-    # Create a list of all ports in the range and shuffle them
-    ports_to_check = list(range(port_range[0], port_range[1]))
-    random.shuffle(ports_to_check)
-
-    for port in ports_to_check:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind((host, port))
-                return port
-            except OSError:
-                continue
-
-    return None
-
 
 def call_llm(
     model: str,

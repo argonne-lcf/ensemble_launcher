@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel
 
+from .utils import find_free_port
+
 from .async_connection import (
     AsyncZMQDealerConnection,
     AsyncZMQDealerConnectionState,
@@ -165,9 +167,10 @@ class AsyncZMQTransport(AsyncTransport):
         router = self._server_connections.get(key, None)
 
         if router is None:
+            free_port = find_free_port((10000, 30000), self._hostname)
             address = (
                 kwargs.get("address")
-                or f"{self._hostname}:{5555 + random.randint(1, 5000)}"
+                or f"{self._hostname}:{free_port}"
             )
             expected_remotes = kwargs.get("expected_remotes", None)
             router = AsyncZMQRouterConnection(
