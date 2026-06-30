@@ -473,7 +473,7 @@ class AsyncMaster(Node):
             child_idx: Index of the child, used to set EL_CHILDID in the environment.
         """
 
-        if self._config.child_executor_name == "async_mpi":
+        if self._config.child_executor_name in ("async_mpi", "async_ssh"):
             child_nodes = child_obj.init_nodes
             head_node = child_nodes.nodes[0]
 
@@ -543,7 +543,7 @@ class AsyncMaster(Node):
         for child_name in child_names:
             children[child_name] = self._child_objs[child_name]
 
-        if self._config.child_executor_name == "async_mpi":
+        if self._config.child_executor_name in ("async_mpi", "async_ssh"):
             first_headnode = next(iter(children.values())).init_nodes.resources[0]
             worker_equality = all(
                 [
@@ -551,7 +551,7 @@ class AsyncMaster(Node):
                     for child in children.values()
                 ]
             )
-            if len(child_names) > 1 and (
+            if self._config.child_executor_name == "async_mpi" and len(child_names) > 1 and (
                 (worker_equality and self._config.sequential_child_launch is None)
                 or (
                     self._config.sequential_child_launch is not None
