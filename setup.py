@@ -18,10 +18,12 @@ setup(
         "pyzmq",
         "loky",
         "typer",
+        "uvloop",
     ],
     extras_require={
         "dragonhpc": ["dragonhpc"],
         "mcp": ["mcp", "paramiko"],
+        "inference": ["vllm"]
     },
     entry_points={
         "console_scripts": [

@@ -509,7 +509,8 @@ class _ActorBase(ABC):
         pass
 
     def __call__(self):
-        asyncio.run(self._run())
+        from ensemble_launcher.loop import run
+        run(self._run())
 
     def create_task(
         self,

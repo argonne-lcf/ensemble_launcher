@@ -299,7 +299,8 @@ if __name__ == "__main__":
     logger = setup_logger(__name__, node_id="mpi_pool")
 
     if RANK == 0:
-        asyncio.run(run_master(args.socket_base))
+        from ensemble_launcher.loop import run
+        run(run_master(args.socket_base))
     else:
         run_worker()
 

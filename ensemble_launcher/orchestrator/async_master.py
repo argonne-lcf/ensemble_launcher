@@ -1981,7 +1981,8 @@ class AsyncMaster(Node):
 
     def create_an_event_loop(self) -> None:
         """Entry point for a new child process: run the async event loop."""
-        asyncio.run(self.run())
+        from ensemble_launcher.loop import run
+        run(self.run())
 
     # -------------------------------------------------------------------------
     #                       Serialization and Deserialization

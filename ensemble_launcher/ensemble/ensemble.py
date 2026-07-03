@@ -212,7 +212,8 @@ class _AsyncWrapper:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self._loop is not None:
             return self._loop.run_until_complete(self._fn(*args, **kwargs))
-        return asyncio.run(self._fn(*args, **kwargs))
+        from ensemble_launcher.loop import run
+        return run(self._fn(*args, **kwargs))
 
 
 class AsyncTask(Task):
