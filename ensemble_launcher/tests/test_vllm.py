@@ -294,9 +294,8 @@ async def test_online_inference():
             transport="zmq",
             model=model,
             cache_dir=model_cache,
-            tensor_parallel_size=1,
+            server_args={"tensor_parallel_size":1, "port":8001},
             ckpt_dir=actor_ckpt,
-            port=8001,
         )
 
         task = actor.create_task(

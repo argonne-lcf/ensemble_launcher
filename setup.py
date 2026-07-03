@@ -22,7 +22,7 @@ setup(
     extras_require={
         "dragonhpc": ["dragonhpc"],
         "mcp": ["mcp", "paramiko"],
-        "inference": ["vllm", "uvloop"]
+        "inference": ["vllm", "uvloop", "uvicorn", "fastapi"]
     },
     entry_points={
         "console_scripts": [

@@ -35,6 +35,129 @@ from .utils import _build_model_cache, _setup_vllm_file_logging
 #       one large batch).
 # ---------------------------------------------------------------------------
 
+def _setup_env(name,
+                logger,
+                model: str,
+                cache_dir: str,
+                use_cached_modelinfo: bool = False,
+                model_info_cache: Optional[str] = None):
+    os.environ["MASTER_ADDR"] = "localhost"
+    _actor_port = 10000 + (os.getpid() % 100) * 200
+    _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
+    os.environ["MASTER_PORT"] = (
+        str(_actor_port) if _actor_port is not None else "0"
+    )
+    os.environ["VLLM_PORT"] = (
+        str(_actor_port) if _actor_port is not None else "0"
+    )
+    os.environ["VLLM_HOST_IP"] = "localhost"
+    if use_cached_modelinfo:
+        os.environ["VLLM_CACHE_ROOT"] = model_info_cache
+        logger.info(f"Reusing cache at {model_info_cache}")
+        logger.debug("File list in cache")
+        for root, dirs, files in os.walk(model_info_cache):
+            for file in files:
+                logger.debug(f"{file}")
+    else:
+        if model_info_cache is None:
+            model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
+        os.environ["VLLM_CACHE_ROOT"] = model_info_cache
+        try:
+            os.makedirs(os.environ["VLLM_CACHE_ROOT"])
+            _build_model_cache(logger=logger.getChild("BuildModelInfo"))
+        except Exception as e:
+            logger.error(f"Building model infos failed with error {e}")
+            raise
+    vllm_log_dir = get_log_dir("vllm")
+    os.makedirs(vllm_log_dir, exist_ok=True)
+    _setup_vllm_file_logging(f"{vllm_log_dir}/vllm_{name}.log")
+    snapshots = glob(
+        f"{cache_dir}/hub/models--{model.replace('/', '--')}/snapshots/*"
+    )
+    if len(snapshots) > 0:
+        logger.info(f"model: {snapshots[0]}")
+    else:
+        logger.error(f"No snapshots found in {cache_dir}/hub.")
+        raise RuntimeError("No snapshots found.")
+    
+    return snapshots
+
+def _create_engine(name,
+                   logger,
+                   model: str,
+                   cache_dir: str,
+                   use_cached_modelinfo: bool = False,
+                   model_info_cache: Optional[str] = None,
+                   llm_kwargs: Dict[str, Any] = {},
+                   async_engine: bool = False):
+    
+    snapshots = _setup_env( name, 
+                            logger, 
+                            model, 
+                            cache_dir, 
+                            use_cached_modelinfo, 
+                            model_info_cache)
+    try:
+        if async_engine:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.engine.async_llm_engine import AsyncLLMEngine
+            engine_args = AsyncEngineArgs(
+                model=snapshots[0],
+                trust_remote_code=True,
+                **llm_kwargs,
+            )
+            engine = AsyncLLMEngine.from_engine_args(engine_args)
+        else:
+            from vllm import LLM
+            engine = LLM(
+                model=snapshots[0],
+                trust_remote_code=True,
+                **llm_kwargs,
+            )
+        return engine
+    except Exception as e:
+        logger.error(f"Starting LLM failed with Exception: {e}")
+        raise RuntimeError(str(e))
+
+def _create_online_engine(name,
+                   logger,
+                   model: str,
+                   cache_dir: str,
+                   use_cached_modelinfo: bool = False,
+                   model_info_cache: Optional[str] = None,
+                   server_args: Dict = {}):
+
+    snapshots = _setup_env(name, logger, model, cache_dir,
+                           use_cached_modelinfo, model_info_cache)
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
+    from vllm.entrypoints.openai.cli_args import make_arg_parser
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    cli_overrides = []
+    for key, value in server_args.items():
+        arg_key = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                cli_overrides.append(arg_key)
+        elif isinstance(value, list):
+            cli_overrides.append(arg_key)
+            cli_overrides.extend(str(v) for v in value)
+        else:
+            cli_overrides.extend([arg_key, str(value)])
+
+    parser = FlexibleArgumentParser()
+    parser = make_arg_parser(parser)
+    args = parser.parse_args(
+        ["--model", snapshots[0], "--trust-remote-code"] + cli_overrides)
+
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+    return args, engine
+
+    
 
 class _VLLMOfflineMixin:
     def _init_vllm(
@@ -63,68 +186,15 @@ class _VLLMOfflineMixin:
             f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
         )
         if self._engine is None:
-            os.environ["MASTER_ADDR"] = "localhost"
-            _actor_port = 10000 + (os.getpid() % 100) * 200
-            _actor_port = find_free_port((_actor_port, _actor_port + 200), "localhost")
-            os.environ["MASTER_PORT"] = (
-                str(_actor_port) if _actor_port is not None else "0"
-            )
-            os.environ["VLLM_PORT"] = (
-                str(_actor_port) if _actor_port is not None else "0"
-            )
-            os.environ["VLLM_HOST_IP"] = "localhost"
-            if self._use_cached_modelinfo:
-                os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
-                self.logger.info(f"Reusing cache at {self._model_info_cache}")
-                self.logger.debug("File list in cache")
-                for root, dirs, files in os.walk(self._model_info_cache):
-                    for file in files:
-                        self.logger.debug(f"{file}")
-            else:
-                if self._model_info_cache is None:
-                    self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
-                os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
-                try:
-                    os.makedirs(os.environ["VLLM_CACHE_ROOT"])
-                    _build_model_cache(logger=self.logger.getChild("BuildModelInfo"))
-                except Exception as e:
-                    self.logger.error(f"Building model infos failed with error {e}")
-                    raise
-            vllm_log_dir = get_log_dir("vllm")
-            os.makedirs(vllm_log_dir, exist_ok=True)
-            _setup_vllm_file_logging(f"{vllm_log_dir}/vllm_{self._name}.log")
-
-            snapshots = glob(
-                f"{self.cache_dir}/hub/models--{self.model.replace('/', '--')}/snapshots/*"
-            )
-            if len(snapshots) > 0:
-                self.logger.info(f"model: {snapshots[0]}")
-            else:
-                self.logger.error(f"No snapshots found in {self.cache_dir}/hub.")
-                raise RuntimeError("No snapshots found.")
-            try:
-                if self._async_engine:
-                    from vllm.engine.arg_utils import AsyncEngineArgs
-                    from vllm.engine.async_llm_engine import AsyncLLMEngine
-
-                    engine_args = AsyncEngineArgs(
-                        model=snapshots[0],
-                        trust_remote_code=True,
-                        **self.llm_kwargs,
-                    )
-                    self._engine = AsyncLLMEngine.from_engine_args(engine_args)
-                else:
-                    from vllm import LLM
-
-                    self._engine = LLM(
-                        model=snapshots[0],
-                        trust_remote_code=True,
-                        **self.llm_kwargs,
-                    )
-            except Exception as e:
-                self.logger.error(f"Starting LLM failed with Exception: {e}")
-                raise RuntimeError(str(e))
-            self.logger.info("init done!")
+            self._engine = _create_engine(self._name, 
+                                          self.logger, 
+                                          self.model,
+                                          self.cache_dir, 
+                                          self._use_cached_modelinfo, 
+                                          self._model_info_cache, 
+                                          self.llm_kwargs, 
+                                          self._async_engine)
+        self.logger.info("init done!")
 
     @action
     async def generate(
@@ -239,7 +309,7 @@ class PrivateVLLMInference(_VLLMOfflineMixin, PrivateActor):
 
 
 # ---------------------------------------------------------------------------
-# Mixin 2: Online vLLM server (subprocess)
+# Mixin 2: Online vLLM server (in-process uvicorn + FastAPI)
 # ---------------------------------------------------------------------------
 
 
@@ -248,82 +318,62 @@ class _VLLMOnlineMixin:
         self,
         model: str,
         cache_dir: str,
-        port: int = 8000,
-        tensor_parallel_size: int = 1,
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        **kwargs,
+        server_args: Dict = {},
     ):
-        self._model_name = model
+        self.model = model
         self.cache_dir = cache_dir
-        self.port = port
-        self.tensor_parallel_size = tensor_parallel_size
-        self._server_process = None
+        self._engine = None
+        self._args = None
+        self._serve_task = None
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
+        self.server_args = server_args
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
-        self.kwargs = kwargs
 
     async def on_start(self):
         if self.logger is None:
             self.logger = setup_logger(name=self._name)
-        script_path = os.path.join(os.path.dirname(__file__), "start_vllm_server.sh")
+        self.logger.info(
+            f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
+        )
+        if self._engine is None:
+            self._args, self._engine = _create_online_engine(
+                self._name, self.logger, self.model, self.cache_dir,
+                self._use_cached_modelinfo, self._model_info_cache,
+                self.server_args)
+
         self._hostname = (
             socket.gethostname()
             if ".local" not in socket.gethostname()
             else "localhost"
         )
+        self.port = self._args.port
 
-        if self._use_cached_modelinfo:
-            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
-        else:
-            if self._model_info_cache is None:
-                self._model_info_cache = f"/tmp/vllm_cache_{uuid.uuid4().hex[:6]}"
-            os.environ["VLLM_CACHE_ROOT"] = self._model_info_cache
-            try:
-                os.makedirs(os.environ["VLLM_CACHE_ROOT"])
-                _build_model_cache(logger=self.logger.getChild("BuildModelInfo"))
-            except Exception as e:
-                self.logger.error(f"Building model infos failed with error {e}")
-                raise
-        self._server_process = subprocess.Popen(
-            [
-                script_path,
-                self._hostname,
-                str(self.port),
-                str(self.tensor_parallel_size),
-                self._model_name,
-                self.cache_dir,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.logger.info(
-            f"Started vLLM server process (pid={self._server_process.pid})"
-        )
-        url = f"http://{self._hostname}:{self.port}/v1/models"
-        start = time.time()
-        timeout = 600
-        while time.time() - start < timeout:
-            try:
-                urllib.request.urlopen(url, timeout=5)
-                self.logger.info(f"vLLM server ready at {self._hostname}:{self.port}")
-                return
-            except Exception:
-                self.logger.info(f"Waiting for vLLM ({time.time() - start:.0f}s)...")
-                time.sleep(10)
-        raise RuntimeError(f"vLLM server not ready after {timeout}s")
+        from vllm.entrypoints.openai.api_server import build_and_serve
+        from vllm.tool_parsers import ToolParserManager
+        from vllm.reasoning import ReasoningParserManager
+
+        if getattr(self._args, "tool_parser_plugin", None) and len(self._args.tool_parser_plugin) > 3:
+            ToolParserManager.import_tool_parser(self._args.tool_parser_plugin)
+
+        if getattr(self._args, "reasoning_parser_plugin", None) and len(self._args.reasoning_parser_plugin) > 3:
+            ReasoningParserManager.import_reasoning_parser(self._args.reasoning_parser_plugin)
+
+        self._serve_task = asyncio.create_task(
+            build_and_serve(self._engine, None, None, self._args))
+
+        self.logger.info(f"vLLM server ready at {self._hostname}:{self.port}")
 
     async def on_stop(self):
-        if self._server_process is not None:
-            subprocess.run(["pkill", "-f", "vllm serve *"])
-            self._server_process.terminate()
-            try:
-                self._server_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._server_process.kill()
-                self._server_process.wait()
+        if self._serve_task is not None:
+            self._serve_task.cancel()
+            self._serve_task = None
+        if self._engine is not None:
+            self._engine.shutdown()
+            self._engine = None
 
     @action
     def get_address(self):
@@ -331,7 +381,7 @@ class _VLLMOnlineMixin:
 
     @action
     def model(self):
-        return self._model_name
+        return self.model
 
 
 class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
@@ -340,24 +390,19 @@ class OnlineVLLMInference(_VLLMOnlineMixin, PublicActor):
         name: str,
         model: str,
         cache_dir: str,
-        port: int = 8000,
-        tensor_parallel_size: int = 1,
+        server_args: Dict = {},
         transport: str = "zmq",
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
         ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
-        llm_kwargs: Dict = {},
         **kwargs,
     ):
         PublicActor.__init__(self, name, transport, ckpt_dir=ckpt_dir, max_workers=1, run_in_executor=False, **kwargs)
         self._init_vllm_online(
-            model,
-            cache_dir,
-            port,
-            tensor_parallel_size,
-            use_cached_modelinfo,
-            model_info_cache,
-            **llm_kwargs,
+            model, cache_dir,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            server_args=server_args,
         )
 
 
@@ -368,22 +413,17 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
         model: str,
         cache_dir: str,
         client_conn: ClientConnection,
-        port: int = 8000,
-        tensor_parallel_size: int = 1,
+        server_args: Dict = {},
         use_cached_modelinfo: bool = False,
         model_info_cache: Optional[str] = None,
-        llm_kwargs: Dict = {},
         **kwargs,
     ):
         PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
         self._init_vllm_online(
-            model,
-            cache_dir,
-            port,
-            tensor_parallel_size,
-            use_cached_modelinfo,
-            model_info_cache,
-            **llm_kwargs,
+            model, cache_dir,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            server_args=server_args,
         )
 
 
