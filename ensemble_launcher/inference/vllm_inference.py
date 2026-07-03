@@ -1104,6 +1104,14 @@ class _MultiNodeOnlineVLLMMixin:
         else:
             return await self._engine.generate(*args, **kwargs)
 
+    @action
+    def get_address(self):
+        return f"{self._hostname}:{self.port}"
+
+    @action
+    def get_model(self):
+        return self._model_name
+
     async def _send(self):
         if self._rank == 0:
             await super()._send()
