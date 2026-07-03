@@ -645,8 +645,7 @@ async def test_private_online_inference():
             model=model,
             cache_dir=model_cache,
             client_conn=client,
-            tensor_parallel_size=1,
-            port=8002,
+            server_args = {"tensor_parallel_size":1, "port":8002},
         )
 
         task = actor.create_task(
