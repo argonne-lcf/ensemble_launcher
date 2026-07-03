@@ -1139,3 +1139,83 @@ class _MultiNodeOnlineVLLMMixin:
             self._sub_socket.close()
         if self._zmq_context is not None:
             self._zmq_context.term()
+
+
+class MultiNodeOnlineVLLMInference(_MultiNodeOnlineVLLMMixin, PublicActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        transport: str = "zmq",
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+        sync_location: Optional[str] = None,
+        rank_env: str = "PALS_RANKID",
+        local_rank_env: str = "PALS_LOCAL_RANKID",
+        sync_timeout: float = 60,
+        gpu_selector: str = "ZE_AFFINITY_MASK",
+        server_kwargs: Dict = {},
+        **kwargs,
+    ):
+        PublicActor.__init__(self, name, transport, max_workers=1, run_in_executor=False, **kwargs)
+        self._init_multinode_vllm(
+            model,
+            cache_dir,
+            self.ckpt_dir,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            sync_location=sync_location,
+            rank_env=rank_env,
+            local_rank_env=local_rank_env,
+            sync_timeout=sync_timeout,
+            server_kwargs=server_kwargs,
+            gpu_selector=gpu_selector,
+        )
+
+    async def _setup_rank0_connection(self):
+        self._start_transport()
+        await self._conn.open()
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        fname = f"{self.ckpt_dir}/{self.name}.ckpt"
+        with open(fname, "w") as f:
+            f.write(self._conn.get_state().serialize())
+        self.logger.info("Rank 0: ROUTER transport ready, checkpoint written.")
+
+
+class PrivateMultiNodeOnlineVLLMInference(_MultiNodeOnlineVLLMMixin, PrivateActor):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        cache_dir: str,
+        client_conn: ClientConnection,
+        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt",
+        use_cached_modelinfo: bool = False,
+        model_info_cache: Optional[str] = None,
+        sync_location: Optional[str] = None,
+        rank_env: str = "PALS_RANKID",
+        local_rank_env: str = "PALS_LOCAL_RANKID",
+        sync_timeout: float = 60,
+        gpu_selector: str = "ZE_AFFINITY_MASK",
+        server_kwargs: Dict = {},
+        **kwargs,
+    ):
+        PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
+        self._init_multinode_vllm(
+            model,
+            cache_dir,
+            ckpt_dir,
+            use_cached_modelinfo=use_cached_modelinfo,
+            model_info_cache=model_info_cache,
+            sync_location=sync_location,
+            rank_env=rank_env,
+            local_rank_env=local_rank_env,
+            sync_timeout=sync_timeout,
+            server_kwargs=server_kwargs,
+            gpu_selector=gpu_selector,
+        )
+
+    async def _setup_rank0_connection(self):
+        await self._conn.open()
+        self.logger.info("Rank 0: transport ready.")
