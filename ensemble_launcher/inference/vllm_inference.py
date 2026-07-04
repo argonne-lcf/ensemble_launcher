@@ -1100,73 +1100,54 @@ class _MultiNodeOnlineVLLMMixin:
 
         if self._rank == 0:
             await self._setup_rank0_connection()
-
-        signal_ready = getattr(self, "_signal_ready", None)
-        if callable(signal_ready):
-            asyncio.create_task(self._signal_ready())
-
-        await asyncio.gather(self._recv(), self._send(), self._main_loop())
-
-        await self.on_stop()
-        if self._conn is not None:
-            await self._conn.close()
-
-    async def _recv(self):
-        if self._rank == 0:
-            self.logger.info("Rank 0: Receive loop started (ROUTER + PUB forward).")
-            while not self._stop.is_set():
-                try:
-                    frames = await asyncio.wait_for(self._conn.recv(), timeout=5.0)
-                    sender_id = self._extract_sender(frames)
-                    self.logger.info(f"Received args from {sender_id}")
-                    args = cloudpickle.loads(frames[1])
-                    await self._pub_socket.send(frames[1])
-                    await self._input_queue.put((sender_id, args))
-                except Exception:
-                    pass
+            signal_ready = getattr(self, "_signal_ready", None)
+            if callable(signal_ready):
+                asyncio.create_task(self._signal_ready())
+            await asyncio.gather(self._recv(), self._send(), self._main_loop())
+            await self.on_stop()
+            if self._conn is not None:
+                await self._conn.close()
         else:
-            self.logger.info(f"Rank {self._rank}: Receive loop started (SUB).")
-            while not self._stop.is_set():
-                try:
-                    raw = await asyncio.wait_for(self._sub_socket.recv(), timeout=5.0)
-                    args = cloudpickle.loads(raw)
-                    await self._input_queue.put((None, args))
-                except Exception:
-                    pass
-    
-    @action
-    async def generate(self, *args, **kwargs):
-        if self._rank == 0:
-            return None
-        else:
-            self.logger.info(f"Got: {args}, {kwargs}")
-            async for _ in self._engine.generate(*args, **kwargs):
+            self._generate_queue = asyncio.Queue()
+            await asyncio.gather(self._sub_recv(), self._sub_engine_loop())
+            await self.on_stop()
+
+    async def _sub_recv(self):
+        self.logger.info(f"Rank {self._rank}: SUB recv loop started.")
+        while not self._stop.is_set():
+            try:
+                raw = await asyncio.wait_for(self._sub_socket.recv(), timeout=5.0)
+                msg = cloudpickle.loads(raw)
+                if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "generate":
+                    await self._generate_queue.put((msg[1], msg[2]))
+                else:
+                    self.logger.debug(f"Rank {self._rank}: ignoring non-generate msg")
+            except asyncio.TimeoutError:
                 pass
+            except Exception as e:
+                self.logger.error(f"Rank {self._rank}: SUB recv error: {e}")
+
+    async def _sub_engine_loop(self):
+        self.logger.info(f"Rank {self._rank}: engine loop started.")
+        while not self._stop.is_set():
+            try:
+                args, kwargs = await asyncio.wait_for(
+                    self._generate_queue.get(), timeout=5.0)
+                self.logger.info(f"Rank {self._rank}: driving engine.generate")
+                async for _ in self._engine.generate(*args, **kwargs):
+                    pass
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                self.logger.error(f"Rank {self._rank}: engine loop error: {e}")
 
     @action
     def get_address(self):
-        if self._rank == 0:
-            return f"{self._hostname}:{self.port}"
-        else:
-            return None
+        return f"{self._hostname}:{self.port}"
 
     @action
     def get_model(self):
-        if self._rank == 0:
-            return self._model_name
-        else:
-            return None
-
-    async def _send(self):
-        if self._rank == 0:
-            await super()._send()
-        else:
-            self.logger.info(f"Rank {self._rank}: Send loop (drain-only).")
-            while not self._stop.is_set():
-                try:
-                    await asyncio.wait_for(self._output_queue.get(), timeout=5.0)
-                except Exception:
-                    pass
+        return self._model_name
 
     async def on_stop(self):
         if self._serve_task is not None:
