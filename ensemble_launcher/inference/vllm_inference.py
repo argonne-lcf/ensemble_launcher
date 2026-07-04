@@ -307,6 +307,7 @@ class _VLLMOnlineMixin:
         self._use_cached_modelinfo = use_cached_modelinfo
         self._model_info_cache = model_info_cache
         self.server_args = server_args
+        self.server_args["served_model_name"] = self.model
         if self._use_cached_modelinfo:
             assert model_info_cache is not None, "model_info_cache can't be None"
 
@@ -906,20 +907,19 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
 # ---------------------------------------------------------------------------
 
 class BcastEngineClient:
-    def __init__(self, pub_socket, engine_client):
+    def __init__(self, logger, pub_socket, engine_client):
+        self.logger = logger
         self._pub_socket = pub_socket
         self._engine_client = engine_client
     
     async def generate(self, *args, **kwargs):
+        self.logger.info(f"Bcast:{"generate", args, kwargs}")
         await self._pub_socket.send(cloudpickle.dumps(("generate", args, kwargs)))
-        res = await self._engine_client.generate(*args, **kwargs)
-        return res
+        async for output in self._engine_client.generate(*args, **kwargs):
+            yield output
 
     def __getattr__(self, name):
-        attr = getattr(self._engine_client, name, None)
-        if attr is None:
-            raise AttributeError(f"{type(self._engine_client)} does not have attribute {name}")
-        return attr
+        return getattr(self._engine_client, name)
             
 
 class _MultiNodeOnlineVLLMMixin:
@@ -967,6 +967,7 @@ class _MultiNodeOnlineVLLMMixin:
         self._engine = None
         self._serve_task = None
         self.server_kwargs = server_kwargs
+        self.server_kwargs["served_model_name"] = self._model_name
         self.gpu_selector = gpu_selector
         self._args = None
 
@@ -1027,7 +1028,7 @@ class _MultiNodeOnlineVLLMMixin:
             merged_kwargs = {**multinode_defaults, **(self.server_kwargs or {})}
             self._args, self._engine = _create_online_engine(self.logger, snapshots, merged_kwargs)
             if self._rank == 0:
-                self._engine = BcastEngineClient(self._pub_socket, self._engine)
+                self._engine = BcastEngineClient(self.logger, self._pub_socket, self._engine)
                 self._hostname = get_hsn_ip_cli() or socket.gethostname()
                 self.port = self._args.port
                 self._args.host = self._hostname
@@ -1075,6 +1076,14 @@ class _MultiNodeOnlineVLLMMixin:
 
                 self._serve_task = asyncio.create_task(
                         build_and_serve(self._engine, None, None, self._args))
+                def _serve_done(task):
+                    if task.cancelled():
+                        self.logger.info("serve task cancelled")
+                    elif task.exception():
+                        self.logger.error(f"serve task failed: {task.exception()}")
+                    else:
+                        self.logger.info("serve task finished")
+                self._serve_task.add_done_callback(_serve_done)
 
 
         except Exception as e:
@@ -1130,7 +1139,9 @@ class _MultiNodeOnlineVLLMMixin:
         if self._rank == 0:
             return None
         else:
-            return await self._engine.generate(*args, **kwargs)
+            self.logger.info(f"Got: {args}, {kwargs}")
+            async for _ in self._engine.generate(*args, **kwargs):
+                pass
 
     @action
     def get_address(self):
@@ -1190,9 +1201,10 @@ class MultiNodeOnlineVLLMInference(_MultiNodeOnlineVLLMMixin, PublicActor):
         sync_timeout: float = 60,
         gpu_selector: str = "ZE_AFFINITY_MASK",
         server_kwargs: Dict = {},
+        max_workers: int = 1,
         **kwargs,
     ):
-        PublicActor.__init__(self, name, transport, max_workers=1, run_in_executor=False, **kwargs)
+        PublicActor.__init__(self, name, transport, max_workers=max_workers, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
@@ -1233,9 +1245,10 @@ class PrivateMultiNodeOnlineVLLMInference(_MultiNodeOnlineVLLMMixin, PrivateActo
         sync_timeout: float = 60,
         gpu_selector: str = "ZE_AFFINITY_MASK",
         server_kwargs: Dict = {},
+        max_workers: int = 1,
         **kwargs,
     ):
-        PrivateActor.__init__(self, name, client_conn, max_workers=1, run_in_executor=False, **kwargs)
+        PrivateActor.__init__(self, name, client_conn, max_workers=max_workers, run_in_executor=False, **kwargs)
         self._init_multinode_vllm(
             model,
             cache_dir,
