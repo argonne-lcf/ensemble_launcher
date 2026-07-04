@@ -1028,12 +1028,9 @@ class _MultiNodeOnlineVLLMMixin:
             self._args, self._engine = _create_online_engine(self.logger, snapshots, merged_kwargs)
             if self._rank == 0:
                 self._engine = BcastEngineClient(self._pub_socket, self._engine)
-                self._hostname = (
-                                    socket.gethostname()
-                                    if ".local" not in socket.gethostname()
-                                    else "localhost"
-                                )
+                self._hostname = get_hsn_ip_cli() or socket.gethostname()
                 self.port = self._args.port
+                self._args.host = self._hostname
 
                 try:
                     from vllm.entrypoints.openai.api_server import build_and_serve
