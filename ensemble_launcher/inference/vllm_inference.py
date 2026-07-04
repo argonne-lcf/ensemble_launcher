@@ -1129,13 +1129,20 @@ class _MultiNodeOnlineVLLMMixin:
 
     async def _sub_engine_loop(self):
         self.logger.info(f"Rank {self._rank}: engine loop started.")
+
+        async def _drive_generate(args, kwargs):
+            try:
+                async for _ in self._engine.generate(*args, **kwargs):
+                    pass
+            except Exception as e:
+                self.logger.error(f"Rank {self._rank}: generate error: {e}")
+
         while not self._stop.is_set():
             try:
                 args, kwargs = await asyncio.wait_for(
                     self._generate_queue.get(), timeout=5.0)
                 self.logger.info(f"Rank {self._rank}: driving engine.generate")
-                async for _ in self._engine.generate(*args, **kwargs):
-                    pass
+                asyncio.create_task(_drive_generate(args, kwargs))
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
