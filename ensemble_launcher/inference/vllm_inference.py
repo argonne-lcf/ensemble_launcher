@@ -1035,7 +1035,38 @@ class _MultiNodeOnlineVLLMMixin:
                                 )
                 self.port = self._args.port
 
-                from vllm.entrypoints.openai.api_server import build_and_serve
+                try:
+                    from vllm.entrypoints.openai.api_server import build_and_serve
+                except Exception:
+                    import vllm.envs as envs  # isort: skip
+                    from vllm.entrypoints.openai.api_server import build_app, init_app_state, serve_http
+
+                    async def build_and_serve(engine_client, listen_address, sock, args, **uvicorn_kwargs):
+                        app = build_app(args)
+
+                        await init_app_state(engine_client, app.state, args)
+
+                        return await serve_http(
+                                        app,
+                                        sock=sock,
+                                        enable_ssl_refresh=args.enable_ssl_refresh,
+                                        host=args.host,
+                                        port=args.port,
+                                        log_level=args.uvicorn_log_level,
+                                        # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                                        # no access log will be output.
+                                        access_log=not args.disable_uvicorn_access_log,
+                                        timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                                        ssl_keyfile=args.ssl_keyfile,
+                                        ssl_certfile=args.ssl_certfile,
+                                        ssl_ca_certs=args.ssl_ca_certs,
+                                        ssl_cert_reqs=args.ssl_cert_reqs,
+                                        ssl_ciphers=args.ssl_ciphers,
+                                        h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                                        h11_max_header_count=args.h11_max_header_count,
+                                        **uvicorn_kwargs,
+                                        )
+                        
                 from vllm.tool_parsers import ToolParserManager
                 from vllm.reasoning import ReasoningParserManager
 
@@ -1106,11 +1137,17 @@ class _MultiNodeOnlineVLLMMixin:
 
     @action
     def get_address(self):
-        return f"{self._hostname}:{self.port}"
+        if self._rank == 0:
+            return f"{self._hostname}:{self.port}"
+        else:
+            return None
 
     @action
     def get_model(self):
-        return self._model_name
+        if self._rank == 0:
+            return self._model_name
+        else:
+            return None
 
     async def _send(self):
         if self._rank == 0:
