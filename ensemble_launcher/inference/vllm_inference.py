@@ -106,12 +106,15 @@ def _create_engine(logger, snapshots, llm_kwargs: Dict[str, Any] = {}, async_eng
         logger.error(f"Starting LLM failed with Exception: {e}")
         raise RuntimeError(str(e))
 
-def _create_online_engine(logger, snapshots, server_args: Dict = {}):
+def _create_online_engine(logger, snapshots, server_args: Dict = {}, engine_cls=None):
 
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
     from vllm.entrypoints.openai.cli_args import make_arg_parser
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    if engine_cls is None:
+        engine_cls = AsyncLLMEngine
 
     cli_overrides = []
     for key, value in server_args.items():
@@ -131,7 +134,7 @@ def _create_online_engine(logger, snapshots, server_args: Dict = {}):
         ["--model", snapshots[0], "--trust-remote-code"] + cli_overrides)
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    engine = engine_cls.from_engine_args(engine_args)
 
     return args, engine
 
@@ -414,6 +417,29 @@ class PrivateOnlineVLLMInference(_VLLMOnlineMixin, PrivateActor):
 # ---------------------------------------------------------------------------
 
 
+def _bind_zmq_socket(zmq_context, zmq_type, hostname, port_range, logger, label, AsyncSocket):
+    import zmq as _zmq
+    sock = zmq_context.socket(zmq_type, socket_class=AsyncSocket)
+    port = find_free_port(port_range, host=hostname)
+    if port is None:
+        port = "0"
+        logger.warning(f"Couldn't find any free port for {label}, using 0")
+    address = f"{hostname}:{port}"
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        try:
+            sock.bind(f"tcp://{address}")
+            break
+        except _zmq.error.ZMQError as e:
+            if "Address already in use" in str(e) and attempt < max_attempts - 1:
+                port = random.randint(30000, 40000)
+                address = f"{hostname}:{port}"
+            else:
+                raise
+    logger.info(f"{label} socket bound to {address}")
+    return sock, address
+
+
 def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
     import zmq
     from zmq.asyncio import Context as AsyncContext
@@ -425,29 +451,12 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
         os.environ["MASTER_ADDR"] = hostname
         os.environ["MASTER_PORT"] = str(random.randint(20000, 30000))
         zmq_context = AsyncContext()
-        zmq_socket = zmq_context.socket(
-            zmq.PUB, socket_class=AsyncSocket
-        )
-        pub_port = find_free_port((10000, 30000), host=hostname)
-        if pub_port is None:
-            pub_port = "0"
-            logger.warning("Couldn't find any free port, using 0")
-        pub_address = f"{hostname}:{pub_port}"
-        max_attempts = 10
-        for attempt in range(max_attempts):
-            try:
-                zmq_socket.bind(f"tcp://{pub_address}")
-                break
-            except zmq.error.ZMQError as e:
-                if (
-                    "Address already in use" in str(e)
-                    and attempt < max_attempts - 1
-                ):
-                    pub_port = random.randint(30000, 40000)
-                    pub_address = f"{hostname}:{pub_port}"
-                else:
-                    raise
-        logger.info(f"PUB socket bound to {pub_address}")
+
+        pub_socket, pub_address = _bind_zmq_socket(
+            zmq_context, zmq.PUB, hostname, (10000, 30000), logger, "PUB", AsyncSocket)
+        pull_socket, pull_address = _bind_zmq_socket(
+            zmq_context, zmq.PULL, hostname, (10000, 30000), logger, "PULL", AsyncSocket)
+
         logger.info(f"Sync location: {sync_location}")
         try:
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -457,6 +466,7 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
                 temp.write(
                     f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}\n"
                     f"{pub_address}\n"
+                    f"{pull_address}\n"
                 )
                 temp.flush()
                 os.fsync(temp.fileno())
@@ -464,7 +474,7 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
         except Exception as e:
             logger.error(f"Writing temp file failed with exception {e}")
             raise e
-        
+
         try:
             os.replace(temp_path, sync_location)
             logger.info(f"Wrote the sync file to {sync_location}")
@@ -473,6 +483,8 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise
+
+        return zmq_context, pub_socket, pull_socket
     else:
         start = time.perf_counter()
         while time.perf_counter() - start < sync_timeout:
@@ -489,15 +501,19 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
         pub_address = lines[1]
+        pull_address = lines[2]
+
         zmq_context = AsyncContext()
-        zmq_socket = zmq_context.socket(
-            zmq.SUB, socket_class=AsyncSocket
-        )
-        zmq_socket.setsockopt(zmq.SUBSCRIBE, b"")
-        zmq_socket.connect(f"tcp://{pub_address}")
+        sub_socket = zmq_context.socket(zmq.SUB, socket_class=AsyncSocket)
+        sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        sub_socket.connect(f"tcp://{pub_address}")
         logger.info(f"SUB socket connected to {pub_address}")
 
-    return zmq_context, zmq_socket
+        push_socket = zmq_context.socket(zmq.PUSH, socket_class=AsyncSocket)
+        push_socket.connect(f"tcp://{pull_address}")
+        logger.info(f"PUSH socket connected to {pull_address}")
+
+        return zmq_context, sub_socket, push_socket
 
 async def _set_multinode_env(model,
                             cache_dir,
@@ -638,22 +654,23 @@ class _MultiNodeVLLMMixin:
                 f"{self.rank_env}, {self.local_rank_env}"
             ) from e
 
-        self._zmq_context, zmq_socket = _create_sockets(self._rank, 
-                                                  self.logger, 
-                                                  self.sync_location, 
-                                                  self.sync_timeout, 
-                                                  self._ckpt_dir)
+        self._zmq_context, sock_a, sock_b = _create_sockets(
+            self._rank, self.logger, self.sync_location,
+            self.sync_timeout, self._ckpt_dir)
+        sock_b.close()
         if self._rank == 0:
-            self._pub_socket = zmq_socket
+            self._pub_socket = sock_a
         else:
-            self._sub_socket = zmq_socket
+            self._sub_socket = sock_a
+
+        zmq_socket = self._pub_socket if self._rank == 0 else self._sub_socket
 
         snapshots = await _set_multinode_env(self._model_name,
                                        self.cache_dir,
                                        self._ckpt_dir,
                                        self._use_cached_modelinfo,
                                        self._model_info_cache,
-                                       self._name,self._local_rank,
+                                       self._name, self._local_rank,
                                        self._rank,
                                        self.logger,
                                        self.tensor_parallel_size,
@@ -906,20 +923,100 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
 # Mixin 4: Online Multi-Node vLLM server (in-process uvicorn + FastAPI of Rank 0. zmq sub on others)
 # ---------------------------------------------------------------------------
 
-class BcastEngineClient:
-    def __init__(self, logger, pub_socket, engine_client):
-        self.logger = logger
+class SPMDAsyncLLM:
+    """SPMD-aware wrapper around AsyncLLM.
+
+    On rank 0: intercepts generate() to broadcast via PUB before delegating.
+    On all ranks: overrides _add_request() to enqueue into a submission queue.
+    A single _submission_loop coroutine processes the queue with a PUSH/PULL
+    barrier so all ranks call engine_core.add_request_async() at the same time.
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._spmd_rank = None
+        self._spmd_world_size = None
+        self._pub_socket = None
+        self._pull_socket = None
+        self._push_socket = None
+        self._submission_queue = None
+        self._go_queue = None
+        self._submission_task = None
+        self._original_add_request = None
+
+    def init_spmd(self, rank, world_size, pub_socket=None,
+                  pull_socket=None, push_socket=None, logger=None):
+        self._spmd_rank = rank
+        self._spmd_world_size = world_size
         self._pub_socket = pub_socket
-        self._engine_client = engine_client
-    
-    async def generate(self, *args, **kwargs):
-        self.logger.info(f"Bcast:{"generate", args, kwargs}")
-        await self._pub_socket.send(cloudpickle.dumps(("generate", args, kwargs)))
-        async for output in self._engine_client.generate(*args, **kwargs):
-            yield output
+        self._pull_socket = pull_socket
+        self._push_socket = push_socket
+        self._logger = logger
+        self._submission_queue = asyncio.Queue()
+        self._go_queue = asyncio.Queue()
+        self._request_queue = asyncio.Queue()
+        self._broadcast_lock = asyncio.Lock()
+        self._original_add_request = self._engine._add_request
+        self._engine._add_request = self._spmd_add_request
+        self._submission_task = asyncio.create_task(self._submission_loop())
+
+    async def _spmd_add_request(self, request, prompt, parent_req, index, queue):
+        self._engine.output_processor.add_request(
+            request, prompt, parent_req, index, queue)
+        if self._engine.log_requests:
+            import logging
+            logging.getLogger("vllm.v1.engine.async_llm").info(
+                "Added request %s.", request.request_id)
+
+        event = asyncio.Event()
+        async with self._broadcast_lock:
+            await self._pub_socket.send(
+                cloudpickle.dumps(("request", request)))
+            await self._submission_queue.put((request, event))
+        await asyncio.wait_for(event.wait(), timeout=60.0)
+
+    async def _submission_loop(self):
+        while True:
+            request, event = await self._submission_queue.get()
+            request_id = request.request_id
+            try:
+                if self._spmd_rank == 0:
+                    acks = 0
+                    needed = self._spmd_world_size - 1
+                    while acks < needed:
+                        raw = await asyncio.wait_for(
+                            self._pull_socket.recv(), timeout=30.0)
+                        msg = cloudpickle.loads(raw)
+                        if msg[0] == "ack" and msg[1] == request_id:
+                            acks += 1
+                    await self._pub_socket.send(
+                        cloudpickle.dumps(("go", request_id)))
+                else:
+                    go_id = await asyncio.wait_for(
+                        self._go_queue.get(), timeout=30.0)
+                await self._engine.engine_core.add_request_async(request)
+                event.set()
+            except Exception as e:
+                if self._logger:
+                    self._logger.error(
+                        f"Rank {self._spmd_rank}: submission loop error "
+                        f"for {request_id}: {e}")
+                event.set()
+                raise
+
+    async def stop(self):
+        if self._submission_task:
+            self._submission_task.cancel()
+            try:
+                await self._submission_task
+            except asyncio.CancelledError:
+                pass
+
+    def shutdown(self, *args, **kwargs):
+        self._engine.shutdown(*args, **kwargs)
 
     def __getattr__(self, name):
-        return getattr(self._engine_client, name)
+        return getattr(self._engine, name)
             
 
 class _MultiNodeOnlineVLLMMixin:
@@ -959,10 +1056,13 @@ class _MultiNodeOnlineVLLMMixin:
             )
         else:
             raise ValueError("Unknown sync location prefix")
+        self._world_size = self.tensor_parallel_size * self.pipeline_parallel_size
         self._rank = None
         self._local_rank = None
         self._pub_socket = None
         self._sub_socket = None
+        self._pull_socket = None
+        self._push_socket = None
         self._zmq_context = None
         self._engine = None
         self._serve_task = None
@@ -990,22 +1090,25 @@ class _MultiNodeOnlineVLLMMixin:
                 f"{self.rank_env}, {self.local_rank_env}"
             ) from e
 
-        self._zmq_context, zmq_socket = _create_sockets(self._rank, 
-                                                  self.logger, 
-                                                  self.sync_location, 
-                                                  self.sync_timeout, 
-                                                  self._ckpt_dir)
+        self._zmq_context, sock_a, sock_b = _create_sockets(
+            self._rank, self.logger, self.sync_location,
+            self.sync_timeout, self._ckpt_dir)
         if self._rank == 0:
-            self._pub_socket = zmq_socket
+            self._pub_socket = sock_a
+            self._pull_socket = sock_b
         else:
-            self._sub_socket = zmq_socket
+            self._sub_socket = sock_a
+            self._push_socket = sock_b
+
+        # For _set_multinode_env, rank 0 uses PUB, non-rank-0 uses SUB
+        zmq_socket = self._pub_socket if self._rank == 0 else self._sub_socket
 
         snapshots = await _set_multinode_env(self._model_name,
                                        self.cache_dir,
                                        self._ckpt_dir,
                                        self._use_cached_modelinfo,
                                        self._model_info_cache,
-                                       self._name,self._local_rank,
+                                       self._name, self._local_rank,
                                        self._rank,
                                        self.logger,
                                        self.tensor_parallel_size,
@@ -1026,9 +1129,20 @@ class _MultiNodeOnlineVLLMMixin:
                 "seed": 1,
             }
             merged_kwargs = {**multinode_defaults, **(self.server_kwargs or {})}
-            self._args, self._engine = _create_online_engine(self.logger, snapshots, merged_kwargs)
+            self._args, raw_engine = _create_online_engine(
+                self.logger, snapshots, merged_kwargs)
+
+            self._engine = SPMDAsyncLLM(raw_engine)
+            self._engine.init_spmd(
+                rank=self._rank,
+                world_size=self._world_size,
+                pub_socket=self._pub_socket,
+                pull_socket=self._pull_socket,
+                push_socket=self._push_socket,
+                logger=self.logger,
+            )
+
             if self._rank == 0:
-                self._engine = BcastEngineClient(self.logger, self._pub_socket, self._engine)
                 self._hostname = get_hsn_ip_cli() or socket.gethostname()
                 self.port = self._args.port
                 self._args.host = self._hostname
@@ -1041,9 +1155,7 @@ class _MultiNodeOnlineVLLMMixin:
 
                     async def build_and_serve(engine_client, listen_address, sock, args, **uvicorn_kwargs):
                         app = build_app(args)
-
                         await init_app_state(engine_client, app.state, args)
-
                         return await serve_http(
                                         app,
                                         sock=sock,
@@ -1051,8 +1163,6 @@ class _MultiNodeOnlineVLLMMixin:
                                         host=args.host,
                                         port=args.port,
                                         log_level=args.uvicorn_log_level,
-                                        # NOTE: When the 'disable_uvicorn_access_log' value is True,
-                                        # no access log will be output.
                                         access_log=not args.disable_uvicorn_access_log,
                                         timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
                                         ssl_keyfile=args.ssl_keyfile,
@@ -1064,7 +1174,7 @@ class _MultiNodeOnlineVLLMMixin:
                                         h11_max_header_count=args.h11_max_header_count,
                                         **uvicorn_kwargs,
                                         )
-                        
+
                 from vllm.tool_parsers import ToolParserManager
                 from vllm.reasoning import ReasoningParserManager
 
@@ -1084,7 +1194,6 @@ class _MultiNodeOnlineVLLMMixin:
                     else:
                         self.logger.info("serve task finished")
                 self._serve_task.add_done_callback(_serve_done)
-
 
         except Exception as e:
             self.logger.error(f"Starting LLM failed with Exception: {e}")
@@ -1108,45 +1217,52 @@ class _MultiNodeOnlineVLLMMixin:
             if self._conn is not None:
                 await self._conn.close()
         else:
-            self._generate_queue = asyncio.Queue()
-            await asyncio.gather(self._sub_recv(), self._sub_engine_loop())
+            await asyncio.gather(
+                self._sub_recv(), self._submission_loop_driver())
             await self.on_stop()
 
     async def _sub_recv(self):
         self.logger.info(f"Rank {self._rank}: SUB recv loop started.")
         while not self._stop.is_set():
             try:
-                raw = await asyncio.wait_for(self._sub_socket.recv(), timeout=5.0)
+                raw = await asyncio.wait_for(
+                    self._sub_socket.recv(), timeout=5.0)
                 msg = cloudpickle.loads(raw)
-                if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "generate":
-                    await self._generate_queue.put((msg[1], msg[2]))
-                else:
-                    self.logger.debug(f"Rank {self._rank}: ignoring non-generate msg")
+                if not isinstance(msg, tuple) or len(msg) < 1:
+                    continue
+                msg_type = msg[0]
+                if msg_type == "request":
+                    request = msg[1]
+                    await self._engine._request_queue.put(request)
+                    await self._push_socket.send(
+                        cloudpickle.dumps(("ack", request.request_id, self._rank)))
+                elif msg_type == "go":
+                    request_id = msg[1]
+                    await self._engine._go_queue.put(request_id)
+                elif msg_type == "stop":
+                    self._stop.set()
+                    break
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
                 self.logger.error(f"Rank {self._rank}: SUB recv error: {e}")
 
-    async def _sub_engine_loop(self):
-        self.logger.info(f"Rank {self._rank}: engine loop started.")
-
-        async def _drive_generate(args, kwargs):
-            try:
-                async for _ in self._engine.generate(*args, **kwargs):
-                    pass
-            except Exception as e:
-                self.logger.error(f"Rank {self._rank}: generate error: {e}")
-
+    async def _submission_loop_driver(self):
+        self.logger.info(f"Rank {self._rank}: submission loop driver started.")
         while not self._stop.is_set():
             try:
-                args, kwargs = await asyncio.wait_for(
-                    self._generate_queue.get(), timeout=5.0)
-                self.logger.info(f"Rank {self._rank}: driving engine.generate")
-                asyncio.create_task(_drive_generate(args, kwargs))
+                request = await asyncio.wait_for(
+                    self._engine._request_queue.get(), timeout=5.0)
+                self.logger.info(
+                    f"Rank {self._rank}: submitting request {request.request_id}")
+                event = asyncio.Event()
+                await self._engine._submission_queue.put((request, event))
+                await asyncio.wait_for(event.wait(), timeout=60.0)
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
-                self.logger.error(f"Rank {self._rank}: engine loop error: {e}")
+                self.logger.error(
+                    f"Rank {self._rank}: submission driver error: {e}")
 
     @action
     def get_address(self):
@@ -1161,15 +1277,17 @@ class _MultiNodeOnlineVLLMMixin:
             self._serve_task.cancel()
             self._serve_task = None
         if self._engine is not None:
-            if isinstance(self._engine, BcastEngineClient):
-                self._engine._engine_client.shutdown()
-            else:
-                self._engine.shutdown()
+            await self._engine.stop()
+            self._engine.shutdown()
             self._engine = None
         if self._pub_socket is not None:
             self._pub_socket.close()
         if self._sub_socket is not None:
             self._sub_socket.close()
+        if self._pull_socket is not None:
+            self._pull_socket.close()
+        if self._push_socket is not None:
+            self._push_socket.close()
         if self._zmq_context is not None:
             self._zmq_context.term()
 
