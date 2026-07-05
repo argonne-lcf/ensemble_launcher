@@ -992,6 +992,8 @@ class SPMDAsyncLLM:
                     await self._pub_socket.send(
                         cloudpickle.dumps(("go", request_id)))
                 else:
+                    await self._push_socket.send(
+                        cloudpickle.dumps(("ack", request_id, self._spmd_rank)))
                     go_id = await asyncio.wait_for(
                         self._go_queue.get(), timeout=30.0)
                 await self._engine.engine_core.add_request_async(request)
@@ -1234,8 +1236,6 @@ class _MultiNodeOnlineVLLMMixin:
                 if msg_type == "request":
                     request = msg[1]
                     await self._engine._request_queue.put(request)
-                    await self._push_socket.send(
-                        cloudpickle.dumps(("ack", request.request_id, self._rank)))
                 elif msg_type == "go":
                     request_id = msg[1]
                     await self._engine._go_queue.put(request_id)
@@ -1252,7 +1252,7 @@ class _MultiNodeOnlineVLLMMixin:
         while not self._stop.is_set():
             try:
                 request = await asyncio.wait_for(
-                    self._engine._request_queue.get(), timeout=5.0)
+                    self._engine._request_queue.get(), timeout=1.0)
                 self.logger.info(
                     f"Rank {self._rank}: submitting request {request.request_id}")
                 event = asyncio.Event()
