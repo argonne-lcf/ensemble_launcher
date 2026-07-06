@@ -11,6 +11,7 @@ import urllib.request
 import uuid
 from glob import glob
 from typing import Any, Dict, List, Optional, Union
+import queue
 
 import cloudpickle
 
@@ -923,104 +924,144 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
 # Mixin 4: Online Multi-Node vLLM server (in-process uvicorn + FastAPI of Rank 0. zmq sub on others)
 # ---------------------------------------------------------------------------
 
-class SPMDAsyncLLM:
-    """SPMD-aware wrapper around AsyncLLM.
+class SPMDEngineCoreProc:
+    def __init__(self, engine_core_proc):
+        self._engine_core = engine_core_proc
+        self._spmd_rank = int(os.environ.get("SPMD_RANK", "0"))
+        self._spmd_world_size = int(os.environ.get("SPMD_WORLD_SIZE", "1"))
+        self._bcast_queue = []
 
-    On rank 0: intercepts generate() to broadcast via PUB before delegating.
-    On all ranks: overrides _add_request() to enqueue into a submission queue.
-    A single _submission_loop coroutine processes the queue with a PUSH/PULL
-    barrier so all ranks call engine_core.add_request_async() at the same time.
-    """
+    def _spmd_handle_client_request(self, *args):
+        if self._spmd_rank == 0:
+            self._bcast_queue.append(args)
+        self._engine_core._original_handle_client_request(*args)
 
-    def __init__(self, engine):
-        self._engine = engine
-        self._spmd_rank = None
-        self._spmd_world_size = None
-        self._pub_socket = None
-        self._pull_socket = None
-        self._push_socket = None
-        self._submission_queue = None
-        self._go_queue = None
-        self._submission_task = None
-        self._original_add_request = None
+    def spmd_run_busy_loop(self):
+        import torch
+        from vllm.distributed.parallel_state import get_world_group
+        cpu_group = get_world_group().cpu_group
 
-    def init_spmd(self, rank, world_size, pub_socket=None,
-                  pull_socket=None, push_socket=None, logger=None):
-        self._spmd_rank = rank
-        self._spmd_world_size = world_size
-        self._pub_socket = pub_socket
-        self._pull_socket = pull_socket
-        self._push_socket = push_socket
-        self._logger = logger
-        self._submission_queue = asyncio.Queue()
-        self._go_queue = asyncio.Queue()
-        self._request_queue = asyncio.Queue()
-        self._broadcast_lock = asyncio.Lock()
-        self._original_add_request = self._engine._add_request
-        self._engine._add_request = self._spmd_add_request
-        self._submission_task = asyncio.create_task(self._submission_loop())
+        self._engine_core._original_handle_client_request = (
+            self._engine_core._handle_client_request)
+        self._engine_core._handle_client_request = (
+            self._spmd_handle_client_request)
 
-    async def _spmd_add_request(self, request, prompt, parent_req, index, queue):
-        self._engine.output_processor.add_request(
-            request, prompt, parent_req, index, queue)
-        if self._engine.log_requests:
-            import logging
-            logging.getLogger("vllm.v1.engine.async_llm").info(
-                "Added request %s.", request.request_id)
+        while self._engine_core._handle_shutdown():
+            if self._spmd_rank == 0:
+                self._bcast_queue = []
+                self._engine_core._process_input_queue()
+                items = [self._bcast_queue]
+            else:
+                items = [None]
 
-        event = asyncio.Event()
-        async with self._broadcast_lock:
-            await self._pub_socket.send(
-                cloudpickle.dumps(("request", request)))
-            await self._submission_queue.put((request, event))
-        await asyncio.wait_for(event.wait(), timeout=60.0)
+            torch.distributed.broadcast_object_list(
+                items, src=0, group=cpu_group)
 
-    async def _submission_loop(self):
-        while True:
-            request, event = await self._submission_queue.get()
-            request_id = request.request_id
-            try:
-                if self._spmd_rank == 0:
-                    acks = 0
-                    needed = self._spmd_world_size - 1
-                    while acks < needed:
-                        raw = await asyncio.wait_for(
-                            self._pull_socket.recv(), timeout=30.0)
-                        msg = cloudpickle.loads(raw)
-                        if msg[0] == "ack" and msg[1] == request_id:
-                            acks += 1
-                    await self._pub_socket.send(
-                        cloudpickle.dumps(("go", request_id)))
-                else:
-                    await self._push_socket.send(
-                        cloudpickle.dumps(("ack", request_id, self._spmd_rank)))
-                    go_id = await asyncio.wait_for(
-                        self._go_queue.get(), timeout=30.0)
-                await self._engine.engine_core.add_request_async(request)
-                event.set()
-            except Exception as e:
-                if self._logger:
-                    self._logger.error(
-                        f"Rank {self._spmd_rank}: submission loop error "
-                        f"for {request_id}: {e}")
-                event.set()
-                raise
+            if self._spmd_rank != 0:
+                while not self._engine_core.input_queue.empty():
+                    try:
+                        self._engine_core.input_queue.get_nowait()
+                    except Exception:
+                        break
+                for obj in items:
+                    for o in obj:
+                        self._engine_core.input_queue.put_nowait(o)
+                self._engine_core._process_input_queue()
 
-    async def stop(self):
-        if self._submission_task:
-            self._submission_task.cancel()
-            try:
-                await self._submission_task
-            except asyncio.CancelledError:
-                pass
+            self._engine_core._process_engine_step()
 
-    def shutdown(self, *args, **kwargs):
-        self._engine.shutdown(*args, **kwargs)
+        raise SystemExit
+
+    def __setattr__(self, name, value):
+        if name in ("_engine_core", "_spmd_rank", "_spmd_world_size",
+                     "_bcast_queue"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._engine_core, name, value)
 
     def __getattr__(self, name):
-        return getattr(self._engine, name)
-            
+        return getattr(self._engine_core, name)
 
+
+def _spmd_run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+    import signal
+    from vllm.config import VllmConfig, ParallelConfig
+    from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+    from vllm.utils.system_utils import decorate_logs, set_process_title
+    from vllm.utils import numa_utils
+    from vllm.tracing import maybe_init_worker_tracer
+    from vllm.v1.engine.core import (
+        EngineCoreProc, EngineCoreRequestType, EngineShutdownState,
+        SignalCallback,
+    )
+
+    maybe_register_config_serialize_by_value()
+
+    engine_core = None
+    signal_callback = None
+    try:
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        parallel_config: ParallelConfig = vllm_config.parallel_config
+        data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
+        if data_parallel:
+            parallel_config.data_parallel_rank_local = local_dp_rank
+            process_title = f"EngineCore_DP{dp_rank}"
+        else:
+            process_title = "EngineCore"
+        set_process_title(process_title)
+        maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
+        decorate_logs()
+        if parallel_config.numa_bind:
+            numa_utils.log_current_affinity_state(process_title)
+
+        if data_parallel and vllm_config.kv_transfer_config is not None:
+            vllm_config.kv_transfer_config.engine_id = (
+                f"{vllm_config.kv_transfer_config.engine_id}_dp{local_dp_rank}"
+            )
+
+        parallel_config.data_parallel_index = dp_rank
+        parallel_config.data_parallel_size = 1
+        parallel_config.data_parallel_size_local = 1
+        parallel_config.data_parallel_rank = 0
+        raw_engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+
+        engine_core = SPMDEngineCoreProc(raw_engine_core)
+
+        def wakeup_engine():
+            engine_core.input_queue.put_nowait(
+                (EngineCoreRequestType.WAKEUP, None))
+
+        signal_callback = SignalCallback(wakeup_engine)
+
+        def signal_handler(signum, frame):
+            engine_core.shutdown_state = EngineShutdownState.REQUESTED
+            signal_callback.trigger()
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        engine_core.spmd_run_busy_loop()
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        if engine_core is None:
+            import logging
+            logging.getLogger("vllm").exception("EngineCore failed to start.")
+        else:
+            import logging
+            logging.getLogger("vllm").exception(
+                "EngineCore encountered a fatal error.")
+            engine_core._send_engine_dead()
+        raise e
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if signal_callback is not None:
+            signal_callback.stop()
+        if engine_core is not None:
+            engine_core.shutdown()
+    
 class _MultiNodeOnlineVLLMMixin:
     def _init_multinode_vllm(
         self,
@@ -1063,8 +1104,6 @@ class _MultiNodeOnlineVLLMMixin:
         self._local_rank = None
         self._pub_socket = None
         self._sub_socket = None
-        self._pull_socket = None
-        self._push_socket = None
         self._zmq_context = None
         self._engine = None
         self._serve_task = None
@@ -1097,10 +1136,9 @@ class _MultiNodeOnlineVLLMMixin:
             self.sync_timeout, self._ckpt_dir)
         if self._rank == 0:
             self._pub_socket = sock_a
-            self._pull_socket = sock_b
         else:
             self._sub_socket = sock_a
-            self._push_socket = sock_b
+        sock_b.close()
 
         # For _set_multinode_env, rank 0 uses PUB, non-rank-0 uses SUB
         zmq_socket = self._pub_socket if self._rank == 0 else self._sub_socket
@@ -1126,6 +1164,12 @@ class _MultiNodeOnlineVLLMMixin:
             f"{self._rank},{self._local_rank},{os.environ[self.gpu_selector]}"
         )
         try:
+            os.environ["SPMD_RANK"] = str(self._rank)
+            os.environ["SPMD_WORLD_SIZE"] = str(self._world_size)
+
+            from vllm.v1.engine.core import EngineCoreProc
+            EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
+
             multinode_defaults = {
                 "distributed_executor_backend": "external_launcher",
                 "seed": 1,
@@ -1134,15 +1178,7 @@ class _MultiNodeOnlineVLLMMixin:
             self._args, raw_engine = _create_online_engine(
                 self.logger, snapshots, merged_kwargs)
 
-            self._engine = SPMDAsyncLLM(raw_engine)
-            self._engine.init_spmd(
-                rank=self._rank,
-                world_size=self._world_size,
-                pub_socket=self._pub_socket,
-                pull_socket=self._pull_socket,
-                push_socket=self._push_socket,
-                logger=self.logger,
-            )
+            self._engine = raw_engine
 
             if self._rank == 0:
                 self._hostname = get_hsn_ip_cli() or socket.gethostname()
@@ -1219,8 +1255,7 @@ class _MultiNodeOnlineVLLMMixin:
             if self._conn is not None:
                 await self._conn.close()
         else:
-            await asyncio.gather(
-                self._sub_recv(), self._submission_loop_driver())
+            await self._sub_recv()
             await self.on_stop()
 
     async def _sub_recv(self):
@@ -1232,37 +1267,13 @@ class _MultiNodeOnlineVLLMMixin:
                 msg = cloudpickle.loads(raw)
                 if not isinstance(msg, tuple) or len(msg) < 1:
                     continue
-                msg_type = msg[0]
-                if msg_type == "request":
-                    request = msg[1]
-                    await self._engine._request_queue.put(request)
-                elif msg_type == "go":
-                    request_id = msg[1]
-                    await self._engine._go_queue.put(request_id)
-                elif msg_type == "stop":
+                if msg[0] == "stop":
                     self._stop.set()
                     break
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
                 self.logger.error(f"Rank {self._rank}: SUB recv error: {e}")
-
-    async def _submission_loop_driver(self):
-        self.logger.info(f"Rank {self._rank}: submission loop driver started.")
-        while not self._stop.is_set():
-            try:
-                request = await asyncio.wait_for(
-                    self._engine._request_queue.get(), timeout=1.0)
-                self.logger.info(
-                    f"Rank {self._rank}: submitting request {request.request_id}")
-                event = asyncio.Event()
-                await self._engine._submission_queue.put((request, event))
-                await asyncio.wait_for(event.wait(), timeout=60.0)
-            except asyncio.TimeoutError:
-                pass
-            except Exception as e:
-                self.logger.error(
-                    f"Rank {self._rank}: submission driver error: {e}")
 
     @action
     def get_address(self):
@@ -1277,17 +1288,12 @@ class _MultiNodeOnlineVLLMMixin:
             self._serve_task.cancel()
             self._serve_task = None
         if self._engine is not None:
-            await self._engine.stop()
             self._engine.shutdown()
             self._engine = None
         if self._pub_socket is not None:
             self._pub_socket.close()
         if self._sub_socket is not None:
             self._sub_socket.close()
-        if self._pull_socket is not None:
-            self._pull_socket.close()
-        if self._push_socket is not None:
-            self._push_socket.close()
         if self._zmq_context is not None:
             self._zmq_context.term()
 
