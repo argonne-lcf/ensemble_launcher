@@ -109,10 +109,14 @@ def _create_engine(logger, snapshots, llm_kwargs: Dict[str, Any] = {}, async_eng
 
 def _create_online_engine(logger, snapshots, server_args: Dict = {}, engine_cls=None):
 
+    from vllm.v1.engine.core import EngineCoreProc
+    EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
+    logger.info("Monkey patch successful")
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
     from vllm.entrypoints.openai.cli_args import make_arg_parser
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
 
     if engine_cls is None:
         engine_cls = AsyncLLMEngine
@@ -925,20 +929,23 @@ class PrivateMultiNodeVLLMInference(_MultiNodeVLLMMixin, PrivateActor):
 # ---------------------------------------------------------------------------
 
 class SPMDEngineCoreProc:
-    def __init__(self, engine_core_proc):
+    def __init__(self, engine_core_proc, vllm_logger):
         self._engine_core = engine_core_proc
         self._spmd_rank = int(os.environ.get("SPMD_RANK", "0"))
         self._spmd_world_size = int(os.environ.get("SPMD_WORLD_SIZE", "1"))
         self._bcast_queue = []
+        self._logger = vllm_logger
 
     def _spmd_handle_client_request(self, *args):
         if self._spmd_rank == 0:
             self._bcast_queue.append(args)
         self._engine_core._original_handle_client_request(*args)
 
-    def spmd_run_busy_loop(self):
+    def run_busy_loop(self):
         import torch
         from vllm.distributed.parallel_state import get_world_group
+        import cloudpickle
+
         cpu_group = get_world_group().cpu_group
 
         self._engine_core._original_handle_client_request = (
@@ -946,16 +953,26 @@ class SPMDEngineCoreProc:
         self._engine_core._handle_client_request = (
             self._spmd_handle_client_request)
 
-        while self._engine_core._handle_shutdown():
+        while True:
             if self._spmd_rank == 0:
                 self._bcast_queue = []
                 self._engine_core._process_input_queue()
-                items = [self._bcast_queue]
+                nitems = [len(self._bcast_queue)]
+                if len(self._bcast_queue)>0:
+                    items = [cloudpickle.dumps(self._bcast_queue)]
             else:
+                nitems = [None]
                 items = [None]
 
-            torch.distributed.broadcast_object_list(
-                items, src=0, group=cpu_group)
+            try:
+                torch.distributed.broadcast_object_list(
+                    nitems, src=0, group=cpu_group)
+                if nitems[0] > 0:
+                    self._logger.info(f"Ranks {self._spmd_rank}: Starting torch bcast for {len(self._bcast_queue)}")
+                    torch.distributed.broadcast_object_list(
+                        items, src=0, group=cpu_group)
+            except Exception as e:
+                self._logger.error(f"Bcast failed with exception: {e}")
 
             if self._spmd_rank != 0:
                 while not self._engine_core.input_queue.empty():
@@ -963,14 +980,14 @@ class SPMDEngineCoreProc:
                         self._engine_core.input_queue.get_nowait()
                     except Exception:
                         break
-                for obj in items:
-                    for o in obj:
-                        self._engine_core.input_queue.put_nowait(o)
+                if nitems[0] > 0:
+                    for obj_bytes in items:
+                        obj = cloudpickle.loads(obj_bytes)
+                        for o in obj:
+                            self._engine_core.input_queue.put_nowait(o)
                 self._engine_core._process_input_queue()
 
             self._engine_core._process_engine_step()
-
-        raise SystemExit
 
     def __setattr__(self, name, value):
         if name in ("_engine_core", "_spmd_rank", "_spmd_world_size",
@@ -982,85 +999,157 @@ class SPMDEngineCoreProc:
     def __getattr__(self, name):
         return getattr(self._engine_core, name)
 
-
 def _spmd_run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+
     import signal
     from vllm.config import VllmConfig, ParallelConfig
     from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
     from vllm.utils.system_utils import decorate_logs, set_process_title
-    from vllm.utils import numa_utils
-    from vllm.tracing import maybe_init_worker_tracer
-    from vllm.v1.engine.core import (
-        EngineCoreProc, EngineCoreRequestType, EngineShutdownState,
-        SignalCallback,
-    )
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
+    from vllm.v1.engine.core import logger as vllm_logger
 
+    # Signal handler used for graceful termination.
+    # SystemExit exception is only raised once to allow this and worker
+    # processes to terminate without error
+    shutdown_requested = False
+    # Ensure we can serialize transformer config after spawning
     maybe_register_config_serialize_by_value()
-
-    engine_core = None
-    signal_callback = None
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            shutdown_requested = True
+            raise SystemExit()
+    # Either SIGTERM or SIGINT will terminate the engine_core
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    engine_core: SPMDEngineCoreProc = None
     try:
         vllm_config: VllmConfig = kwargs["vllm_config"]
         parallel_config: ParallelConfig = vllm_config.parallel_config
         data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
         if data_parallel:
             parallel_config.data_parallel_rank_local = local_dp_rank
-            process_title = f"EngineCore_DP{dp_rank}"
+            set_process_title("EngineCore", f"DP{dp_rank}")
         else:
-            process_title = "EngineCore"
-        set_process_title(process_title)
-        maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
+            set_process_title("EngineCore")
         decorate_logs()
-        if parallel_config.numa_bind:
-            numa_utils.log_current_affinity_state(process_title)
-
         if data_parallel and vllm_config.kv_transfer_config is not None:
+            # modify the engine_id and append the local_dp_rank to it to ensure
+            # that the kv_transfer_config is unique for each DP rank.
             vllm_config.kv_transfer_config.engine_id = (
                 f"{vllm_config.kv_transfer_config.engine_id}_dp{local_dp_rank}"
             )
-
+            # logger.debug(
+            #     "Setting kv_transfer_config.engine_id to %s",
+            #     vllm_config.kv_transfer_config.engine_id,
+            # )
         parallel_config.data_parallel_index = dp_rank
-        parallel_config.data_parallel_size = 1
-        parallel_config.data_parallel_size_local = 1
-        parallel_config.data_parallel_rank = 0
-        raw_engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
-
-        engine_core = SPMDEngineCoreProc(raw_engine_core)
-
-        def wakeup_engine():
-            engine_core.input_queue.put_nowait(
-                (EngineCoreRequestType.WAKEUP, None))
-
-        signal_callback = SignalCallback(wakeup_engine)
-
-        def signal_handler(signum, frame):
-            engine_core.shutdown_state = EngineShutdownState.REQUESTED
-            signal_callback.trigger()
-
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-
-        engine_core.spmd_run_busy_loop()
-
+        if data_parallel and vllm_config.model_config.is_moe:
+            # Set data parallel rank for this engine process.
+            parallel_config.data_parallel_rank = dp_rank
+            engine_core = DPEngineCoreProc(*args, **kwargs)
+        else:
+            # Non-MoE DP ranks are completely independent, so treat like DP=1.
+            # Note that parallel_config.data_parallel_index will still reflect
+            # the original DP rank.
+            parallel_config.data_parallel_size = 1
+            parallel_config.data_parallel_size_local = 1
+            parallel_config.data_parallel_rank = 0
+            engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+            engine_core = SPMDEngineCoreProc(engine_core, vllm_logger)
+        engine_core.run_busy_loop()
     except SystemExit:
+        # logger.debug("EngineCore exiting.")
         raise
     except Exception as e:
-        if engine_core is None:
-            import logging
-            logging.getLogger("vllm").exception("EngineCore failed to start.")
-        else:
-            import logging
-            logging.getLogger("vllm").exception(
-                "EngineCore encountered a fatal error.")
-            engine_core._send_engine_dead()
+        # if engine_core is None:
+        #     # logger.exception("EngineCore failed to start.")
+        # else:
+        #     logger.exception("EngineCore encountered a fatal error.")
+        #     engine_core._send_engine_dead()
         raise e
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        if signal_callback is not None:
-            signal_callback.stop()
         if engine_core is not None:
             engine_core.shutdown()
+
+# def _spmd_run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+#     import signal
+#     from vllm.config import VllmConfig, ParallelConfig
+#     from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+#     from vllm.utils.system_utils import decorate_logs, set_process_title
+#     from vllm.utils import numa_utils
+#     from vllm.tracing import maybe_init_worker_tracer
+#     from vllm.v1.engine.core import (
+#         EngineCoreProc, EngineCoreRequestType, EngineShutdownState,
+#         SignalCallback,
+#     )
+
+#     maybe_register_config_serialize_by_value()
+
+#     engine_core = None
+#     signal_callback = None
+#     try:
+#         vllm_config: VllmConfig = kwargs["vllm_config"]
+#         parallel_config: ParallelConfig = vllm_config.parallel_config
+#         data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
+#         if data_parallel:
+#             parallel_config.data_parallel_rank_local = local_dp_rank
+#             process_title = f"EngineCore_DP{dp_rank}"
+#         else:
+#             process_title = "EngineCore"
+#         set_process_title(process_title)
+#         maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
+#         decorate_logs()
+#         if parallel_config.numa_bind:
+#             numa_utils.log_current_affinity_state(process_title)
+
+#         if data_parallel and vllm_config.kv_transfer_config is not None:
+#             vllm_config.kv_transfer_config.engine_id = (
+#                 f"{vllm_config.kv_transfer_config.engine_id}_dp{local_dp_rank}"
+#             )
+
+#         parallel_config.data_parallel_index = dp_rank
+#         parallel_config.data_parallel_size = 1
+#         parallel_config.data_parallel_size_local = 1
+#         parallel_config.data_parallel_rank = 0
+#         raw_engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+
+#         engine_core = SPMDEngineCoreProc(raw_engine_core)
+
+#         def wakeup_engine():
+#             engine_core.input_queue.put_nowait(
+#                 (EngineCoreRequestType.WAKEUP, None))
+
+#         signal_callback = SignalCallback(wakeup_engine)
+
+#         def signal_handler(signum, frame):
+#             engine_core.shutdown_state = EngineShutdownState.REQUESTED
+#             signal_callback.trigger()
+
+#         signal.signal(signal.SIGTERM, signal_handler)
+#         signal.signal(signal.SIGINT, signal_handler)
+
+#         engine_core.spmd_run_busy_loop()
+
+#     except SystemExit:
+#         raise
+#     except Exception as e:
+#         if engine_core is None:
+#             import logging
+#             logging.getLogger("vllm").exception("EngineCore failed to start.")
+#         else:
+#             import logging
+#             logging.getLogger("vllm").exception(
+#                 "EngineCore encountered a fatal error.")
+#             engine_core._send_engine_dead()
+#         raise e
+#     finally:
+#         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+#         signal.signal(signal.SIGINT, signal.SIG_DFL)
+#         if signal_callback is not None:
+#             signal_callback.stop()
+#         if engine_core is not None:
+#             engine_core.shutdown()
     
 class _MultiNodeOnlineVLLMMixin:
     def _init_multinode_vllm(
@@ -1166,9 +1255,6 @@ class _MultiNodeOnlineVLLMMixin:
         try:
             os.environ["SPMD_RANK"] = str(self._rank)
             os.environ["SPMD_WORLD_SIZE"] = str(self._world_size)
-
-            from vllm.v1.engine.core import EngineCoreProc
-            EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
 
             multinode_defaults = {
                 "distributed_executor_backend": "external_launcher",
