@@ -943,6 +943,7 @@ class SPMDEngineCoreProc:
 
     def run_busy_loop(self):
         import torch
+        from torch import Tensor
         from vllm.distributed.parallel_state import get_world_group
         import cloudpickle
 
@@ -953,20 +954,19 @@ class SPMDEngineCoreProc:
         self._engine_core._handle_client_request = (
             self._spmd_handle_client_request)
 
+        nitems = torch.zeros(size=(1,),dtype=torch.int32)
         while True:
             if self._spmd_rank == 0:
                 self._bcast_queue = []
                 self._engine_core._process_input_queue()
-                nitems = [len(self._bcast_queue)]
+                nitems[0] = len(self._bcast_queue)
                 if len(self._bcast_queue)>0:
                     items = [cloudpickle.dumps(self._bcast_queue)]
             else:
-                nitems = [None]
                 items = [None]
 
             try:
-                torch.distributed.broadcast_object_list(
-                    nitems, src=0, group=cpu_group)
+                torch.distributed.broadcast(nitems, src=0, group=cpu_group)
                 if nitems[0] > 0:
                     self._logger.info(f"Ranks {self._spmd_rank}: Starting torch bcast for {len(self._bcast_queue)}")
                     torch.distributed.broadcast_object_list(
