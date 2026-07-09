@@ -342,7 +342,34 @@ class _VLLMOnlineMixin:
             self._args, self._engine = _create_online_engine(self.logger, snapshots, self.server_args)
 
 
-        from vllm.entrypoints.openai.api_server import build_and_serve
+        try:
+            from vllm.entrypoints.openai.api_server import build_and_serve
+        except Exception:
+            self.logger.warning("Installed vllm does not have build_and_serve using custom")
+            
+            import vllm.envs as envs  # isort: skip
+            from vllm.entrypoints.openai.api_server import build_app, init_app_state, serve_http
+            async def build_and_serve(engine_client, listen_address, sock, args, **uvicorn_kwargs):
+                app = build_app(args)
+                await init_app_state(engine_client, app.state, args)
+                return await serve_http(
+                                app,
+                                sock=sock,
+                                enable_ssl_refresh=args.enable_ssl_refresh,
+                                host=args.host,
+                                port=args.port,
+                                log_level=args.uvicorn_log_level,
+                                access_log=not args.disable_uvicorn_access_log,
+                                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                                ssl_keyfile=args.ssl_keyfile,
+                                ssl_certfile=args.ssl_certfile,
+                                ssl_ca_certs=args.ssl_ca_certs,
+                                ssl_cert_reqs=args.ssl_cert_reqs,
+                                ssl_ciphers=args.ssl_ciphers,
+                                h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                                h11_max_header_count=args.h11_max_header_count,
+                                **uvicorn_kwargs,
+                                )
         from vllm.tool_parsers import ToolParserManager
         from vllm.reasoning import ReasoningParserManager
 
