@@ -108,10 +108,6 @@ def _create_engine(logger, snapshots, llm_kwargs: Dict[str, Any] = {}, async_eng
         raise RuntimeError(str(e))
 
 def _create_online_engine(logger, snapshots, server_args: Dict = {}, engine_cls=None):
-
-    from vllm.v1.engine.core import EngineCoreProc
-    EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
-    logger.info("Monkey patch successful")
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
     from vllm.entrypoints.openai.cli_args import make_arg_parser
@@ -325,22 +321,26 @@ class _VLLMOnlineMixin:
         self.logger.info(
             f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
         )
-        snapshots = _setup_env(self._name, self.logger, self.model, self.cache_dir,
+        try:
+            snapshots = _setup_env(self._name, self.logger, self.model, self.cache_dir,
                            self._use_cached_modelinfo, self._model_info_cache)
+        except Exception as e:
+            self.logger.error(f"Setting env failed with error {e}")
+            raise e
         
         if len(snapshots) == 0:
             self.logger.error("No model snapshots found.")
             raise FileNotFoundError
         
+        self._hostname = self.server_args.get("host", get_hsn_ip_cli() or 
+                                                    socket.gethostbyname(socket.gethostname()))
+        self.port = self.server_args.get("port", 8001)
+        self.server_args["host"] = self._hostname
+        self.server_args["port"] = self.port
+
         if self._engine is None:
             self._args, self._engine = _create_online_engine(self.logger, snapshots, self.server_args)
 
-        self._hostname = (
-            socket.gethostname()
-            if ".local" not in socket.gethostname()
-            else "localhost"
-        )
-        self.port = self._args.port
 
         from vllm.entrypoints.openai.api_server import build_and_serve
         from vllm.tool_parsers import ToolParserManager
@@ -450,7 +450,7 @@ def _create_sockets(rank, logger, sync_location, sync_timeout, ckpt_dir):
     from zmq.asyncio import Context as AsyncContext
     from zmq.asyncio import Socket as AsyncSocket
 
-    hostname = get_hsn_ip_cli() or socket.gethostname()
+    hostname = get_hsn_ip_cli() or socket.gethostbyname(socket.gethostname())
 
     if rank == 0:
         os.environ["MASTER_ADDR"] = hostname
@@ -1261,13 +1261,16 @@ class _MultiNodeOnlineVLLMMixin:
                 "seed": 1,
             }
             merged_kwargs = {**multinode_defaults, **(self.server_kwargs or {})}
+            from vllm.v1.engine.core import EngineCoreProc
+            EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
+            
             self._args, raw_engine = _create_online_engine(
                 self.logger, snapshots, merged_kwargs)
 
             self._engine = raw_engine
 
             if self._rank == 0:
-                self._hostname = get_hsn_ip_cli() or socket.gethostname()
+                self._hostname = self.server_kwargs.get("host", get_hsn_ip_cli() or socket.gethostbyname(socket.gethostname()))
                 self.port = self._args.port
                 self._args.host = self._hostname
 
