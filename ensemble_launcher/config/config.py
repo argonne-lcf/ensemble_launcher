@@ -35,8 +35,20 @@ def get_system_config(name="aurora"):
             cpus=list(range(1, 52)) + list(range(53, 104)),
             gpus=list(map(str, range(12))),
         )
+    elif name == "polaris":
+        return SystemConfig(
+            name="polaris",
+            ncpus=32,
+            ngpus=4,
+            cpus=list(range(32)),
+            gpus=list(range(4)),
+        )
     else:
         raise NotImplementedError(f"unknown system {name}")
+
+
+aurora_config = get_system_config("aurora")
+polaris_config = get_system_config("polaris")
 
 
 class LauncherConfig(BaseModel):

@@ -1,17 +1,17 @@
 import asyncio
+import multiprocessing
 import os
-import random
-import threading
+import queue
 import time
 from asyncio import Queue
 from logging import Logger
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
-import cloudpickle
 from pydantic import BaseModel, SerializeAsAny
 
 from ensemble_launcher.profiling import EventRegistry, get_registry
 
+from .hb import HeartBeatProcess
 from .messages import Message, all_messages
 from .nodeinfo import NodeInfo
 from .pipe import (
@@ -67,9 +67,6 @@ class AsyncCommState(BaseModel):
                         raw[key] = cs_cls.model_validate(nested)
 
         return cls.model_validate(raw)
-
-
-_HB_PING = b"\x01"
 
 
 def _decode_identity(raw: bytes) -> Tuple[str, str, Optional[str]]:
@@ -193,8 +190,10 @@ class AsyncComm:
         heartbeat_interval: float = 1.0,
         heartbeat_dead_threshold: float = 30.0,
         cluster_secret: Optional[str] = None,
+        skip_hb: bool = False,
     ):
         self.logger = logger
+        self._skip_hb = skip_hb
         self._node_info = node_info
         self._cluster_secret = cluster_secret
         self.last_update_time = time.time()
@@ -212,23 +211,23 @@ class AsyncComm:
             )
         transport_cls = entry["transport"]
         self._data_transport: AsyncTransport = transport_cls()
-        self._hb_transport: AsyncTransport = transport_cls()
+        try:
+            self._hb_transport: AsyncTransport = transport_cls(lightweight=True)
+        except TypeError:
+            self._hb_transport: AsyncTransport = transport_cls()
 
         self._recv_queue: asyncio.Queue = asyncio.Queue()
         self._recv_tasks: Dict[int, asyncio.Task] = {}
 
-        self._hb_recv_queue: asyncio.Queue = asyncio.Queue()
-        self._hb_recv_tasks: Dict[int, asyncio.Task] = {}
-
         self._cache: Dict[str, AsyncMessageRoutingQueue] = {}
-        self._stop_event = None
+        self._stop_event = asyncio.Event()
         self._client_queue: asyncio.Queue = asyncio.Queue()
 
         self._parent_monitor_started = False
         self._child_monitor_started = False
         self._monitor_tasks: List[asyncio.Task] = []
 
-        self.parent_dead_event: Optional[asyncio.Event] = None
+        self.parent_dead_event: Optional[asyncio.Event] = asyncio.Event()
         self._child_dead_events: Dict[str, asyncio.Event] = {}
 
         self._event_registry: Optional[EventRegistry] = None
@@ -236,21 +235,16 @@ class AsyncComm:
             self._event_registry: EventRegistry = get_registry()
 
         # Heartbeat state
-        self._parent_hb_thread: Optional[threading.Thread] = None
-        self._parent_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._parent_hb_asyncio_stop: Optional[asyncio.Event] = None
-        self._parent_hb_started: bool = False
+        self._hb_process: Optional[multiprocessing.Process] = None
+        self._hb_control_queue: Optional[multiprocessing.Queue] = None
+        self._hb_notify_queue: Optional[multiprocessing.Queue] = None
+        self._hb_watcher_task: Optional[asyncio.Task] = None
+        self._hb_process_started: bool = False
 
-        self._children_hb_thread: Optional[threading.Thread] = None
-        self._children_hb_thread_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._children_hb_asyncio_stop: Optional[asyncio.Event] = None
-        self._children_hb_started: bool = False
-
-        self._last_parent_hb_time: Optional[float] = None
-        self._last_child_hb_time: Dict[str, float] = {}
-        self._hb_parent_ready: Optional[asyncio.Event] = None
+        self._hb_parent_ready: Optional[asyncio.Event] = asyncio.Event()
         self._hb_child_ready: Dict[str, asyncio.Event] = {}
         self._heartbeat_dead_threshold: float = heartbeat_dead_threshold
+        self.update_node_info(node_info=node_info)
 
     # -----------------------------------------------------------------
     #  Properties
@@ -267,7 +261,7 @@ class AsyncComm:
     def parent_address(self) -> Optional[str]:
         if self._parent_conn is None:
             return None
-        return self._parent_conn.remote_address
+        return getattr(self._parent_conn, "remote_address", None)
 
     @property
     def my_hb_address(self) -> Optional[str]:
@@ -306,9 +300,12 @@ class AsyncComm:
 
         return validator
 
-    def create_child_pipe(
+    async def create_child_pipe(
         self, child_id: str, child_secret_id: str
     ) -> Tuple[ClientConnection, ClientConnection]:
+        known_data_conns = set(
+            id(c) for c in self._data_transport.get_server_connections()
+        )
         data_server, data_client = self._data_transport.create_child_pipe(
             self._node_info.node_id,
             self._node_info.secret_id,
@@ -316,64 +313,53 @@ class AsyncComm:
             child_secret_id,
         )
         data_server.set_unknown_sender_validator(self._make_client_validator())
-        _, hb_client = self._hb_transport.create_child_pipe(
+        if id(data_server) not in known_data_conns:
+            if not data_server.is_open:
+                await data_server.open()
+            self._monitor_tasks.append(
+                asyncio.create_task(self._monitor_children_data_conn(data_server))
+            )
+
+        known_hb_conns = set(id(c) for c in self._hb_transport.get_server_connections())
+        hb_server, hb_client = self._hb_transport.create_child_pipe(
             self._node_info.node_id,
             self._node_info.secret_id,
             child_id,
             child_secret_id,
         )
+        if id(hb_server) not in known_hb_conns and self._hb_control_queue is not None:
+            self._hb_control_queue.put(("add_server_connection", hb_server))
         return data_client, hb_client
 
     # -----------------------------------------------------------------
     #  Cache management
     # -----------------------------------------------------------------
 
-    async def init_cache(self):
-        for child_id in self._node_info.children_ids:
-            if child_id in self._cache:
-                continue
-            self.logger.info(f"Initializing cache for child_id: {child_id}")
-            self._cache[child_id] = AsyncMessageRoutingQueue(
-                logger=self.logger, message_types=all_messages
-            )
-
-        if self._node_info.parent_id and self._node_info.parent_id not in self._cache:
-            self.logger.info(
-                f"Initializing cache for parent_id: {self._node_info.parent_id}"
-            )
-            self._cache[self._node_info.parent_id] = AsyncMessageRoutingQueue(
-                logger=self.logger, message_types=all_messages
-            )
-
-    async def update_node_info(self, node_info: NodeInfo):
-        added_children = set(node_info.children_ids) - set(self._node_info.children_ids)
-        removed_children = set(self._node_info.children_ids) - set(
-            node_info.children_ids
-        )
-
-        for child_id in added_children:
-            self._child_dead_events[child_id] = asyncio.Event()
-            self._hb_child_ready[child_id] = asyncio.Event()
-            self._last_child_hb_time[child_id] = None
-            child_secret = node_info.children_secret_ids.get(child_id)
-            if child_secret:
-                for conn in self._data_transport.get_server_connections():
-                    conn.add_expected_remote(child_id, child_secret)
-                for conn in self._hb_transport.get_server_connections():
-                    conn.add_expected_remote(child_id, child_secret)
-
-        for child_id in removed_children:
-            self._hb_child_ready.pop(child_id, None)
-            self._last_child_hb_time.pop(child_id, None)
-            self._child_dead_events.pop(child_id, None)
-            self._cache.pop(child_id, None)
-            for conn in self._data_transport.get_server_connections():
-                conn.remove_expected_remote(child_id)
-            for conn in self._hb_transport.get_server_connections():
-                conn.remove_expected_remote(child_id)
-
+    def update_node_info(self, node_info: NodeInfo):
         self._node_info = node_info
-        await self.init_cache()
+        ## Add children
+        for child_id in node_info.children_ids:
+            if child_id not in self._hb_child_ready:
+                self._hb_child_ready[child_id] = asyncio.Event()
+                self._child_dead_events[child_id] = asyncio.Event()
+                self._cache[child_id] = AsyncMessageRoutingQueue(
+                    logger=self.logger, message_types=all_messages
+                )
+                if self._hb_control_queue is not None:
+                    child_secret = node_info.children_secret_ids[child_id]
+                    self._hb_control_queue.put(("add_child", child_id, child_secret))
+                elif self._hb_process_started:
+                    self._hb_child_ready[child_id].set()
+
+        # Remove children
+        child_ids = set(self._hb_child_ready.keys())
+        for child_id in child_ids:
+            if child_id not in node_info.children_ids:
+                self._hb_child_ready.pop(child_id, None)
+                self._child_dead_events.pop(child_id, None)
+                self._cache.pop(child_id, None)
+                if self._hb_control_queue is not None:
+                    self._hb_control_queue.put(("remove_child", child_id))
 
     async def clear_cache(self):
         for routing_queue in self._cache.values():
@@ -385,286 +371,166 @@ class AsyncComm:
     # -----------------------------------------------------------------
 
     async def start_monitors(self, **kwargs):
-        await self.init_cache()
-        if self._stop_event is None:
-            self._stop_event = asyncio.Event()
 
         if self._parent_conn is not None and not self._parent_conn.is_open:
             await self._parent_conn.open()
+            if self._node_info.parent_id not in self._cache:
+                self._cache[self._node_info.parent_id] = AsyncMessageRoutingQueue(
+                    logger=self.logger, message_types=all_messages
+                )
+            self._monitor_tasks.append(
+                asyncio.create_task(self._monitor_parent_data_conn())
+            )
+        if self._node_info.parent_id is not None:
             self.logger.info(
                 f"{self._node_info.node_id}: Connected to parent at {self.parent_address}"
             )
 
-        if self._parent_conn is not None:
-            self.logger.info(f"My hb secret: {self._hb_parent_conn._secret_id}")
-            self.logger.info(f"My data secret: {self._parent_conn._secret_id}")
-
-        if self._hb_transport is not None:
-            self.logger.info(
-                f"Expected hb remotes: {[conn.expected_remotes for conn in self._hb_transport.get_server_connections()]}"
+        # Eagerly create the local server connections (ZMQ supports this;
+        # MP transport does not, so we guard with try/except).
+        try:
+            data_conn = self._data_transport.get_server_connection(
+                self._node_info.node_id, self._node_info.secret_id
             )
-            self.logger.info(
-                f"Expected data remotes: {[conn.expected_remotes for conn in self._data_transport.get_server_connections()]}"
-            )
-
-        parent_only = kwargs.get("parent_only", False)
-        children_only = kwargs.get("children_only", False)
-
-        if not children_only:
-            if (
-                self._node_info.parent_id is not None
-                and not self._parent_monitor_started
-            ):
-                self._monitor_tasks.append(asyncio.create_task(self._monitor_parent()))
-                self._parent_monitor_started = True
-
-        if not parent_only:
-            for conn in self._data_transport.get_server_connections():
-                if not conn.is_open:
-                    await conn.open()
-                    self.logger.info(
-                        f"{self._node_info.node_id}: Data connection bound to {self.my_address}"
-                    )
-
-                if id(conn) not in self._recv_tasks:
-                    self._recv_tasks[id(conn)] = asyncio.create_task(
-                        self._recv_loop(conn)
-                    )
-            if not self._child_monitor_started:
+            if not data_conn.is_open:
+                await data_conn.open()
+                self.logger.info(
+                    f"{self._node_info.node_id}: Data server connection bound to {self.my_address}"
+                )
                 self._monitor_tasks.append(
-                    asyncio.create_task(self._monitor_children())
+                    asyncio.create_task(self._monitor_children_data_conn(data_conn))
                 )
-                self._child_monitor_started = True
-
-        main_loop = asyncio.get_running_loop()
-
-        # Parent HB thread
-        if (
-            not children_only
-            and self._hb_parent_conn is not None
-            and not self._parent_hb_started
-        ):
-            self._parent_hb_started = True
-            if self._node_info.parent_id:
-                self.parent_dead_event = asyncio.Event()
-                self._hb_parent_ready = asyncio.Event()
-            self._parent_hb_thread = threading.Thread(
-                target=self._parent_hb_thread_main,
-                args=(main_loop,),
-                daemon=True,
-                name=f"hb-parent-{self._node_info.node_id}",
-            )
-            self._parent_hb_thread.start()
-
-        # Children HB thread
-        if not parent_only and not self._children_hb_started:
-            self._children_hb_started = True
-            for child_id in self._node_info.children_ids:
-                self._child_dead_events[child_id] = asyncio.Event()
-                self._hb_child_ready[child_id] = asyncio.Event()
-                self._last_child_hb_time[child_id] = None
-
-            addr_q: asyncio.Queue = asyncio.Queue()
-            self._children_hb_thread = threading.Thread(
-                target=self._children_hb_thread_main,
-                args=(main_loop, addr_q),
-                daemon=True,
-                name=f"hb-children-{self._node_info.node_id}",
-            )
-            self._children_hb_thread.start()
-
-            try:
-                actual_hb_addr = await asyncio.wait_for(addr_q.get(), timeout=10.0)
-                if actual_hb_addr is not None:
-                    self.logger.info(
-                        f"{self._node_info.node_id}: Children HB thread bound to {actual_hb_addr}"
-                    )
-            except asyncio.TimeoutError:
-                self.logger.warning(
-                    f"{self._node_info.node_id}: Children HB thread did not report bound address"
-                )
-
-    # ------------------------------------------------------------------ #
-    # HB threads                                                          #
-    # ------------------------------------------------------------------ #
-
-    def _parent_hb_thread_main(self, main_loop: asyncio.AbstractEventLoop) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._parent_hb_thread_loop = loop
-        try:
-            loop.run_until_complete(self._parent_hb_coroutine(main_loop))
-        finally:
-            loop.close()
-            self._parent_hb_thread_loop = None
-
-    async def _parent_hb_coroutine(self, main_loop: asyncio.AbstractEventLoop) -> None:
-        stop = asyncio.Event()
-        self._parent_hb_asyncio_stop = stop
-
-        hb_conn = self._hb_parent_conn
-        await hb_conn.open()
-        try:
-            self.logger.info(f"Connected hb thread to {hb_conn.remote_address}")
-        except Exception:
+        except NotImplementedError:
             pass
+        # HB process (only for transports that support standalone server connections)
+        if not self._hb_process_started and (self._hb_transport.transport_type == "mp" or self._skip_hb):
+            self.logger.warning(
+                f"{self._node_info.node_id}: MP transport does not support HB process, "
+                "setting all HB events as ready"
+            )
+            if self._hb_parent_ready is not None:
+                self._hb_parent_ready.set()
+            for ev in self._hb_child_ready.values():
+                ev.set()
+            self._hb_process_started = True
 
-        self._last_parent_hb_time = time.time()
-        try:
-            while not stop.is_set():
+        if not self._hb_process_started and self._hb_transport.transport_type != "mp":
+            initial_children = {}
+            for child_id in self._node_info.children_ids:
+                secret = self._node_info.children_secret_ids.get(child_id)
+                initial_children[child_id] = secret
+            self._hb_transport.get_server_connection(
+                self._node_info.node_id, self._node_info.secret_id
+            )
+            hb_server_conns = self._hb_transport.get_server_connections()
+            self._hb_control_queue = multiprocessing.Queue()
+            self._hb_notify_queue = multiprocessing.Queue()
+            hb_proc = HeartBeatProcess(
+                node_id=self._node_info.node_id,
+                secret_id=self._node_info.secret_id,
+                parent_id=self._node_info.parent_id,
+                hb_parent_conn=self._hb_parent_conn,
+                hb_server_conns=hb_server_conns,
+                heartbeat_interval=self.heartbeat_interval,
+                heartbeat_dead_threshold=self._heartbeat_dead_threshold,
+                control_queue=self._hb_control_queue,
+                notify_queue=self._hb_notify_queue,
+                initial_children=initial_children if initial_children else None,
+            )
+            self._hb_process = multiprocessing.Process(
+                target=hb_proc,
+                daemon=True,
+                name=f"hb-{self._node_info.node_id}",
+            )
+            self._hb_process.start()
+            loop = asyncio.get_running_loop()
+            num_expected_addrs = len(hb_server_conns)
+            for _ in range(num_expected_addrs):
                 try:
-                    await hb_conn.send(_HB_PING)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    self.logger.warning(
-                        f"{self._node_info.node_id}:{self._node_info.secret_id}: HB send error: {e}"
+                    msg = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, self._hb_notify_queue.get, True, 10.0
+                        ),
+                        timeout=15.0,
                     )
-
-                try:
-                    raw = await asyncio.wait_for(hb_conn.recv(), timeout=1.0)
-                    if raw is not None and len(raw) >= 2 and raw[1] == _HB_PING:
-                        if (
-                            self._hb_parent_ready is not None
-                            and not self._hb_parent_ready.is_set()
-                        ):
-                            try:
-                                main_loop.call_soon_threadsafe(
-                                    self._hb_parent_ready.set
-                                )
-                            except RuntimeError:
-                                pass
-                        self._last_parent_hb_time = time.time()
-                except (asyncio.TimeoutError, TimeoutError):
-                    # Parent didn't respond in time. Pass so the threshold logic can evaluate.
-                    pass
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    # If the parent abruptly dies, recv() might raise EOFError or ConnectionResetError
+                    if msg[0] == "hb_address":
+                        actual_addr = msg[1]
+                        for conn in self._hb_transport.get_server_connections():
+                            conn._address = actual_addr
+                        self.logger.info(
+                            f"{self._node_info.node_id}: HB process bound to {actual_addr}"
+                        )
+                except (asyncio.TimeoutError, queue.Empty):
                     self.logger.warning(
-                        f"{self._node_info.node_id}:{self._node_info.secret_id}: HB recv error: {e}"
+                        f"{self._node_info.node_id}: HB process did not report bound address"
                     )
+            self._hb_watcher_task = asyncio.create_task(self._hb_watcher())
+            self._hb_process_started = True
+        self.logger.info(f"Start monitors done {self._node_info.node_id}")
 
-                if (
-                    time.time() - self._last_parent_hb_time
-                    > self._heartbeat_dead_threshold
-                ):
+    # ------------------------------------------------------------------ #
+    # HB process watcher                                                  #
+    # ------------------------------------------------------------------ #
+
+    async def _hb_watcher(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._stop_event.is_set():
+            try:
+                msg = await loop.run_in_executor(
+                    None, self._hb_notify_queue.get, True, 0.5
+                )
+            except queue.Empty:
+                if self._hb_process is not None and not self._hb_process.is_alive():
                     self.logger.warning(
-                        f"{self._node_info.node_id}: Parent HB dead — setting parent_dead_event"
+                        f"{self._node_info.node_id}: HB process died, setting all dead events"
                     )
                     if self.parent_dead_event is not None:
-                        try:
-                            main_loop.call_soon_threadsafe(self.parent_dead_event.set)
-                        except RuntimeError:
-                            pass
+                        self.parent_dead_event.set()
+                    for ev in self._child_dead_events.values():
+                        ev.set()
                     break
-                jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
-                await asyncio.sleep(jitter)
-        finally:
-            await hb_conn.close()
-
-    def _children_hb_thread_main(
-        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
-    ) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._children_hb_thread_loop = loop
-        try:
-            loop.run_until_complete(self._children_hb_coroutine(main_loop, addr_q))
-        finally:
-            loop.close()
-            self._children_hb_thread_loop = None
-
-    async def _children_hb_coroutine(
-        self, main_loop: asyncio.AbstractEventLoop, addr_q: asyncio.Queue
-    ) -> None:
-        stop = asyncio.Event()
-        self._children_hb_asyncio_stop = stop
-
-        for conn in self._hb_transport.get_server_connections():
-            if not conn.is_open:
-                await conn.open()
-
-        actual_hb_address = self.my_hb_address
-        main_loop.call_soon_threadsafe(addr_q.put_nowait, actual_hb_address)
-
-        recv_tasks = {}
-        for conn in self._hb_transport.get_server_connections():
-            recv_tasks[id(conn)] = asyncio.create_task(self._hb_recv_loop(conn, stop))
-
-        async def dispatch():
-            while not stop.is_set():
-                try:
-                    parts = await self._hb_recv_queue.get()
-                    full_id, sender_id, _ = _decode_identity(parts[0])
-                    hb_conn = self._hb_transport.get_server_connection(
-                        self._node_info.node_id, self._node_info.secret_id
-                    )
-                    if hb_conn is None:
-                        self.logger.warning(
-                            f"{self._node_info.node_id}: HB from unknown identity {full_id}, ignoring"
-                        )
-                        continue
-                    self._last_child_hb_time[sender_id] = time.time()
-                    ev = self._hb_child_ready.get(sender_id)
-                    if ev is not None and not ev.is_set():
-                        try:
-                            main_loop.call_soon_threadsafe(ev.set)
-                        except RuntimeError:
-                            pass
-                    await hb_conn.send(_HB_PING, full_id)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    self.logger.warning(
-                        f"{self._node_info.node_id}: HB dispatch error: {e}"
-                    )
-
-        async def dead_check():
-            while not stop.is_set():
-                jitter = self.heartbeat_interval * (1 + random.uniform(-0.1, 0.1))
-                await asyncio.sleep(jitter)
-                for child_id, last in list(self._last_child_hb_time.items()):
-                    if (
-                        last is not None
-                        and time.time() - last > self._heartbeat_dead_threshold
-                    ):
-                        self.logger.warning(
-                            f"{self._node_info.node_id}: Child {child_id} HB dead — setting dead event"
-                        )
-                        ev = self._child_dead_events.get(child_id)
-                        if ev is not None:
-                            try:
-                                main_loop.call_soon_threadsafe(ev.set)
-                            except RuntimeError:
-                                pass
-
-        dispatch_task = asyncio.create_task(dispatch())
-        dead_check_task = asyncio.create_task(dead_check())
-
-        await stop.wait()
-        for t in recv_tasks.values():
-            t.cancel()
-        dispatch_task.cancel()
-        dead_check_task.cancel()
-        await asyncio.gather(
-            *recv_tasks.values(), dispatch_task, dead_check_task, return_exceptions=True
-        )
-
-        for conn in self._hb_transport.get_server_connections():
-            if conn.is_open:
-                await conn.close()
-
-    async def _hb_recv_loop(self, conn: AsyncConnection, stop: asyncio.Event) -> None:
-        while not stop.is_set():
-            try:
-                raw = await conn.recv()
-                self._hb_recv_queue.put_nowait(raw)
-            except asyncio.CancelledError:
+                continue
+            except Exception:
                 break
-            except Exception as e:
-                self.logger.warning(f"{self._node_info.node_id}: HB recv error: {e}")
+
+            kind = msg[0]
+            self.logger.debug(
+                f"{self._node_info.node_id}: HB watcher received {msg}, "
+                f"process alive={self._hb_process.is_alive() if self._hb_process else 'N/A'}"
+            )
+            if kind == "ready_child":
+                child_id = msg[1]
+                ev = self._hb_child_ready.get(child_id)
+                if ev is not None and not ev.is_set():
+                    ev.set()
+            elif kind == "dead_child":
+                child_id = msg[1]
+                self.logger.warning(
+                    f"{self._node_info.node_id}: HB watcher received dead_child for {child_id}"
+                )
+                ev = self._child_dead_events.get(child_id)
+                if ev is not None:
+                    ev.set()
+                else:
+                    self.logger.warning(
+                        f"{self._node_info.node_id}: No dead event for child {child_id}"
+                    )
+            elif kind == "ready_parent":
+                if (
+                    self._hb_parent_ready is not None
+                    and not self._hb_parent_ready.is_set()
+                ):
+                    self._hb_parent_ready.set()
+            elif kind == "dead_parent":
+                if self.parent_dead_event is not None:
+                    self.parent_dead_event.set()
+            elif kind == "hb_address":
+                actual_addr = msg[1]
+                for conn in self._hb_transport.get_server_connections():
+                    conn._address = actual_addr
+                self.logger.info(
+                    f"{self._node_info.node_id}: HB address updated to {actual_addr}"
+                )
 
     # ------------------------------------------------------------------ #
     # Sync heartbeat                                                     #
@@ -701,7 +567,11 @@ class AsyncComm:
         self, raw_data: list, loop: asyncio.AbstractEventLoop, parent_id: str
     ) -> None:
         try:
-            msg = cloudpickle.loads(raw_data[1])
+            data_frames = raw_data[1:]
+            if len(data_frames) == 1:
+                msg = Message.from_bytes(data_frames[0])
+            else:
+                msg = Message.from_byte_array(data_frames)
             self._cache[parent_id].put_nowait(msg)
             self.logger.debug(
                 f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}"
@@ -714,14 +584,17 @@ class AsyncComm:
     async def _deserialize_and_dispatch_child(self, raw_data: list) -> None:
         full_id, sender_id, _ = _decode_identity(raw_data[0])
         try:
+            data_frames = raw_data[1:]
+            if len(data_frames) == 1:
+                msg = Message.from_bytes(data_frames[0])
+            else:
+                msg = Message.from_byte_array(data_frames)
             if sender_id.startswith("client-"):
-                msg = cloudpickle.loads(raw_data[1])
                 self._client_queue.put_nowait((full_id, msg))
                 self.logger.debug(
                     f"{self._node_info.node_id}: Queued client message from {full_id}: {type(msg).__name__}"
                 )
                 return
-            msg = cloudpickle.loads(raw_data[1])
             self._cache[sender_id].put_nowait(msg)
             self.logger.debug(
                 f"{self._node_info.node_id}: Cached message from child {sender_id}: {type(msg).__name__}"
@@ -735,7 +608,10 @@ class AsyncComm:
     # Monitors                                                            #
     # ------------------------------------------------------------------ #
 
-    async def _monitor_parent(self) -> None:
+    async def _monitor_parent_data_conn(self) -> None:
+        if self._parent_conn is None:
+            return
+        self._parent_monitor_started = True
         parent_id = self._node_info.parent_id
         loop = asyncio.get_running_loop()
         failures = 0
@@ -753,24 +629,11 @@ class AsyncComm:
                 )
                 await asyncio.sleep(0.01)
 
-    async def _recv_loop(self, conn: AsyncConnection) -> None:
+    async def _monitor_children_data_conn(self, conn: AsyncConnection) -> None:
+        self._child_monitor_started = True
         while not self._stop_event.is_set():
             try:
                 raw_data = await conn.recv()
-                self._recv_queue.put_nowait(raw_data)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                if not self._stop_event.is_set():
-                    self.logger.warning(
-                        f"{self._node_info.node_id}: recv loop error: {e}"
-                    )
-                    await asyncio.sleep(0.01)
-
-    async def _monitor_children(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                raw_data = await self._recv_queue.get()
                 asyncio.create_task(self._deserialize_and_dispatch_child(raw_data))
             except asyncio.CancelledError:
                 break
@@ -790,7 +653,7 @@ class AsyncComm:
             )
             return False
         try:
-            await self._parent_conn.send(cloudpickle.dumps(msg))
+            await self._parent_conn.send(msg.to_byte_array())
             self.logger.debug(
                 f"{self._node_info.node_id}: Sent message to parent: {type(msg).__name__}"
             )
@@ -802,15 +665,23 @@ class AsyncComm:
             return False
 
     async def recv_message_from_parent(
-        self, cls: Type[Message], block: bool = False, timeout: Optional[float] = None
+        self,
+        cls: Type[Message],
+        block: bool = False,
+        timeout: Optional[float] = None,
+        unpack: bool = False,
     ) -> Message | None:
         parent_id = self._node_info.parent_id
         if parent_id is None or parent_id not in self._cache:
             self.logger.warning("No parent available to receive message from.")
             return None
         if block is False and timeout is None:
-            return self._cache[parent_id].get_nowait(cls)
-        return await self._cache[parent_id].get(cls, timeout=timeout)
+            msg = self._cache[parent_id].get_nowait(cls)
+        else:
+            msg = await self._cache[parent_id].get(cls, timeout=timeout)
+        if msg is not None and unpack:
+            await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
+        return msg
 
     async def send_message_to_child(self, child_id: str, msg: Message) -> bool:
         if (
@@ -822,7 +693,7 @@ class AsyncComm:
             )
             raise RuntimeError(f"No connection to child {child_id}")
         try:
-            packed = cloudpickle.dumps(msg)
+            packed = msg.to_byte_array()
             conn = self._data_transport.get_server_connection(
                 self._node_info.node_id, self._node_info.secret_id
             )
@@ -841,7 +712,7 @@ class AsyncComm:
             return True
         except Exception as e:
             self.logger.warning(
-                f"{self._node_info.node_id}: hello Sending message to child {child_id} failed with {e}"
+                f"{self._node_info.node_id}: Sending message to child {child_id} failed with {e}"
             )
             return False
 
@@ -851,6 +722,7 @@ class AsyncComm:
         child_id: str,
         block: bool = False,
         timeout: Optional[float] = None,
+        unpack: bool = False,
     ) -> Message | None:
         if child_id not in self._cache:
             self.logger.warning(
@@ -858,8 +730,12 @@ class AsyncComm:
             )
             return None
         if block is False and timeout is None:
-            return self._cache[child_id].get_nowait(cls)
-        return await self._cache[child_id].get(cls, timeout=timeout)
+            msg = self._cache[child_id].get_nowait(cls)
+        else:
+            msg = await self._cache[child_id].get(cls, timeout=timeout)
+        if msg is not None and unpack:
+            await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
+        return msg
 
     async def recv_client_message(
         self, timeout: Optional[float] = None
@@ -950,38 +826,39 @@ class AsyncComm:
             await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
         self._monitor_tasks.clear()
 
-        if (
-            self._parent_hb_thread_loop is not None
-            and self._parent_hb_asyncio_stop is not None
-        ):
-            self._parent_hb_thread_loop.call_soon_threadsafe(
-                self._parent_hb_asyncio_stop.set
-            )
-        if self._parent_hb_thread is not None:
-            self._parent_hb_thread.join(timeout=5.0)
+        if self._hb_watcher_task is not None and not self._hb_watcher_task.done():
+            self._hb_watcher_task.cancel()
+            try:
+                await self._hb_watcher_task
+            except asyncio.CancelledError:
+                pass
 
-        if (
-            self._children_hb_thread_loop is not None
-            and self._children_hb_asyncio_stop is not None
-        ):
-            self._children_hb_thread_loop.call_soon_threadsafe(
-                self._children_hb_asyncio_stop.set
-            )
-        if self._children_hb_thread is not None:
-            self._children_hb_thread.join(timeout=5.0)
+        if self._hb_control_queue is not None:
+            try:
+                self._hb_control_queue.put(("stop",))
+            except Exception:
+                pass
+        if self._hb_process is not None:
+            self._hb_process.join(timeout=5.0)
+            if self._hb_process.is_alive():
+                self._hb_process.terminate()
 
-        self.logger.info("Stopped HB threads")
+        self.logger.info("Stopped HB process")
 
         await self.clear_cache()
         try:
             if self._parent_conn and self._parent_conn.is_open:
                 await self._parent_conn.close()
-            if self._hb_parent_conn and self._hb_parent_conn.is_open:
-                await self._hb_parent_conn.close()
             for conn in self._data_transport.get_server_connections():
                 if conn.is_open:
                     await conn.close()
             for conn in self._hb_transport.get_server_connections():
+                if conn.is_open:
+                    await conn.close()
+            for conn in self._data_transport.get_client_connections():
+                if conn.is_open:
+                    await conn.close()
+            for conn in self._hb_transport.get_client_connections():
                 if conn.is_open:
                     await conn.close()
         except Exception as e:

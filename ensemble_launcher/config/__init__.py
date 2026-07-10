@@ -1,4 +1,11 @@
-from .config import LauncherConfig, PolicyConfig, SystemConfig, get_system_config
+from .config import (
+    LauncherConfig,
+    PolicyConfig,
+    SystemConfig,
+    aurora_config,
+    polaris_config,
+    get_system_config,
+)
 from .mpi_config import MPIConfig
 
 __all__ = [
@@ -6,5 +13,7 @@ __all__ = [
     "PolicyConfig",
     "SystemConfig",
     "MPIConfig",
+    "aurora_config",
+    "polaris_config",
     "get_system_config",
 ]

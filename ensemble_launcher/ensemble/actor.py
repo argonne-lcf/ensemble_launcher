@@ -5,7 +5,8 @@ import secrets
 import time
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Union
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any, Callable, Dict, Optional, Set, Union
 
 import cloudpickle
 from typing_extensions import Unpack
@@ -22,6 +23,8 @@ from ensemble_launcher.comm.pipe import (
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.ensemble.ensemble import TaskKwargs
 from ensemble_launcher.logging import setup_logger
+
+_READY_SENTINEL = b"__ACTOR_READY__"
 
 
 def action(fn: Callable):
@@ -82,8 +85,198 @@ class AgentHandle:
         return
 
 
+class PrivateActorHandle:
+    def __init__(
+        self,
+        conn: ServerConnection,
+        actions: Dict[str, inspect.Signature],
+        flush_interval: float = 0.01,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
+        default_target_id: Optional[str] = None,
+    ):
+        self._conn = conn
+        self._actions = actions
+        self._default_target_id = default_target_id
+        self._ready_actors: set = set()
+        self._ready_events: Dict[str, asyncio.Event] = {}
+        self._ready_condition: asyncio.Condition = asyncio.Condition()
+        self._results_queue: asyncio.Queue = asyncio.Queue()
+        self._input_queue: asyncio.Queue = asyncio.Queue()
+        self._recv_task = None
+        self._send_task = None
+        self._flush_interval = flush_interval
+        self._send_timeout = send_timeout
+        self._send_retries = send_retries
+
+    def __getattr__(self, name):
+        _actions = self.__dict__.get("_actions")
+        if _actions is not None and name in _actions:
+            sig = _actions[name]
+
+            async def proxy(*args, actor_id: Optional[str] = None, **kwargs):
+                tid = actor_id or self._default_target_id
+                if tid is None:
+                    raise ValueError(
+                        f"actor_id required for {name}() (no default_target_id set)"
+                    )
+                await self.send((name, args, kwargs), target_id=tid)
+                return await self.recv()
+
+            params = list(sig.parameters.values())
+            if len(params) > 0 and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
+                params.insert(
+                    -1,
+                    inspect.Parameter(
+                        "actor_id",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default=None,
+                        annotation=Optional[str],
+                    ),
+                )
+            else:
+                params.append(
+                    inspect.Parameter(
+                        "actor_id",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default=None,
+                        annotation=Optional[str],
+                    )
+                )
+            proxy.__name__ = name
+            proxy.__qualname__ = name
+            proxy.__signature__ = sig.replace(parameters=params)
+            proxy.__annotations__ = {
+                k: v.annotation
+                for k, v in sig.parameters.items()
+                if v.annotation is not inspect.Parameter.empty
+            }
+            return proxy
+
+        raise AttributeError(f"No attribute named {name}")
+
+    @property
+    def ready_actors(self) -> Set:
+        return self._ready_actors
+
+    async def open(self):
+        self.logger = setup_logger(name=self._conn.identity, subdir="handles")
+        await self._conn.open()
+        self._recv_task = asyncio.create_task(self._recv_loop())
+        self._send_task = asyncio.create_task(self._send_loop())
+
+    async def close(self):
+        if self._recv_task:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        if self._send_task:
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
+        await self._conn.close()
+
+    async def _recv_loop(self):
+        try:
+            while True:
+                try:
+                    frames = await self._conn.recv()
+                    full_id, _, _ = decode_identity(frames[0])
+                    if frames[1] == _READY_SENTINEL:
+                        self._ready_actors.add(full_id)
+                        event = self._ready_events.setdefault(full_id, asyncio.Event())
+                        event.set()
+                        async with self._ready_condition:
+                            self._ready_condition.notify_all()
+                    else:
+                        result = cloudpickle.loads(frames[1])
+                        await self._results_queue.put((full_id, result))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.error(f"PrivateActorHandle recv error: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_loop(self):
+        try:
+            while True:
+                data, target_id = await self._input_queue.get()
+                try:
+                    success = False
+                    for i in range(self._send_retries):
+                        success = await self._conn.send(
+                            data, target_id, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
+                    if not success:
+                        self.logger.warning(
+                            f"Send failed to {target_id} after {self._retries} retries"
+                        )
+                except Exception as e:
+                    self.logger.error(
+                        f"PrivateActorHandle: failed to send to {target_id}: {e}"
+                    )
+                await asyncio.sleep(self._flush_interval)
+        except asyncio.CancelledError:
+            pass
+
+    async def recv(self) -> tuple:
+        return await self._results_queue.get()
+
+    async def send(self, msg: Any, target_id: str):
+        if target_id not in self._ready_actors:
+            event = self._ready_events.setdefault(target_id, asyncio.Event())
+            await event.wait()
+        data = cloudpickle.dumps(msg)
+        self._input_queue.put_nowait((data, target_id))
+
+    async def wait_for_ready(self, expected: int, timeout: Optional[float] = None):
+        # Define the core waiting logic
+        async def _wait_for_condition():
+            async with self._ready_condition:
+                await self._ready_condition.wait_for(
+                    lambda: len(self._ready_actors) >= expected
+                )
+
+        if timeout is not None:
+            try:
+                await asyncio.wait_for(_wait_for_condition(), timeout=timeout)
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    f"Only {len(self._ready_actors)}/{expected} ready after {timeout}s"
+                )
+                raise asyncio.TimeoutError
+        else:
+            await _wait_for_condition()
+
+    async def broadcast(self, msg: Any, expected: int):
+        await self.wait_for_ready(expected=expected)
+
+        data = cloudpickle.dumps(msg)
+        for actor_id in list(self._ready_actors):
+            await self._conn.send(data, actor_id)
+
+    async def stop(self, timeout: float = 10.0):
+        data = cloudpickle.dumps(("stop", (), None))
+        for actor_id in list(self._ready_actors):
+            await self._conn.send(data, actor_id)
+        await asyncio.sleep(timeout)
+
+
 class _ActorBase(ABC):
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
+    ):
         self._name = name
         self._secret = secrets.token_hex(16)
         self._conn: Union[ServerConnection, ClientConnection] = None
@@ -91,6 +284,10 @@ class _ActorBase(ABC):
         self._input_queue: asyncio.Queue = None
         self._output_queue: asyncio.Queue = None
         self.logger = None
+        self._executor = None
+        self._max_workers = max_workers
+        self._send_timeout = send_timeout
+        self._send_retries = send_retries
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -101,10 +298,11 @@ class _ActorBase(ABC):
                     cls.__actions__.setdefault(attr.__action_name__, attr)
 
     def _init_runtime(self):
-        self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+        self.logger = setup_logger(name=self._name, subdir="actors")
         self._stop = asyncio.Event()
         self._input_queue = asyncio.Queue()
         self._output_queue = asyncio.Queue()
+        self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
 
     @property
     def secret(self) -> str:
@@ -121,9 +319,10 @@ class _ActorBase(ABC):
     @abstractmethod
     def create_handle(self, *args, **kwargs): ...
 
-    def _build_action_signatures(self) -> Dict[str, inspect.Signature]:
+    @classmethod
+    def _build_action_signatures(cls) -> Dict[str, inspect.Signature]:
         sigs = {}
-        for name, fn in self.__actions__.items():
+        for name, fn in cls.__actions__.items():
             sig = inspect.signature(fn)
             params = [p for p in sig.parameters.values() if p.name != "self"]
             sigs[name] = sig.replace(parameters=params)
@@ -136,7 +335,7 @@ class _ActorBase(ABC):
         self.logger.info("Receive loop started.")
         while not self._stop.is_set():
             try:
-                frames = await asyncio.wait_for(self._conn.recv(), timeout=5.0)
+                frames = await self._conn.recv(timeout=5.0)
                 sender_id = self._extract_sender(frames)
                 self.logger.info(f"Received args from {sender_id}")
                 args = cloudpickle.loads(frames[1])
@@ -151,12 +350,26 @@ class _ActorBase(ABC):
                 target_id, data = await asyncio.wait_for(
                     self._output_queue.get(), timeout=5.0
                 )
-                payload = cloudpickle.dumps(data)
+                payload = cloudpickle.dumps(data) if data != _READY_SENTINEL else data
+                success = False
                 if isinstance(self._conn, ServerConnection):
-                    await self._conn.send(payload, target_id)
+                    for i in range(self._send_retries):
+                        success = await self._conn.send(
+                            payload, target_id, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
                 else:
-                    await self._conn.send(payload)
-                self.logger.info(f"Sent results to {target_id}")
+                    for i in range(self._send_retries):
+                        success = await self._conn.send(
+                            payload, timeout=self._send_timeout
+                        )
+                        if success:
+                            break
+                if not success:
+                    self.logger.warning(f"Sending message to {target_id} failed")
+                else:
+                    self.logger.info(f"Sent results to {target_id}")
             except Exception as e:
                 self.logger.debug(f"Send failed with error: {str(e)}")
 
@@ -199,9 +412,14 @@ class _ActorBase(ABC):
                 except Exception as e:
                     self.logger.error(f"Invoke failed with error: {e}")
                     raise e
-                await self._output_queue.put((target_id, result))
+                if inspect.isasyncgen(result):
+                    async for item in result:
+                        await self._output_queue.put((target_id, item))
+                else:
+                    await self._output_queue.put((target_id, result))
             else:
                 raise ValueError("Message must be either List[Tuple] or Tuple")
+        self.logger.info("Main loop stopped.")
 
     async def on_start(self):
         pass
@@ -233,9 +451,19 @@ class PublicActor(_ActorBase):
         self,
         name: str,
         transport: str = "zmq",
-        ckpt_dir: str = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}",
+        ckpt_dir: Optional[str] = None,
+        max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
     ):
-        super().__init__(name)
+        super().__init__(
+            name,
+            max_workers=max_workers,
+            send_timeout=send_timeout,
+            send_retries=send_retries,
+        )
+        if ckpt_dir is None:
+            ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
         os.makedirs(ckpt_dir, exist_ok=True)
         self._ckpt_dir = ckpt_dir
         self._transport_classes = transport_registry.get(transport)
@@ -309,7 +537,7 @@ class PublicActor(_ActorBase):
     async def _run(self):
         self._init_runtime()
 
-        result = await self.on_start()
+        await self.on_start()
 
         self._start_transport()
         await self._conn.open()
@@ -321,72 +549,64 @@ class PublicActor(_ActorBase):
 
         self.logger.info("Done opening the server!")
 
-        if asyncio.iscoroutine(result):
-            await result
-
         await asyncio.gather(self._recv(), self._send(), self._main_loop())
 
-        result = await self.on_stop()
-        if asyncio.iscoroutine(result):
-            await result
+        await self.on_stop()
+
+        await self._conn.close()
 
 
 class PrivateActor(_ActorBase):
     def __init__(
         self,
         name: str,
-        transport: str = "zmq",
+        client_conn: ClientConnection,
+        max_workers: int = 2,
+        send_timeout: float = 5.0,
+        send_retries: int = 3,
     ):
-        super().__init__(name)
-        self._transport_classes = transport_registry.get(transport)
-        self._transport: AsyncTransport = None
-        self._server_conn: ServerConnection = None
-
-    def _start_transport(self):
-        if self._transport is not None:
-            return
-        transport = self._transport_classes["transport"]()
-        self._transport = transport
-        server, client = transport.create_child_pipe(
-            parent_id=f"{self._name}-handle",
-            parent_secret=self._secret,
-            child_id=self._name,
-            child_secret=self._secret,
+        super().__init__(
+            name,
+            max_workers=max_workers,
+            send_timeout=send_timeout,
+            send_retries=send_retries,
         )
-        self._conn = client
-        self._server_conn = server
+        self._conn = client_conn
 
-    def create_handle(self) -> AgentHandle:
-        assert self._server_conn is not None, "call create_task first"
-        target_id = f"{self._name}:{self._secret}"
-        return AgentHandle(
-            self._server_conn,
-            self._build_action_signatures(),
-            default_target_id=target_id,
+    @classmethod
+    def create_handle(
+        cls,
+        server_conn: ServerConnection,
+        default_target_id: Optional[str] = None,
+        **kwargs,
+    ) -> PrivateActorHandle:
+        return PrivateActorHandle(
+            server_conn,
+            cls._build_action_signatures(),
+            default_target_id=default_target_id,
+            **kwargs,
         )
+
+    async def _signal_ready(self):
+        await self._output_queue.put((None, _READY_SENTINEL))
+        self.logger.info("Pushed ready signal to the output queue.")
 
     async def _run(self):
         self._init_runtime()
 
-        result = await self.on_start()
+        await self.on_start()
 
         await self._conn.open()
 
         self.logger.info("Connected to server, ready!")
 
-        if asyncio.iscoroutine(result):
-            await result
+        await asyncio.gather(
+            self._recv(), self._send(), self._main_loop(), self._signal_ready()
+        )
 
-        await asyncio.gather(self._recv(), self._send(), self._main_loop())
+        await self.on_stop()
 
-        result = await self.on_stop()
-        if asyncio.iscoroutine(result):
-            await result
-
-    def create_task(self, task_id, nnodes, ppn, **kwargs):
-        task = super().create_task(task_id, nnodes, ppn, **kwargs)
-        self._start_transport()
-        return task
+        await self._conn.close()
 
 
 Actor = PublicActor

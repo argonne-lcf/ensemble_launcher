@@ -294,10 +294,9 @@ async def run_master(socket_base):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket-base", required=True)
-    parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
 
-    logger = setup_logger(__name__, node_id="mpi_pool", log_dir=args.log_dir)
+    logger = setup_logger(__name__, node_id="mpi_pool")
 
     if RANK == 0:
         asyncio.run(run_master(args.socket_base))

@@ -1,9 +1,13 @@
 import random
+import re
 import socket
+import subprocess
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel
+
+from .utils import find_free_port
 
 from .async_connection import (
     AsyncZMQDealerConnection,
@@ -18,6 +22,26 @@ from .async_connection import (
 from .registry import transport_registry
 
 T = TypeVar("T", bound="AsyncTransportState")
+
+def get_hsn_ip_cli(ifname="hsn0")->Optional[str]:
+    """
+    Retrieves the IPv4 address by parsing the standard Linux `ip` command.
+    """
+    try:
+        # Run: ip -4 addr show hsn0
+        output = subprocess.check_output(
+            ["ip", "-4", "addr", "show", ifname],
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8')
+
+        # Regex to match the first IPv4 address in the output
+        match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', output)
+        if match:
+            return match.group(1)
+
+    except subprocess.CalledProcessError:
+        pass # Interface doesn't exist or command failed
+
 
 
 class AsyncTransportState(BaseModel):
@@ -41,22 +65,26 @@ class AsyncTransport(ABC):
         self._client_connections: Dict[str, ClientConnection] = {}
 
     def get_server_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> Optional[ServerConnection]:
         key = f"{identity}:{secret_id}"
         conn = self._server_connections.get(key)
-        if conn is None and kwargs:
-            conn = self._create_server_connection(identity, secret_id, **kwargs)
+        if conn is None:
+            conn = self._create_server_connection(
+                identity, secret_id, req_res=req_res, **kwargs
+            )
             self._server_connections[key] = conn
         return conn
 
     def get_client_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> Optional[ClientConnection]:
         key = f"{identity}:{secret_id}"
         conn = self._client_connections.get(key)
         if conn is None and kwargs:
-            conn = self._create_client_connection(identity, secret_id, **kwargs)
+            conn = self._create_client_connection(
+                identity, secret_id, req_res=req_res, **kwargs
+            )
             self._client_connections[key] = conn
         return conn
 
@@ -74,13 +102,13 @@ class AsyncTransport(ABC):
 
     @abstractmethod
     def _create_server_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> ServerConnection:
         pass
 
     @abstractmethod
     def _create_client_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> ClientConnection:
         pass
 
@@ -91,6 +119,7 @@ class AsyncTransport(ABC):
         parent_secret: str,
         child_id: str,
         child_secret: str,
+        req_res: bool = False,
     ) -> Tuple[ServerConnection, ClientConnection]:
         pass
 
@@ -122,36 +151,41 @@ class AsyncZMQTransportState(AsyncTransportState):
 class AsyncZMQTransport(AsyncTransport):
     transport_type: str = "zmq"
 
-    def __init__(self):
+    def __init__(self, lightweight: bool = False):
         super().__init__()
-        hn = socket.gethostname()
+        hn = get_hsn_ip_cli() or socket.gethostname()
         hostname = "localhost" if "local" in hn else hn
         self._hostname = hostname
+        self._lightweight = lightweight
         self._server_connections: Dict[str, AsyncZMQRouterConnection] = {}
         self._client_connections: Dict[str, AsyncZMQDealerConnection] = {}
 
     def _create_server_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> AsyncZMQRouterConnection:
         key = f"{identity}:{secret_id}"
         router = self._server_connections.get(key, None)
+
         if router is None:
+            free_port = find_free_port((10000, 30000), self._hostname)
             address = (
                 kwargs.get("address")
-                or f"{self._hostname}:{5555 + random.randint(1, 5000)}"
+                or f"{self._hostname}:{free_port}"
             )
             expected_remotes = kwargs.get("expected_remotes", None)
             router = AsyncZMQRouterConnection(
                 identity=identity,
                 secret_id=secret_id,
                 address=address,
+                req_res=req_res,
                 expected_remotes=expected_remotes,
+                lightweight=self._lightweight,
             )
             self._server_connections[key] = router
         return router
 
     def _create_client_connection(
-        self, identity: str, secret_id: str, **kwargs
+        self, identity: str, secret_id: str, req_res: bool = False, **kwargs
     ) -> AsyncZMQDealerConnection:
         key = f"{identity}:{secret_id}"
         dealer = self._client_connections.get(key, None)
@@ -160,9 +194,11 @@ class AsyncZMQTransport(AsyncTransport):
             dealer = AsyncZMQDealerConnection(
                 identity=identity,
                 secret_id=secret_id,
+                req_res=req_res,
                 remote_address=remote_address,
                 remote_identity=kwargs.get("remote_identity"),
                 remote_secret_id=kwargs.get("remote_secret_id"),
+                lightweight=self._lightweight,
             )
             self._client_connections[key] = dealer
         return dealer
@@ -173,12 +209,16 @@ class AsyncZMQTransport(AsyncTransport):
         parent_secret: str,
         child_id: str,
         child_secret: str,
+        req_res: bool = False,
     ) -> Tuple[AsyncZMQRouterConnection, AsyncZMQDealerConnection]:
-        server = self.get_server_connection(parent_id, parent_secret, address=None)
+        server = self.get_server_connection(
+            parent_id, parent_secret, req_res=req_res, address=None
+        )
         server.add_expected_remote(child_id, child_secret)
         client = self.get_client_connection(
             child_id,
             child_secret,
+            req_res=req_res,
             remote_address=server.address,
             remote_identity=parent_id,
             remote_secret_id=parent_secret,
@@ -192,14 +232,17 @@ class AsyncZMQTransport(AsyncTransport):
         secret_id: str,
         address: Optional[str] = None,
         remote_address: Optional[str] = None,
+        req_res: bool = False,
     ):
         if cls is AsyncZMQRouterConnection:
-            return self._create_server_connection(identity, secret_id, address=address)
+            return self._create_server_connection(
+                identity, secret_id, req_res=req_res, address=address
+            )
         elif cls is AsyncZMQDealerConnection:
             if remote_address is None:
                 raise ValueError(f"Need remote address to create {cls}")
             return self._create_client_connection(
-                identity, secret_id, remote_address=remote_address
+                identity, secret_id, req_res=req_res, remote_address=remote_address
             )
         raise ValueError(f"Unknown connection type: {cls}")
 

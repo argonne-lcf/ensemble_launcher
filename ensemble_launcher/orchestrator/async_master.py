@@ -227,13 +227,9 @@ class AsyncMaster(Node):
 
     def _setup_logger(self) -> None:
         """Configure the logger for this master, optionally writing to a per-node log file."""
-        log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir)
-            if self._config.master_logs
-            else None
-        )
         self.logger = setup_logger(
-            __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
+            __name__, self.node_id, level=self._config.log_level,
+            log_to_file=self._config.master_logs,
         )
 
     def _create_comm(self) -> None:
@@ -367,6 +363,7 @@ class AsyncMaster(Node):
         self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
         target_ids = set(self._scheduler.child_assignments.keys()) - existing_ids
+        self.logger.info(f"{self._scheduler.child_assignments}")
         return self._instantiate_children(include_tasks, target_ids)
 
     async def _init_child(self, child_id: str, child: Node) -> None:
@@ -379,8 +376,8 @@ class AsyncMaster(Node):
         self._child_objs[child_id] = child
         self.add_child(child_id, child.info())
         child.set_parent(self.info())
-        await self._comm.update_node_info(self.info())
-        child_data_conn, child_hb_conn = self._comm.create_child_pipe(
+        self._comm.update_node_info(self.info())
+        child_data_conn, child_hb_conn = await self._comm.create_child_pipe(
             child_id=child.info().node_id, child_secret_id=child.info().secret_id
         )
         child.parent_data_conn = child_data_conn
@@ -480,6 +477,7 @@ class AsyncMaster(Node):
         if self._config.child_executor_name == "async_mpi":
             child_nodes = child_obj.init_nodes
             head_node = child_nodes.nodes[0]
+            self.logger.info(f"head node: {head_node}")
 
             # Serialize child object
             child_dict = child_obj.asdict()
@@ -490,9 +488,12 @@ class AsyncMaster(Node):
                 self._executor.tmp_dir, f"child_{uuid.uuid4()}.json"
             )
             if hasattr(self._executor, "write_file_to_nodes"):
-                await self._executor.write_file_to_nodes(
+                success = await self._executor.write_file_to_nodes(
                     json_fname, json_str, [head_node]
                 )
+                if not success:
+                    self.logger.error("Copying file to nodes failed!!")
+                    raise RuntimeError
             else:
                 with open(json_fname, "w") as _f:
                     _f.write(json_str)
@@ -617,9 +618,12 @@ class AsyncMaster(Node):
                     self._executor.tmp_dir, f"workers_{uuid.uuid4()}.json"
                 )
                 if hasattr(self._executor, "write_file_to_nodes"):
-                    await self._executor.write_file_to_nodes(
+                    success = await self._executor.write_file_to_nodes(
                         json_fname, json_str, child_head_nodes
                     )
+                    if not success:
+                        self.logger.error("Copying file to nodes failed!!")
+                        raise RuntimeError
                 else:
                     with open(json_fname, "w") as _f:
                         _f.write(json_str)
@@ -662,6 +666,7 @@ class AsyncMaster(Node):
                 if cb is not None:
                     future.add_done_callback(cb)
             else:
+                self.logger.info("Launching children in serial")
                 ##launch children in parallel using gather
                 launch_tasks = [
                     self._launch_child(child_name, child_obj, child_idx)
@@ -722,7 +727,7 @@ class AsyncMaster(Node):
         # await self._restore_comm_state()
 
         # Start parent comm end point monitor
-        await self._comm.start_monitors(parent_only=True)
+        await self._comm.start_monitors()
 
         # Receive node update from parent if it has a parent
         self.logger.info("Syncing with parent")
@@ -784,9 +789,6 @@ class AsyncMaster(Node):
             )
         for child_id, child in children.items():
             await self._init_child(child_id, child)
-
-        # Start the shared comm monitor for all child sockets (idempotent).
-        await self._comm.start_monitors(children_only=True)
 
         # Launch and sync children, retrying failures up to 2 times
         children_names = self._scheduler.children_names
@@ -881,7 +883,7 @@ class AsyncMaster(Node):
         )
 
         ## Don't restore the node_info. This will be updated once the scheduler is end
-        await self._comm.update_node_info(self.info())
+        self._comm.update_node_info(self.info())
         self.logger.info(
             f"{self._secret_id}, {self._comm._node_info.secret_id}, {self.info().secret_id}"
         )
@@ -1063,6 +1065,7 @@ class AsyncMaster(Node):
             None if successful, Result object with exception if failed
         """
         # Sync heartbeat with child
+        self.logger.debug(f"Syncing with child {child_id}")
         if not await self._comm.sync_heartbeat_with_child(
             child_id=child_id, timeout=600.0
         ):
@@ -1102,6 +1105,7 @@ class AsyncMaster(Node):
             # Create node update
             node_update = self._build_init_node_update(child_id)
 
+            self.logger.debug(f"Built NodeUpdate for child {child_id}")
             ##Task update handled by the seperate tast request monitor
 
             # Add sync task
@@ -1761,7 +1765,7 @@ class AsyncMaster(Node):
         self._routed_task_ids.pop(child_id, None)
         self._iresult_q.pop(child_id, None)
         self._itask_q.pop(child_id, None)
-        await self._comm.update_node_info(self.info())
+        self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
         """Gracefully shut down the master in a fixed teardown order.
@@ -1971,6 +1975,8 @@ class AsyncMaster(Node):
         for child_results in self._results.values():
             for rb in child_results:
                 result_batch += rb
+        if self.level == 0:
+            result_batch.unpack()
         return result_batch
 
     def create_an_event_loop(self) -> None:

@@ -195,13 +195,9 @@ class AsyncWorker(Node):
 
     def _setup_logger(self) -> None:
         """Configure the logger, optionally writing to a per-worker log file."""
-        log_dir = (
-            os.path.join(os.getcwd(), self._config.log_dir)
-            if self._config.worker_logs
-            else None
-        )
         self.logger = setup_logger(
-            __name__, self.node_id, log_dir=log_dir, level=self._config.log_level
+            __name__, self.node_id, level=self._config.log_level,
+            log_to_file=self._config.worker_logs,
         )
 
     def _create_comm(self) -> None:
@@ -275,7 +271,7 @@ class AsyncWorker(Node):
 
         # We need to create pipe so that a server connection is create and
         #  client could connect to the child too
-        self._comm.create_child_pipe(
+        await self._comm.create_child_pipe(
             child_id="child0", child_secret_id=secrets.token_hex(16)
         )
 
@@ -361,7 +357,6 @@ class AsyncWorker(Node):
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
-        kwargs["log_dir"] = self._config.log_dir
 
         ##Async mpi specific options
         kwargs["mpi_config"] = self._config.mpi_config
@@ -530,7 +525,7 @@ class AsyncWorker(Node):
                 )
             )
             task_update = await self._comm.recv_message_from_parent(
-                TaskUpdate, timeout=5.0
+                TaskUpdate, timeout=5.0, unpack=True
             )
             if task_update is not None:
                 self.logger.info(
@@ -730,6 +725,7 @@ class AsyncWorker(Node):
                 continue
             client_id, msg = item
             if isinstance(msg, TaskUpdate):
+                await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
                 self._update_tasks(msg, client_id=client_id)
 
     async def _parent_ready_monitor(self) -> None:
@@ -767,7 +763,7 @@ class AsyncWorker(Node):
         while not self._stop_task_update.is_set():
             try:
                 task_update = await self._comm.recv_message_from_parent(
-                    TaskUpdate, block=True
+                    TaskUpdate, block=True, unpack=True
                 )
                 if task_update is not None:
                     self._update_tasks(task_update)

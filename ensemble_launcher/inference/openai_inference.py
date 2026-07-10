@@ -33,7 +33,7 @@ class OpenAIInference(PublicActor):
 
     async def on_start(self):
         if self.logger is None:
-            self.logger = setup_logger(name=self._name, log_dir=f"{os.getcwd()}/logs")
+            self.logger = setup_logger(name=self._name)
         if self._openai_client is None:
             from openai import OpenAI
 

@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from ensemble_launcher.comm.pipe import transport_registry
 from ensemble_launcher.ensemble.actor import Actor, PrivateActor, action, actor
 
 pytestmark = pytest.mark.core
@@ -244,20 +245,30 @@ class AddPrivateActor(PrivateActor):
 
 @pytest.mark.asyncio
 async def test_private_actor_single_call():
-    a = AddPrivateActor(name="priv-actor")
-    task = a.create_task(task_id="t0", nnodes=1, ppn=1)
-    handle = a.create_handle()
+    transport = transport_registry.get("zmq")["transport"]()
+    server = transport.get_server_connection("parent", "secret", address=None)
+    client = transport.get_client_connection(
+        "priv-actor", "secret",
+        remote_address=server.address,
+        remote_identity="parent",
+        remote_secret_id="secret",
+    )
+    server.add_expected_remote("priv-actor", "secret")
+
+    a = AddPrivateActor(name="priv-actor", client_conn=client)
+    handle = AddPrivateActor.create_handle(server)
 
     a._init_runtime()
     await handle.open()
     await a._conn.open()
-    await asyncio.sleep(0.1)
 
     recv_task = asyncio.create_task(a._recv())
     send_task = asyncio.create_task(a._send())
     main_task = asyncio.create_task(a._main_loop())
+    ready_task = asyncio.create_task(a._signal_ready())
 
-    result = await asyncio.wait_for(handle.add(10, 20), timeout=5.0)
+    await handle.send(("add", (10, 20), None), target_id="priv-actor:secret")
+    sender_id, result = await asyncio.wait_for(handle.recv(), timeout=5.0)
     assert result == 30
 
     await handle.stop()
@@ -270,23 +281,108 @@ async def test_private_actor_single_call():
 
 
 @pytest.mark.asyncio
-async def test_private_actor_batch_call():
-    a = AddPrivateActor(name="priv-batch")
-    task = a.create_task(task_id="t0", nnodes=1, ppn=1)
-    handle = a.create_handle()
+async def test_private_actor_handle_getattr():
+    transport = transport_registry.get("zmq")["transport"]()
+    server = transport.get_server_connection("parent-getattr", "secret", address=None)
+    client = transport.get_client_connection(
+        "priv-getattr", "secret",
+        remote_address=server.address,
+        remote_identity="parent-getattr",
+        remote_secret_id="secret",
+    )
+    server.add_expected_remote("priv-getattr", "secret")
+
+    a = AddPrivateActor(name="priv-getattr", client_conn=client)
+    handle = AddPrivateActor.create_handle(server)
 
     a._init_runtime()
     await handle.open()
     await a._conn.open()
-    await asyncio.sleep(0.1)
 
     recv_task = asyncio.create_task(a._recv())
     send_task = asyncio.create_task(a._send())
     main_task = asyncio.create_task(a._main_loop())
+    ready_task = asyncio.create_task(a._signal_ready())
+
+    _, result = await asyncio.wait_for(
+        handle.add(10, 20, actor_id="priv-getattr:secret"), timeout=5.0
+    )
+    assert result == 30
+
+    await handle.stop()
+    await asyncio.wait_for(main_task, timeout=5.0)
+    recv_task.cancel()
+    send_task.cancel()
+
+    await a._conn.close()
+    await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_private_actor_handle_default_target_id():
+    transport = transport_registry.get("zmq")["transport"]()
+    server = transport.get_server_connection("parent-default", "secret", address=None)
+    client = transport.get_client_connection(
+        "priv-default", "secret",
+        remote_address=server.address,
+        remote_identity="parent-default",
+        remote_secret_id="secret",
+    )
+    server.add_expected_remote("priv-default", "secret")
+
+    a = AddPrivateActor(name="priv-default", client_conn=client)
+    handle = AddPrivateActor.create_handle(
+        server, default_target_id="priv-default:secret"
+    )
+
+    a._init_runtime()
+    await handle.open()
+    await a._conn.open()
+
+    recv_task = asyncio.create_task(a._recv())
+    send_task = asyncio.create_task(a._send())
+    main_task = asyncio.create_task(a._main_loop())
+    ready_task = asyncio.create_task(a._signal_ready())
+
+    _, result = await asyncio.wait_for(handle.add(5, 7), timeout=5.0)
+    assert result == 12
+
+    await handle.stop()
+    await asyncio.wait_for(main_task, timeout=5.0)
+    recv_task.cancel()
+    send_task.cancel()
+
+    await a._conn.close()
+    await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_private_actor_batch_call():
+    transport = transport_registry.get("zmq")["transport"]()
+    server = transport.get_server_connection("parent-batch", "secret", address=None)
+    client = transport.get_client_connection(
+        "priv-batch", "secret",
+        remote_address=server.address,
+        remote_identity="parent-batch",
+        remote_secret_id="secret",
+    )
+    server.add_expected_remote("priv-batch", "secret")
+
+    a = AddPrivateActor(name="priv-batch", client_conn=client)
+    handle = AddPrivateActor.create_handle(server)
+
+    a._init_runtime()
+    await handle.open()
+    await a._conn.open()
+
+    recv_task = asyncio.create_task(a._recv())
+    send_task = asyncio.create_task(a._send())
+    main_task = asyncio.create_task(a._main_loop())
+    ready_task = asyncio.create_task(a._signal_ready())
 
     batch = [("add", (1, 2), None), ("add", (3, 4), None), ("add", (5, 6), None)]
-    await handle.send(batch)
-    results = await asyncio.wait_for(handle.recv(), timeout=5.0)
+    await handle.send(batch, target_id="priv-batch:secret")
+    sender_id, results = await asyncio.wait_for(handle.recv(), timeout=5.0)
     assert results == [3, 7, 11]
 
     await handle.stop()

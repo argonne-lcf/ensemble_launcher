@@ -39,7 +39,6 @@ def _build_mpirun_cmd(
     mpi_info: Dict[str, Any],
     mpi_config: MPIConfig,
     socket_base: str,
-    log_dir: str = "logs",
 ) -> list:
     """Build the mpirun command from structured mpi_info and MPIConfig.
 
@@ -92,8 +91,6 @@ def _build_mpirun_cmd(
         _MPI_POOL_SCRIPT,
         "--socket-base",
         socket_base,
-        "--log-dir",
-        log_dir,
     ]
     return cmd
 
@@ -107,7 +104,6 @@ class AsyncMPIPoolExecutor:
         cpu_to_pid: Dict[Tuple[str, int], int],
         gpu_selector: str = "ZE_AFFINITY_MASK",
         mpi_config: Optional[MPIConfig] = None,
-        log_dir: str = "logs",
         **kwargs,
     ):
         import zmq
@@ -130,7 +126,7 @@ class AsyncMPIPoolExecutor:
         )
         self.logger.info(f"MPI pool mpi_info: {self._mpi_info}")
         cmd = _build_mpirun_cmd(
-            self._mpi_info, self._mpi_config, self._socket_base, log_dir=log_dir
+            self._mpi_info, self._mpi_config, self._socket_base,
         )
         self.logger.info(f"MPI pool cmd: {' '.join(cmd)}")
         self._server_proc = subprocess.Popen(cmd, cwd=cwd, env=launch_env)

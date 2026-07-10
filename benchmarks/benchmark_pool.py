@@ -24,7 +24,7 @@ def _create_tasks(ntasks):
 def benchmark_max_throughput(task_executor="async_mpi_processpool"):
     ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
     os.makedirs(ckpt_dir)
-    logger = setup_logger("Pool_benchmark", log_dir="logs")
+    logger = setup_logger("Pool_benchmark")
     launcher_config = LauncherConfig(
         task_executor_name=task_executor,
         cluster=True,

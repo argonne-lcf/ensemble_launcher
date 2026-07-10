@@ -1,13 +1,10 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from .async_connection import (
     ServerConnection,
     ServerConnectionState,
-)
-from .async_connection import (
-    decode_identity as _decode_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,8 +17,7 @@ class AsyncMPConnectionState(ServerConnectionState):
 class AsyncMPConnection(ServerConnection):
     """Wraps one end of a multiprocessing.Pipe.
 
-    Frames messages to match ZMQ wire format: send prepends own identity:secret_id,
-    recv returns [sender_identity_frame, data].
+    Sends/receives lists of byte frames to match the ZMQ multipart convention.
     """
 
     transport_type: str = "mp"
@@ -32,54 +28,57 @@ class AsyncMPConnection(ServerConnection):
         secret_id: str,
         pipe_conn,
         expected_remotes: Optional[Dict[str, str]] = None,
+        req_res: bool = False,
     ):
         super().__init__(
             identity=identity,
             secret_id=secret_id,
             expected_remotes=expected_remotes,
+            req_res=req_res,
         )
         self._conn = pipe_conn
         self._identity_frame = f"{identity}:{secret_id}".encode()
-        self._is_open = True
 
-    @property
-    def is_open(self) -> bool:
-        return self._is_open and not self._conn.closed
-
-    async def open(self) -> None:
+    async def _raw_open(self) -> None:
         pass
 
-    async def send(self, data: bytes, target_id: str = None) -> bool:
-        header = len(self._identity_frame).to_bytes(4, "big")
+    async def _raw_close(self) -> None:
+        self._conn.close()
+
+    async def _raw_send(
+        self,
+        data: Union[bytes, List[bytes]],
+        msg_id: Optional[int] = None,
+        target_id: Optional[str] = None,
+    ) -> bool:
+        """Send frames via multiprocessing pipe.
+
+        Data frames are joined into a single blob before sending.
+        Sends: [identity_frame, msg_id(8B)?, blob]
+        """
+        blob = b"".join(data) if isinstance(data, list) else data
+        if msg_id is not None:
+            frames = [self._identity_frame, msg_id.to_bytes(8, "big"), blob]
+        else:
+            frames = [self._identity_frame, blob]
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, self._conn.send_bytes, header + self._identity_frame + data
-        )
+        await loop.run_in_executor(None, self._conn.send, frames)
         return True
 
-    async def recv(self) -> List[bytes]:
-        loop = asyncio.get_running_loop()
-        while True:
-            raw = await loop.run_in_executor(None, self._conn.recv_bytes)
-            id_len = int.from_bytes(raw[:4], "big")
-            identity = raw[4 : 4 + id_len]
-            data = raw[4 + id_len :]
-            _, sender_id, sender_secret = _decode_identity(identity)
-            if not self.verify_sender(sender_id, sender_secret):
-                logger.warning(
-                    f"{self._identity}: Discarding message from {sender_id} "
-                    f"— secret_id mismatch (stale connection)"
-                )
-                continue
-            return [identity, data]
+    async def _raw_recv(self) -> List[bytes]:
+        """Receive frames via multiprocessing pipe.
 
-    async def close(self) -> None:
-        self._is_open = False
-        self._conn.close()
+        Returns: [identity_frame, msg_id(8B)?, blob]
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._conn.recv)
 
     def get_state(self) -> AsyncMPConnectionState:
         return AsyncMPConnectionState(
-            transport_type="mp", identity=self._identity, secret_id=self._secret_id
+            transport_type="mp",
+            identity=self._identity,
+            secret_id=self._secret_id,
+            req_res=self._req_res,
         )
 
     @classmethod

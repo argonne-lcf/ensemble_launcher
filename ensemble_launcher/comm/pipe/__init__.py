@@ -17,10 +17,12 @@ from .async_transport import (
     AsyncTransportState,
     AsyncZMQTransport,
     AsyncZMQTransportState,
+    get_hsn_ip_cli,
 )
 from .mp_connection import AsyncMPConnection
 from .mp_transport import AsyncMPTransport
 from .registry import transport_registry
+from .utils import find_free_port
 
 __all__ = [
     "AsyncConnection",

@@ -9,11 +9,9 @@ from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
-import cloudpickle
-
 from ensemble_launcher.checkpointing import CommCheckpointData
 from ensemble_launcher.comm import AsyncCommState, ClientConnection, transport_registry
-from ensemble_launcher.comm.messages import IResultBatch, Result, TaskUpdate
+from ensemble_launcher.comm.messages import IResultBatch, Message, Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
 
@@ -69,7 +67,8 @@ class _WorkerPipeline:
                 t0 = time.perf_counter()
                 parts = await self.conn.recv()
                 self.recv_time += time.perf_counter() - t0
-                asyncio.create_task(self._deserialize_and_set(parts[-1]))
+                data_frames = parts[1:]
+                asyncio.create_task(self._deserialize_and_set(data_frames))
         except asyncio.CancelledError:
             logger.info(
                 f"{self.worker_id} recv={self.recv_time:.3f}s "
@@ -77,11 +76,18 @@ class _WorkerPipeline:
                 f"set_result={self.set_result_time:.3f}s"
             )
 
-    async def _deserialize_and_set(self, raw: bytes) -> None:
+    async def _deserialize_and_set(self, frames: list) -> None:
         t0 = time.perf_counter()
-        msg: IResultBatch = await asyncio.get_running_loop().run_in_executor(
-            None, cloudpickle.loads, raw
-        )
+        loop = asyncio.get_running_loop()
+        if len(frames) == 1:
+            msg: IResultBatch = await loop.run_in_executor(
+                None, Message.from_bytes, frames[0]
+            )
+        else:
+            msg: IResultBatch = await loop.run_in_executor(
+                None, Message.from_byte_array, frames
+            )
+        await loop.run_in_executor(None, msg.unpack)
         t1 = time.perf_counter()
         for result in msg.data:
             self.set_result(result)
@@ -104,7 +110,7 @@ class _WorkerPipeline:
         else:
             fut.set_exception(Exception(result.exception or "Task failed"))
 
-    def send(self, data: bytes) -> None:
+    def send(self, data: Union[bytes, List[bytes]]) -> None:
         """Thread-safe send: schedules onto this pipeline's own event loop."""
         asyncio.run_coroutine_threadsafe(self.conn.send(data), self._loop)
 
@@ -193,7 +199,6 @@ class ClusterClient:
         node_id: str = "global",
         client_id: Optional[str] = None,
         n_workers: int = 1,
-        log_dir: str = "logs",
         log_level: int = logging.INFO,
         checkpoint_timeout: float = 60.0,
         task_buffer_size: int = 10000,
@@ -209,9 +214,6 @@ class ClusterClient:
                                  that node.
             client_id:           Optional client identity string; auto-generated if omitted.
             n_workers:           Number of parallel send/recv pipelines (default 1).
-            log_dir:             Directory for log files.  When provided a file
-                                 ``{log_dir}/{client_id}.log`` is created.  When
-                                 ``None`` (default) logging goes to the root handler.
             log_level:           Logging level (default ``logging.INFO``).
             checkpoint_timeout:  Seconds to wait for checkpoint files to appear before
                                  raising ``TimeoutError`` (default 60).  Useful when the
@@ -233,7 +235,7 @@ class ClusterClient:
         self._flush_stop_event = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self.logger = setup_logger(
-            __name__, self._client_id, log_dir=log_dir, level=log_level
+            __name__, self._client_id, level=log_level,
         )
         self._node_id = None
 
@@ -384,9 +386,9 @@ class ClusterClient:
 
         for pipeline, batch in zip(self._pipelines, pipeline_batches):
             if batch:
-                data = cloudpickle.dumps(
-                    TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
-                )
+                data = TaskUpdate(
+                    sender=pipeline.worker_id, added_tasks=batch
+                ).to_byte_array()
                 pipeline.send(data)
         self.logger.info(
             f"Flushed {len(items) - len(remaining)} tasks across {self._n_workers} pipeline(s)"
