@@ -117,6 +117,7 @@ class ActorHandle:
                     action_name, result = cloudpickle.loads(frames[1])
                     self._cache[action_name].put_nowait(result)
                 except asyncio.TimeoutError:
+                    self.logger.warning("recv timedout")
                     await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             pass
@@ -128,6 +129,7 @@ class ActorHandle:
             await self._conn.send(data, tid)
         else:
             await self._conn.send(data)
+        self.logger.info("Successfully sent message")
         return
 
 
@@ -397,6 +399,7 @@ class _ActorBase(ABC):
                 args = cloudpickle.loads(frames[1])
                 await self._input_queue.put((sender_id, args))
             except Exception:
+                self.logger.warning("Recv timed out")
                 pass
 
     async def _send(self):
@@ -427,7 +430,7 @@ class _ActorBase(ABC):
                 else:
                     self.logger.info(f"Sent results to {target_id}")
             except Exception as e:
-                self.logger.debug(f"Send failed with error: {str(e)}")
+                self.logger.warning(f"Send failed with error: {str(e)}")
 
     @action
     def stop(self):

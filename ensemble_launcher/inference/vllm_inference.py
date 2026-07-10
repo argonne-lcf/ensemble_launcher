@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 import queue
 
 import cloudpickle
+import multiprocessing as mp
 
 from ensemble_launcher.comm.pipe import ClientConnection, get_hsn_ip_cli, find_free_port
 from ensemble_launcher.ensemble.actor import PrivateActor, PublicActor, action
@@ -65,7 +66,12 @@ def _setup_env(name,
         os.environ["VLLM_CACHE_ROOT"] = model_info_cache
         try:
             os.makedirs(os.environ["VLLM_CACHE_ROOT"])
-            _build_model_cache(logger=logger.getChild("BuildModelInfo"))
+            logger.info("Bulding model info")
+            p = mp.get_context("spawn").Process(target=_build_model_cache)
+            p.start()
+            p.join()
+            # _build_model_cache()#logger=logger.getChild("BuildModelInfo"))
+            logger.info("Done Building model cache")
         except Exception as e:
             logger.error(f"Building model infos failed with error {e}")
             raise
@@ -107,7 +113,7 @@ def _create_engine(logger, snapshots, llm_kwargs: Dict[str, Any] = {}, async_eng
         logger.error(f"Starting LLM failed with Exception: {e}")
         raise RuntimeError(str(e))
 
-def _create_online_engine(logger, snapshots, server_args: Dict = {}, engine_cls=None):
+def _create_online_engine(snapshots, server_args: Dict = {}, engine_cls=None):
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
     from vllm.entrypoints.openai.cli_args import make_arg_parser
@@ -319,7 +325,7 @@ class _VLLMOnlineMixin:
         if self.logger is None:
             self.logger = setup_logger(name=self._name)
         self.logger.info(
-            f"{socket.gethostname()}:{os.environ.get('ZE_AFFINITY_MASK', None)}"
+            f" Running on host {socket.gethostname()}"
         )
         try:
             snapshots = _setup_env(self._name, self.logger, self.model, self.cache_dir,
@@ -328,9 +334,13 @@ class _VLLMOnlineMixin:
             self.logger.error(f"Setting env failed with error {e}")
             raise e
         
+        self.logger.info("Successfully setup env")
+
         if len(snapshots) == 0:
             self.logger.error("No model snapshots found.")
             raise FileNotFoundError
+        else:
+            self.logger.info(f"Using model snapshot: {snapshots[0]}")
         
         self._hostname = self.server_args.get("host", get_hsn_ip_cli() or 
                                                     socket.gethostbyname(socket.gethostname()))
@@ -338,11 +348,13 @@ class _VLLMOnlineMixin:
         self.server_args["host"] = self._hostname
         self.server_args["port"] = self.port
 
+        self.logger.info("Before starting engine")
         if self._engine is None:
-            self._args, self._engine = _create_online_engine(self.logger, snapshots, self.server_args)
+            self._args, self._engine = _create_online_engine(snapshots, self.server_args)
 
 
         try:
+            self.logger.info("Starting build_and_serve import")
             from vllm.entrypoints.openai.api_server import build_and_serve
         except Exception:
             self.logger.warning("Installed vllm does not have build_and_serve using custom")
@@ -381,6 +393,15 @@ class _VLLMOnlineMixin:
 
         self._serve_task = asyncio.create_task(
             build_and_serve(self._engine, None, None, self._args))
+        
+        def _serve_done(task):
+            if task.cancelled():
+                self.logger.info("serve task cancelled")
+            elif task.exception():
+                self.logger.error(f"serve task failed: {task.exception()}")
+            else:
+                self.logger.info("serve task finished")
+        self._serve_task.add_done_callback(_serve_done)
 
         self.logger.info(f"vLLM server ready at {self._hostname}:{self.port}")
 
@@ -1291,8 +1312,7 @@ class _MultiNodeOnlineVLLMMixin:
             from vllm.v1.engine.core import EngineCoreProc
             EngineCoreProc.run_engine_core = staticmethod(_spmd_run_engine_core)
             
-            self._args, raw_engine = _create_online_engine(
-                self.logger, snapshots, merged_kwargs)
+            self._args, raw_engine = _create_online_engine(snapshots, merged_kwargs)
 
             self._engine = raw_engine
 
