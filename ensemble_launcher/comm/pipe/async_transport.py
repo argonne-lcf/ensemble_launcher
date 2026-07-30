@@ -39,7 +39,7 @@ def get_hsn_ip_cli(ifname="hsn0")->Optional[str]:
         if match:
             return match.group(1)
 
-    except subprocess.CalledProcessError:
+    except Exception:
         pass # Interface doesn't exist or command failed
 
 
