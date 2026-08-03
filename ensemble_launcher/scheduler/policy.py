@@ -562,8 +562,16 @@ class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
 
         x_vals = [0.0, float(nlevels)]
         y_vals = [0.0, max(np.log2(leaf_nodes), 0)]
-        nchildren_current_level = 2 ** (np.ceil(np.interp([level], x_vals, y_vals)[0]))
-        nchildren_next_level = 2 ** (np.ceil(np.interp([level + 1], x_vals, y_vals)[0]))
+        if level == 0:
+            nchildren_current_level = 1
+        else:
+            nchildren_current_level = 2 ** (np.interp([level], x_vals, y_vals)[0])
+
+        if self.policy_config.nlevels == level + 1:
+            nchildren_next_level = self.policy_config.leaf_nodes
+        else:
+            nchildren_next_level = 2 ** (np.interp([level + 1], x_vals, y_vals)[0])
+
 
         if level > 0:
             my_id = int(self.node_id.split(".")[-1].replace("m", ""))
