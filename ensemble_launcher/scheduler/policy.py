@@ -546,10 +546,11 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
 class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
     def __init__(
         self,
-        policy_config: PolicyConfig = PolicyConfig(),
+        policy_config: PolicyConfig | None = None,
         node_id: str = None,
         logger: Logger = None,
     ):
+        policy_config = policy_config or PolicyConfig()
         super().__init__(policy_config, node_id, logger)
         self.logger.info(f"Using FixedLeadNodePolicy")
 
@@ -562,25 +563,37 @@ class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
 
         x_vals = [0.0, float(nlevels)]
         y_vals = [0.0, max(np.log2(leaf_nodes), 0)]
+        
+        if level == 0:
+            nchildren_parent_level = 0
+        else:
+            nchildren_parent_level = 2 ** (int(np.interp([level-1], x_vals, y_vals)[0]))
+
         if level == 0:
             nchildren_current_level = 1
         else:
-            nchildren_current_level = 2 ** (np.interp([level], x_vals, y_vals)[0])
+            nchildren_current_level = 2 ** (int(np.interp([level], x_vals, y_vals)[0]))
 
         if self.policy_config.nlevels == level + 1:
             nchildren_next_level = self.policy_config.leaf_nodes
         else:
-            nchildren_next_level = 2 ** (np.interp([level + 1], x_vals, y_vals)[0])
+            nchildren_next_level = 2 ** (int(np.interp([level + 1], x_vals, y_vals)[0]))
 
 
         if level > 0:
-            my_id = int(self.node_id.split(".")[-1].replace("m", ""))
+            my_local_id = int(self.node_id.split(".")[-1].replace("m", ""))
+            if level > 1:
+                my_parent_id = int(self.node_id.split(".")[-2].replace("m", ""))
+                nchildren_per_parent = nchildren_current_level // nchildren_parent_level
+                my_global_id = nchildren_per_parent * my_parent_id + my_local_id
+            else:
+                my_global_id = my_local_id
         else:
-            my_id = 0
+            my_global_id = 0
 
         n_children = int(nchildren_next_level // nchildren_current_level)
         remainder = int(nchildren_next_level % nchildren_current_level)
-        if my_id < remainder:
+        if my_global_id < remainder:
             n_children += 1
 
         nnodes = len(nodes.nodes)
