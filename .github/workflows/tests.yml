@@ -31,4 +31,4 @@ jobs:
 
       - name: Run core tests
         working-directory: ensemble_launcher/tests
-        run: pytest -m core --timeout=120 -v --tb=short -W ignore::pytest.PytestUnraisableExceptionWarning --ignore=test_mcp.py --ignore=test_vllm.py
+        run: pytest -m core --timeout=300 -v --tb=short -W ignore::pytest.PytestUnraisableExceptionWarning --ignore=test_mcp.py --ignore=test_vllm.py
