@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ensemble_launcher"
-version = "0.0.1"
+version = "0.1.0"
 description = "A lightweight, scalable tool for launching and orchestrating task ensembles across HPC clusters."
 readme = "README.md"
 requires-python = ">=3.10"
