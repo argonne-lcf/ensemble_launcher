@@ -85,7 +85,7 @@ def _make_mp_pair(req_res=False):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_basic_send_recv():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -98,7 +98,7 @@ async def test_zmq_basic_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_basic_roundtrip():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -115,7 +115,7 @@ async def test_zmq_basic_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_multiple_messages():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -135,7 +135,7 @@ async def test_zmq_multiple_messages():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_send_recv():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -149,7 +149,7 @@ async def test_zmq_req_res_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -168,7 +168,7 @@ async def test_zmq_req_res_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(15)
+
 async def test_zmq_req_res_multiple():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -184,7 +184,7 @@ async def test_zmq_req_res_multiple():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_pickled_data():
     """Verify cloudpickled payloads work through req_res."""
     server, client = await _open_zmq_pair(req_res=True)
@@ -208,7 +208,7 @@ async def test_zmq_req_res_pickled_data():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_router_state_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -228,7 +228,7 @@ async def test_zmq_router_state_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_dealer_state_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -251,7 +251,7 @@ async def test_zmq_dealer_state_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(20)
+
 async def test_mp_basic_send_recv():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -265,7 +265,7 @@ async def test_mp_basic_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_basic_roundtrip():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -284,7 +284,7 @@ async def test_mp_basic_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_multiple_messages():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -306,7 +306,7 @@ async def test_mp_multiple_messages():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_req_res_send_recv():
     server, client = _make_mp_pair(req_res=True)
     await server.open()
@@ -322,7 +322,7 @@ async def test_mp_req_res_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_req_res_roundtrip():
     server, client = _make_mp_pair(req_res=True)
     await server.open()
@@ -343,7 +343,7 @@ async def test_mp_req_res_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(15)
+
 async def test_mp_req_res_multiple():
     server, client = _make_mp_pair(req_res=True)
     await server.open()

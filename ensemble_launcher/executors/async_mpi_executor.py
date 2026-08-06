@@ -426,6 +426,7 @@ class AsyncMPIExecutor(Executor):
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 _, std_err = await proc.communicate()
+                proc._transport.close()
                 if proc.returncode != 0:
                     self.logger.warning(
                         f"Copying chunk {i} failed!! retrying {retry + 1}/3"
@@ -451,6 +452,7 @@ class AsyncMPIExecutor(Executor):
                     *cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
                 )
                 _, stderr = await proc.communicate()
+                proc._transport.close()
                 if proc.returncode != 0:
                     self.logger.warning(
                         f"Making executable failed. retrying {retry + 1}/3"
@@ -559,7 +561,9 @@ class AsyncMPIExecutor(Executor):
             if stderr_fh:
                 stderr_fh.close()
             if task_id in self._processes:
-                del self._processes[task_id]
+                proc = self._processes.pop(task_id)
+                if proc._transport is not None:
+                    proc._transport.close()
 
     def _kill_process_group(
         self, process: asyncio.subprocess.Process, force: bool

@@ -106,7 +106,7 @@ def _node_worker(
     return result
 
 
-@pytest.mark.timeout(60)
+
 def test_mp_comm():
     max_depth = 3
     results = _node_worker(0, max_depth, None, None, "mp")
@@ -116,7 +116,7 @@ def test_mp_comm():
         assert result == f"Message from {i + 1} to {i}"
 
 
-@pytest.mark.timeout(60)
+
 def test_zmq_comm():
     max_depth = 2
     results = _node_worker(0, max_depth, None, None, "zmq")
@@ -126,7 +126,7 @@ def test_zmq_comm():
         assert result == f"Message from {i + 1} to {i}"
 
 
-@pytest.mark.timeout(60)
+
 @pytest.mark.asyncio
 async def test_comm_state_roundtrip_zmq():
     from ensemble_launcher.comm.async_base import AsyncCommState

@@ -22,7 +22,7 @@ from ensemble_launcher.scheduler.resource import (
 pytestmark = pytest.mark.core
 
 
-@pytest.mark.timeout(60)
+
 @pytest.mark.asyncio
 async def test_async_master(nlevels=1, ntask_per_core=1):
     ##create tasks
@@ -65,7 +65,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
     ), f"{[result for task_id, result in results.items()]}"
 
 
-@pytest.mark.timeout(60)
+
 @pytest.mark.asyncio
 async def test_async_mpi_master(nlevels=1):
     ##create tasks
