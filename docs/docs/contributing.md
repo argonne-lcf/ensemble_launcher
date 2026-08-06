@@ -7,7 +7,23 @@ We welcome contributions!
 ```bash
 git clone https://github.com/argonne-lcf/ensemble_launcher.git
 cd ensemble_launcher
-python3 -m pip install -e ".[dev]"
+pip install -e ".[dev-core]"
+```
+
+This installs the core dev dependencies (`pytest`, `pytest-timeout`, `pytest-asyncio`) plus `mpi4py`.
+
+For the full dev environment including MCP and inference dependencies:
+
+```bash
+pip install -e ".[dev-extensions]"
+```
+
+### Building Docs
+
+```bash
+pip install -e ".[docs]"
+cd docs
+mkdocs serve
 ```
 
 ## Running Tests
