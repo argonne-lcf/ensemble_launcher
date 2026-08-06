@@ -70,13 +70,19 @@ class AsyncMPConnection(ServerConnection):
         await loop.run_in_executor(None, self._conn.send, frames)
         return True
 
+    def _poll_recv(self):
+        while not self._conn.closed:
+            if self._conn.poll(0.5):
+                return self._conn.recv()
+        raise OSError("pipe closed")
+
     async def _raw_recv(self) -> List[bytes]:
         """Receive frames via multiprocessing pipe.
 
         Returns: [identity_frame, msg_id(8B)?, blob]
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._conn.recv)
+        return await loop.run_in_executor(None, self._poll_recv)
 
     def get_state(self) -> AsyncMPConnectionState:
         return AsyncMPConnectionState(
