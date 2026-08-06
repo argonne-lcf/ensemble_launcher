@@ -58,7 +58,7 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 
 - MPI implementation (for distributed execution via `mpirun` or `mpiexec`)
 - [DragonHPC](https://github.com/DragonHPC/dragon) (for extreme-scale deployment on HPC systems)
-- [mcp](https://github.com/modelcontextprotocol/python-sdk?tab=readme-ov-file) and [paramiko] (https://www.paramiko.org/) for hosting mcp server on HPC compute nodes
+- [mcp](https://github.com/modelcontextprotocol/python-sdk?tab=readme-ov-file) and [paramiko](https://www.paramiko.org/) for hosting mcp server on HPC compute nodes
 
 ### Quick Install
 
@@ -96,7 +96,7 @@ The configuration specifies an ensemble with:
 - Tasks running on a single node with a single process per node
 - Tasks executed with `./exe -a {arg1} -b {arg2}` taking two input arguments
 - The values of the two input arguments are defined as 5 linearly spaced numbers between 0-10 and 0-1 for `arg1` and `arg2`, respectively.
-- The raletionship between the values of the two arguments is set to `one-to-one`, meaning the ensemble consists of 5 tasks, one for each pair of values. 
+- The relationship between the values of the two arguments is set to `one-to-one`, meaning the ensemble consists of 5 tasks, one for each pair of values. 
 
 **Supported Relations:**
 - `one-to-one`: Pair parameters element-wise (N tasks)
@@ -658,7 +658,7 @@ launcher_config = LauncherConfig(
     worker_logs=True,
     master_logs=True,
     report_interval=5.0,  # Report status every 5 seconds
-    profile = "basic" or "timeline" #basic ouputs the communication latencies and task runtime. timeline outputs the mean, std, sum, and counts of various events in the orchestrator
+    profile = "basic" or "timeline" #basic outputs the communication latencies and task runtime. timeline outputs the mean, std, sum, and counts of various events in the orchestrator
 )
 ```
 
@@ -813,6 +813,3 @@ If you use Ensemble Launcher in your research, please cite:
   url = {https://github.com/argonne-lcf/ensemble_launcher}
 }
 ```
-
-
-
