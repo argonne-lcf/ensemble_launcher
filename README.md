@@ -1,6 +1,6 @@
 # Ensemble Launcher
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 A lightweight, scalable tool for launching and orchestrating task ensembles across HPC clusters with intelligent resource management and hierarchical execution.
 
@@ -29,15 +29,12 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 
 ## Features
 
-- **Flexible Execution**: Support for serial, MPI, and mixed workloads
-- **Intelligent Scheduling**: Automatic resource allocation with customizable policies
-- **Hierarchical Architecture**: Efficient master-worker patterns for large-scale deployments (1-2048+ nodes)
-- **Multiple Communication Backends**: Choose between Python multiprocessing, [ZMQ](https://zeromq.org/), or [DragonHPC](https://dragonhpc.org/portal/index.html) for performance at scale
-- **Resource Pinning**: Fine-grained CPU and GPU affinity control
-- **Real-time Monitoring**: Track task execution with configurable status updates
-- **Fault Tolerance**: Graceful handling of task failures with detailed error reporting
-- **Python & Shell Support**: Execute Python callables or shell commands seamlessly
-- **Cluster Mode**: Run the orchestrator as a long-lived background service and submit tasks dynamically from any client process
+- **Scalability**: Hierarchical master-worker architecture tested from 1 to 2048+ nodes
+- **Flexible Execution**: Support for serial, MPI, and mixed workloads with Python callables or shell commands
+- **Co-Scheduling**: Run heterogeneous tasks (different node counts, GPU requirements) in a single ensemble
+- **Custom Scheduling Policies**: Pluggable policy system with built-in bin-packing, split, and FIFO strategies, or write your own
+- **Actors**: Distributed actor model with async/await communication over ZMQ for long-lived stateful services
+- **Inference**: Actor-based vLLM wrappers for offline, online, and multi-node LLM serving on HPC clusters
 
 ---
 
@@ -45,14 +42,13 @@ A lightweight, scalable tool for launching and orchestrating task ensembles acro
 
 ### Requirements
 
-- Python 3.6+
+- Python 3.10+
 - numpy
-- matplotlib
-- scienceplots
-- pytest
 - cloudpickle
 - pydantic
 - pyzmq
+- loky
+- typer
 
 ### Optional Dependencies
 
@@ -154,8 +150,6 @@ el start ENSEMBLE_FILE [OPTIONS]
 | `--system-config-file` | Path to system configuration JSON |
 | `--launcher-config-file` | Path to launcher configuration JSON |
 | `--nodes-str` | Comma-separated compute nodes, e.g. `"node-001,node-002"` |
-| `--pin-resources / --no-pin-resources` | CPU/GPU resource pinning (default: enabled) |
-| `--async-orchestrator / --no-async-orchestrator` | Event-driven orchestrator (default: enabled) |
 
 #### `el stop` — stop a running cluster
 
@@ -213,10 +207,9 @@ el stop   # gracefully shut down
 **Launcher Configuration (launcher.json):**
 ```json
 {
-    "child_executor_name": "mpi",
-    "task_executor_name": "mpi",
-    "comm_name": "zmq",
-    "nlevels": 2,
+    "child_executor_name": "async_mpi",
+    "task_executor_name": "async_processpool",
+    "comm_name": "async_zmq",
     "report_interval": 10.0,
     "return_stdout": true,
     "worker_logs": true,
@@ -236,8 +229,8 @@ el stop   # gracefully shut down
 - **Global/Local Master**: Orchestrates workers, handles task distribution and aggregation
 - **Worker**: Executes tasks using configured executor
 - **Scheduler**: Allocates resources across cluster nodes with intelligent policies
-- **Executors**: Backend task launching engines (Python multiprocessing, MPI, DragonHPC)
-- **Communication Layer**: ZMQ or Python multiprocessing pipes
+- **Executors**: Backend task launching engines (async process pool, async MPI)
+- **Communication Layer**: Async ZMQ
 
 ### Hierarchical Execution Model
 
@@ -261,7 +254,6 @@ from ensemble_launcher import EnsembleLauncher
 el = EnsembleLauncher(
     ensemble_file="config.json",
     Nodes=["node-001", "node-002"],  # Optional: auto-detects from PBS_NODEFILE, works only on PBS
-    pin_resources=True,              # Enable CPU/GPU pinning
 )
 ```
 
@@ -271,7 +263,7 @@ For fine-grained control, explicitly configure system and launcher settings:
 
 ```python
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import SystemConfig, LauncherConfig
+from ensemble_launcher.config import SystemConfig, LauncherConfig, PolicyConfig
 
 # Define system resources
 system_config = SystemConfig(
@@ -284,22 +276,20 @@ system_config = SystemConfig(
 
 # Configure launcher behavior
 launcher_config = LauncherConfig(
-    child_executor_name="mpi",      # multiprocessing, mpi, dragon
-    task_executor_name="mpi",       # Executor for tasks
-    comm_name="zmq",                # multiprocessing, zmq, dragon
-    nlevels=2,                      # Hierarchy depth (auto-computed if None)
-    report_interval=10.0,           # Status update frequency (seconds)
-    return_stdout=True,             # Capture stdout
-    worker_logs=True,               # Enable worker logging
-    master_logs=True                # Enable master logging
+    child_executor_name="async_mpi",       # async_processpool, async_mpi
+    task_executor_name="async_processpool", # Executor for tasks
+    comm_name="async_zmq",                 # async_zmq (only supported backend)
+    policy_config=PolicyConfig(nlevels=2), # Hierarchy depth
+    report_interval=10.0,                  # Status update frequency (seconds)
+    return_stdout=True,                    # Capture stdout
+    worker_logs=True,                      # Enable worker logging
+    master_logs=True                       # Enable master logging
 )
 
 el = EnsembleLauncher(
     ensemble_file="config.json",
     system_config=system_config,
     launcher_config=launcher_config,
-    pin_resources=True,
-    async_orchestrator=False #use event driven orchestrator (only for zmq communication backend)
 )
 
 results = el.run()
@@ -620,23 +610,18 @@ See the [`examples`](examples/) directory for complete workflow samples:
 
 ## Performance Tuning
 
-### Communication Backend Selection
-
-| Backend          | Best For                    | Nodes    |
-|------------------|-----------------------------|----------|
-| `multiprocessing`| Single node, small ensembles| 1        |
-| `zmq`            | Multi-node, large scale     | 2-2048+  |
-
 ### Hierarchy Levels
 
-The launcher automatically determines hierarchy depth based on node count, but you can override it with:
+The launcher automatically determines hierarchy depth based on node count, but you can override it via `PolicyConfig`:
 
 ```python
+from ensemble_launcher.config import LauncherConfig, PolicyConfig
+
 launcher_config = LauncherConfig(
-    nlevels=0   # Direct worker execution (single node)
-    nlevels=1   # Master + Workers (up to ~64 nodes)
-    nlevels=2   # Master + Sub-masters + Workers (64-2048 nodes)
-    nlevels=3   # Deep hierarchy (2048+ nodes)
+    policy_config=PolicyConfig(nlevels=0),   # Direct worker execution (single node)
+    # policy_config=PolicyConfig(nlevels=1), # Master + Workers (up to ~64 nodes)
+    # policy_config=PolicyConfig(nlevels=2), # Master + Sub-masters + Workers (64-2048 nodes)
+    # policy_config=PolicyConfig(nlevels=3), # Deep hierarchy (2048+ nodes)
 )
 ```
 
@@ -658,11 +643,11 @@ launcher_config = LauncherConfig(
     worker_logs=True,
     master_logs=True,
     report_interval=5.0,  # Report status every 5 seconds
-    profile = "basic" or "timeline" #basic ouputs the communication latencies and task runtime. timeline outputs the mean, std, sum, and counts of various events in the orchestrator
+    profile="perfetto",   # Perfetto profiling for timeline visualization
 )
 ```
 
-Logs are written to `logs/master-*.log` and `logs/worker-*.log`. Profiles are written to `profiles/*`
+Logs are written to `logs/master-*.log` and `logs/worker-*.log`. Profiles are written to `profiles/*_perfetto.json` and `profiles/*_stats.json`.
 
 ---
 
@@ -676,8 +661,6 @@ EnsembleLauncher(
     system_config: SystemConfig = SystemConfig(name="local"),
     launcher_config: Optional[LauncherConfig] = None,
     Nodes: Optional[List[str]] = None,
-    pin_resources: bool = True,
-    async_orchestrator: bool = True
 )
 ```
 
@@ -686,8 +669,6 @@ EnsembleLauncher(
 - `system_config`: System resource configuration
 - `launcher_config`: Launcher behavior configuration (auto-configured if None)
 - `Nodes`: List of compute nodes (auto-detected if None)
-- `pin_resources`: Enable CPU/GPU affinity
-- `async_orchestrator`: Use event-driven orchestrator (only for ZMQ backend)
 
 **Methods:**
 - `run()`: Execute ensemble synchronously and return results (raises `RuntimeError` in cluster mode)
@@ -732,17 +713,21 @@ SystemConfig(
 
 ```python
 LauncherConfig(
-    child_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing",
-    task_executor_name: Literal["multiprocessing","dragon","mpi"] = "multiprocessing",
-    comm_name: Literal["multiprocessing","zmq","dragon"] = "multiprocessing",
+    child_executor_name: str = "async_processpool",
+    task_executor_name: Union[str, List[str]] = "async_processpool",
+    comm_name: Literal["async_zmq"] = "async_zmq",
     report_interval: float = 10.0,
-    nlevels: int = 1,
     return_stdout: bool = False,
     worker_logs: bool = False,
     master_logs: bool = False,
-    nchildren: Optional[int] = None #Forces number of children at every level
-    profile: Optional[Literal["basic","timeline"]] = None
-    gpu_selector: str = "ZE_AFFINITY_MASK"
+    profile: Optional[Literal["perfetto"]] = None,
+    gpu_selector: str = "ZE_AFFINITY_MASK",
+    cluster: bool = False,
+    checkpoint_dir: Optional[str] = None,
+    enable_workstealing: bool = False,
+    children_scheduler_policy: str = "simple_split_children_policy",
+    task_scheduler_policy: str = "large_resource_policy",
+    policy_config: PolicyConfig = PolicyConfig(),
 )
 ```
 
@@ -806,11 +791,11 @@ This work was supported by the U.S. Department of Energy, Office of Science, und
 If you use Ensemble Launcher in your research, please cite:
 
 ```bibtex
-@software{ensemble_launcher,
-  title = {Ensemble Launcher: Scalable Task Orchestration for HPC},
-  author = {Argonne National Laboratory},
-  year = {2025},
-  url = {https://github.com/argonne-lcf/ensemble_launcher}
+@article{tummalapalli2026overcoming,
+  title={Overcoming Orchestration Bottlenecks at Exascale: A Decentralized, Policy-Driven Approach for Sim-AI Ensembles},
+  author={Tummalapalli, Harikrishna and Simpson, Christine M and Balin, Riccardo and Morozov, Vitali A and Pham, Thang D and Keceli, Murat and Uram, Thomas D},
+  journal={arXiv preprint arXiv:2607.12211},
+  year={2026}
 }
 ```
 

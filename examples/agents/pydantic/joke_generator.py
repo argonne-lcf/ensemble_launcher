@@ -22,7 +22,8 @@ async def main():
 
     ## Start local vllm
     llm = OnlineVLLMInference(
-        name="vllm", model=model, cache_dir=model_cache, port=9000, ckpt_dir=llm_ckpt
+        name="vllm", model=model, cache_dir=model_cache,
+        server_args={"port": 9000}, ckpt_dir=llm_ckpt,
     )
     llm_task = llm.create_task(task_id="llm", nnodes=1, ppn=1, ngpus_per_process=1)
     client.submit(llm_task)

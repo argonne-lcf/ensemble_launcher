@@ -8,7 +8,7 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from ensemble_launcher.ensemble import Actor
-from ensemble_launcher.ensemble.actor import AgentHandle, action
+from ensemble_launcher.ensemble.actor import ActorHandle, action
 
 
 class JokeGenerationAgent(Actor):
@@ -57,7 +57,7 @@ class JokeSelectionAgent(Actor):
         transport="zmq",
         llm_address="localhost:8000",
         llm_model="Qwen/Qwen3-0.6B",
-        generation_agent_handle: Optional[AgentHandle] = None,
+        generation_agent_handle: Optional[ActorHandle] = None,
         ckpt_dir=...,
     ):
         super().__init__(name, transport, ckpt_dir)
