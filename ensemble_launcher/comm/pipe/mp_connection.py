@@ -42,8 +42,13 @@ class AsyncMPConnection(ServerConnection):
     async def _raw_open(self) -> None:
         pass
 
-    async def _raw_close(self) -> None:
+    async def close(self):
         self._conn.close()
+        await super().close()
+
+    async def _raw_close(self) -> None:
+        if not self._conn.closed:
+            self._conn.close()
 
     async def _raw_send(
         self,
