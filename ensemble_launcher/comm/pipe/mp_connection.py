@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from typing import Dict, List, Optional, Union
 
 from .async_connection import (
@@ -38,11 +39,13 @@ class AsyncMPConnection(ServerConnection):
         )
         self._conn = pipe_conn
         self._identity_frame = f"{identity}:{secret_id}".encode()
+        self._stop = threading.Event()
 
     async def _raw_open(self) -> None:
         pass
 
     async def close(self):
+        self._stop.set()
         self._conn.close()
         await super().close()
 
@@ -71,10 +74,10 @@ class AsyncMPConnection(ServerConnection):
         return True
 
     def _poll_recv(self):
-        while not self._conn.closed:
+        while not self._stop.is_set() and not self._conn.closed:
             if self._conn.poll(0.5):
                 return self._conn.recv()
-        raise OSError("pipe closed")
+        raise OSError("connection stopped")
 
     async def _raw_recv(self) -> List[bytes]:
         """Receive frames via multiprocessing pipe.
@@ -82,7 +85,11 @@ class AsyncMPConnection(ServerConnection):
         Returns: [identity_frame, msg_id(8B)?, blob]
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._poll_recv)
+        try:
+            return await loop.run_in_executor(None, self._poll_recv)
+        except asyncio.CancelledError:
+            self._stop.set()
+            raise
 
     def get_state(self) -> AsyncMPConnectionState:
         return AsyncMPConnectionState(
