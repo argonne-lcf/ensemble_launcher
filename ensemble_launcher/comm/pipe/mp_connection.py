@@ -39,10 +39,10 @@ class AsyncMPConnection(ServerConnection):
         )
         self._conn = pipe_conn
         self._identity_frame = f"{identity}:{secret_id}".encode()
-        self._stop = threading.Event()
+        self._stop: Optional[threading.Event] = None
 
     async def _raw_open(self) -> None:
-        pass
+        self._stop = threading.Event()
 
     async def close(self):
         self._stop.set()
