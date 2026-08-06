@@ -190,7 +190,10 @@ async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
             comm_name="async_zmq",
             report_interval=100.0,
             mpi_config=MPIConfig(
-                processes_per_node_flag=None, hosts_flag=None, cpu_bind_method="none"
+                processes_per_node_flag=None,
+                hosts_flag=None,
+                cpu_bind_method="none",
+                extra_launcher_flags=["--oversubscribe", "--allow-run-as-root"],
             ),
             log_level=logging.INFO,
         ),

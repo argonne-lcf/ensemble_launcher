@@ -18,7 +18,10 @@ pytestmark = pytest.mark.core
 @pytest.mark.asyncio
 async def test_async_mpi_pool():
 
-    mpi_config = MPIConfig(flavor="test")
+    mpi_config = MPIConfig(
+        flavor="test",
+        extra_launcher_flags=["--oversubscribe", "--allow-run-as-root"],
+    )
     mpi_info = {}
     mpi_info["np"] = 12
     cpu_to_pid = {(socket.gethostname(), i): i for i in range(12)}
