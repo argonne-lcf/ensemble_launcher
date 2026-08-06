@@ -176,7 +176,8 @@ class EnsembleLauncher:
         if not self.async_orchestrator:
             raise RuntimeError("Sync orchestrator is deprecated")
         try:
-            results = asyncio.run(self._launcher.run())
+            from ensemble_launcher.loop import run
+            results = run(self._launcher.run())
         except BaseException:
             logger.exception("EnsembleLauncher.run() failed, stopping launcher")
             raise

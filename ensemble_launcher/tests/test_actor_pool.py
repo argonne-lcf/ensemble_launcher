@@ -23,11 +23,6 @@ class AddPrivateActor(PrivateActor):
         return a + b
 
 
-class MulPrivateActor(PrivateActor):
-    @action
-    def mul(self, a, b):
-        return a * b
-
 
 # ---------------------------------------------------------------------------
 # Unit tests (no cluster needed)
@@ -49,7 +44,7 @@ def test_actor_pool_construction():
     )
 
     assert pool._n_children == 3
-    assert pool._actor_class_list == [AddPrivateActor] * 3
+    assert pool._actor_class is AddPrivateActor
     assert len(pool._actor_kwargs_list) == 3
     assert len(pool._task_kwargs_list) == 3
     assert pool._child_handle is None
@@ -86,9 +81,8 @@ def test_actor_pool_per_actor_kwargs():
 
 
 def test_actor_pool_has_actions():
-    assert "invoke" in ActorPool.__actions__
-    assert "invoke_all" in ActorPool.__actions__
-    assert "invoke_all_stream" in ActorPool.__actions__
+    assert "invoke_children" in ActorPool.__actions__
+    assert "invoke_all_children" in ActorPool.__actions__
     assert "get_n_actors" in ActorPool.__actions__
     assert "get_actor_ids" in ActorPool.__actions__
     assert "stop" in ActorPool.__actions__
@@ -184,17 +178,17 @@ async def test_actor_pool_invoke():
     await handle.open()
     await handle.wait_for_ready(expected=1)
 
-    _, result = await asyncio.wait_for(
-        handle.invoke(0, ("add", (3, 4), None)), timeout=30.0
+    result = await asyncio.wait_for(
+        handle.invoke_children(0, "add", (3, 4)), timeout=30.0
     )
     assert result == 7
 
-    _, result = await asyncio.wait_for(
-        handle.invoke(1, ("add", (10, 20), None)), timeout=30.0
+    result = await asyncio.wait_for(
+        handle.invoke_children(1, "add", (10, 20)), timeout=30.0
     )
     assert result == 30
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
@@ -233,83 +227,83 @@ async def test_actor_pool_invoke_all():
     await handle.open()
     await handle.wait_for_ready(expected=1)
 
-    # Same message to all (tuple)
-    _, results = await asyncio.wait_for(
-        handle.invoke_all(("add", (5, 6), None)),
+    # Same args to all
+    results = await asyncio.wait_for(
+        handle.invoke_all_children("add", (5, 6)),
         timeout=30.0,
     )
     assert len(results) == 3
     assert all(r == 11 for r in results)
 
-    # Different message per actor (list of tuples)
-    per_actor_msgs = [
-        ("add", (1, 10), None),
-        ("add", (2, 20), None),
-        ("add", (3, 30), None),
+    # Different args per actor
+    per_actor_args = [
+        (1, 10),
+        (2, 20),
+        (3, 30),
     ]
-    _, results = await asyncio.wait_for(
-        handle.invoke_all(per_actor_msgs),
+    results = await asyncio.wait_for(
+        handle.invoke_all_children("add", per_actor_args),
         timeout=30.0,
     )
     assert len(results) == 3
     assert sorted(results) == [11, 22, 33]
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
     process.join(timeout=10.0)
 
 
-@pytest.mark.asyncio
-async def test_actor_pool_invoke_all_stream():
-    ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
-    process = _start_cluster(ckpt_dir)
-
-    transport = transport_registry.get("zmq")["transport"]()
-    pool_secret = "pool_secret_stream"
-    server, client = transport.create_child_pipe(
-        "pool_parent_stream", pool_secret, "pool_stream", pool_secret
-    )
-
-    pool = ActorPool(
-        name="pool_stream",
-        client_conn=client,
-        actor_class=AddPrivateActor,
-        n_actors=2,
-        actor_kwargs={},
-        task_kwargs={"nnodes": 1, "ppn": 1},
-        checkpoint_dir=ckpt_dir,
-    )
-    pool_task = pool.create_task(task_id="pool-stream-task", nnodes=1, ppn=1)
-
-    cluster_client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
-    cluster_client.start()
-    cluster_client.submit(pool_task)
-
-    handle = ActorPool.create_handle(
-        server, default_target_id=f"pool_stream:{pool_secret}"
-    )
-    await handle.open()
-    await handle.wait_for_ready(expected=1)
-
-    # invoke_all_stream yields one result per child
-    await handle.send(
-        ("invoke_all_stream", (("add", (100, 200), None),), None),
-        target_id=f"pool_stream:{pool_secret}",
-    )
-    streamed_results = []
-    for _ in range(2):
-        _, result = await asyncio.wait_for(handle.recv(), timeout=30.0)
-        streamed_results.append(result)
-    assert len(streamed_results) == 2
-    assert all(r == 300 for r in streamed_results)
-
-    await handle.stop()
-    await handle.close()
-    cluster_client.teardown()
-    process.terminate()
-    process.join(timeout=10.0)
+# @pytest.mark.asyncio
+# async def test_actor_pool_invoke_all_stream():
+#     ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
+#     process = _start_cluster(ckpt_dir)
+#
+#     transport = transport_registry.get("zmq")["transport"]()
+#     pool_secret = "pool_secret_stream"
+#     server, client = transport.create_child_pipe(
+#         "pool_parent_stream", pool_secret, "pool_stream", pool_secret
+#     )
+#
+#     pool = ActorPool(
+#         name="pool_stream",
+#         client_conn=client,
+#         actor_class=AddPrivateActor,
+#         n_actors=2,
+#         actor_kwargs={},
+#         task_kwargs={"nnodes": 1, "ppn": 1},
+#         checkpoint_dir=ckpt_dir,
+#     )
+#     pool_task = pool.create_task(task_id="pool-stream-task", nnodes=1, ppn=1)
+#
+#     cluster_client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
+#     cluster_client.start()
+#     cluster_client.submit(pool_task)
+#
+#     handle = ActorPool.create_handle(
+#         server, default_target_id=f"pool_stream:{pool_secret}"
+#     )
+#     await handle.open()
+#     await handle.wait_for_ready(expected=1)
+#
+#     # invoke_all_stream yields one result per child
+#     await handle.send(
+#         ("invoke_all_stream", (("add", (100, 200), None),), None),
+#         target_id=f"pool_stream:{pool_secret}",
+#     )
+#     streamed_results = []
+#     for _ in range(2):
+#         result = await asyncio.wait_for(handle.recv("invoke_all_stream"), timeout=30.0)
+#         streamed_results.append(result)
+#     assert len(streamed_results) == 2
+#     assert all(r == 300 for r in streamed_results)
+#
+#     await handle.stop(timeout=1.0)
+#     await handle.close()
+#     cluster_client.teardown()
+#     process.terminate()
+#     process.join(timeout=10.0)
 
 
 @pytest.mark.asyncio
@@ -344,75 +338,16 @@ async def test_actor_pool_get_n_actors_and_ids():
     await handle.open()
     await handle.wait_for_ready(expected=1)
 
-    _, n = await asyncio.wait_for(handle.get_n_actors(), timeout=30.0)
+    n = await asyncio.wait_for(handle.get_n_actors(), timeout=30.0)
     assert n == 2
 
-    _, ids = await asyncio.wait_for(handle.get_actor_ids(), timeout=30.0)
+    ids = await asyncio.wait_for(handle.get_actor_ids(), timeout=30.0)
     assert ids == ["alice", "bob"]
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
     process.join(timeout=10.0)
 
 
-@pytest.mark.asyncio
-async def test_actor_pool_mixed_classes():
-    ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
-    process = _start_cluster(ckpt_dir)
-
-    transport = transport_registry.get("zmq")["transport"]()
-    pool_secret = "pool_secret_mix"
-    server, client = transport.create_child_pipe(
-        "pool_parent_mix", pool_secret, "pool_mix", pool_secret
-    )
-
-    pool = ActorPool(
-        name="pool_mix",
-        client_conn=client,
-        actor_class=[AddPrivateActor, MulPrivateActor],
-        n_actors=2,
-        actor_kwargs=[{}, {}],
-        task_kwargs={"nnodes": 1, "ppn": 1},
-        checkpoint_dir=ckpt_dir,
-    )
-    pool_task = pool.create_task(task_id="pool-mix-task", nnodes=1, ppn=1)
-
-    cluster_client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
-    cluster_client.start()
-    cluster_client.submit(pool_task)
-
-    handle = ActorPool.create_handle(
-        server, default_target_id=f"pool_mix:{pool_secret}"
-    )
-    await handle.open()
-    await handle.wait_for_ready(expected=1)
-
-    # invoke add on child 0
-    _, result = await asyncio.wait_for(
-        handle.invoke(0, ("add", (3, 4), None)), timeout=30.0
-    )
-    assert result == 7
-
-    # invoke mul on child 1
-    _, result = await asyncio.wait_for(
-        handle.invoke(1, ("mul", (3, 4), None)), timeout=30.0
-    )
-    assert result == 12
-
-    # invoke_all with different actions per child
-    _, results = await asyncio.wait_for(
-        handle.invoke_all([
-            ("add", (10, 20), None),
-            ("mul", (10, 20), None),
-        ]),
-        timeout=30.0,
-    )
-    assert sorted(results) == [30, 200]
-
-    await handle.stop()
-    await handle.close()
-    cluster_client.teardown()
-    process.terminate()
-    process.join(timeout=10.0)

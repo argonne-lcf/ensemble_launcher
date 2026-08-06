@@ -25,6 +25,15 @@ def dummy_task():
 def dummy_task():
     return
 
+def init_worker():
+    import sys
+    worker_id = os.getpid()
+    fname = os.path.join(os.getcwd(),"logs","worker_logs",f"worker_{worker_id}.log")
+    os.makedirs(os.path.dirname(fname),exist_ok=True)
+    sys.stdout = open(fname, "w")
+    sys.stderr = sys.stdout
+
+    
 
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
@@ -44,10 +53,10 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         if worker_method == "spawn":
             mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
             super().__init__(
-                mp_context=mp_context, max_workers=kwargs.get("max_workers", None)
+                mp_context=mp_context, max_workers=kwargs.get("max_workers", None), initializer=init_worker
             )
         else:
-            super().__init__(max_workers=kwargs.get("max_workers", None))
+            super().__init__(max_workers=kwargs.get("max_workers", None),initializer=init_worker)
         # super().__init__()
 
         super().submit(dummy_task)

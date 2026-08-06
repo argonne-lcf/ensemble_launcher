@@ -129,7 +129,7 @@ async def test_actor_single_call():
     result = await asyncio.wait_for(handle.add(3, 4), timeout=5.0)
     assert result == 7
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -157,10 +157,10 @@ async def test_actor_batch_call():
 
     batch_args = [("call", (2,), None), ("call", (3,), None), ("call", (5,), None)]
     await handle.send(batch_args)
-    results = await asyncio.wait_for(handle.recv(), timeout=10.0)
+    results = await asyncio.wait_for(handle.recv("call"), timeout=10.0)
     assert results == [4, 9, 25]
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -190,7 +190,7 @@ async def test_actor_multiple_calls():
         result = await asyncio.wait_for(handle.add(x, y), timeout=5.0)
         assert result == expected, f"add({x}, {y}) expected {expected}, got {result}"
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -223,7 +223,7 @@ async def test_actor_lifecycle_hooks():
     result = await asyncio.wait_for(handle.sum(1, 2, 3), timeout=5.0)
     assert result == 6
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -268,10 +268,10 @@ async def test_private_actor_single_call():
     ready_task = asyncio.create_task(a._signal_ready())
 
     await handle.send(("add", (10, 20), None), target_id="priv-actor:secret")
-    sender_id, result = await asyncio.wait_for(handle.recv(), timeout=5.0)
+    result = await asyncio.wait_for(handle.recv("add"), timeout=5.0)
     assert result == 30
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -304,12 +304,12 @@ async def test_private_actor_handle_getattr():
     main_task = asyncio.create_task(a._main_loop())
     ready_task = asyncio.create_task(a._signal_ready())
 
-    _, result = await asyncio.wait_for(
+    result = await asyncio.wait_for(
         handle.add(10, 20, actor_id="priv-getattr:secret"), timeout=5.0
     )
     assert result == 30
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -344,10 +344,10 @@ async def test_private_actor_handle_default_target_id():
     main_task = asyncio.create_task(a._main_loop())
     ready_task = asyncio.create_task(a._signal_ready())
 
-    _, result = await asyncio.wait_for(handle.add(5, 7), timeout=5.0)
+    result = await asyncio.wait_for(handle.add(5, 7), timeout=5.0)
     assert result == 12
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()
@@ -382,10 +382,10 @@ async def test_private_actor_batch_call():
 
     batch = [("add", (1, 2), None), ("add", (3, 4), None), ("add", (5, 6), None)]
     await handle.send(batch, target_id="priv-batch:secret")
-    sender_id, results = await asyncio.wait_for(handle.recv(), timeout=5.0)
+    results = await asyncio.wait_for(handle.recv("add"), timeout=5.0)
     assert results == [3, 7, 11]
 
-    await handle.stop()
+    await handle.stop(timeout=1.0)
     await asyncio.wait_for(main_task, timeout=5.0)
     recv_task.cancel()
     send_task.cancel()

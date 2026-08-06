@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from asyncio import run as asyncio_run
 import logging
 import multiprocessing as mp
 import os
@@ -12,6 +13,7 @@ from ensemble_launcher.comm import (
     Result,
     Stop,
 )
+from ensemble_launcher.loop import run as uv_run
 
 """
 The benchmark tests the robustness of the EL heartbeat mechanism.
@@ -107,20 +109,37 @@ def child_main(
     skip_child_monitors=False,
     heartbeat_interval=1.0,
     heartbeat_dead_threshold=30.0,
+    use_uv = False,
 ):
-    asyncio.run(
-        _child_async(
-            child_idx,
-            mps,
-            duration,
-            payload_size,
-            data_conn,
-            hb_conn,
-            skip_child_monitors,
-            heartbeat_interval,
-            heartbeat_dead_threshold,
+    if use_uv:
+        uv_run(
+            _child_async(
+                child_idx,
+                mps,
+                duration,
+                payload_size,
+                data_conn,
+                hb_conn,
+                skip_child_monitors,
+                heartbeat_interval,
+                heartbeat_dead_threshold,
+            )
         )
-    )
+    else:
+        asyncio_run(
+            _child_async(
+                child_idx,
+                mps,
+                duration,
+                payload_size,
+                data_conn,
+                hb_conn,
+                skip_child_monitors,
+                heartbeat_interval,
+                heartbeat_dead_threshold,
+            )
+        )
+
 
 
 async def busy_wait(duration):
@@ -142,6 +161,7 @@ async def main(
     hb_threshold,
     use_mpi,
     skip_child_monitors=False,
+    use_uv = False,
 ):
     children_ids = [f"child-{i}" for i in range(num_children)]
     children_secret_ids = {
@@ -205,7 +225,7 @@ async def main(
             task = executor.submit(
                 job_resource=job_resource,
                 task=child_main,
-                task_args=(i, mps, duration, payload_size, data_conn, hb_conn, False, hb_interval, hb_threshold),
+                task_args=(i, mps, duration, payload_size, data_conn, hb_conn, False, hb_interval, hb_threshold, use_uv),
             )
             mpi_tasks[child_id] = task
     else:
@@ -224,6 +244,7 @@ async def main(
                     skip_child_monitors,
                     hb_interval,
                     hb_threshold,
+                    use_uv,
                 ),
             )
             p.start()
@@ -324,24 +345,45 @@ if __name__ == "__main__":
         help="Launch children on remote node via AsyncMPIExecutor",
     )
     parser.add_argument(
+        "--use-uv",
+        action="store_true",
+        help="Launch children on remote node via AsyncMPIExecutor",
+    )
+    parser.add_argument(
         "--skip-child-monitors",
         action="store_true",
         help="Skip HB process and data server on child nodes",
     )
     args = parser.parse_args()
 
-    success, false_positives, mean_dt = asyncio.run(
-        main(
-            args.children,
-            args.mps,
-            args.duration,
-            args.payload_size,
-            args.hb_interval,
-            args.hb_threshold,
-            args.mpi,
-            args.skip_child_monitors,
+    if args.use_uv:
+        success, false_positives, mean_dt = uv_run(
+            main(
+                args.children,
+                args.mps,
+                args.duration,
+                args.payload_size,
+                args.hb_interval,
+                args.hb_threshold,
+                args.mpi,
+                args.skip_child_monitors,
+                args.use_uv,
+            )
         )
-    )
+    else:
+        success, false_positives, mean_dt = asyncio_run(
+            main(
+                args.children,
+                args.mps,
+                args.duration,
+                args.payload_size,
+                args.hb_interval,
+                args.hb_threshold,
+                args.mpi,
+                args.skip_child_monitors,
+                args.use_uv,
+            )
+        )
     print(
         f"\nChildren: {args.children}, MPS/child: {args.mps}, "
         f"Total MPS: {args.children * args.mps}, Duration: {args.duration}s, "

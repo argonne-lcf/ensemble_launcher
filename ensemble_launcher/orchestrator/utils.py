@@ -12,7 +12,7 @@ load_str = "import base64, json, socket; "\
            "child_obj.run(); "\
            "print(child_obj.node_id, start, after_deserialization);"
 
-async_load_str = "import base64, json, socket, asyncio; "\
+async_load_str = "import base64, json, socket; from ensemble_launcher.loop import run; "\
            "from datetime import datetime; "\
            "import os; "\
            "from ensemble_launcher.orchestrator.async_worker import AsyncWorker; "\
@@ -30,7 +30,7 @@ async_load_str = "import base64, json, socket, asyncio; "\
            "after_deserialization = datetime.now(); "\
            "class_map = {'AsyncWorker': AsyncWorker, 'AsyncMaster': AsyncMaster, 'AsyncWorkStealingWorker': AsyncWorkStealingWorker, 'AsyncWorkStealingMaster': AsyncWorkStealingMaster}; "\
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\
-           "asyncio.run(child_obj.run()); "\
+           "run(child_obj.run()); "\
            "print(child_obj.node_id, start, after_deserialization);"
 
 # Simpler load_str for sequential single-child launches (no per-host dictionary needed)
@@ -45,7 +45,7 @@ simple_load_str = "import base64, json; "\
            "child_obj.run(); "\
            "print(child_obj.node_id, start, after_deserialization);"
 
-async_simple_load_str = "import base64, json, asyncio; "\
+async_simple_load_str = "import base64, json; from ensemble_launcher.loop import run; "\
            "from datetime import datetime; "\
            "from ensemble_launcher.orchestrator.async_worker import AsyncWorker; "\
            "from ensemble_launcher.orchestrator.async_master import AsyncMaster; "\
@@ -56,12 +56,12 @@ async_simple_load_str = "import base64, json, asyncio; "\
            "after_deserialization = datetime.now(); "\
            "class_map = {'AsyncWorker': AsyncWorker, 'AsyncMaster': AsyncMaster, 'AsyncWorkStealingWorker': AsyncWorkStealingWorker, 'AsyncWorkStealingMaster': AsyncWorkStealingMaster}; "\
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\
-           "asyncio.run(child_obj.run()); "\
+           "run(child_obj.run()); "\
            "print(child_obj.node_id, start, after_deserialization);"
 
 # File-based variants: read JSON from a temp file instead of inlining base64.
 # Use these when the serialised payload is too large for a command-line argument.
-async_load_str_file = "import json, socket, asyncio; "\
+async_load_str_file = "import json, socket; from ensemble_launcher.loop import run; "\
            "from datetime import datetime; "\
            "import os; "\
            "from ensemble_launcher.orchestrator.async_worker import AsyncWorker; "\
@@ -79,10 +79,10 @@ async_load_str_file = "import json, socket, asyncio; "\
            "after_deserialization = datetime.now(); "\
            "class_map = {'AsyncWorker': AsyncWorker, 'AsyncMaster': AsyncMaster, 'AsyncWorkStealingWorker': AsyncWorkStealingWorker, 'AsyncWorkStealingMaster': AsyncWorkStealingMaster}; "\
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\
-           "asyncio.run(child_obj.run()); "\
+           "run(child_obj.run()); "\
            "print(child_obj.node_id, start, after_deserialization);"
 
-async_simple_load_str_file = "import json, asyncio; "\
+async_simple_load_str_file = "import json; from ensemble_launcher.loop import run; "\
            "from datetime import datetime; "\
            "from ensemble_launcher.orchestrator.async_worker import AsyncWorker; "\
            "from ensemble_launcher.orchestrator.async_master import AsyncMaster; "\
@@ -93,5 +93,5 @@ async_simple_load_str_file = "import json, asyncio; "\
            "after_deserialization = datetime.now(); "\
            "class_map = {'AsyncWorker': AsyncWorker, 'AsyncMaster': AsyncMaster, 'AsyncWorkStealingWorker': AsyncWorkStealingWorker, 'AsyncWorkStealingMaster': AsyncWorkStealingMaster}; "\
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\
-           "asyncio.run(child_obj.run()); "\
+           "run(child_obj.run()); "\
            "print(child_obj.node_id, start, after_deserialization);"

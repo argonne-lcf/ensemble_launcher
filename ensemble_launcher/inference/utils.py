@@ -31,12 +31,12 @@ def _setup_vllm_file_logging(log_file: str):
             "vllm": {
                 "class": "logging.FileHandler",
                 "formatter": "vllm",
-                "level": "INFO",
+                "level": "DEBUG",
                 "filename": log_file,
             }
         },
         "loggers": {
-            "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": False}
+            "vllm": {"handlers": ["vllm"], "level": "DEBUG", "propagate": False}
         },
     }
     cfg_path = os.path.join(tempfile.gettempdir(), f"vllm_log_cfg_{os.getpid()}.json")

@@ -1,12 +1,13 @@
 import asyncio
+from functools import partial
 import inspect
 import os
 import secrets
 import time
 import uuid
 from abc import ABC, abstractmethod
-from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Callable, Dict, Optional, Set, Union
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import cloudpickle
 from typing_extensions import Unpack
@@ -32,7 +33,7 @@ def action(fn: Callable):
     return fn
 
 
-class AgentHandle:
+class ActorHandle:
     def __init__(
         self,
         conn: Union[ClientConnection, ServerConnection],
@@ -42,6 +43,9 @@ class AgentHandle:
         self._conn = conn
         self._actions = actions
         self._default_target_id = default_target_id
+        self._cache: Dict[str, asyncio.Queue] = {}
+        self._recv_task: asyncio.Task = None
+        self._stop_event: asyncio.Event = None
 
     def __getattr__(self, name):
         _actions = self.__dict__.get("_actions")
@@ -55,7 +59,7 @@ class AgentHandle:
                     **kwargs,
                 ):
                     await self.send((name, args, kwargs), target_id=target_id)
-                    return await self.recv()
+                    return await self.recv(name)
 
                 proxy.__name__ = name
                 proxy.__qualname__ = name
@@ -71,9 +75,52 @@ class AgentHandle:
             return getattr(_conn, name)
         raise AttributeError(f"No attribute named {name}")
 
-    async def recv(self):
-        frames = await self._conn.recv()
-        return cloudpickle.loads(frames[1])
+    async def recv(self, action_name: str):
+        return await self._cache[action_name].get()
+
+    async def open(self):
+        self.logger = setup_logger(name=self._conn.identity, subdir="handles")
+        try:
+            self._cache: Dict[str, asyncio.Queue] = {name: asyncio.Queue() for name in self._actions.keys()}    
+            self._stop_event = asyncio.Event()
+            self.logger.info("Wainting to open connection")
+            await self._conn.open()
+            self.logger.info("Opened connection")
+            self._recv_task = asyncio.create_task(self._recv_loop())
+            self.logger.info("Successfully opened the handle")
+        except Exception as e:
+            self.logger.error(f"Opening the handle failed with error {e}")
+            raise e
+    
+    async def close(self):
+        self._stop_event.set()
+        await asyncio.sleep(1.0)
+
+        if self._recv_task:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        await self._conn.close()
+
+    async def stop(self, timeout: float = 10.0):
+        data = cloudpickle.dumps(("stop", (), None))
+        await self._conn.send(data)
+        await asyncio.sleep(timeout)
+        
+    async def _recv_loop(self):
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    frames = await self._conn.recv(timeout=5.0)
+                    action_name, result = cloudpickle.loads(frames[1])
+                    self._cache[action_name].put_nowait(result)
+                except asyncio.TimeoutError:
+                    self.logger.warning("recv timedout")
+                    await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            pass
 
     async def send(self, msg: Any, target_id: Optional[str] = None):
         data = cloudpickle.dumps(msg)
@@ -82,6 +129,7 @@ class AgentHandle:
             await self._conn.send(data, tid)
         else:
             await self._conn.send(data)
+        self.logger.info("Successfully sent message")
         return
 
 
@@ -101,7 +149,7 @@ class PrivateActorHandle:
         self._ready_actors: set = set()
         self._ready_events: Dict[str, asyncio.Event] = {}
         self._ready_condition: asyncio.Condition = asyncio.Condition()
-        self._results_queue: asyncio.Queue = asyncio.Queue()
+        self._cache: Dict[str, asyncio.Queue] = {}
         self._input_queue: asyncio.Queue = asyncio.Queue()
         self._recv_task = None
         self._send_task = None
@@ -121,7 +169,7 @@ class PrivateActorHandle:
                         f"actor_id required for {name}() (no default_target_id set)"
                     )
                 await self.send((name, args, kwargs), target_id=tid)
-                return await self.recv()
+                return await self.recv(name)
 
             params = list(sig.parameters.values())
             if len(params) > 0 and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
@@ -161,6 +209,7 @@ class PrivateActorHandle:
 
     async def open(self):
         self.logger = setup_logger(name=self._conn.identity, subdir="handles")
+        self._cache = {name: asyncio.Queue() for name in self._actions.keys()}
         await self._conn.open()
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._send_task = asyncio.create_task(self._send_loop())
@@ -193,8 +242,8 @@ class PrivateActorHandle:
                         async with self._ready_condition:
                             self._ready_condition.notify_all()
                     else:
-                        result = cloudpickle.loads(frames[1])
-                        await self._results_queue.put((full_id, result))
+                        action_name, result = cloudpickle.loads(frames[1])
+                        self._cache[action_name].put_nowait(result)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -216,7 +265,7 @@ class PrivateActorHandle:
                             break
                     if not success:
                         self.logger.warning(
-                            f"Send failed to {target_id} after {self._retries} retries"
+                            f"Send failed to {target_id} after {self._send_retries} retries"
                         )
                 except Exception as e:
                     self.logger.error(
@@ -226,13 +275,14 @@ class PrivateActorHandle:
         except asyncio.CancelledError:
             pass
 
-    async def recv(self) -> tuple:
-        return await self._results_queue.get()
+    async def recv(self, action_name: str):
+        return await self._cache[action_name].get()
 
     async def send(self, msg: Any, target_id: str):
         if target_id not in self._ready_actors:
             event = self._ready_events.setdefault(target_id, asyncio.Event())
             await event.wait()
+        self.logger.info(f"Got message: {msg}")
         data = cloudpickle.dumps(msg)
         self._input_queue.put_nowait((data, target_id))
 
@@ -273,7 +323,8 @@ class _ActorBase(ABC):
     def __init__(
         self,
         name: str,
-        max_workers: int = 2,
+        max_workers: int = 1,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -284,10 +335,14 @@ class _ActorBase(ABC):
         self._input_queue: asyncio.Queue = None
         self._output_queue: asyncio.Queue = None
         self.logger = None
-        self._executor = None
+        self._sync_executor = None
+        self._loop = None
         self._max_workers = max_workers
         self._send_timeout = send_timeout
         self._send_retries = send_retries
+        self._free_slots = None
+        self._running_tasks = None
+        self._run_in_executor = run_in_executor
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -302,7 +357,10 @@ class _ActorBase(ABC):
         self._stop = asyncio.Event()
         self._input_queue = asyncio.Queue()
         self._output_queue = asyncio.Queue()
-        self._pool = ProcessPoolExecutor(max_workers=self._max_workers)
+        self._sync_executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        self._loop = asyncio.get_running_loop()
+        self._free_slots = asyncio.Semaphore(self._max_workers)
+        self._running_tasks = set()
 
     @property
     def secret(self) -> str:
@@ -341,6 +399,7 @@ class _ActorBase(ABC):
                 args = cloudpickle.loads(frames[1])
                 await self._input_queue.put((sender_id, args))
             except Exception:
+                self.logger.warning("Recv timed out")
                 pass
 
     async def _send(self):
@@ -371,54 +430,79 @@ class _ActorBase(ABC):
                 else:
                     self.logger.info(f"Sent results to {target_id}")
             except Exception as e:
-                self.logger.debug(f"Send failed with error: {str(e)}")
+                self.logger.warning(f"Send failed with error: {str(e)}")
 
     @action
     def stop(self):
         try:
+            if len(self._running_tasks) > 0:
+                self.logger.warning(f"Not all invocations are done. running tasks = {len(self._running_tasks)}")
             self._stop.set()
             self.logger.info("Actor stop set")
+            
         except Exception as e:
             self.logger.error(f"Setting stop failed with exception {e}")
             raise
 
-    async def _invoke(
-        self, action_name: str, args: tuple = (), kwargs: Optional[dict] = None
-    ) -> Any:
-        act = self.__actions__.get(action_name)
-        self.logger.info(f"Invoking {action_name}")
-        result = act(self, *args, **(kwargs or {}))
-        if asyncio.iscoroutine(result):
-            result = await result
-        return result
+    async def _invoke(self, target_id: str, msg: Union[List, Tuple]):
+        async def _execute(action_name, args, kwargs):
+            act = self.__actions__.get(action_name)
+            self.logger.info(f"Invoking {action_name}")
+            if inspect.iscoroutinefunction(act):
+                result = await act(self, *args, **(kwargs or {}))
+            elif inspect.isasyncgenfunction(act):
+                # async for r in act(self, *args, **(kwargs or {})):
+                #     self._output_queue.put_nowait((target_id, r))
+                self.logger.warning("Actors don't support async generators yet.")
+                result = None
+            else:
+                if self._run_in_executor:
+                    result = await self._loop.run_in_executor(
+                        self._sync_executor, partial(act, self, *args, **(kwargs or {}))
+                    )
+                else:
+                    result = act(self, *args, **(kwargs or {}))
+            return result
+
+        async with self._free_slots:
+            if isinstance(msg, list):
+                result = []
+                for action_name, args, kwargs in msg:
+                    r = await _execute(action_name, args, kwargs)
+                    result.append(r)
+
+                if not inspect.isasyncgenfunction(self.__actions__.get(action_name)):
+                    self._output_queue.put_nowait((target_id, (action_name, result)))
+            elif isinstance(msg, tuple):
+                action_name, args, kwargs = msg
+                result = await _execute(action_name, args, kwargs)
+
+                if not inspect.isasyncgenfunction(self.__actions__.get(action_name)):
+                    self._output_queue.put_nowait((target_id, (action_name, result)))
+            else:
+                self.logger.warning("Actions only support either a tuple or list(tuple)")
+                result = None
+
+    def _task_done_callback(self, task: asyncio.Task):
+        self._running_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"Invoke task failed with error: {exc}")
 
     async def _main_loop(self):
         self.logger.info("Main loop started.")
         while not self._stop.is_set():
-            target_id, msg = await self._input_queue.get()
-            if isinstance(msg, list):
-                results = []
-                for action_name, args, kwargs in msg:
-                    try:
-                        results.append(await self._invoke(action_name, args, kwargs))
-                    except Exception as e:
-                        self.logger.error(f"Invoke failed with error: {e}")
-                        raise e
-                await self._output_queue.put((target_id, results))
-            elif isinstance(msg, tuple):
-                action_name, args, kwargs = msg
-                try:
-                    result = await self._invoke(action_name, args, kwargs)
-                except Exception as e:
-                    self.logger.error(f"Invoke failed with error: {e}")
-                    raise e
-                if inspect.isasyncgen(result):
-                    async for item in result:
-                        await self._output_queue.put((target_id, item))
-                else:
-                    await self._output_queue.put((target_id, result))
-            else:
-                raise ValueError("Message must be either List[Tuple] or Tuple")
+            try:
+                target_id, msg = await asyncio.wait_for(
+                    self._input_queue.get(), timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                continue
+            task = asyncio.create_task(self._invoke(target_id, msg))
+            self._running_tasks.add(task)
+            task.add_done_callback(self._task_done_callback)
         self.logger.info("Main loop stopped.")
 
     async def on_start(self):
@@ -428,7 +512,8 @@ class _ActorBase(ABC):
         pass
 
     def __call__(self):
-        asyncio.run(self._run())
+        from ensemble_launcher.loop import run
+        run(self._run())
 
     def create_task(
         self,
@@ -453,6 +538,7 @@ class PublicActor(_ActorBase):
         transport: str = "zmq",
         ckpt_dir: Optional[str] = None,
         max_workers: int = 2,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -461,6 +547,7 @@ class PublicActor(_ActorBase):
             max_workers=max_workers,
             send_timeout=send_timeout,
             send_retries=send_retries,
+            run_in_executor=run_in_executor,
         )
         if ckpt_dir is None:
             ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
@@ -486,7 +573,7 @@ class PublicActor(_ActorBase):
     def create_handle(
         self,
         timeout=300,
-    ) -> Optional[AgentHandle]:
+    ) -> Optional[ActorHandle]:
         fname = f"{self.ckpt_dir}/{self.name}.ckpt"
         start = time.time()
         while time.time() - start < timeout:
@@ -514,7 +601,7 @@ class PublicActor(_ActorBase):
         else:
             raise NotImplementedError("Only zmq is implemented")
 
-        return AgentHandle(
+        return ActorHandle(
             clientconn,
             self._build_action_signatures(),
             default_target_id=f"{self.name}:{self.secret}",
@@ -562,6 +649,7 @@ class PrivateActor(_ActorBase):
         name: str,
         client_conn: ClientConnection,
         max_workers: int = 2,
+        run_in_executor: bool = True,
         send_timeout: float = 5.0,
         send_retries: int = 3,
     ):
@@ -570,6 +658,7 @@ class PrivateActor(_ActorBase):
             max_workers=max_workers,
             send_timeout=send_timeout,
             send_retries=send_retries,
+            run_in_executor=run_in_executor,
         )
         self._conn = client_conn
 

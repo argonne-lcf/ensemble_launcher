@@ -356,6 +356,9 @@ class AsyncMPIExecutor(Executor):
         """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
         cfg = self._mpi_config
 
+        ## remove any duplicates
+        nodes = list(set(nodes))
+        
         base_cmd = (
             [cfg.launcher]
             + [cfg.nprocesses_flag, str(len(nodes))]
