@@ -22,7 +22,7 @@ pytestmark = pytest.mark.core
 
 
 def echo(task_id: str):
-    time.sleep(1.0)
+    time.sleep(0.01)
     return f"Hello from task {task_id}"
 
 

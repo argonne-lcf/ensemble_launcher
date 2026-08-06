@@ -47,7 +47,7 @@ def _node_worker(
             parent_conn=parent_conn,
             hb_parent_conn=parent_hb_conn,
             child_transport=transport,
-            heartbeat_interval=1.0,
+            heartbeat_interval=0.1,
         )
 
         logger.info(f"After Async comm creation depth:{depth}")
