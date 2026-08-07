@@ -842,6 +842,14 @@ class AsyncComm:
             self._hb_process.join(timeout=5.0)
             if self._hb_process.is_alive():
                 self._hb_process.terminate()
+                self._hb_process.join(timeout=2.0)
+
+        for q in (self._hb_control_queue, self._hb_notify_queue):
+            if q is not None:
+                q.cancel_join_thread()
+                q.close()
+        self._hb_control_queue = None
+        self._hb_notify_queue = None
 
         self.logger.info("Stopped HB process")
 
