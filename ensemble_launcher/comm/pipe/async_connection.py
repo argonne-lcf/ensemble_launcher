@@ -422,7 +422,10 @@ class AsyncZMQRouterConnection(ServerConnection):
         self.logger.info(f"Server bound to {self._address}")
 
     async def _raw_close(self) -> None:
+        import zmq
+
         if self._socket:
+            self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.close()
             self._socket = None
         if self._context:
@@ -562,7 +565,10 @@ class AsyncZMQDealerConnection(ClientConnection):
         self.logger.info(f"Connected to {self.remote_address}")
 
     async def _raw_close(self) -> None:
+        import zmq
+
         if self._socket:
+            self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.close()
             self._socket = None
         if self._context:

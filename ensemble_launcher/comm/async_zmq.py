@@ -351,6 +351,7 @@ class AsyncZMQComm(AsyncComm):
         await stop.wait()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        dealer.setsockopt(zmq.LINGER, 0)
         dealer.close()
         ctx.term()
 
@@ -413,6 +414,7 @@ class AsyncZMQComm(AsyncComm):
         await stop.wait()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        router.setsockopt(zmq.LINGER, 0)
         router.close()
         ctx.term()
 
@@ -865,8 +867,10 @@ class AsyncZMQComm(AsyncComm):
 
             # Close ZMQ resources
             if self.router_socket:
+                self.router_socket.setsockopt(zmq.LINGER, 0)
                 self.router_socket.close()
             if self.dealer_socket:
+                self.dealer_socket.setsockopt(zmq.LINGER, 0)
                 self.dealer_socket.close()
             if self.zmq_context:
                 self.zmq_context.term()
