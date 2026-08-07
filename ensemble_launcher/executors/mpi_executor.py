@@ -197,14 +197,18 @@ class MPIExecutor(Executor):
     def running(self, task_id: str):
         return not self.done(task_id)
     
-    def shutdown(self, force:bool = False):
+    def shutdown(self, force:bool = False, **kwargs):
         for task_id, process in self._processes.items():
             try:
                 if process.poll() is None:
                     if force:
                         process.kill()
                     else:
-                        self.wait(task_id)
+                        process.terminate()
+                    process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
             except Exception as e:
                 self.logger.warning(f"Failed to kill process {task_id}: {e}")
         self._processes.clear()

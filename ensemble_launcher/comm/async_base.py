@@ -843,6 +843,9 @@ class AsyncComm:
             if self._hb_process.is_alive():
                 self._hb_process.terminate()
                 self._hb_process.join(timeout=2.0)
+            if self._hb_process.is_alive():
+                self._hb_process.kill()
+                self._hb_process.join(timeout=1.0)
 
         for q in (self._hb_control_queue, self._hb_notify_queue):
             if q is not None:

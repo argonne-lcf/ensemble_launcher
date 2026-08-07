@@ -111,12 +111,15 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         return asyncio.wrap_future(future)
 
     def shutdown(self, wait=True, **kwargs):
-        if self._processes is not None:
-            for p in self._processes.values():
-                if p.is_alive():
-                    p.kill()
-                    p.join(timeout=5.0)
+        processes = dict(self._processes) if self._processes else {}
+        kwargs.setdefault("cancel_futures", True)
         super().shutdown(wait=wait, **kwargs)
+        for p in processes.values():
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5.0)
+            elif p.exitcode is None:
+                p.join(timeout=5.0)
 
 
 @executor_registry.register("async_threadpool", type="async")
