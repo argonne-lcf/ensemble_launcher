@@ -243,6 +243,9 @@ class AsyncMaster(Node):
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             cluster_secret=self._config.cluster_secret,
+            req_res=self._config.req_res,
+            send_retries=self._config.send_retries,
+            send_timeout=self._config.send_timeout,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -1472,14 +1475,40 @@ class AsyncMaster(Node):
         task_q = self._itask_q.get(child_id)
         if not task_q:
             return
+
+        state = self._scheduler.get_child_state(child_id)
+        if state == ChildState.RECOVERING:
+            return
+
         tasks = []
         while task_q:
             tasks.append(task_q.popleft())
-        await self._comm.send_message_to_child(
+        success = await self._comm.send_message_to_child(
             child_id,
             TaskUpdate(sender=self.node_id, added_tasks=tasks),
         )
-        self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
+        if success:
+            self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
+        else:
+            state = self._scheduler.get_child_state(child_id)
+            if self._scheduler.is_child_terminal(child_id):
+                self.logger.error(
+                    f"Failed to send TaskUpdate of size {len(tasks)} to {child_id} (state={state})"
+                )
+                for task in tasks:
+                    result = Result(
+                        sender=self.node_id,
+                        task_id=task.task_id,
+                        success=False,
+                        exception=f"Send to {child_id} failed at {self.node_id}",
+                    )
+                    asyncio.create_task(self._forward_result(result))
+            else:
+                self.logger.info(
+                    f"Send to {child_id} failed (state={state}), re-queuing {len(tasks)} tasks"
+                )
+                task_q = self._itask_q.setdefault(child_id, deque())
+                task_q.extend(tasks)
 
     async def _periodic_task_flush_loop(self) -> None:
         """Flush buffered child-bound tasks on a fixed interval with jitter.

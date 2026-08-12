@@ -90,6 +90,10 @@ class LauncherConfig(BaseModel):
         30.0  # Seconds before HB process declares a peer dead.
     )
 
+    req_res: bool = True  # Enable ACK-based guaranteed delivery
+    send_retries: int = 10  # Retry count on ACK timeout (req_res=True only)
+    send_timeout: float = 1.0  # Per-attempt ACK timeout in seconds (req_res=True only)
+
     overload_orchestrator_core: bool = True  # Setting this to false reserves the first core of the head compute node for EL orchestrator
 
     restart_children_on_failure: bool = True
@@ -98,13 +102,13 @@ class LauncherConfig(BaseModel):
         1000000  # max buffer size of the result queue in cluster mode
     )
 
-    result_flush_interval: float = 0.5  # Flush result queues every fixed time
+    result_flush_interval: float = 5.0  # Flush result queues every fixed time
 
     task_buffer_size: int = 1000000  # max buffer size of the task queue per child
 
     cluster_secret: Optional[str] = None
 
-    task_flush_interval: float = 0.5  # Flush task queues every fixed time
+    task_flush_interval: float = 5.0  # Flush task queues every fixed time
 
     task_request_size: Optional[int] = (
         None  # size of the task request in work stealing mode

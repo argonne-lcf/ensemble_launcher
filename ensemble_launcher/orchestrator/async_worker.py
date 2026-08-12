@@ -211,6 +211,9 @@ class AsyncWorker(Node):
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             cluster_secret=self._config.cluster_secret,
+            req_res=self._config.req_res,
+            send_retries=self._config.send_retries,
+            send_timeout=self._config.send_timeout,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 

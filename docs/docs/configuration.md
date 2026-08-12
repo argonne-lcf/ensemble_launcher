@@ -87,6 +87,10 @@ launcher_config = LauncherConfig(
 | `children_scheduler_policy` | `str` | `"simple_split_children_policy"` | Policy for partitioning resources across children |
 | `task_scheduler_policy` | `str` | `"large_resource_policy"` | Policy for task scoring/priority |
 | `policy_config` | `PolicyConfig` | `PolicyConfig()` | Configuration passed to scheduling policies |
+| `req_res` | `bool` | `True` | Enable ACK-based guaranteed delivery for task messages |
+| `send_retries` | `int` | `10` | Retry count on ACK timeout (`req_res=True` only) |
+| `send_timeout` | `float` | `1.0` | Per-attempt ACK timeout in seconds (`req_res=True` only) |
+
 
 ### PolicyConfig
 
