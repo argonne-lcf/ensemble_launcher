@@ -16,6 +16,8 @@ from typing import (
     Union,
 )
 
+import pickle
+
 import cloudpickle
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr
@@ -33,6 +35,7 @@ class TaskStatus(enum.Enum):
 
 
 _DEEP_FIELDS = ("executable", "args", "kwargs", "env", "result")
+_DEEP_FIELDS_NO_EXEC = ("args", "kwargs", "env", "result")
 
 
 class Task(BaseModel):
@@ -57,6 +60,7 @@ class Task(BaseModel):
     tag: Optional[str] = None
     stdout_file: Optional[str] = None
     stderr_file: Optional[str] = None
+    serialize_executable_by_value: bool = True
 
     _packed: bool = PrivateAttr(default=False)
     _raw_deep: Optional[bytes] = PrivateAttr(default=None)
@@ -78,9 +82,16 @@ class Task(BaseModel):
     def pack(self) -> Task:
         if self._packed:
             return self
-        self._raw_deep = cloudpickle.dumps(
-            {f: getattr(self, f) for f in _DEEP_FIELDS}
-        )
+        if self.serialize_executable_by_value:
+            self._raw_deep = cloudpickle.dumps(
+                {f: getattr(self, f) for f in _DEEP_FIELDS}
+            )
+        else:
+            exec_blob = pickle.dumps(self.executable)
+            rest_blob = cloudpickle.dumps(
+                {f: getattr(self, f) for f in _DEEP_FIELDS_NO_EXEC}
+            )
+            self._raw_deep = struct.pack("!I", len(exec_blob)) + exec_blob + rest_blob
         for f in _DEEP_FIELDS:
             object.__setattr__(self, f, None)
         self._packed = True
@@ -89,7 +100,13 @@ class Task(BaseModel):
     def unpack(self) -> None:
         if not self._packed:
             return
-        deep = cloudpickle.loads(self._raw_deep)
+        if self.serialize_executable_by_value:
+            deep = cloudpickle.loads(self._raw_deep)
+        else:
+            (exec_len,) = struct.unpack_from("!I", self._raw_deep, 0)
+            executable = pickle.loads(self._raw_deep[4 : 4 + exec_len])
+            deep = cloudpickle.loads(self._raw_deep[4 + exec_len :])
+            deep["executable"] = executable
         for f in _DEEP_FIELDS:
             object.__setattr__(self, f, deep[f])
         self._raw_deep = None

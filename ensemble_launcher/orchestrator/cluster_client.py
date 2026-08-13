@@ -386,6 +386,7 @@ class ClusterClient:
         nnodes: int = 1,
         ppn: int = 1,
         ngpus_per_process: int = 0,
+        serialize_executable_by_value: bool = True,
     ) -> Task:
         """Wrap a callable or shell string in a Task with the given resource spec."""
         if isinstance(task_or_callable, Task):
@@ -399,6 +400,7 @@ class ClusterClient:
                 executable=task_or_callable,
                 args=args,
                 kwargs=kwargs,
+                serialize_executable_by_value=serialize_executable_by_value,
             )
         raise TypeError(
             f"submit() expects a Task, callable, or str; got {type(task_or_callable)}"
@@ -478,6 +480,7 @@ class ClusterClient:
         ppn: int = 1,
         ngpus_per_process: int = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
+        serialize_executable_by_value: bool = True,
         **kwargs,
     ) -> ConcurrentFuture:
         """Send a task to the node. Returns a Future resolved on completion.
@@ -493,10 +496,14 @@ class ClusterClient:
             nnodes: Number of nodes to request (ignored when *task* is a Task).
             ppn: Processes per node (ignored when *task* is a Task).
             ngpus_per_process: GPUs per process (ignored when *task* is a Task).
+            serialize_executable_by_value: When False, serialize the callable
+                by reference (module + qualname) using pickle instead of
+                cloudpickle. This preserves per-worker caches across calls.
             **kwargs: Keyword arguments forwarded to the callable.
         """
         return self._send_batch(
-            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)],
+            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process,
+                           serialize_executable_by_value=serialize_executable_by_value)],
             dependencies=[dependencies],
         )[0]
 
@@ -516,6 +523,7 @@ class ClusterClient:
         ppn: int = 1,
         ngpus_per_process: int = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
+        serialize_executable_by_value: bool = True,
         **kwargs,
     ) -> List[ConcurrentFuture]:
         """Submit *fn* applied to each element of *iterable* in a single batch.
@@ -530,6 +538,9 @@ class ClusterClient:
             nnodes: Number of nodes per task.
             ppn: Processes per node per task.
             ngpus_per_process: GPUs per process per task.
+            serialize_executable_by_value: When False, serialize the callable
+                by reference (module + qualname) using pickle instead of
+                cloudpickle. This preserves per-worker caches across calls.
             **kwargs: Keyword arguments forwarded to *fn* for every call.
 
         Example::
@@ -545,6 +556,7 @@ class ClusterClient:
                 nnodes,
                 ppn,
                 ngpus_per_process,
+                serialize_executable_by_value=serialize_executable_by_value,
             )
             for item in iterable
         ]
