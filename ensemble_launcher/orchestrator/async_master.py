@@ -24,7 +24,6 @@ from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Ready,
     Result,
-    ResultAck,
     ResultBatch,
     Status,
     Stop,
@@ -1223,9 +1222,6 @@ class AsyncMaster(Node):
                         r.task_id,
                         TaskStatus.SUCCESS if r.success else TaskStatus.FAILED,
                     )
-                await self._comm.send_message_to_child(
-                    child_id, ResultAck(sender=self.node_id)
-                )
                 # Source c (authoritative): mark SUCCESS from RUNNING or RECOVERING.
                 state = self._scheduler.get_child_state(child_id)
                 if state in {ChildState.RUNNING, ChildState.RECOVERING}:
@@ -1296,29 +1292,15 @@ class AsyncMaster(Node):
             ):
                 final_status = self._scheduler.aggregate_status()
                 final_status.tag = "final"
-                max_retries = 10
-                for i in range(max_retries):
-                    success = await self._comm.send_message_to_parent(final_status)
-                    if not success:
-                        self.logger.warning(
-                            f"{self.node_id}: Failed to send final status to parent"
-                        )
-                    else:
-                        self.logger.info(
-                            f"{self.node_id}: Successfully reported final status to parent"
-                        )
-                        ack = await self._comm.recv_message_from_parent(
-                            ResultAck, timeout=5.0 + i * 5.0
-                        )
-                        if ack is None:
-                            self.logger.warning(
-                                "Did not receive ack for final status from parent in 5sec"
-                            )
-                        else:
-                            self.logger.info(
-                                "Received ack from parent for final status"
-                            )
-                            break
+                success = await self._comm.send_message_to_parent(final_status)
+                if success:
+                    self.logger.info(
+                        f"{self.node_id}: Successfully reported final status to parent"
+                    )
+                else:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send final status to parent"
+                    )
             else:
                 try:
                     status = self._scheduler.aggregate_status()
@@ -1358,35 +1340,25 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Aggregated results from {len(self._results)} children"
             )
 
-        # Send to parent with ACK and retries (skip if parent is dead)
-        max_retries = 10
+        # Send to parent (skip if parent is dead)
         if self.parent and (
             self._comm.parent_dead_event is None
             or not self._comm.parent_dead_event.is_set()
         ):
-            for attempt in range(max_retries):
-                success = await self._comm.send_message_to_parent(result_batch)
-                if not success:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send results to parent "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
-                    continue
-                ack = await self._comm.recv_message_from_parent(
-                    ResultAck, timeout=5.0 + attempt * 5.0
-                )
-                if ack is not None:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully sent results and received ack from parent"
-                    )
-                    break
-                self.logger.warning(
-                    f"{self.node_id}: No ack for result batch from parent "
-                    f"(attempt {attempt + 1}/{max_retries})"
+            success = await self._comm.send_message_to_parent(result_batch)
+            if success:
+                self.logger.info(
+                    f"{self.node_id}: Successfully sent results to parent"
                 )
             else:
                 self.logger.warning(
-                    f"{self.node_id}: Failed to get result batch ack after {max_retries} attempts"
+                    f"{self.node_id}: Failed to send results to parent"
+                )
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_results.bin")
+                with open(fname, "wb") as f:
+                    f.write(result_batch.to_bytes())
+                self.logger.info(
+                    f"{self.node_id}: Checkpointed result batch to {fname}"
                 )
         elif self.parent:
             self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
@@ -1455,9 +1427,12 @@ class AsyncMaster(Node):
         results = []
         while result_q:
             results.append(result_q.popleft())
-        await self._comm.send_message_to_parent(
+        success = await self._comm.send_message_to_parent(
             IResultBatch(sender=self.node_id, data=results)
         )
+        if not success:
+            requeue = self._iresult_q.setdefault(dest_id, deque())
+            requeue.extend(results)
 
     async def _periodic_flush_loop(self) -> None:
         """Flush buffered parent-bound results on a fixed interval with jitter.
@@ -1556,9 +1531,12 @@ class AsyncMaster(Node):
             if dest_id.startswith("client-"):
                 # Client attached at this level: send directly, no buffering needed
                 self._total_streamed += len(results)
-                await self._comm.send_message_to_child(
+                success = await self._comm.send_message_to_child(
                     dest_id, IResultBatch(sender=self.node_id, data=results)
                 )
+                if not success:
+                    requeue = self._iresult_q.setdefault(dest_id, deque())
+                    requeue.extend(results)
             else:
                 # Parent-bound result: buffer to aggregate fan-in before sending up
                 if dest_id not in self._iresult_q:
@@ -1618,9 +1596,8 @@ class AsyncMaster(Node):
                     self._scheduler.set_child_status(child_id, status)
                     if status.tag == "final":
                         self.logger.info(
-                            f"Received final status from {child_id}. Sending ACK"
+                            f"Received final status from {child_id}"
                         )
-                        await self._comm.send_message_to_child(child_id, ResultAck())
                         return
             # Drain any remaining status messages after child process exits
             while True:

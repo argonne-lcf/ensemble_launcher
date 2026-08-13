@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import signal
 import socket
 import time
@@ -74,11 +75,15 @@ def test_el_fault_tolerance():
     with ClusterClient(checkpoint_dir=ckpt_dir, node_id="global") as client:
         futures = {task_id: client.submit(task) for task_id, task in tasks.items()}
 
-        time.sleep(5.0)
         # Kill main.m0 node
         import json
 
+        time.sleep(random.randint(0,15))
         fname = os.path.join(ckpt_dir, "main", "m0", "main.m0_meta.json")
+        while True:
+            if os.path.exists(fname):
+                break
+            time.sleep(0.5)
         with open(fname, "r") as f:
             meta_data = json.load(f)
             pid = meta_data.get("pid", None)

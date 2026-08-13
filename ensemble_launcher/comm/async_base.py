@@ -15,6 +15,8 @@ from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from .hb import HeartBeatProcess
 from .messages import Message, all_messages
+
+_CRITICAL_MSG_TYPES = frozenset({5, 3, 9, 8, 6})  # TaskUpdate, ResultBatch, Stop, Ready, NodeUpdate
 from .nodeinfo import NodeInfo
 from .pipe import (
     AsyncConnection,
@@ -402,8 +404,12 @@ class AsyncComm:
         self,
         send_coro_factory: Callable,
         description: str,
+        msg: Message = None,
     ) -> bool:
-        if not self._req_res:
+        use_retry = self._req_res and (
+            msg is None or msg.MSG_TYPE_ID in _CRITICAL_MSG_TYPES
+        )
+        if not use_retry:
             return await send_coro_factory()
 
         for attempt in range(self._send_retries):
@@ -725,7 +731,7 @@ class AsyncComm:
                 return await self._parent_conn.send(packed, timeout=self._send_timeout)
 
             success = await self._send_with_retry(
-                _do_send, f"send {type(msg).__name__} to parent"
+                _do_send, f"send {type(msg).__name__} to parent", msg=msg
             )
             if success:
                 self.logger.debug(
@@ -785,7 +791,7 @@ class AsyncComm:
                 return await conn.send(packed, target_id, timeout=self._send_timeout)
 
             success = await self._send_with_retry(
-                _do_send, f"send {type(msg).__name__} to child {child_id}"
+                _do_send, f"send {type(msg).__name__} to child {child_id}", msg=msg
             )
             if success:
                 self.logger.debug(
