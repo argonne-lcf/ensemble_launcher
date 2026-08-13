@@ -612,6 +612,9 @@ class AsyncWorker(Node):
             success = await self._comm.send_message_to_parent(msg)
 
         if not success:
+            self.logger.warning(
+                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
+            )
             requeue = self._iresult_q.setdefault(dest_id, deque())
             requeue.extend(results)
 
@@ -668,15 +671,17 @@ class AsyncWorker(Node):
         if dest_id is None and self.parent:
             dest_id = self.parent.node_id
 
-        if dest_id is not None:
-            if dest_id not in self._iresult_q:
-                self._iresult_q[dest_id] = deque()
+        if dest_id is None:
+            self.logger.warning(
+                f"{self.node_id}: No destination for task {task_id} result, dropping"
+            )
+            return
 
-            result_q = self._iresult_q[dest_id]
-            result_q.append(result)
-            self._streamed_task_ids.add(task_id)
-            if len(result_q) >= self._config.result_buffer_size:
-                asyncio.create_task(self._flush_dest_queue(dest_id))
+        result_q = self._iresult_q.setdefault(dest_id, deque())
+        result_q.append(result)
+        self._streamed_task_ids.add(task_id)
+        if len(result_q) >= self._config.result_buffer_size:
+            asyncio.create_task(self._flush_dest_queue(dest_id))
 
     # -------------------------------------------------------------------------
     #                               Monitors
