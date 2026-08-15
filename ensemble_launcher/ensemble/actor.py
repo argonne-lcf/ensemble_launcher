@@ -1,5 +1,5 @@
 import asyncio
-from functools import partial
+import collections
 import inspect
 import os
 import secrets
@@ -7,6 +7,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import cloudpickle
@@ -46,6 +47,8 @@ class ActorHandle:
         self._cache: Dict[str, asyncio.Queue] = {}
         self._recv_task: asyncio.Task = None
         self._stop_event: asyncio.Event = None
+        self._seen_messages: collections.OrderedDict = collections.OrderedDict()
+        self._seen_messages_max: int = 10000
 
     def __getattr__(self, name):
         _actions = self.__dict__.get("_actions")
@@ -114,7 +117,12 @@ class ActorHandle:
             while not self._stop_event.is_set():
                 try:
                     frames = await self._conn.recv(timeout=5.0)
-                    action_name, result = cloudpickle.loads(frames[1])
+                    msg_id, (action_name, result) = cloudpickle.loads(frames[1])
+                    if msg_id in self._seen_messages:
+                        continue
+                    self._seen_messages[msg_id] = 1
+                    if len(self._seen_messages) > self._seen_messages_max:
+                        self._seen_messages.popitem(last=False)
                     self._cache[action_name].put_nowait(result)
                 except asyncio.TimeoutError:
                     self.logger.warning("recv timedout")
@@ -123,7 +131,7 @@ class ActorHandle:
             pass
 
     async def send(self, msg: Any, target_id: Optional[str] = None):
-        data = cloudpickle.dumps(msg)
+        data = cloudpickle.dumps((uuid.uuid4().hex,msg))
         if isinstance(self._conn, ServerConnection):
             tid = target_id or self._default_target_id
             await self._conn.send(data, tid)
@@ -156,6 +164,8 @@ class PrivateActorHandle:
         self._flush_interval = flush_interval
         self._send_timeout = send_timeout
         self._send_retries = send_retries
+        self._seen_messages: collections.OrderedDict = collections.OrderedDict()
+        self._seen_messages_max: int = 10000
 
     def __getattr__(self, name):
         _actions = self.__dict__.get("_actions")
@@ -242,7 +252,12 @@ class PrivateActorHandle:
                         async with self._ready_condition:
                             self._ready_condition.notify_all()
                     else:
-                        action_name, result = cloudpickle.loads(frames[1])
+                        msg_id, (action_name, result) = cloudpickle.loads(frames[1])
+                        if msg_id in self._seen_messages:
+                            continue
+                        self._seen_messages[msg_id] = 1
+                        if len(self._seen_messages) > self._seen_messages_max:
+                            self._seen_messages.popitem(last=False)
                         self._cache[action_name].put_nowait(result)
                 except asyncio.CancelledError:
                     raise
@@ -283,7 +298,7 @@ class PrivateActorHandle:
             event = self._ready_events.setdefault(target_id, asyncio.Event())
             await event.wait()
         self.logger.info(f"Got message: {msg}")
-        data = cloudpickle.dumps(msg)
+        data = cloudpickle.dumps((uuid.uuid4().hex, msg))
         self._input_queue.put_nowait((data, target_id))
 
     async def wait_for_ready(self, expected: int, timeout: Optional[float] = None):
@@ -343,6 +358,8 @@ class _ActorBase(ABC):
         self._free_slots = None
         self._running_tasks = None
         self._run_in_executor = run_in_executor
+        self._seen_messages : collections.OrderedDict = collections.OrderedDict()
+        self._seen_messages_max : int = 10000
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -396,7 +413,12 @@ class _ActorBase(ABC):
                 frames = await self._conn.recv(timeout=5.0)
                 sender_id = self._extract_sender(frames)
                 self.logger.info(f"Received args from {sender_id}")
-                args = cloudpickle.loads(frames[1])
+                msg_id, args = cloudpickle.loads(frames[1])
+                if msg_id in self._seen_messages:
+                    continue
+                self._seen_messages[msg_id] = 1
+                if len(self._seen_messages) > self._seen_messages_max:
+                    self._seen_messages.popitem(last=False)
                 await self._input_queue.put((sender_id, args))
             except Exception:
                 self.logger.warning("Recv timed out")
@@ -409,7 +431,7 @@ class _ActorBase(ABC):
                 target_id, data = await asyncio.wait_for(
                     self._output_queue.get(), timeout=5.0
                 )
-                payload = cloudpickle.dumps(data) if data != _READY_SENTINEL else data
+                payload = cloudpickle.dumps((uuid.uuid4().hex, data)) if data != _READY_SENTINEL else data
                 success = False
                 if isinstance(self._conn, ServerConnection):
                     for i in range(self._send_retries):
