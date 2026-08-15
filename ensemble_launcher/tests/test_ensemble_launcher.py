@@ -36,6 +36,8 @@ def test_el_run():
             comm_name="async_zmq",
             policy_config=PolicyConfig(nlevels=0),
             return_stdout=False,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         Nodes=[socket.gethostname()],
     )
@@ -68,6 +70,8 @@ def test_el_cluster_mode():
             return_stdout=True,
             cluster=True,
             checkpoint_dir=ckpt_dir,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         Nodes=[socket.gethostname()],
     )

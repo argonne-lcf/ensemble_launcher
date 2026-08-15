@@ -107,11 +107,6 @@ class ActorHandle:
                 pass
         await self._conn.close()
 
-    async def stop(self, timeout: float = 10.0):
-        data = cloudpickle.dumps(("stop", (), None))
-        await self._conn.send(data)
-        await asyncio.sleep(timeout)
-        
     async def _recv_loop(self):
         try:
             while not self._stop_event.is_set():
@@ -123,6 +118,7 @@ class ActorHandle:
                     self._seen_messages[msg_id] = 1
                     if len(self._seen_messages) > self._seen_messages_max:
                         self._seen_messages.popitem(last=False)
+                    self.logger.info(f"{msg_id}, {action_name}, {result}")
                     self._cache[action_name].put_nowait(result)
                 except asyncio.TimeoutError:
                     self.logger.warning("recv timedout")
@@ -323,15 +319,9 @@ class PrivateActorHandle:
     async def broadcast(self, msg: Any, expected: int):
         await self.wait_for_ready(expected=expected)
 
-        data = cloudpickle.dumps(msg)
         for actor_id in list(self._ready_actors):
+            data = cloudpickle.dumps((uuid.uuid4().hex, msg))
             await self._conn.send(data, actor_id)
-
-    async def stop(self, timeout: float = 10.0):
-        data = cloudpickle.dumps(("stop", (), None))
-        for actor_id in list(self._ready_actors):
-            await self._conn.send(data, actor_id)
-        await asyncio.sleep(timeout)
 
 
 class _ActorBase(ABC):
@@ -378,6 +368,9 @@ class _ActorBase(ABC):
         self._loop = asyncio.get_running_loop()
         self._free_slots = asyncio.Semaphore(self._max_workers)
         self._running_tasks = set()
+        self._recv_task = None
+        self._send_task = None
+        self._main_loop_task = None
 
     @property
     def secret(self) -> str:
@@ -414,6 +407,7 @@ class _ActorBase(ABC):
                 sender_id = self._extract_sender(frames)
                 self.logger.info(f"Received args from {sender_id}")
                 msg_id, args = cloudpickle.loads(frames[1])
+                self.logger.info(f"{msg_id}, {args}")
                 if msg_id in self._seen_messages:
                     continue
                 self._seen_messages[msg_id] = 1
@@ -454,27 +448,45 @@ class _ActorBase(ABC):
             except Exception as e:
                 self.logger.warning(f"Send failed with error: {str(e)}")
 
+    async def _finalize_stop(self, sender_id: str):
+        self.logger.info("Finalize stop started")
+        current = asyncio.current_task()
+        other_tasks = {t for t in self._running_tasks if t is not current}
+        for t in other_tasks:
+            t.cancel()
+        await asyncio.gather(*other_tasks, return_exceptions=True)
+        for t in (self._recv_task, self._send_task):
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self.logger.info("All loops cancelled")
+        await self.on_stop()
+        payload = cloudpickle.dumps((uuid.uuid4().hex, ("stop", None)))
+        if isinstance(self._conn, ServerConnection):
+            await self._conn.send(payload, sender_id)
+        else:
+            await self._conn.send(payload)
+        await self._conn.close()
+        self.logger.info("Stop confirmation sent and connection closed")
+        self._stop.set()
+
     @action
-    def stop(self):
-        try:
-            if len(self._running_tasks) > 0:
-                self.logger.warning(f"Not all invocations are done. running tasks = {len(self._running_tasks)}")
-            self._stop.set()
-            self.logger.info("Actor stop set")
-            
-        except Exception as e:
-            self.logger.error(f"Setting stop failed with exception {e}")
-            raise
+    async def stop(self, _sender_id: str = None):
+        await self._finalize_stop(_sender_id)
 
     async def _invoke(self, target_id: str, msg: Union[List, Tuple]):
         async def _execute(action_name, args, kwargs):
             act = self.__actions__.get(action_name)
             self.logger.info(f"Invoking {action_name}")
+            if action_name == "stop":
+                kwargs = kwargs or {}
+                kwargs["_sender_id"] = target_id
             if inspect.iscoroutinefunction(act):
                 result = await act(self, *args, **(kwargs or {}))
             elif inspect.isasyncgenfunction(act):
-                # async for r in act(self, *args, **(kwargs or {})):
-                #     self._output_queue.put_nowait((target_id, r))
                 self.logger.warning("Actors don't support async generators yet.")
                 result = None
             else:
@@ -499,7 +511,7 @@ class _ActorBase(ABC):
                 action_name, args, kwargs = msg
                 result = await _execute(action_name, args, kwargs)
 
-                if not inspect.isasyncgenfunction(self.__actions__.get(action_name)):
+                if action_name != "stop" and not inspect.isasyncgenfunction(self.__actions__.get(action_name)):
                     self._output_queue.put_nowait((target_id, (action_name, result)))
             else:
                 self.logger.warning("Actions only support either a tuple or list(tuple)")
@@ -515,7 +527,7 @@ class _ActorBase(ABC):
 
     async def _main_loop(self):
         self.logger.info("Main loop started.")
-        while not self._stop.is_set():
+        while True:
             try:
                 target_id, msg = await asyncio.wait_for(
                     self._input_queue.get(), timeout=1.0
@@ -658,11 +670,17 @@ class PublicActor(_ActorBase):
 
         self.logger.info("Done opening the server!")
 
-        await asyncio.gather(self._recv(), self._send(), self._main_loop())
+        self._recv_task = asyncio.create_task(self._recv())
+        self._send_task = asyncio.create_task(self._send())
+        self._main_loop_task = asyncio.create_task(self._main_loop())
 
-        await self.on_stop()
+        await self._stop.wait()
 
-        await self._conn.close()
+        self._main_loop_task.cancel()
+        try:
+            await self._main_loop_task
+        except asyncio.CancelledError:
+            pass
 
 
 class PrivateActor(_ActorBase):
@@ -711,13 +729,18 @@ class PrivateActor(_ActorBase):
 
         self.logger.info("Connected to server, ready!")
 
-        await asyncio.gather(
-            self._recv(), self._send(), self._main_loop(), self._signal_ready()
-        )
+        self._recv_task = asyncio.create_task(self._recv())
+        self._send_task = asyncio.create_task(self._send())
+        self._main_loop_task = asyncio.create_task(self._main_loop())
+        asyncio.create_task(self._signal_ready())
 
-        await self.on_stop()
+        await self._stop.wait()
 
-        await self._conn.close()
+        self._main_loop_task.cancel()
+        try:
+            await self._main_loop_task
+        except asyncio.CancelledError:
+            pass
 
 
 Actor = PublicActor

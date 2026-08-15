@@ -64,6 +64,8 @@ def test_el_fault_tolerance():
             log_level=logging.INFO,
             heartbeat_dead_threshold=5.0,
             heartbeat_interval=0.5,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         Nodes=[socket.gethostname()],
     )
