@@ -93,10 +93,10 @@ class AsyncWorkStealingMaster(AsyncMaster):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    def _route_tasks(self, tasks: List[Task]) -> List[Optional[str]]:
+    async def _route_tasks(self, tasks: List[Task], client_id: Optional[str] = None) -> List[Optional[str]]:
         """In workstealing mode tasks are only added to the scheduler queue."""
         for task in tasks:
-            self._scheduler.add_task(task)
+            self._scheduler.add_task(task, client_id = client_id)
 
     # ------------------------------------------------------------------
     # Dynamic task monitoring
@@ -160,7 +160,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
                             sender=self.node_id, added_tasks=available_tasks
                         )
                         await self._comm.send_message_to_child(child_id, task_update)
-                        self.logger.debug(
+                        self.logger.info(
                             f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
                         )
 

@@ -46,6 +46,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
     async def _lazy_init(self) -> None:
         """Extend base init: start periodic task requester and task update monitor."""
         await super()._lazy_init()
+        self.logger.info("I am workstealing worker!")
         asyncio.create_task(self._periodic_task_requester())
         # Base only starts _task_update_monitor in cluster mode; start it always here.
         if self.parent and not self._config.cluster:
@@ -140,7 +141,7 @@ class AsyncWorkStealingWorker(AsyncWorker):
                     else self._config.task_request_size
                 )
                 task_request = TaskRequest(sender=self.node_id, ntasks=ntasks)
-                self.logger.debug(
+                self.logger.info(
                     f"{self.node_id}: Requesting {ntasks} tasks from master"
                 )
                 await self._comm.send_message_to_parent(task_request)

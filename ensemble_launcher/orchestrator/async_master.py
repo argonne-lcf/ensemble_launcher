@@ -1421,16 +1421,22 @@ class AsyncMaster(Node):
     async def _client_request_monitor(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this master."""
         while not self._all_children_done_event.is_set():
-            item = await self._comm.recv_client_message()
-            if item is None:
-                continue
-            client_id, msg = item
-            if isinstance(msg, TaskUpdate):
-                self._total_received += len(msg.added_tasks)
-                self.logger.info(
-                    f"Received TaskUpdate from client. Total tasks: {self._total_received}"
-                )
-                await self._route_tasks(msg.added_tasks, client_id=client_id)
+            try:
+                item = await self._comm.recv_client_message()
+                if item is None:
+                    continue
+                client_id, msg = item
+                if isinstance(msg, TaskUpdate):
+                    self._total_received += len(msg.added_tasks)
+                    self.logger.info(
+                        f"Received TaskUpdate from client. Total tasks: {self._total_received}"
+                    )
+                    await self._route_tasks(msg.added_tasks, client_id=client_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Client task update monitor failed with error: {e}")
+                await asyncio.sleep(0.5)
 
     async def _flush_dest_queue(self, dest_id: str) -> None:
         """Send all buffered results for dest_id as a single IResultBatch."""
