@@ -1,18 +1,20 @@
 import asyncio
 import logging
+import multiprocessing as mp
+import os
 import socket
+import uuid
 
 import pytest
-from utils import echo, echo_stdout
+from utils import echo
 
 from ensemble_launcher.config import (
     LauncherConfig,
-    MPIConfig,
     PolicyConfig,
     SystemConfig,
 )
 from ensemble_launcher.ensemble import Task
-from ensemble_launcher.orchestrator import AsyncWorkStealingMaster as AsyncMaster
+from ensemble_launcher.orchestrator import AsyncWorkStealingMaster, ClusterClient
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceList,
@@ -21,10 +23,8 @@ from ensemble_launcher.scheduler.resource import (
 pytestmark = pytest.mark.core
 
 
-# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 @pytest.mark.asyncio
-async def test_async_master(nlevels=1, ntask_per_core=1):
-    ##create tasks
+async def test_workstealing_master(ntask_per_core=1):
     tasks = {}
     for i in range(12 * ntask_per_core):
         tasks[f"task-{i}"] = Task(
@@ -37,16 +37,16 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    m = AsyncMaster(
+    m = AsyncWorkStealingMaster(
         "test",
         LauncherConfig(
             return_stdout=True,
             comm_name="async_zmq",
-            policy_config=PolicyConfig(nlevels=nlevels, nchildren=2),
+            enable_workstealing=True,
+            policy_config=PolicyConfig(nlevels=1, nchildren=2),
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
             log_level=logging.DEBUG,
-            children_scheduler_policy="simple_split_children_policy",
             task_flush_interval=0.5,
             result_flush_interval=0.5,
         ),
@@ -57,64 +57,68 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
     resultbatch = await m.run()
     results = {r.task_id: r.data for r in resultbatch.data}
 
-    assert len(results) > 0 and all(
-        [result == f"Hello from task {task_id}" for task_id, result in results.items()]
+    assert len(results) == len(tasks) and all(
+        result == f"Hello from task {task_id}" for task_id, result in results.items()
     ), f"{[result for task_id, result in results.items()]}"
 
 
 @pytest.mark.asyncio
-async def test_async_mpi_master(nlevels=1):
-    ##create tasks
+async def test_workstealing_cluster(ntask_per_core=1):
     tasks = {}
-    for i in range(12):
+    for i in range(12 * ntask_per_core):
         tasks[f"task-{i}"] = Task(
-            task_id=f"task-{i}",
-            nnodes=1,
-            ppn=1,
-            executable=echo_stdout,
-            args=(f"task-{i}",),
+            task_id=f"task-{i}", nnodes=1, ppn=1, executable=echo, args=(f"task-{i}",)
         )
 
     nodes = [socket.gethostname()]
     sys_info = NodeResourceList.from_config(
-        SystemConfig(name="local", cpus=list(range(1, 13)), ncpus=12)
+        SystemConfig(name="local", ncpus=12, cpus=list(range(1, 13)))
     )
     job_resource = JobResource(resources=[sys_info], nodes=nodes)
 
-    m = AsyncMaster(
+    ckpt_dir = os.path.join("/tmp", f"ckpt_{str(uuid.uuid4())}")
+    m = AsyncWorkStealingMaster(
         "test",
         LauncherConfig(
             return_stdout=True,
             comm_name="async_zmq",
-            policy_config=PolicyConfig(nlevels=nlevels, nchildren=2),
-            child_executor_name="async_mpi",
-            task_executor_name="async_mpi",
-            log_level=logging.INFO,
-            mpi_config=MPIConfig(flavor="test"),
-            sequential_child_launch=True,
-            children_scheduler_policy="simple_split_children_policy",
+            enable_workstealing=True,
+            cluster=True,
+            checkpoint_dir=ckpt_dir,
+            policy_config=PolicyConfig(nlevels=1, nchildren=2),
+            child_executor_name="async_processpool",
+            task_executor_name="async_processpool",
+            log_level=logging.DEBUG,
             task_flush_interval=0.5,
             result_flush_interval=0.5,
         ),
         job_resource,
-        tasks,
     )
 
-    resultbatch = await m.run()
-    results = {r.task_id: r.data for r in resultbatch.data}
+    process = mp.Process(target=m.create_an_event_loop)
+    process.start()
+    client = ClusterClient(node_id="test", checkpoint_dir=ckpt_dir)
+    client.start()
+    futures = {}
+    for task_id, task in tasks.items():
+        futures[task_id] = client.submit(task)
 
-    assert len(results) > 0 and all(
-        [
-            result.split(",")[0].strip() == f"Hello from task {task_id}"
-            for task_id, result in results.items()
-        ]
+    results = {}
+    for task_id, fut in futures.items():
+        results[task_id] = fut.result()
+    client.teardown()
+    process.terminate()
+    process.join(timeout=10.0)
+
+    assert len(results) == len(tasks) and all(
+        result == f"Hello from task {task_id}" for task_id, result in results.items()
     ), f"{[result for task_id, result in results.items()]}"
 
 
 if __name__ == "__main__":
-    print("Testing Async Master with ProcessPool Executor for 1 task per core")
-    asyncio.run(test_async_master(nlevels=1, ntask_per_core=1))
-    print("Testing Async Master with ProcessPool Executor for 10 tasks per core")
-    asyncio.run(test_async_master(nlevels=1, ntask_per_core=10))
-    print("Testing Async Master with MPI Executor")
-    asyncio.run(test_async_mpi_master(nlevels=1))
+    print("Testing WorkStealing Master with 1 task per core")
+    asyncio.run(test_workstealing_master(ntask_per_core=1))
+    print("Testing WorkStealing Master with 10 tasks per core")
+    asyncio.run(test_workstealing_master(ntask_per_core=10))
+    print("Testing WorkStealing Cluster mode")
+    asyncio.run(test_workstealing_cluster(ntask_per_core=1))

@@ -386,6 +386,16 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Return the client_id that submitted this task, or None."""
         return self._task_to_client.get(task_id)
 
+    def unassign_tasks(self, child_id: str, task_ids: List[str]) -> None:
+        """Move tasks from a child's assignment back to the unassigned pool."""
+        if child_id not in self._child_assignments:
+            return
+        child_task_list = self._child_assignments[child_id]["task_ids"]
+        for tid in task_ids:
+            if tid in child_task_list:
+                child_task_list.remove(tid)
+            self._unassigned_tasks[tid] = None
+
     def delete_task(self, task_id: str) -> None:
         """Remove a task from the scheduler entirely.
 

@@ -159,10 +159,17 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         task_update = TaskUpdate(
                             sender=self.node_id, added_tasks=available_tasks
                         )
-                        await self._comm.send_message_to_child(child_id, task_update)
-                        self.logger.info(
-                            f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
-                        )
+                        success = await self._comm.send_message_to_child(child_id, task_update)
+                        if success:
+                            self.logger.info(
+                                f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"{self.node_id}: Failed to send TaskUpdate to {child_id}, "
+                                f"re-queuing {len(available_tasks)} tasks"
+                            )
+                            self._scheduler.unassign_tasks(child_id, assigned_task_ids)
 
             except asyncio.CancelledError:
                 self.logger.info(
