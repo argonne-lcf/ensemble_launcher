@@ -61,14 +61,16 @@ class AsyncMPConnection(ServerConnection):
     ) -> bool:
         """Send frames via multiprocessing pipe.
 
-        Data frames are joined into a single blob before sending.
-        Sends: [identity_frame, msg_id(8B)?, blob]
+        Sends: [identity_frame, msg_id(8B)?, *data_frames]
         """
-        blob = b"".join(data) if isinstance(data, list) else data
         if msg_id is not None:
-            frames = [self._identity_frame, msg_id.to_bytes(8, "big"), blob]
+            frames = [self._identity_frame, msg_id.to_bytes(8, "big")]
         else:
-            frames = [self._identity_frame, blob]
+            frames = [self._identity_frame]
+        if isinstance(data, list):
+            frames.extend(data)
+        else:
+            frames.append(data)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conn.send, frames)
         return True
