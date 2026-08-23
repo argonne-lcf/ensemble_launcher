@@ -17,7 +17,7 @@ class JokeGenerationAgent(Actor):
         name,
         transport="zmq",
         llm_address: str = "localhost:8000",
-        llm_model: str = "Qwen/Qwen3-0.6B",
+        llm_model: str = "EMPTY",
         ckpt_dir=...,
     ):
         super().__init__(name, transport, ckpt_dir)
@@ -56,7 +56,7 @@ class JokeSelectionAgent(Actor):
         name,
         transport="zmq",
         llm_address="localhost:8000",
-        llm_model="Qwen/Qwen3-0.6B",
+        llm_model="EMPTY",
         generation_agent_handle: Optional[ActorHandle] = None,
         ckpt_dir=...,
     ):
