@@ -1,11 +1,13 @@
 import asyncio
+import collections
 import multiprocessing
 import os
 import queue
 import time
+import uuid
 from asyncio import Queue
 from logging import Logger
-from typing import Dict, List, Optional, Tuple, Type, TypeVar
+from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, SerializeAsAny
 
@@ -13,6 +15,8 @@ from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from .hb import HeartBeatProcess
 from .messages import Message, all_messages
+
+_CRITICAL_MSG_TYPES = frozenset({5, 3, 9, 8, 6})  # TaskUpdate, ResultBatch, Stop, Ready, NodeUpdate
 from .nodeinfo import NodeInfo
 from .pipe import (
     AsyncConnection,
@@ -34,6 +38,9 @@ class AsyncCommState(BaseModel):
     hb_parent_conn_state: Optional[SerializeAsAny[ClientConnectionState]] = None
     data_transport_state: Optional[SerializeAsAny[AsyncTransportState]] = None
     hb_transport_state: Optional[SerializeAsAny[AsyncTransportState]] = None
+    req_res: bool = False
+    send_retries: int = 3
+    send_timeout: float = 5.0
 
     def serialize(self, *args, **kwargs) -> str:
         return self.model_dump_json(*args, **kwargs)
@@ -191,6 +198,9 @@ class AsyncComm:
         heartbeat_dead_threshold: float = 30.0,
         cluster_secret: Optional[str] = None,
         skip_hb: bool = False,
+        req_res: bool = False,
+        send_retries: int = 3,
+        send_timeout: float = 5.0,
     ):
         self.logger = logger
         self._skip_hb = skip_hb
@@ -202,6 +212,11 @@ class AsyncComm:
         self._parent_conn = parent_conn
         self._hb_parent_conn = hb_parent_conn
         self._child_transport = child_transport
+        self._req_res = req_res
+        self._send_retries = send_retries
+        self._send_timeout = send_timeout
+        self._seen_message_ids: collections.OrderedDict = collections.OrderedDict()
+        self._seen_message_ids_max: int = 10000
 
         entry = transport_registry.get(child_transport)
         if entry is None:
@@ -311,6 +326,7 @@ class AsyncComm:
             self._node_info.secret_id,
             child_id,
             child_secret_id,
+            req_res=self._req_res,
         )
         data_server.set_unknown_sender_validator(self._make_client_validator())
         if id(data_server) not in known_data_conns:
@@ -367,6 +383,50 @@ class AsyncComm:
         self._cache.clear()
 
     # -----------------------------------------------------------------
+    #  req_res helpers
+    # -----------------------------------------------------------------
+
+    def _assign_message_id(self, msg: Message) -> None:
+        if self._req_res and msg.message_id is None:
+            msg.message_id = uuid.uuid4().hex
+
+    def _is_duplicate(self, msg: Message) -> bool:
+        if not self._req_res or msg.message_id is None:
+            return False
+        if msg.message_id in self._seen_message_ids:
+            return True
+        self._seen_message_ids[msg.message_id] = None
+        if len(self._seen_message_ids) > self._seen_message_ids_max:
+            self._seen_message_ids.popitem(last=False)
+        return False
+
+    async def _send_with_retry(
+        self,
+        send_coro_factory: Callable,
+        description: str,
+        msg: Message = None,
+    ) -> bool:
+        use_retry = self._req_res and (
+            msg is None or msg.MSG_TYPE_ID in _CRITICAL_MSG_TYPES
+        )
+        if not use_retry:
+            return await send_coro_factory()
+
+        for attempt in range(self._send_retries):
+            success = await send_coro_factory()
+            if success:
+                return True
+            self.logger.warning(
+                f"{self._node_info.node_id}: {description} failed attempt "
+                f"{attempt + 1}/{self._send_retries}"
+            )
+        self.logger.error(
+            f"{self._node_info.node_id}: {description} failed after "
+            f"{self._send_retries} retries"
+        )
+        return False
+
+    # -----------------------------------------------------------------
     #  Monitors
     # -----------------------------------------------------------------
 
@@ -390,7 +450,8 @@ class AsyncComm:
         # MP transport does not, so we guard with try/except).
         try:
             data_conn = self._data_transport.get_server_connection(
-                self._node_info.node_id, self._node_info.secret_id
+                self._node_info.node_id, self._node_info.secret_id,
+                req_res=self._req_res,
             )
             if not data_conn.is_open:
                 await data_conn.open()
@@ -572,6 +633,11 @@ class AsyncComm:
                 msg = Message.from_bytes(data_frames[0])
             else:
                 msg = Message.from_byte_array(data_frames)
+            if self._is_duplicate(msg):
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Dropping duplicate {msg.message_id} from parent"
+                )
+                return
             self._cache[parent_id].put_nowait(msg)
             self.logger.debug(
                 f"{self._node_info.node_id}: Cached message from parent: {type(msg).__name__}"
@@ -589,6 +655,11 @@ class AsyncComm:
                 msg = Message.from_bytes(data_frames[0])
             else:
                 msg = Message.from_byte_array(data_frames)
+            if self._is_duplicate(msg):
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Dropping duplicate {msg.message_id} from child {sender_id}"
+                )
+                return
             if sender_id.startswith("client-"):
                 self._client_queue.put_nowait((full_id, msg))
                 self.logger.debug(
@@ -653,11 +724,20 @@ class AsyncComm:
             )
             return False
         try:
-            await self._parent_conn.send(msg.to_byte_array())
-            self.logger.debug(
-                f"{self._node_info.node_id}: Sent message to parent: {type(msg).__name__}"
+            self._assign_message_id(msg)
+            packed = msg.to_byte_array()
+
+            async def _do_send():
+                return await self._parent_conn.send(packed, timeout=self._send_timeout)
+
+            success = await self._send_with_retry(
+                _do_send, f"send {type(msg).__name__} to parent", msg=msg
             )
-            return True
+            if success:
+                self.logger.debug(
+                    f"{self._node_info.node_id}: Sent message to parent: {type(msg).__name__}"
+                )
+            return success
         except Exception as e:
             self.logger.warning(
                 f"{self._node_info.node_id}: Sending message to parent failed with {e}"
@@ -693,6 +773,7 @@ class AsyncComm:
             )
             raise RuntimeError(f"No connection to child {child_id}")
         try:
+            self._assign_message_id(msg)
             packed = msg.to_byte_array()
             conn = self._data_transport.get_server_connection(
                 self._node_info.node_id, self._node_info.secret_id
@@ -700,16 +781,23 @@ class AsyncComm:
             if conn is None:
                 raise RuntimeError(f"No server connection for {child_id}")
             if child_id.startswith("client-"):
-                await conn.send(packed, child_id)
+                target_id = child_id
             else:
                 target_id = _encode_identity(
                     child_id, self._node_info.children_secret_ids[child_id]
                 )
-                await conn.send(packed, target_id)
+
+            async def _do_send():
+                return await conn.send(packed, target_id, timeout=self._send_timeout)
+
+            success = await self._send_with_retry(
+                _do_send, f"send {type(msg).__name__} to child {child_id}", msg=msg
+            )
+            if success:
                 self.logger.debug(
-                    f"{self._node_info.node_id}: Sent message of type {type(msg).__name__} to child {target_id}"
+                    f"{self._node_info.node_id}: Sent {type(msg).__name__} to child {target_id}"
                 )
-            return True
+            return success
         except Exception as e:
             self.logger.warning(
                 f"{self._node_info.node_id}: Sending message to child {child_id} failed with {e}"
@@ -766,6 +854,9 @@ class AsyncComm:
             else None,
             data_transport_state=self._data_transport.get_state(),
             hb_transport_state=self._hb_transport.get_state(),
+            req_res=self._req_res,
+            send_retries=self._send_retries,
+            send_timeout=self._send_timeout,
         )
 
     @classmethod
@@ -794,6 +885,9 @@ class AsyncComm:
             parent_conn=parent_conn,
             hb_parent_conn=hb_parent_conn,
             child_transport=child_tt,
+            req_res=state.req_res,
+            send_retries=state.send_retries,
+            send_timeout=state.send_timeout,
         )
         if state.data_transport_state is not None:
             ret._data_transport = child_entry["transport"].set_state(
@@ -842,6 +936,17 @@ class AsyncComm:
             self._hb_process.join(timeout=5.0)
             if self._hb_process.is_alive():
                 self._hb_process.terminate()
+                self._hb_process.join(timeout=2.0)
+            if self._hb_process.is_alive():
+                self._hb_process.kill()
+                self._hb_process.join(timeout=1.0)
+
+        for q in (self._hb_control_queue, self._hb_notify_queue):
+            if q is not None:
+                q.cancel_join_thread()
+                q.close()
+        self._hb_control_queue = None
+        self._hb_notify_queue = None
 
         self.logger.info("Stopped HB process")
 

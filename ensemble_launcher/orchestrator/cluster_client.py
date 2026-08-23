@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import logging
 import os
 import secrets
@@ -23,7 +24,14 @@ from ensemble_launcher.logging import setup_logger
 class _WorkerPipeline:
     """One independent send/recv pipeline: own thread, event loop, and connection."""
 
-    def __init__(self, worker_id: str, conn: ClientConnection):
+    def __init__(
+        self,
+        worker_id: str,
+        conn: ClientConnection,
+        req_res: bool = False,
+        send_retries: int = 3,
+        send_timeout: float = 5.0,
+    ):
         self.worker_id = worker_id
         self.conn = conn
         self.pending: Dict[str, ConcurrentFuture] = {}
@@ -38,6 +46,11 @@ class _WorkerPipeline:
         self.set_result_time = 0.0
         self.total_results = 0
         self._logger = None
+        self._req_res = req_res
+        self._send_retries = send_retries
+        self._send_timeout = send_timeout
+        self._seen_message_ids: collections.OrderedDict = collections.OrderedDict()
+        self._seen_message_ids_max: int = 10000
 
     def start(self, logger) -> None:
         """Start the pipeline's dedicated thread and wait until its event loop is ready."""
@@ -87,6 +100,12 @@ class _WorkerPipeline:
             msg: IResultBatch = await loop.run_in_executor(
                 None, Message.from_byte_array, frames
             )
+        if self._req_res and msg.message_id is not None:
+            if msg.message_id in self._seen_message_ids:
+                return
+            self._seen_message_ids[msg.message_id] = None
+            if len(self._seen_message_ids) > self._seen_message_ids_max:
+                self._seen_message_ids.popitem(last=False)
         await loop.run_in_executor(None, msg.unpack)
         t1 = time.perf_counter()
         for result in msg.data:
@@ -110,9 +129,39 @@ class _WorkerPipeline:
         else:
             fut.set_exception(Exception(result.exception or "Task failed"))
 
-    def send(self, data: Union[bytes, List[bytes]]) -> None:
+    def send(
+        self, data: Union[bytes, List[bytes]], task_ids: Optional[List[str]] = None,
+    ) -> None:
         """Thread-safe send: schedules onto this pipeline's own event loop."""
-        asyncio.run_coroutine_threadsafe(self.conn.send(data), self._loop)
+        asyncio.run_coroutine_threadsafe(
+            self._send_with_retry(data, task_ids or []), self._loop
+        )
+
+    async def _send_with_retry(
+        self, data: Union[bytes, List[bytes]], task_ids: List[str],
+    ) -> None:
+        if not self._req_res:
+            await self.conn.send(data)
+            return
+        for attempt in range(self._send_retries):
+            success = await self.conn.send(data, timeout=self._send_timeout)
+            if success:
+                return
+            if self._logger:
+                self._logger.warning(
+                    f"{self.worker_id}: send failed attempt "
+                    f"{attempt + 1}/{self._send_retries}"
+                )
+        if self._logger:
+            self._logger.error(
+                f"{self.worker_id}: send failed after {self._send_retries} retries"
+            )
+        for task_id in task_ids:
+            self.set_result(Result(
+                task_id=task_id,
+                success=False,
+                exception=f"Send failed after {self._send_retries} retries",
+            ))
 
     def stop(self) -> None:
         """Cancel the recv task and wait for the thread to finish.
@@ -273,6 +322,9 @@ class ClusterClient:
             )
 
         comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
+        self._req_res = comm_state.req_res
+        self._send_retries = comm_state.send_retries
+        self._send_timeout = comm_state.send_timeout
         self._node_address = None
         if comm_state.data_transport_state is not None:
             tt = comm_state.data_transport_state.transport_type
@@ -290,7 +342,11 @@ class ClusterClient:
                     identity=f"{self._client_id}-w{i}",
                     secret_id=cluster_secret or secrets.token_hex(4),
                     remote_address=self._node_address,
+                    req_res=self._req_res,
                 ),
+                req_res=self._req_res,
+                send_retries=self._send_retries,
+                send_timeout=self._send_timeout,
             )
             for i in range(n_workers)
         ]
@@ -330,6 +386,7 @@ class ClusterClient:
         nnodes: int = 1,
         ppn: int = 1,
         ngpus_per_process: int = 0,
+        serialize_executable_by_value: bool = True,
     ) -> Task:
         """Wrap a callable or shell string in a Task with the given resource spec."""
         if isinstance(task_or_callable, Task):
@@ -343,6 +400,7 @@ class ClusterClient:
                 executable=task_or_callable,
                 args=args,
                 kwargs=kwargs,
+                serialize_executable_by_value=serialize_executable_by_value,
             )
         raise TypeError(
             f"submit() expects a Task, callable, or str; got {type(task_or_callable)}"
@@ -386,10 +444,13 @@ class ClusterClient:
 
         for pipeline, batch in zip(self._pipelines, pipeline_batches):
             if batch:
-                data = TaskUpdate(
-                    sender=pipeline.worker_id, added_tasks=batch
-                ).to_byte_array()
-                pipeline.send(data)
+                msg = TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
+                if self._req_res:
+                    msg.message_id = uuid.uuid4().hex
+                pipeline.send(
+                    msg.to_byte_array(),
+                    task_ids=[t.task_id for t in batch],
+                )
         self.logger.info(
             f"Flushed {len(items) - len(remaining)} tasks across {self._n_workers} pipeline(s)"
         )
@@ -419,6 +480,7 @@ class ClusterClient:
         ppn: int = 1,
         ngpus_per_process: int = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
+        serialize_executable_by_value: bool = True,
         **kwargs,
     ) -> ConcurrentFuture:
         """Send a task to the node. Returns a Future resolved on completion.
@@ -434,10 +496,14 @@ class ClusterClient:
             nnodes: Number of nodes to request (ignored when *task* is a Task).
             ppn: Processes per node (ignored when *task* is a Task).
             ngpus_per_process: GPUs per process (ignored when *task* is a Task).
+            serialize_executable_by_value: When False, serialize the callable
+                by reference (module + qualname) using pickle instead of
+                cloudpickle. This preserves per-worker caches across calls.
             **kwargs: Keyword arguments forwarded to the callable.
         """
         return self._send_batch(
-            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process)],
+            [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process,
+                           serialize_executable_by_value=serialize_executable_by_value)],
             dependencies=[dependencies],
         )[0]
 
@@ -457,6 +523,7 @@ class ClusterClient:
         ppn: int = 1,
         ngpus_per_process: int = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
+        serialize_executable_by_value: bool = True,
         **kwargs,
     ) -> List[ConcurrentFuture]:
         """Submit *fn* applied to each element of *iterable* in a single batch.
@@ -471,6 +538,9 @@ class ClusterClient:
             nnodes: Number of nodes per task.
             ppn: Processes per node per task.
             ngpus_per_process: GPUs per process per task.
+            serialize_executable_by_value: When False, serialize the callable
+                by reference (module + qualname) using pickle instead of
+                cloudpickle. This preserves per-worker caches across calls.
             **kwargs: Keyword arguments forwarded to *fn* for every call.
 
         Example::
@@ -486,6 +556,7 @@ class ClusterClient:
                 nnodes,
                 ppn,
                 ngpus_per_process,
+                serialize_executable_by_value=serialize_executable_by_value,
             )
             for item in iterable
         ]

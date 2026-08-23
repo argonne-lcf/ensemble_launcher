@@ -56,6 +56,8 @@ async def test_async_worker_cluster(
             worker_logs=True,
             master_logs=True,
             mpi_config=MPIConfig(flavor="test"),
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
     )
@@ -119,6 +121,8 @@ async def test_async_master_cluster(
             worker_logs=True,
             master_logs=True,
             mpi_config=MPIConfig(flavor="test"),
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
     )
@@ -180,6 +184,8 @@ async def test_async_master_cluster_dependencies(
             result_buffer_size=100,
             worker_logs=True,
             master_logs=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
     )

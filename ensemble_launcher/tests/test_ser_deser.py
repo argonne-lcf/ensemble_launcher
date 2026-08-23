@@ -371,7 +371,6 @@ from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Ready,
     Result,
-    ResultAck,
     ResultBatch,
     Status,
     Stop,
@@ -721,14 +720,6 @@ class TestMetadataOnlyMessages:
         r2.unpack()
         assert r2.sender == "w0"
 
-    def test_result_ack_roundtrip(self):
-        ra = ResultAck(sender="main", receiver="w0")
-        wire = ra.to_bytes()
-        ra2 = Message.from_bytes(wire)
-        assert isinstance(ra2, ResultAck)
-        ra2.unpack()
-        assert ra2.sender == "main"
-
     def test_task_request_roundtrip(self):
         tr = TaskRequest(sender="w0", receiver="main", ntasks=5)
         wire = tr.to_bytes()
@@ -767,7 +758,6 @@ class TestFromBytesDispatch:
             (_make_task_update(), TaskUpdate),
             (Ready(sender="a"), Ready),
             (Stop(type=StopType.KILL), Stop),
-            (ResultAck(), ResultAck),
             (TaskRequest(ntasks=3), TaskRequest),
             (NodeRequest(), NodeRequest),
         ]

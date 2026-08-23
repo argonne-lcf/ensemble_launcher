@@ -5,4 +5,8 @@ logs/
 *_status.json
 *.mpiexec_tmp/
 profiles/
+build/
+dist/
+*.egg-info/
+docs/site/
 

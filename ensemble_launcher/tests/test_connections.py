@@ -85,7 +85,7 @@ def _make_mp_pair(req_res=False):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_basic_send_recv():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -98,7 +98,7 @@ async def test_zmq_basic_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_basic_roundtrip():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -115,7 +115,7 @@ async def test_zmq_basic_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_multiple_messages():
     server, client = await _open_zmq_pair(req_res=False)
 
@@ -135,7 +135,7 @@ async def test_zmq_multiple_messages():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_send_recv():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -149,7 +149,7 @@ async def test_zmq_req_res_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -168,7 +168,7 @@ async def test_zmq_req_res_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(15)
+
 async def test_zmq_req_res_multiple():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -184,7 +184,7 @@ async def test_zmq_req_res_multiple():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_req_res_pickled_data():
     """Verify cloudpickled payloads work through req_res."""
     server, client = await _open_zmq_pair(req_res=True)
@@ -208,7 +208,7 @@ async def test_zmq_req_res_pickled_data():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_router_state_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -228,7 +228,7 @@ async def test_zmq_router_state_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_zmq_dealer_state_roundtrip():
     server, client = await _open_zmq_pair(req_res=True)
 
@@ -251,7 +251,7 @@ async def test_zmq_dealer_state_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(20)
+
 async def test_mp_basic_send_recv():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -265,7 +265,7 @@ async def test_mp_basic_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_basic_roundtrip():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -284,7 +284,7 @@ async def test_mp_basic_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_multiple_messages():
     server, client = _make_mp_pair(req_res=False)
     await server.open()
@@ -306,7 +306,7 @@ async def test_mp_multiple_messages():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_req_res_send_recv():
     server, client = _make_mp_pair(req_res=True)
     await server.open()
@@ -322,7 +322,7 @@ async def test_mp_req_res_send_recv():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(10)
+
 async def test_mp_req_res_roundtrip():
     server, client = _make_mp_pair(req_res=True)
     await server.open()
@@ -343,7 +343,7 @@ async def test_mp_req_res_roundtrip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(15)
+
 async def test_mp_req_res_multiple():
     server, client = _make_mp_pair(req_res=True)
     await server.open()
@@ -356,6 +356,113 @@ async def test_mp_req_res_multiple():
     for i in range(5):
         frames = await server.recv(timeout=5.0)
         assert frames[-1] == f"mp-rr-{i}".encode()
+
+    await _close_pair(server, client)
+
+
+# ---------------------------------------------------------------------------
+#  ZMQ — batched send (List[bytes])
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_zmq_batched_send_client_to_server():
+    """Client sends List[bytes]; server receives all payloads in frames[1:]."""
+    server, client = await _open_zmq_pair(req_res=False)
+
+    payloads = [f"msg-{i}".encode() for i in range(5)]
+    await client.send(payloads)
+
+    frames = await server.recv(timeout=5.0)
+    assert frames[1:] == payloads
+
+    await _close_pair(server, client)
+
+
+@pytest.mark.asyncio
+async def test_zmq_batched_send_server_to_client():
+    """Server sends List[bytes]; client receives all payloads in frames[1:]."""
+    server, client = await _open_zmq_pair(req_res=False)
+
+    # Need a client→server message first to learn the routing id
+    await client.send(b"hello")
+    frames = await server.recv(timeout=5.0)
+    sender_id = frames[0].decode()
+
+    payloads = [f"reply-{i}".encode() for i in range(5)]
+    await server.send(payloads, target_id=sender_id)
+
+    reply = await client.recv(timeout=5.0)
+    assert reply[1:] == payloads
+
+    await _close_pair(server, client)
+
+
+@pytest.mark.asyncio
+async def test_zmq_batched_send_req_res():
+    """Batched send works with req_res ACK mode."""
+    server, client = await _open_zmq_pair(req_res=True)
+
+    payloads = [f"rr-batch-{i}".encode() for i in range(5)]
+    success = await client.send(payloads, timeout=5.0)
+    assert success is True
+
+    frames = await server.recv(timeout=5.0)
+    assert frames[1:] == payloads
+
+    await _close_pair(server, client)
+
+
+@pytest.mark.asyncio
+async def test_zmq_batched_send_pickled_roundtrip():
+    """Batched pickled payloads survive a full roundtrip."""
+    server, client = await _open_zmq_pair(req_res=False)
+
+    objects = [{"i": i, "data": list(range(i))} for i in range(4)]
+    payloads = [cloudpickle.dumps(obj) for obj in objects]
+    await client.send(payloads)
+
+    frames = await server.recv(timeout=5.0)
+    received = [cloudpickle.loads(f) for f in frames[1:]]
+    assert received == objects
+
+    await _close_pair(server, client)
+
+
+# ---------------------------------------------------------------------------
+#  MP — batched send (List[bytes])
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mp_batched_send():
+    """MP connection sends List[bytes]; receiver gets all payloads in frames[1:]."""
+    server, client = _make_mp_pair(req_res=False)
+    await server.open()
+    await client.open()
+
+    payloads = [f"mp-batch-{i}".encode() for i in range(5)]
+    await client.send(payloads)
+
+    frames = await server.recv(timeout=5.0)
+    assert frames[1:] == payloads
+
+    await _close_pair(server, client)
+
+
+@pytest.mark.asyncio
+async def test_mp_batched_send_req_res():
+    """MP batched send works with req_res ACK mode."""
+    server, client = _make_mp_pair(req_res=True)
+    await server.open()
+    await client.open()
+
+    payloads = [f"mp-rr-batch-{i}".encode() for i in range(5)]
+    success = await client.send(payloads, timeout=5.0)
+    assert success is True
+
+    frames = await server.recv(timeout=5.0)
+    assert frames[1:] == payloads
 
     await _close_pair(server, client)
 

@@ -1,0 +1,65 @@
+site_name: Ensemble Launcher
+site_url: https://argonne-lcf.github.io/ensemble_launcher/
+site_description: A lightweight, scalable tool for launching and orchestrating task ensembles across HPC clusters.
+repo_url: https://github.com/argonne-lcf/ensemble_launcher
+repo_name: argonne-lcf/ensemble_launcher
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: installation.md
+    - Quick Start: quickstart.md
+  - User Guide:
+    - Configuration: configuration.md
+    - CLI Reference: cli.md
+    - Cluster Mode: cluster-mode.md
+    - Custom Scheduling: custom-scheduling.md
+  - Experimental:
+    - MCP Integration: experimental/mcp.md
+    - Actors: experimental/actors.md
+    - Inference (vLLM): experimental/inference.md
+  - Reference:
+    - Architecture: architecture.md
+    - API Reference: api-reference.md
+    - Examples: examples.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search

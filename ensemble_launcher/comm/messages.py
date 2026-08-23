@@ -579,11 +579,6 @@ class NodeUpdate(Message):
 
 
 @dataclass
-class ResultAck(Message):
-    MSG_TYPE_ID: int = field(default=7, init=False, repr=False)
-
-
-@dataclass
 class Ready(Message):
     MSG_TYPE_ID: int = field(default=8, init=False, repr=False)
 
@@ -615,7 +610,6 @@ all_messages = [
     ResultBatch,
     TaskUpdate,
     NodeUpdate,
-    ResultAck,
     Ready,
     Stop,
     TaskRequest,

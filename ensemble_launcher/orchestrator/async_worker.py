@@ -22,7 +22,6 @@ from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Ready,
     Result,
-    ResultAck,
     ResultBatch,
     Status,
     Stop,
@@ -211,6 +210,9 @@ class AsyncWorker(Node):
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             cluster_secret=self._config.cluster_secret,
+            req_res=self._config.req_res,
+            send_retries=self._config.send_retries,
+            send_timeout=self._config.send_timeout,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -483,8 +485,9 @@ class AsyncWorker(Node):
 
         ##Forward the result to the appropriate place.
         ##task_id to client map should be restored from scheduler state
-        for result in self._ckpt_results.values():
-            self._forward_result(result)
+        if self._ckpt_results is not None:
+            for result in self._ckpt_results.values():
+                self._forward_result(result)
 
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
@@ -604,9 +607,16 @@ class AsyncWorker(Node):
         msg = IResultBatch(sender=self.node_id, data=results)
         if dest_id.startswith("client-"):
             self.logger.info(f"Flushing queue of size {len(results)} to {dest_id}")
-            await self._comm.send_message_to_child(dest_id, msg)
+            success = await self._comm.send_message_to_child(dest_id, msg)
         else:
-            await self._comm.send_message_to_parent(msg)
+            success = await self._comm.send_message_to_parent(msg)
+
+        if not success:
+            self.logger.warning(
+                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
+            )
+            requeue = self._iresult_q.setdefault(dest_id, deque())
+            requeue.extend(results)
 
         return time.time()
 
@@ -661,15 +671,17 @@ class AsyncWorker(Node):
         if dest_id is None and self.parent:
             dest_id = self.parent.node_id
 
-        if dest_id is not None:
-            if dest_id not in self._iresult_q:
-                self._iresult_q[dest_id] = deque()
+        if dest_id is None:
+            self.logger.warning(
+                f"{self.node_id}: No destination for task {task_id} result, dropping"
+            )
+            return
 
-            result_q = self._iresult_q[dest_id]
-            result_q.append(result)
-            self._streamed_task_ids.add(task_id)
-            if len(result_q) >= self._config.result_buffer_size:
-                asyncio.create_task(self._flush_dest_queue(dest_id))
+        result_q = self._iresult_q.setdefault(dest_id, deque())
+        result_q.append(result)
+        self._streamed_task_ids.add(task_id)
+        if len(result_q) >= self._config.result_buffer_size:
+            asyncio.create_task(self._flush_dest_queue(dest_id))
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -989,33 +1001,19 @@ class AsyncWorker(Node):
             await self._flush_dest_queue(dest_id)
 
         async with self._timer("final_status"):
-            ##also send the final status
             final_status = self.get_status()
             final_status.tag = "final"
             if self.parent:
-                max_retries = 10
-                for i in range(max_retries):
-                    success = await self._comm.send_message_to_parent(final_status)
-                    if success:
-                        self.logger.info(f"{self.node_id}: Sent final status to parent")
-                        msg = await self._comm.recv_message_from_parent(
-                            ResultAck, timeout=5.0 + i * 5.0
-                        )
-                        if msg is None:
-                            self.logger.warning(
-                                "Did not get the final status update ack from parent in 5 sec!"
-                            )
-                        else:
-                            self.logger.info("Successfully received ack from parent")
-                            break
-                    else:
-                        self.logger.warning(
-                            f"{self.node_id}: Failed to send final status to parent"
-                        )
-                        fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                        self.logger.info(f"{final_status}")
-                        final_status.to_file(fname)
-                        break
+                success = await self._comm.send_message_to_parent(final_status)
+                if success:
+                    self.logger.info(f"{self.node_id}: Sent final status to parent")
+                else:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send final status to parent"
+                    )
+                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                    self.logger.info(f"{final_status}")
+                    final_status.to_file(fname)
         result_batch = ResultBatch(sender=self.node_id)
         for task_id, task in self.tasks.items():
             if task_id in self._streamed_task_ids:
@@ -1030,10 +1028,7 @@ class AsyncWorker(Node):
             else:
                 self.logger.warning(f"Task {task_id} status {task.status}")
 
-        max_retries = 10
         if self.parent:
-            # Wait for parent to signal it is ready before sending the result
-            # batch to avoid a thundering-herd of simultaneous sends.
             self.logger.info(f"{self.node_id}: Waiting for Ready signal from parent")
             await self._parent_ready_event.wait()
             jitter = random.uniform(0, 5.0)
@@ -1041,29 +1036,20 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Parent is ready; sleeping {jitter:.2f}s before sending results"
             )
             await asyncio.sleep(jitter)
-            for attempt in range(max_retries):
-                success = await self._comm.send_message_to_parent(result_batch)
-                if not success:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send results to parent "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
-                    continue
-                ack = await self._comm.recv_message_from_parent(
-                    ResultAck, timeout=5.0 + attempt * 5.0
-                )
-                if ack is not None:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully sent results and received ack from parent"
-                    )
-                    break
-                self.logger.warning(
-                    f"{self.node_id}: No ack for result batch from parent "
-                    f"(attempt {attempt + 1}/{max_retries})"
+            success = await self._comm.send_message_to_parent(result_batch)
+            if success:
+                self.logger.info(
+                    f"{self.node_id}: Successfully sent results to parent"
                 )
             else:
                 self.logger.warning(
-                    f"{self.node_id}: Failed to get result batch ack after {max_retries} attempts"
+                    f"{self.node_id}: Failed to send results to parent"
+                )
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_results.bin")
+                with open(fname, "wb") as f:
+                    f.write(result_batch.to_bytes())
+                self.logger.info(
+                    f"{self.node_id}: Checkpointed result batch to {fname}"
                 )
 
         return result_batch

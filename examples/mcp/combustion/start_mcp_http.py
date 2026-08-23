@@ -4,10 +4,9 @@ import time
 import uuid
 
 from flamespeed import compute_flame_speed
-from mcp.server.fastmcp import FastMCP
 
 from ensemble_launcher import EnsembleLauncher
-from ensemble_launcher.config import LauncherConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.mcp import ELFastMCP
 
 
@@ -22,10 +21,8 @@ def start_mcp():
             worker_logs=True,
             master_logs=True,
             cluster=True,
-            cpu_binding_option="",
             checkpoint_dir=CHECKPOINT_DIR,
-            nlevels=1,
-            nchildren=1,
+            policy_config=PolicyConfig(nlevels=1, nchildren=1),
         ),
         Nodes=[socket.gethostname()],
     )
@@ -33,7 +30,7 @@ def start_mcp():
     el.start()
     time.sleep(10.0)
 
-    mcp = ELFastMCP(name="combustion_mcp", checkpoint_dir=CHECKPOINT_DIR, port=8295)
+    mcp = ELFastMCP(name="combustion_mcp", checkpoint_dir=CHECKPOINT_DIR)
 
     mcp.ensemble_tool(compute_flame_speed)
 

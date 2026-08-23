@@ -130,7 +130,7 @@ class ActorPool(PrivateActor):
                 if future.done() and future.exception() is not None:
                     self.logger.error(f"child {cid} failed with exception {future.exception()}")
             if self._child_handle is not None:
-                await self._child_handle.stop()
+                await self._child_handle.close()
             self.logger.error(f"on_start failed with Exception {e}")
             raise e
 
@@ -181,16 +181,20 @@ class ActorPool(PrivateActor):
     def get_actor_ids(self) -> List[str]:
         return list(self._child_names)
 
-    async def on_stop(self):
-        self.logger.info("In on stop")
+    @action
+    async def stop(self, _sender_id: str = None):
+        self.logger.info("ActorPool stop called")
         if self._child_handle:
             try:
-                self.logger.info(f"Broadcasting stop to {self._n_children} children")
-                await self._child_handle.broadcast(
-                    ("stop", (), None), expected=self._n_children
-                )
+                self.logger.info(f"Stopping {self._n_children} children")
+                for i in range(self._n_children):
+                    target_id = f"{self._child_names[i]}:{self._server_secret}"
+                    await self._child_handle.send(("stop", (), None), target_id=target_id)
+                for _ in range(self._n_children):
+                    await self._child_handle.recv("stop")
+                self.logger.info("All children confirmed stop")
             except Exception as e:
-                self.logger.warning(f"Broadcasting stop to children failed: {e}")
+                self.logger.warning(f"Stopping children failed: {e}")
 
             for f in self._child_futures:
                 try:
@@ -205,3 +209,5 @@ class ActorPool(PrivateActor):
                 self._cluster_client.__exit__(None, None, None)
             except Exception:
                 pass
+
+        await self._finalize_stop(_sender_id)

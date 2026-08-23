@@ -29,10 +29,10 @@ class LifecycleActor(Actor):
         self.started = False
         self.stopped = False
 
-    def on_start(self):
+    async def on_start(self):
         self.started = True
 
-    def on_stop(self):
+    async def on_stop(self):
         self.stopped = True
 
     @action
@@ -122,19 +122,14 @@ async def test_actor_single_call():
 
     a._init_runtime()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
 
     result = await asyncio.wait_for(handle.add(3, 4), timeout=5.0)
     assert result == 7
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(handle.stop(), timeout=10.0)
     await handle.close()
     await _cleanup_ckpt(a)
 
@@ -151,21 +146,16 @@ async def test_actor_batch_call():
 
     a._init_runtime()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
 
     batch_args = [("call", (2,), None), ("call", (3,), None), ("call", (5,), None)]
     await handle.send(batch_args)
     results = await asyncio.wait_for(handle.recv("call"), timeout=10.0)
     assert results == [4, 9, 25]
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(handle.stop(), timeout=10.0)
     await handle.close()
     await _cleanup_ckpt(a)
 
@@ -182,20 +172,15 @@ async def test_actor_multiple_calls():
 
     a._init_runtime()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
 
     for x, y, expected in [(1, 2, 3), (10, 20, 30), (-1, 1, 0)]:
         result = await asyncio.wait_for(handle.add(x, y), timeout=5.0)
         assert result == expected, f"add({x}, {y}) expected {expected}, got {result}"
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(handle.stop(), timeout=10.0)
     await handle.close()
     await _cleanup_ckpt(a)
 
@@ -213,26 +198,20 @@ async def test_actor_lifecycle_hooks():
     a._init_runtime()
 
     assert not a.started
-    a.on_start()
+    await a.on_start()
     assert a.started
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
 
     result = await asyncio.wait_for(handle.sum(1, 2, 3), timeout=5.0)
     assert result == 6
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
+    await asyncio.wait_for(handle.stop(), timeout=10.0)
 
-    assert not a.stopped
-    a.on_stop()
     assert a.stopped
 
-    await a._conn.close()
     await handle.close()
     await _cleanup_ckpt(a)
 
@@ -262,21 +241,18 @@ async def test_private_actor_single_call():
     await handle.open()
     await a._conn.open()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
-    ready_task = asyncio.create_task(a._signal_ready())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
+    asyncio.create_task(a._signal_ready())
 
     await handle.send(("add", (10, 20), None), target_id="priv-actor:secret")
     result = await asyncio.wait_for(handle.recv("add"), timeout=5.0)
     assert result == 30
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(
+        handle.stop(actor_id="priv-actor:secret"), timeout=10.0
+    )
     await handle.close()
 
 
@@ -299,22 +275,19 @@ async def test_private_actor_handle_getattr():
     await handle.open()
     await a._conn.open()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
-    ready_task = asyncio.create_task(a._signal_ready())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
+    asyncio.create_task(a._signal_ready())
 
     result = await asyncio.wait_for(
         handle.add(10, 20, actor_id="priv-getattr:secret"), timeout=5.0
     )
     assert result == 30
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(
+        handle.stop(actor_id="priv-getattr:secret"), timeout=10.0
+    )
     await handle.close()
 
 
@@ -339,20 +312,15 @@ async def test_private_actor_handle_default_target_id():
     await handle.open()
     await a._conn.open()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
-    ready_task = asyncio.create_task(a._signal_ready())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
+    asyncio.create_task(a._signal_ready())
 
     result = await asyncio.wait_for(handle.add(5, 7), timeout=5.0)
     assert result == 12
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(handle.stop(), timeout=10.0)
     await handle.close()
 
 
@@ -375,22 +343,19 @@ async def test_private_actor_batch_call():
     await handle.open()
     await a._conn.open()
 
-    recv_task = asyncio.create_task(a._recv())
-    send_task = asyncio.create_task(a._send())
-    main_task = asyncio.create_task(a._main_loop())
-    ready_task = asyncio.create_task(a._signal_ready())
+    a._recv_task = asyncio.create_task(a._recv())
+    a._send_task = asyncio.create_task(a._send())
+    a._main_loop_task = asyncio.create_task(a._main_loop())
+    asyncio.create_task(a._signal_ready())
 
     batch = [("add", (1, 2), None), ("add", (3, 4), None), ("add", (5, 6), None)]
     await handle.send(batch, target_id="priv-batch:secret")
     results = await asyncio.wait_for(handle.recv("add"), timeout=5.0)
     assert results == [3, 7, 11]
 
-    await handle.stop(timeout=1.0)
-    await asyncio.wait_for(main_task, timeout=5.0)
-    recv_task.cancel()
-    send_task.cancel()
-
-    await a._conn.close()
+    await asyncio.wait_for(
+        handle.stop(actor_id="priv-batch:secret"), timeout=10.0
+    )
     await handle.close()
 
 
@@ -401,7 +366,7 @@ if __name__ == "__main__":
 
     async def main():
         sys_config = SystemConfig(name="local")
-        launcher_config = LauncherConfig(cluster=True, checkpoint_dir="./ckpt_dir")
+        launcher_config = LauncherConfig(cluster=True, checkpoint_dir="./ckpt_dir", task_flush_interval=0.5, result_flush_interval=0.5)
         el = EnsembleLauncher(
             ensemble_file={}, system_config=sys_config, launcher_config=launcher_config
         )

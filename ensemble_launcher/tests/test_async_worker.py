@@ -22,7 +22,7 @@ pytestmark = pytest.mark.core
 
 
 def echo(task_id: str):
-    time.sleep(1.0)
+    time.sleep(0.01)
     return f"Hello from task {task_id}"
 
 
@@ -56,6 +56,8 @@ async def test_async_worker(task_executor="async_processpool", ntasks_per_core=1
             comm_name="async_zmq",
             report_interval=100.0,
             log_level=logging.INFO,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -101,6 +103,8 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
             log_level=logging.INFO,
             worker_logs=True,
             return_stdout=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -147,6 +151,8 @@ async def test_async_mpi_worker_stdout_file(tmp_path, task_executor="async_mpi")
             mpi_config=MPIConfig(processes_per_node_flag=None),
             log_level=logging.INFO,
             return_stdout=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -190,9 +196,14 @@ async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
             comm_name="async_zmq",
             report_interval=100.0,
             mpi_config=MPIConfig(
-                processes_per_node_flag=None, hosts_flag=None, cpu_bind_method="none"
+                processes_per_node_flag=None,
+                hosts_flag=None,
+                cpu_bind_method="none",
+                extra_launcher_flags=["--oversubscribe", "--allow-run-as-root"],
             ),
             log_level=logging.INFO,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -238,6 +249,8 @@ async def test_async_task_worker():
             comm_name="async_zmq",
             report_interval=100.0,
             log_level=logging.INFO,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -284,6 +297,8 @@ async def test_run_dir():
             log_level=logging.INFO,
             return_stdout=True,
             worker_logs=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,

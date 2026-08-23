@@ -24,7 +24,6 @@ from ensemble_launcher.comm.messages import (
     NodeUpdate,
     Ready,
     Result,
-    ResultAck,
     ResultBatch,
     Status,
     Stop,
@@ -158,6 +157,19 @@ class AsyncMaster(Node):
         self._total_received: int = 0
         self._total_streamed = 0
 
+    def _create_forward_task(self, result: Result) -> asyncio.Task:
+        """Create an asyncio task for _forward_result with error logging."""
+        task = asyncio.create_task(self._forward_result(result))
+        task.add_done_callback(self._forward_result_done)
+        return task
+
+    def _forward_result_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"{self.node_id}: _forward_result failed: {exc}")
+
     @asynccontextmanager
     async def _timer(self, event_name: str):
         """Timer that records to event registry for Perfetto export."""
@@ -243,6 +255,9 @@ class AsyncMaster(Node):
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_dead_threshold=self._config.heartbeat_dead_threshold,
             cluster_secret=self._config.cluster_secret,
+            req_res=self._config.req_res,
+            send_retries=self._config.send_retries,
+            send_timeout=self._config.send_timeout,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -425,7 +440,7 @@ class AsyncMaster(Node):
             self._task_flush_task = asyncio.create_task(
                 self._periodic_task_flush_loop()
             )
-        if self.parent:
+        if self.parent or self._config.cluster:
             self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
     def _cpu_bind_mpi_kwargs(self, child_resource) -> dict:
@@ -1180,7 +1195,7 @@ class AsyncMaster(Node):
                 success=False,
                 exception=f"Routing failed at {self.node_id}",
             )
-            asyncio.create_task(self._forward_result(result))
+            self._create_forward_task(result)
         return [task_to_child.get(task.task_id, None) for task in tasks]
 
     # --------------------------------------------------------------------------
@@ -1220,9 +1235,6 @@ class AsyncMaster(Node):
                         r.task_id,
                         TaskStatus.SUCCESS if r.success else TaskStatus.FAILED,
                     )
-                await self._comm.send_message_to_child(
-                    child_id, ResultAck(sender=self.node_id)
-                )
                 # Source c (authoritative): mark SUCCESS from RUNNING or RECOVERING.
                 state = self._scheduler.get_child_state(child_id)
                 if state in {ChildState.RUNNING, ChildState.RECOVERING}:
@@ -1293,29 +1305,15 @@ class AsyncMaster(Node):
             ):
                 final_status = self._scheduler.aggregate_status()
                 final_status.tag = "final"
-                max_retries = 10
-                for i in range(max_retries):
-                    success = await self._comm.send_message_to_parent(final_status)
-                    if not success:
-                        self.logger.warning(
-                            f"{self.node_id}: Failed to send final status to parent"
-                        )
-                    else:
-                        self.logger.info(
-                            f"{self.node_id}: Successfully reported final status to parent"
-                        )
-                        ack = await self._comm.recv_message_from_parent(
-                            ResultAck, timeout=5.0 + i * 5.0
-                        )
-                        if ack is None:
-                            self.logger.warning(
-                                "Did not receive ack for final status from parent in 5sec"
-                            )
-                        else:
-                            self.logger.info(
-                                "Received ack from parent for final status"
-                            )
-                            break
+                success = await self._comm.send_message_to_parent(final_status)
+                if success:
+                    self.logger.info(
+                        f"{self.node_id}: Successfully reported final status to parent"
+                    )
+                else:
+                    self.logger.warning(
+                        f"{self.node_id}: Failed to send final status to parent"
+                    )
             else:
                 try:
                     status = self._scheduler.aggregate_status()
@@ -1355,35 +1353,25 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Aggregated results from {len(self._results)} children"
             )
 
-        # Send to parent with ACK and retries (skip if parent is dead)
-        max_retries = 10
+        # Send to parent (skip if parent is dead)
         if self.parent and (
             self._comm.parent_dead_event is None
             or not self._comm.parent_dead_event.is_set()
         ):
-            for attempt in range(max_retries):
-                success = await self._comm.send_message_to_parent(result_batch)
-                if not success:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send results to parent "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
-                    continue
-                ack = await self._comm.recv_message_from_parent(
-                    ResultAck, timeout=5.0 + attempt * 5.0
-                )
-                if ack is not None:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully sent results and received ack from parent"
-                    )
-                    break
-                self.logger.warning(
-                    f"{self.node_id}: No ack for result batch from parent "
-                    f"(attempt {attempt + 1}/{max_retries})"
+            success = await self._comm.send_message_to_parent(result_batch)
+            if success:
+                self.logger.info(
+                    f"{self.node_id}: Successfully sent results to parent"
                 )
             else:
                 self.logger.warning(
-                    f"{self.node_id}: Failed to get result batch ack after {max_retries} attempts"
+                    f"{self.node_id}: Failed to send results to parent"
+                )
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_results.bin")
+                with open(fname, "wb") as f:
+                    f.write(result_batch.to_bytes())
+                self.logger.info(
+                    f"{self.node_id}: Checkpointed result batch to {fname}"
                 )
         elif self.parent:
             self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
@@ -1433,34 +1421,48 @@ class AsyncMaster(Node):
     async def _client_request_monitor(self) -> None:
         """Cluster mode: handle messages from any ClusterClient connected to this master."""
         while not self._all_children_done_event.is_set():
-            item = await self._comm.recv_client_message()
-            if item is None:
-                continue
-            client_id, msg = item
-            if isinstance(msg, TaskUpdate):
-                self._total_received += len(msg.added_tasks)
-                self.logger.info(
-                    f"Received TaskUpdate from client. Total tasks: {self._total_received}"
-                )
-                await self._route_tasks(msg.added_tasks, client_id=client_id)
+            try:
+                item = await self._comm.recv_client_message()
+                if item is None:
+                    continue
+                client_id, msg = item
+                if isinstance(msg, TaskUpdate):
+                    self._total_received += len(msg.added_tasks)
+                    self.logger.info(
+                        f"Received TaskUpdate from client. Total tasks: {self._total_received}"
+                    )
+                    await self._route_tasks(msg.added_tasks, client_id=client_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Client task update monitor failed with error: {e}")
+                await asyncio.sleep(0.5)
 
     async def _flush_dest_queue(self, dest_id: str) -> None:
-        """Send all buffered results for dest_id to the parent master as a single IResultBatch."""
+        """Send all buffered results for dest_id as a single IResultBatch."""
         result_q = self._iresult_q.get(dest_id)
         if not result_q:
             return
         results = []
         while result_q:
             results.append(result_q.popleft())
-        await self._comm.send_message_to_parent(
-            IResultBatch(sender=self.node_id, data=results)
-        )
+        msg = IResultBatch(sender=self.node_id, data=results)
+        if dest_id.startswith("client-"):
+            self._total_streamed += len(results)
+            success = await self._comm.send_message_to_child(dest_id, msg)
+        else:
+            success = await self._comm.send_message_to_parent(msg)
+        if not success:
+            self.logger.warning(
+                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
+            )
+            if dest_id.startswith("client-"):
+                self._total_streamed -= len(results)
+            requeue = self._iresult_q.setdefault(dest_id, deque())
+            requeue.extend(results)
 
     async def _periodic_flush_loop(self) -> None:
-        """Flush buffered parent-bound results on a fixed interval with jitter.
-
-        Only runs on masters that have a parent (i.e. there are results to forward upward).
-        """
+        """Flush buffered results on a fixed interval with jitter."""
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
             await asyncio.sleep(self._config.result_flush_interval + jitter)
@@ -1472,14 +1474,40 @@ class AsyncMaster(Node):
         task_q = self._itask_q.get(child_id)
         if not task_q:
             return
+
+        state = self._scheduler.get_child_state(child_id)
+        if state == ChildState.RECOVERING:
+            return
+
         tasks = []
         while task_q:
             tasks.append(task_q.popleft())
-        await self._comm.send_message_to_child(
+        success = await self._comm.send_message_to_child(
             child_id,
             TaskUpdate(sender=self.node_id, added_tasks=tasks),
         )
-        self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
+        if success:
+            self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
+        else:
+            state = self._scheduler.get_child_state(child_id)
+            if self._scheduler.is_child_terminal(child_id):
+                self.logger.error(
+                    f"Failed to send TaskUpdate of size {len(tasks)} to {child_id} (state={state})"
+                )
+                for task in tasks:
+                    result = Result(
+                        sender=self.node_id,
+                        task_id=task.task_id,
+                        success=False,
+                        exception=f"Send to {child_id} failed at {self.node_id}",
+                    )
+                    self._create_forward_task(result)
+            else:
+                self.logger.info(
+                    f"Send to {child_id} failed (state={state}), re-queuing {len(tasks)} tasks"
+                )
+                task_q = self._itask_q.setdefault(child_id, deque())
+                task_q.extend(tasks)
 
     async def _periodic_task_flush_loop(self) -> None:
         """Flush buffered child-bound tasks on a fixed interval with jitter.
@@ -1493,12 +1521,7 @@ class AsyncMaster(Node):
                 await self._flush_child_task_queue(child_id)
 
     async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
-        """Route a result to its destination.
-
-        - Client-bound results (root master): forwarded directly as IResultBatch.
-        - Parent-bound results (intermediate master): buffered and flushed periodically
-          to aggregate fan-in across children before sending up the hierarchy.
-        """
+        """Buffer a result for its destination; the periodic flush loop sends it."""
         items = result.data if isinstance(result, IResultBatch) else [result]
 
         for single_result in items:
@@ -1524,21 +1547,10 @@ class AsyncMaster(Node):
             dest_results.setdefault(dest_id, []).append(single_result)
 
         for dest_id, results in dest_results.items():
-            if dest_id.startswith("client-"):
-                # Client attached at this level: send directly, no buffering needed
-                self._total_streamed += len(results)
-                await self._comm.send_message_to_child(
-                    dest_id, IResultBatch(sender=self.node_id, data=results)
-                )
-            else:
-                # Parent-bound result: buffer to aggregate fan-in before sending up
-                if dest_id not in self._iresult_q:
-                    self._iresult_q[dest_id] = deque()
-                result_q = self._iresult_q[dest_id]
-                for r in results:
-                    result_q.append(r)
-                if len(result_q) >= self._config.result_buffer_size:
-                    await self._flush_dest_queue(dest_id)
+            result_q = self._iresult_q.setdefault(dest_id, deque())
+            result_q.extend(results)
+            if len(result_q) >= self._config.result_buffer_size:
+                await self._flush_dest_queue(dest_id)
 
     async def _child_result_monitor(self, child_id: str) -> None:
         """Receive IResultBatch messages from child and forward to client or parent."""
@@ -1556,7 +1568,13 @@ class AsyncMaster(Node):
             if recv_task in done:
                 msg = recv_task.result()
                 if msg is not None:
-                    await self._forward_result(msg)
+                    try:
+                        await self._forward_result(msg)
+                    except Exception as e:
+                        self.logger.error(
+                            f"{self.node_id}: Failed to forward result from {child_id}: {e}",
+                            exc_info=True,
+                        )
             else:
                 recv_task.cancel()
                 try:
@@ -1572,8 +1590,14 @@ class AsyncMaster(Node):
             )
             if msg is None:
                 break
-            await self._forward_result(msg)
-        # Flush any parent-bound results that didn't reach the buffer threshold.
+            try:
+                await self._forward_result(msg)
+            except Exception as e:
+                self.logger.error(
+                    f"{self.node_id}: Failed to forward result from {child_id}: {e}",
+                    exc_info=True,
+                )
+        # Flush any buffered results that didn't reach the buffer threshold.
         for dest_id in list(self._iresult_q.keys()):
             await self._flush_dest_queue(dest_id)
 
@@ -1589,9 +1613,8 @@ class AsyncMaster(Node):
                     self._scheduler.set_child_status(child_id, status)
                     if status.tag == "final":
                         self.logger.info(
-                            f"Received final status from {child_id}. Sending ACK"
+                            f"Received final status from {child_id}"
                         )
-                        await self._comm.send_message_to_child(child_id, ResultAck())
                         return
             # Drain any remaining status messages after child process exits
             while True:
@@ -1836,7 +1859,10 @@ class AsyncMaster(Node):
         # stop comm and executor
         await self._comm.close()
         self.logger.info("Shutting down executor")
-        self._executor.shutdown()
+        if hasattr(self._executor, "ashutdown"):
+            await self._executor.ashutdown()
+        else:
+            self._executor.shutdown()
         self.logger.info("Done Shutting down executor")
 
         if self._config.profile == "perfetto" and self._event_registry is not None:

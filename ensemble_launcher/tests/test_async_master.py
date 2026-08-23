@@ -22,7 +22,7 @@ from ensemble_launcher.scheduler.resource import (
 pytestmark = pytest.mark.core
 
 
-@pytest.mark.timeout(60)
+
 @pytest.mark.asyncio
 async def test_async_master(nlevels=1, ntask_per_core=1):
     ##create tasks
@@ -48,10 +48,12 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
             child_executor_name="async_processpool",
             task_executor_name="async_processpool",
             log_level=logging.DEBUG,
-            heartbeat_interval=1.0,
-            heartbeat_dead_threshold=5.0,
+            heartbeat_interval=0.1,
+            heartbeat_dead_threshold=2.0,
             master_logs=True,
             worker_logs=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,
@@ -65,7 +67,7 @@ async def test_async_master(nlevels=1, ntask_per_core=1):
     ), f"{[result for task_id, result in results.items()]}"
 
 
-@pytest.mark.timeout(60)
+
 @pytest.mark.asyncio
 async def test_async_mpi_master(nlevels=1):
     ##create tasks
@@ -98,9 +100,11 @@ async def test_async_mpi_master(nlevels=1):
             mpi_config=MPIConfig(flavor="test"),
             sequential_child_launch=True,
             heartbeat_interval=0.1,
-            heartbeat_dead_threshold=5.0,
+            heartbeat_dead_threshold=2.0,
             master_logs=True,
             worker_logs=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
         tasks,

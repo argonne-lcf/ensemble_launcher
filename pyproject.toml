@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ensemble_launcher"
+version = "0.1.0"
+description = "A lightweight, scalable tool for launching and orchestrating task ensembles across HPC clusters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+authors = [
+    { name = "Hari Tummalapalli" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "numpy",
+    "cloudpickle",
+    "pydantic",
+    "pyzmq",
+    "loky",
+    "typer",
+]
+
+[project.optional-dependencies]
+hpc = ["mpi4py"]
+mcp = ["mcp", "paramiko"]
+inference = ["vllm", "uvloop", "uvicorn", "fastapi"]
+docs = ["mkdocs-material"]
+dev-core = [
+    "pytest",
+    "pytest-timeout",
+    "pytest-asyncio",
+    "ensemble_launcher[hpc]",
+]
+dev-extensions = ["ensemble_launcher[dev-core,mcp,inference]"]
+all = ["ensemble_launcher[hpc,mcp,inference]"]
+
+[project.scripts]
+el = "ensemble_launcher.cli:el"
+
+[project.urls]
+Homepage = "https://github.com/argonne-lcf/ensemble_launcher"
+Documentation = "https://argonne-lcf.github.io/ensemble_launcher"
+Repository = "https://github.com/argonne-lcf/ensemble_launcher"
+Issues = "https://github.com/argonne-lcf/ensemble_launcher/issues"
+
+[tool.setuptools.packages.find]
+include = ["ensemble_launcher*"]

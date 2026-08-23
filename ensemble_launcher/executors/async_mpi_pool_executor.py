@@ -12,6 +12,7 @@ from logging import Logger
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
+import zmq
 
 from ensemble_launcher.config import MPIConfig
 from ensemble_launcher.scheduler.resource import (
@@ -272,6 +273,20 @@ class AsyncMPIPoolExecutor:
         self._ensure_submitter()
         return future
 
+    def shutdown(self, wait: bool = True, **kwargs):
+        if self._server_proc.poll() is None:
+            self._server_proc.terminate()
+            try:
+                self._server_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._server_proc.kill()
+                self._server_proc.wait()
+        for sock in (self._task_sock, self._result_sock, self._msg_sock):
+            if not sock.closed:
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.close()
+        self._ctx.term()
+
     async def ashutdown(self, wait: bool = True):
         self.logger.info("ashutdown: starting")
 
@@ -305,9 +320,9 @@ class AsyncMPIPoolExecutor:
         self.logger.info("ashutdown: cancelled recv loops")
 
         self.logger.info("ashutdown: closing ZMQ sockets")
-        self._task_sock.close()
-        self._result_sock.close()
-        self._msg_sock.close()
+        for sock in (self._task_sock, self._result_sock, self._msg_sock):
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.close()
         self.logger.info("ashutdown: terminating ZMQ context")
         self._ctx.term()
         self.logger.info("ashutdown: ZMQ teardown complete")

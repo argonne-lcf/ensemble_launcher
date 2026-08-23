@@ -77,6 +77,9 @@ Orchestrator nodes follow a hierarchical naming scheme:
 - `cluster`: enables long-lived cluster mode + `ClusterClient` API
 - `checkpoint_dir`: where the cluster writes its ZMQ address for clients to discover
 - `enable_workstealing`: switches to `AsyncWorkStealingMaster`
+- `req_res`: enables ACK-based guaranteed delivery at the comm layer (default `True`)
+- `send_retries`: number of retry attempts on ACK timeout, only when `req_res=True` (default `10`)
+- `send_timeout`: per-attempt ACK timeout in seconds, only when `req_res=True` (default `1.0`)
 
 ### Cluster / MCP mode
 

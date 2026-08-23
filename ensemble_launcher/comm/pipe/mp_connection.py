@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from typing import Dict, List, Optional, Union
 
 from .async_connection import (
@@ -38,12 +39,19 @@ class AsyncMPConnection(ServerConnection):
         )
         self._conn = pipe_conn
         self._identity_frame = f"{identity}:{secret_id}".encode()
+        self._stop: Optional[threading.Event] = None
 
     async def _raw_open(self) -> None:
-        pass
+        self._stop = threading.Event()
+
+    async def close(self):
+        self._stop.set()
+        self._conn.close()
+        await super().close()
 
     async def _raw_close(self) -> None:
-        self._conn.close()
+        if not self._conn.closed:
+            self._conn.close()
 
     async def _raw_send(
         self,
@@ -53,17 +61,25 @@ class AsyncMPConnection(ServerConnection):
     ) -> bool:
         """Send frames via multiprocessing pipe.
 
-        Data frames are joined into a single blob before sending.
-        Sends: [identity_frame, msg_id(8B)?, blob]
+        Sends: [identity_frame, msg_id(8B)?, *data_frames]
         """
-        blob = b"".join(data) if isinstance(data, list) else data
         if msg_id is not None:
-            frames = [self._identity_frame, msg_id.to_bytes(8, "big"), blob]
+            frames = [self._identity_frame, msg_id.to_bytes(8, "big")]
         else:
-            frames = [self._identity_frame, blob]
+            frames = [self._identity_frame]
+        if isinstance(data, list):
+            frames.extend(data)
+        else:
+            frames.append(data)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conn.send, frames)
         return True
+
+    def _poll_recv(self):
+        while not self._stop.is_set() and not self._conn.closed:
+            if self._conn.poll(0.5):
+                return self._conn.recv()
+        raise OSError("connection stopped")
 
     async def _raw_recv(self) -> List[bytes]:
         """Receive frames via multiprocessing pipe.
@@ -71,7 +87,11 @@ class AsyncMPConnection(ServerConnection):
         Returns: [identity_frame, msg_id(8B)?, blob]
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._conn.recv)
+        try:
+            return await loop.run_in_executor(None, self._poll_recv)
+        except asyncio.CancelledError:
+            self._stop.set()
+            raise
 
     def get_state(self) -> AsyncMPConnectionState:
         return AsyncMPConnectionState(

@@ -29,6 +29,8 @@ def start_mcp():
             checkpoint_dir=CHECKPOINT_DIR,
             worker_logs=True,
             master_logs=True,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         Nodes=[socket.gethostname()],
     )

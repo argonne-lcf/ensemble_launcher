@@ -19,7 +19,8 @@ def test_EL():
         ensemble_file="ensembles.json",
         Nodes=[socket.gethostname()],
         launcher_config=LauncherConfig(
-            return_stdout=True, worker_logs=True, master_logs=True
+            return_stdout=True, worker_logs=True, master_logs=True,
+            task_flush_interval=0.5, result_flush_interval=0.5,
         ),
         async_orchestrator=True,
     )

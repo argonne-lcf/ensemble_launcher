@@ -133,6 +133,8 @@ def _start_cluster(ckpt_dir, ncpus=12):
             worker_logs=True,
             master_logs=True,
             mpi_config=MPIConfig(flavor="test"),
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
         ),
         job_resource,
     )
@@ -188,7 +190,7 @@ async def test_actor_pool_invoke():
     )
     assert result == 30
 
-    await handle.stop(timeout=1.0)
+    await asyncio.wait_for(handle.stop(), timeout=30.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
@@ -248,7 +250,7 @@ async def test_actor_pool_invoke_all():
     assert len(results) == 3
     assert sorted(results) == [11, 22, 33]
 
-    await handle.stop(timeout=1.0)
+    await asyncio.wait_for(handle.stop(), timeout=30.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
@@ -344,7 +346,7 @@ async def test_actor_pool_get_n_actors_and_ids():
     ids = await asyncio.wait_for(handle.get_actor_ids(), timeout=30.0)
     assert ids == ["alice", "bob"]
 
-    await handle.stop(timeout=1.0)
+    await asyncio.wait_for(handle.stop(), timeout=30.0)
     await handle.close()
     cluster_client.teardown()
     process.terminate()
