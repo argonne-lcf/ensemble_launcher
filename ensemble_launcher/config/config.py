@@ -1,9 +1,10 @@
 import logging
 import multiprocessing as mp
 import secrets
+from collections import Counter
 from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .mpi_config import MPIConfig
 
@@ -16,6 +17,20 @@ class PolicyConfig(BaseModel):
     strict_priority: bool = False  # If True, tasks are scheduled in strict priority order (no lower-priority task runs before a higher-priority one)
 
 
+def _reject_duplicates(field_name: str, ids: list) -> list:
+    dupes = sorted(
+        {str(i) for i, n in Counter(ids).items() if n > 1}, key=str
+    )
+    if dupes:
+        raise ValueError(
+            f"SystemConfig.{field_name} contains duplicate ids: {dupes}. "
+            "Repeating an id to oversubscribe a device is no longer supported here; "
+            "express sharing per-task instead, e.g. Task(ngpus_per_process=0.25) "
+            "to let 4 tasks share one GPU."
+        )
+    return ids
+
+
 class SystemConfig(BaseModel):
     """Input configuration of the system"""
 
@@ -24,6 +39,16 @@ class SystemConfig(BaseModel):
     ngpus: int = 0
     cpus: List[int] = Field(default_factory=list)
     gpus: List[Union[str, int]] = Field(default_factory=list)
+
+    @field_validator("cpus")
+    @classmethod
+    def _no_duplicate_cpus(cls, v: List[int]) -> List[int]:
+        return _reject_duplicates("cpus", v)
+
+    @field_validator("gpus")
+    @classmethod
+    def _no_duplicate_gpus(cls, v: List[Union[str, int]]) -> List[Union[str, int]]:
+        return _reject_duplicates("gpus", v)
 
 
 def get_system_config(name="aurora"):

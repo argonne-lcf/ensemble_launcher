@@ -343,9 +343,7 @@ class AsyncMaster(Node):
         ]
         first_node = first_job_resource.resources[0]
         if isinstance(first_node, NodeResourceList):
-            first_job_resource.resources[0] = NodeResourceList(
-                cpus=first_node.cpus[1:], gpus=first_node.gpus
-            )
+            first_job_resource.resources[0] = first_node.with_cpus(first_node.cpus[1:])
         else:
             first_job_resource.resources[0] = NodeResourceCount(
                 ncpus=first_node.cpu_count - 1, ngpus=first_node.gpu_count

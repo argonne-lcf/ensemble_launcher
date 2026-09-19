@@ -91,11 +91,13 @@ class AsyncMPIExecutor(Executor):
         cfg = self._mpi_config
         ppn = job_resource.resources[0].cpu_count
         nnodes = len(job_resource.nodes)
-        ngpus_per_process = (
-            job_resource.resources[0].gpu_count // job_resource.resources[0].cpu_count
-            if job_resource.resources[0].cpu_count > 0
-            else 0
-        )
+        # Rational gpus-per-rank as (num_gpu_ids, ppn) rather than a floored
+        # integer division, so fractional requests (e.g. 1 GPU id shared by
+        # 4 ranks) are not silently rounded down to 0. num_gpu_ids is the
+        # count of *distinct* granted ids (always integral -- a fractional
+        # amount still reserves its id once), which is exactly what the
+        # affinity scripts index into via AVAILABLE_GPUS.
+        num_gpu_ids = len(job_resource.resources[0].gpus)
 
         env = {}
         launcher_cmd = []
@@ -149,7 +151,7 @@ class AsyncMPIExecutor(Executor):
                         f"Unknown cpu_bind_method '{cfg.cpu_bind_method}'. Not setting affinity."
                     )
 
-            if ngpus_per_process > 0:
+            if num_gpu_ids > 0:
                 ##defaults to Aurora (Level zero)
                 self.logger.info(f"Using {self.gpu_selector} for pinning GPUs")
                 common_gpus = set.intersection(
@@ -168,14 +170,14 @@ class AsyncMPIExecutor(Executor):
                     if nnodes == 1 and ppn == 1:
                         env.update(
                             {
-                                "ZE_AFFINITY_MASK": ",".join(
+                                self.gpu_selector: ",".join(
                                     [str(i) for i in job_resource.resources[0].gpus]
                                 )
                             }
                         )
                     else:
                         bash_script = gen_affinity_bash_script_1(
-                            ngpus_per_process, self.gpu_selector
+                            num_gpu_ids, ppn, self.gpu_selector
                         )
                         if self._use_local_tmp:
                             setup_files["gpu_affinity"] = bash_script
@@ -196,7 +198,7 @@ class AsyncMPIExecutor(Executor):
                         )
                 else:
                     bash_script = gen_affinity_bash_script_2(
-                        ngpus_per_process, self.gpu_selector
+                        num_gpu_ids, ppn, self.gpu_selector
                     )
                     if self._use_local_tmp:
                         setup_files["gpu_affinity"] = bash_script

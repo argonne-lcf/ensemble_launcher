@@ -385,7 +385,7 @@ class ClusterClient:
         kwargs: Dict = {},
         nnodes: int = 1,
         ppn: int = 1,
-        ngpus_per_process: int = 0,
+        ngpus_per_process: Union[int, float] = 0,
         serialize_executable_by_value: bool = True,
     ) -> Task:
         """Wrap a callable or shell string in a Task with the given resource spec."""
@@ -478,7 +478,7 @@ class ClusterClient:
         *args,
         nnodes: int = 1,
         ppn: int = 1,
-        ngpus_per_process: int = 0,
+        ngpus_per_process: Union[int, float] = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
         serialize_executable_by_value: bool = True,
         **kwargs,
@@ -521,7 +521,7 @@ class ClusterClient:
         iterable: Iterable,
         nnodes: int = 1,
         ppn: int = 1,
-        ngpus_per_process: int = 0,
+        ngpus_per_process: Union[int, float] = 0,
         dependencies: Optional[List[ConcurrentFuture]] = None,
         serialize_executable_by_value: bool = True,
         **kwargs,
