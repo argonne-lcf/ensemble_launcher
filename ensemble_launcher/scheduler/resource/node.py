@@ -1,9 +1,15 @@
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Tuple, Union
 
 from ensemble_launcher.config import SystemConfig
+
+# A GPU device id. Polaris and most CUDA/ROCm systems use ints (0, 1, 2, 3);
+# aurora uses numeric strings ("0" .. "11"), which is why ordering goes
+# through _amount_sort_key rather than a plain sorted(). Mirrors
+# SystemConfig.gpus (List[Union[str, int]]) and Task.gpu_affinity.
+GpuId = Union[int, str]
 
 # Amounts are rounded to this many decimals everywhere so that repeated
 # allocate/deallocate cycles of fractional GPUs (e.g. 0.1 ten times) don't
@@ -16,7 +22,7 @@ def _round_amount(x: float) -> float:
     return round(float(x), _AMOUNT_DECIMALS)
 
 
-def _amount_sort_key(gpu_id: Any):
+def _amount_sort_key(gpu_id: GpuId):
     """
     Canonical ordering for GPU ids. ``SystemConfig.gpus`` mixes ``int`` ids
     (e.g. polaris: ``[0, 1, 2, 3]``) and numeric ``str`` ids (e.g. aurora:
@@ -31,7 +37,7 @@ def _amount_sort_key(gpu_id: Any):
         return (1, str(gpu_id))
 
 
-def _normalize_gpu_amounts(gpus: Any) -> Tuple[Tuple[Any, float], ...]:
+def _normalize_gpu_amounts(gpus: Iterable[GpuId]) -> Tuple[Tuple[GpuId, float], ...]:
     """
     Normalize the ``gpus=`` constructor argument into a canonical, sorted
     tuple of ``(id, amount)`` pairs.
@@ -54,7 +60,7 @@ def _normalize_gpu_amounts(gpus: Any) -> Tuple[Tuple[Any, float], ...]:
             "Task.ngpus_per_process (e.g. 0.25) rather than a custom amount."
         )
 
-    amounts: Dict[Any, float] = {}
+    amounts: Dict[GpuId, float] = {}
     for gid in gpus:
         if isinstance(gid, (tuple, list)):
             raise TypeError(
@@ -73,7 +79,7 @@ def _normalize_gpu_amounts(gpus: Any) -> Tuple[Tuple[Any, float], ...]:
     return tuple(sorted(amounts.items(), key=lambda kv: _amount_sort_key(kv[0])))
 
 
-def _expand_gpu_ids(amount_pairs: Tuple[Tuple[Any, float], ...]) -> Tuple[Any, ...]:
+def _expand_gpu_ids(amount_pairs: Tuple[Tuple[GpuId, float], ...]) -> Tuple[GpuId, ...]:
     """
     The ids held by an (id, amount) mapping, for callers that only care
     "which devices may I use" -- env var construction, ``set()`` comparisons
@@ -289,8 +295,8 @@ class NodeResourceList(NodeResource):
     MPI executors want. The amounts live in ``gpu_amounts``.
     """
 
-    cpus: tuple = field(default_factory=tuple)
-    gpus: Any = field(default_factory=tuple)
+    cpus: tuple[int, ...] = field(default_factory=tuple)
+    gpus: tuple[GpuId, ...] = field(default_factory=tuple)
     # Future: memory: int = 0
 
     def __post_init__(self):
@@ -301,7 +307,7 @@ class NodeResourceList(NodeResource):
 
     @classmethod
     def _from_amounts(
-        cls, cpus: Any, amounts: Dict[Any, float]
+        cls, cpus: Iterable[int], amounts: Dict[GpuId, float]
     ) -> "NodeResourceList":
         """
         Build directly from ``{id: amount}``, bypassing the ids-only
@@ -315,7 +321,7 @@ class NodeResourceList(NodeResource):
         subtracted -- so it means a resource was deallocated twice. Raise
         rather than let the phantom capacity oversubscribe a real GPU.
         """
-        cleaned: Dict[Any, float] = {}
+        cleaned: Dict[GpuId, float] = {}
         for gid, amt in amounts.items():
             rounded = _round_amount(amt)
             if rounded > 1.0 + _EPS:
@@ -335,7 +341,10 @@ class NodeResourceList(NodeResource):
 
     @classmethod
     def request(
-        cls, cpus: Any = (), gpus: Any = (), gpu_fraction: float = 1.0
+        cls,
+        cpus: Iterable[int] = (),
+        gpus: Iterable[GpuId] = (),
+        gpu_fraction: float = 1.0,
     ) -> "NodeResourceList":
         """
         Build a *demand* for ``gpu_fraction`` of each of the given device
@@ -356,12 +365,12 @@ class NodeResourceList(NodeResource):
             cpus, {gid: gpu_fraction for gid, _ in ids}
         )
 
-    def with_cpus(self, cpus: Any) -> "NodeResourceList":
+    def with_cpus(self, cpus: Iterable[int]) -> "NodeResourceList":
         """This node's GPUs (amounts intact) with a different set of CPUs."""
         return self._from_amounts(cpus, dict(self._gpu_amounts))
 
     @property
-    def gpu_amounts(self) -> Dict[Any, float]:
+    def gpu_amounts(self) -> Dict[GpuId, float]:
         """Mapping of gpu id -> available fraction (1.0 == a whole GPU)."""
         return dict(self._gpu_amounts)
 
@@ -376,7 +385,7 @@ class NodeResourceList(NodeResource):
     def _add_impl(self, other: NodeResource) -> "NodeResourceList":
         if isinstance(other, NodeResourceList):
             merged_cpus = tuple((Counter(self.cpus) + Counter(other.cpus)).elements())
-            merged_gpus: Dict[Any, float] = dict(self._gpu_amounts)
+            merged_gpus: Dict[GpuId, float] = dict(self._gpu_amounts)
             for gid, amt in other._gpu_amounts:
                 merged_gpus[gid] = _round_amount(merged_gpus.get(gid, 0.0) + amt)
             return NodeResourceList._from_amounts(merged_cpus, merged_gpus)
@@ -385,7 +394,7 @@ class NodeResourceList(NodeResource):
             next_cpu_id = max(self.cpus) + 1 if self.cpus else 0
             new_cpus = tuple(range(next_cpu_id, next_cpu_id + other.ncpus))
 
-            merged_gpus: Dict[Any, float] = dict(self._gpu_amounts)
+            merged_gpus: Dict[GpuId, float] = dict(self._gpu_amounts)
             remaining = float(other.ngpus)
             if remaining > _EPS:
                 int_ids = [gid for gid in merged_gpus if isinstance(gid, int)]
@@ -405,7 +414,7 @@ class NodeResourceList(NodeResource):
                 (Counter(self.cpus) - Counter(other.cpus)).elements()
             )
             other_map = dict(other._gpu_amounts)
-            remaining_gpus: Dict[Any, float] = {}
+            remaining_gpus: Dict[GpuId, float] = {}
             for gid, amt in self._gpu_amounts:
                 new_amt = _round_amount(amt - other_map.get(gid, 0.0))
                 if new_amt > _EPS:
@@ -416,7 +425,7 @@ class NodeResourceList(NodeResource):
             # fractional) across ids in canonical order.
             remaining_cpus = self.cpus[other.ncpus :]
             demand = _round_amount(other.ngpus)
-            remaining_gpus: Dict[Any, float] = {}
+            remaining_gpus: Dict[GpuId, float] = {}
             for gid, amt in self._gpu_amounts:
                 if demand <= _EPS:
                     remaining_gpus[gid] = amt
