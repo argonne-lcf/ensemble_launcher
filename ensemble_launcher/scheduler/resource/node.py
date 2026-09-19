@@ -99,6 +99,22 @@ def _plan_gpu_take(
     4-GPU node the first three share GPU 0 (leaving 0.1) and the fourth
     moves to GPU 1, rather than the fourth straddling both.
 
+    Why a shared helper rather than the check inlined in each caller:
+    ``__contains__`` and ``_sub_impl`` have to agree exactly. When they did
+    not, ``__contains__`` approved a request on total free capacity that
+    ``_sub_impl`` then satisfied by straddling two devices. Routing both
+    through one planner makes the feasibility test *be* the subtraction:
+    ``__contains__`` asks whether a plan exists, ``_sub_impl`` applies it.
+    Note a per-device test alone ("does any one GPU have room") cannot
+    replace this -- it answers False for ``ngpus=2`` on an idle 4-GPU node,
+    since no single device holds 2.0. Counting whole devices and placing a
+    remainder are two different questions, and this function is where they
+    are answered together.
+
+    ``_add_impl`` deliberately does not use this: ``deallocate`` returns the
+    granted resource, which ``allocate`` built by subtraction, so it is
+    always a ``NodeResourceList`` carrying explicit ids.
+
     Returns ``{gpu_id: amount_to_take}``, which the caller subtracts.
     """
     demand = _round_amount(demand)
