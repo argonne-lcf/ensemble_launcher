@@ -73,9 +73,10 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         task_args: Tuple = (),
         task_kwargs: Dict = {},
         env: Dict[str, Any] = {},
+        driver_only: bool = False,
         **kwargs,
     ) -> AsyncFuture:
-        if len(job_resource.nodes) > 1:
+        if len(job_resource.nodes) > 1 and not driver_only:
             raise ValueError(
                 "MultiProcessingExecutor can only execute single node tasks"
             )
@@ -95,6 +96,15 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
             elif isinstance(req, NodeResourceList):
                 gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
             env.update({self._gpu_selector: gpu_ids})
+
+        if driver_only:
+            env = dict(env)  # do not mutate the caller's dict
+            env["EL_TASK_NODES"] = ",".join(str(n) for n in job_resource.nodes)
+            env["EL_TASK_NNODES"] = str(len(job_resource.nodes))
+            for i, r in enumerate(job_resource.resources):
+                if isinstance(r, NodeResourceList):
+                    env[f"EL_TASK_CPUS_{i}"] = ",".join(str(c) for c in r.cpus)
+                    env[f"EL_TASK_GPUS_{i}"] = ",".join(str(g) for g in r.gpus)
 
         if callable(fn):
             future = super().submit(
