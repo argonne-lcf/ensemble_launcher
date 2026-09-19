@@ -37,19 +37,41 @@ system_config = SystemConfig(
 | `cpus` | `List[int]` | `[]` | Specific CPU IDs |
 | `gpus` | `List[Union[str, int]]` | `[]` | Specific GPU IDs |
 
-### GPU Overloading
+### Sharing a GPU across tasks
 
-You can overload GPUs by repeating IDs in the `gpus` list. The scheduler treats each entry as a separate GPU slot:
+> **Breaking change:** `SystemConfig` used to let you "overload" a GPU by
+> repeating its ID in the `gpus` list (e.g. `gpus=['0', '0', '1', '1']`), and
+> the scheduler treated each repeated entry as a separate slot. Duplicate IDs
+> in `cpus`/`gpus` now raise a `ValidationError` instead. That mechanism was
+> cluster-wide and node-scoped -- every task on the node could oversubscribe
+> the GPU, with no way to say how many tasks should actually share it.
+
+Sharing is now expressed per task via `Task.ngpus_per_process`, which accepts
+a fraction:
 
 ```python
 system_config = SystemConfig(
     name="my_cluster",
     cpus=list(range(104)),
-    gpus=['0', '0', '1', '1', '2', '3']  # GPU 0 and 1 are overloaded
+    gpus=[0, 1, 2, 3],  # each ID must be unique
+)
+
+# Four tasks at ngpus_per_process=0.25 share GPU 0 concurrently; a fifth
+# will not be scheduled until one of them completes.
+task = Task(
+    task_id="t0",
+    nnodes=1,
+    ppn=1,
+    ngpus_per_process=0.25,
+    executable="my_program",
 )
 ```
 
-The scheduler sees 6 GPU slots instead of 4, allowing more tasks to share GPUs 0 and 1.
+Internally each GPU ID is tracked as an available fraction starting at
+`1.0`; a request subtracts `ngpus_per_process` from the ID(s) it is granted
+and the fraction is restored on completion. This makes the sharing decision
+explicit at the task that wants it, instead of an invisible cluster-wide
+setting.
 
 ## LauncherConfig
 

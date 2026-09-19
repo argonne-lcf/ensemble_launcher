@@ -133,7 +133,17 @@ when all ranks on various nodes use the same GPU
 """
 
 
-def gen_affinity_bash_script_1(ngpus_per_process: int, gpu_selector: str) -> str:
+def gen_affinity_bash_script_1(num_gpus: int, num_ranks: int, gpu_selector: str) -> str:
+    """
+    ``num_gpus / num_ranks`` is the (possibly fractional) number of GPUs each
+    rank should get. Expressed as the rational ``num_gpus/num_ranks`` rather
+    than a pre-divided float so the slice math below stays in bash integer
+    arithmetic: ``start_idx`` is the floor of ``rank * num_gpus / num_ranks``,
+    and the slice length is ``num_gpus // num_ranks`` when that is at least
+    1 (multiple whole GPUs per rank), or 1 when ranks share a single GPU
+    (``num_gpus < num_ranks``, e.g. 1 GPU shared by 4 ranks all resolve to
+    the same index).
+    """
     bash_script = [
         "#!/bin/bash",
         "##get the free gpus from the environment variable",
@@ -152,8 +162,10 @@ def gen_affinity_bash_script_1(ngpus_per_process: int, gpu_selector: str) -> str
         if gpu_selector == "ZE_AFFINITY_MASK"
         else "",
         "# Calculate the GPUs assigned to this rank",
-        f"start_idx=$((_MPI_RANKID * {ngpus_per_process}))",
-        f"rank_gpus=$(IFS=','; echo \"${{my_free_gpus[@]:${{start_idx}}:{ngpus_per_process}}}\")",
+        f"start_idx=$(( (_MPI_RANKID * {num_gpus}) / {num_ranks} ))",
+        f"num_gpus_per_rank=$(( {num_gpus} / {num_ranks} ))",
+        "if [ \"$num_gpus_per_rank\" -lt 1 ]; then num_gpus_per_rank=1; fi",
+        f"rank_gpus=$(IFS=','; echo \"${{my_free_gpus[@]:${{start_idx}}:${{num_gpus_per_rank}}}}\")",
         f"export {gpu_selector}" + r"=${rank_gpus}",
         '"$@"',
     ]
@@ -166,9 +178,12 @@ when all ranks on various nodes use different GPUs
 """
 
 
-def gen_affinity_bash_script_2(ngpus_per_process: int, gpu_selector: str) -> str:
+def gen_affinity_bash_script_2(num_gpus: int, num_ranks: int, gpu_selector: str) -> str:
     """
     the below bash script is adapted from gpu_tile_compact.sh script from aurora
+
+    See ``gen_affinity_bash_script_1`` for the ``num_gpus/num_ranks`` slicing
+    rationale; this variant differs only in reading a per-hostname GPU list.
     """
     bash_script = [
         "#!/bin/bash",
@@ -190,8 +205,10 @@ def gen_affinity_bash_script_2(ngpus_per_process: int, gpu_selector: str) -> str
         if gpu_selector == "ZE_AFFINITY_MASK"
         else "",
         "# Calculate the GPUs assigned to this rank",
-        f"start_idx=$((_MPI_RANKID * {ngpus_per_process}))",
-        f"rank_gpus=$(IFS=','; echo \"${{my_free_gpus[@]:${{start_idx}}:{ngpus_per_process}}}\")",
+        f"start_idx=$(( (_MPI_RANKID * {num_gpus}) / {num_ranks} ))",
+        f"num_gpus_per_rank=$(( {num_gpus} / {num_ranks} ))",
+        "if [ \"$num_gpus_per_rank\" -lt 1 ]; then num_gpus_per_rank=1; fi",
+        f"rank_gpus=$(IFS=','; echo \"${{my_free_gpus[@]:${{start_idx}}:${{num_gpus_per_rank}}}}\")",
         f"export {gpu_selector}" + r"=${rank_gpus}",
         '"$@"',
     ]

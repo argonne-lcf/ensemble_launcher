@@ -41,7 +41,7 @@ class MultiprocessingExecutor(Executor):
         
         if req.gpu_count > 0:
             if isinstance(req, NodeResourceCount):
-                gpu_ids = ",".join([str(gpu) for gpu in req.gpu_count])
+                gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
                 self.logger.warning(f"Received non-zero gpu request using NodeResourceCount. Oversubscribing")
             elif isinstance(req, NodeResourceList):
                 gpu_ids = ",".join([str(gpu) for gpu in req.gpus])

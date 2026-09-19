@@ -89,7 +89,7 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         if req.gpu_count > 0:
             if isinstance(req, NodeResourceCount):
-                gpu_ids = ",".join([str(gpu) for gpu in req.gpu_count])
+                gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
                 self.logger.warning(
                     "Received non-zero gpu request using NodeResourceCount. Oversubscribing"
                 )
@@ -262,7 +262,7 @@ class AsyncLokyExecutor:
 
         if req.gpu_count > 0:
             if isinstance(req, NodeResourceCount):
-                gpu_ids = ",".join([str(gpu) for gpu in req.gpu_count])
+                gpu_ids = ",".join([str(gpu) for gpu in req.gpus])
                 self.logger.warning(
                     "Received non-zero gpu request using NodeResourceCount. Oversubscribing"
                 )

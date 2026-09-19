@@ -38,7 +38,13 @@ class MPIExecutor(Executor):
 
         ppn = job_resource.resources[0].cpu_count
         nnodes = len(job_resource.nodes)
-        ngpus_per_process = job_resource.resources[0].gpu_count//job_resource.resources[0].cpu_count
+        # Rational gpus-per-rank as (num_gpu_ids, ppn) rather than a floored
+        # integer division, so fractional requests (e.g. 1 GPU id shared by
+        # 4 ranks) are not silently rounded down to 0. num_gpu_ids is the
+        # count of *distinct* granted ids (always integral -- a fractional
+        # amount still reserves its id once), which is exactly what the
+        # affinity scripts index into via AVAILABLE_GPUS.
+        num_gpu_ids = len(job_resource.resources[0].gpus)
 
         env = {}
         launcher_cmd = []
@@ -67,16 +73,16 @@ class MPIExecutor(Executor):
             launcher_cmd.append("--cpu-bind")
             launcher_cmd.append(f"list:{cores}")
         
-            if ngpus_per_process > 0:
+            if num_gpu_ids > 0:
                 ##defaults to Aurora (Level zero)
                 self.logger.info(f"Using {self.gpu_selector} for pinning GPUs")
                 common_gpus = set.intersection(*[set(node_resource.gpus) for node_resource in job_resource.resources])
                 use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
                 if use_common_gpus:
                     if nnodes == 1 and ppn == 1:
-                        env.update({"ZE_AFFINITY_MASK": ",".join([str(i) for i in job_resource.resources[0].gpus])})
+                        env.update({self.gpu_selector: ",".join([str(i) for i in job_resource.resources[0].gpus])})
                     else:
-                        bash_script = gen_affinity_bash_script_1(ngpus_per_process,self.gpu_selector)
+                        bash_script = gen_affinity_bash_script_1(num_gpu_ids, ppn, self.gpu_selector)
                         fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
                         if not os.path.exists(fname):
                             with open(fname, "w") as f:
@@ -87,7 +93,7 @@ class MPIExecutor(Executor):
                         ##set environment variables
                         env.update({"AVAILABLE_GPUS": ",".join([str(i) for i in job_resource.resources[0].gpus])})
                 else:
-                    bash_script = gen_affinity_bash_script_2(ngpus_per_process,self.gpu_selector)
+                    bash_script = gen_affinity_bash_script_2(num_gpu_ids, ppn, self.gpu_selector)
                     fname = os.path.join(self.tmp_dir,f"gpu_affinity_file_{task_id}.sh")
                     if not os.path.exists(fname):
                         with open(fname, "w") as f:

@@ -3,7 +3,7 @@ import json
 import struct
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 import cloudpickle
 
@@ -137,7 +137,7 @@ class Status(Message):
     nfailed_tasks: int = 0
     nsuccessful_tasks: int = 0
     nfree_cores: int = 0
-    nfree_gpus: int = 0
+    nfree_gpus: Union[int, float] = 0
     nremaining_tasks: int = 0
     ##performance metrics
     task_throughput: float = 0.0

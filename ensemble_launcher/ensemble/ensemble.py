@@ -162,15 +162,15 @@ class Task(BaseModel):
         req = JobResource(
             resources=[
                 NodeResourceCount(
-                    ncpus=self.ppn, ngpus=int(self.ngpus_per_process * self.ppn)
+                    ncpus=self.ppn, ngpus=self.ngpus_per_process * self.ppn
                 )
                 for i in range(self.nnodes)
             ]
         )
         if len(self.cpu_affinity) > 0 or len(self.gpu_affinity) > 0:
             ncpus = self.ppn * self.nnodes
-            ngpus = int(ncpus * self.ngpus_per_process)
-            if ncpus >= 1 and ngpus >= 1:
+            ngpus = ncpus * self.ngpus_per_process
+            if ncpus >= 1 and ngpus > 0:
                 if self.cpu_affinity and (
                     self.ngpus_per_process > 0 and not self.gpu_affinity
                 ):
@@ -181,10 +181,16 @@ class Task(BaseModel):
                     # Ignore gpu_affinity if cpu_affinity is not set
                     return req
 
+                # Distribute the (possibly fractional) total GPU demand evenly
+                # across the explicitly requested ids, so a fractional
+                # ngpus_per_process still works with gpu_affinity set.
+                gpu_amount_per_id = ngpus / len(self.gpu_affinity)
                 req = JobResource(
                     resources=[
-                        NodeResourceList(
-                            cpus=tuple(self.cpu_affinity), gpus=tuple(self.gpu_affinity)
+                        NodeResourceList.request(
+                            cpus=tuple(self.cpu_affinity),
+                            gpus=self.gpu_affinity,
+                            gpu_fraction=gpu_amount_per_id,
                         )
                         for node in range(self.nnodes)
                     ]

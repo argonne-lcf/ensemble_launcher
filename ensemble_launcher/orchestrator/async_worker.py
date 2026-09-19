@@ -306,8 +306,8 @@ class AsyncWorker(Node):
                     ncpus=original_head_node.ncpus - 1, ngpus=original_head_node.ngpus
                 )
             else:
-                trimmed_head_node = NodeResourceList(
-                    cpus=original_head_node.cpus[1:], gpus=original_head_node.gpus
+                trimmed_head_node = original_head_node.with_cpus(
+                    original_head_node.cpus[1:]
                 )
 
             self._init_nodes.resources[0] = trimmed_head_node
