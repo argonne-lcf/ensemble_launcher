@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ensemble_launcher.config import SystemConfig
 
@@ -77,6 +77,61 @@ def _normalize_gpu_amounts(gpus: Iterable[GpuId]) -> Tuple[Tuple[GpuId, float], 
         amounts[gid] = 1.0
 
     return tuple(sorted(amounts.items(), key=lambda kv: _amount_sort_key(kv[0])))
+
+
+def _plan_gpu_take(
+    amount_pairs: Tuple[Tuple[GpuId, float], ...], demand: float
+) -> Optional[Dict[GpuId, float]]:
+    """
+    Decide which devices satisfy a ``NodeResourceCount`` demand for
+    ``demand`` GPUs, or return ``None`` if it cannot be satisfied.
+
+    **A fraction of a GPU never spans two physical devices.** 0.3 of a GPU
+    means 0.3 of *one* device; stitching it together from 0.1 of GPU 0 and
+    0.2 of GPU 1 would hand the task ``ZE_AFFINITY_MASK=0,1`` -- two devices
+    it can only partly use -- which is not a thing a caller can ask for.
+    So a sub-1.0 remainder must land on a single device with room for all
+    of it, and a whole-GPU request takes fully-free devices.
+
+    The remainder uses **best fit**: the smallest device that still has room.
+    That fills partly-used devices before breaking into an untouched one, so
+    whole-GPU requests keep finding whole GPUs. With four 0.3 requests on a
+    4-GPU node the first three share GPU 0 (leaving 0.1) and the fourth
+    moves to GPU 1, rather than the fourth straddling both.
+
+    Returns ``{gpu_id: amount_to_take}``, which the caller subtracts.
+    """
+    demand = _round_amount(demand)
+    if demand <= _EPS:
+        return {}
+
+    n_whole = int(demand + _EPS)
+    remainder = _round_amount(demand - n_whole)
+
+    take: Dict[GpuId, float] = {}
+    free = [(gid, amt) for gid, amt in amount_pairs if amt > _EPS]
+
+    # Whole devices first, in canonical order, so integer requests are
+    # unchanged: N GPUs means N untouched devices.
+    if n_whole:
+        whole = [gid for gid, amt in free if amt >= 1.0 - _EPS]
+        if len(whole) < n_whole:
+            return None
+        for gid in whole[:n_whole]:
+            take[gid] = 1.0
+
+    if remainder > _EPS:
+        candidates = [
+            (amt, gid) for gid, amt in free
+            if gid not in take and amt + _EPS >= remainder
+        ]
+        if not candidates:
+            return None
+        # Best fit: tightest device that fits, ties broken canonically.
+        _, gid = min(candidates, key=lambda c: (c[0], _amount_sort_key(c[1])))
+        take[gid] = remainder
+
+    return take
 
 
 def _expand_gpu_ids(amount_pairs: Tuple[Tuple[GpuId, float], ...]) -> Tuple[GpuId, ...]:
@@ -421,18 +476,21 @@ class NodeResourceList(NodeResource):
                     remaining_gpus[gid] = new_amt
             return NodeResourceList._from_amounts(remaining_cpus, remaining_gpus)
         elif isinstance(other, NodeResourceCount):
-            # Remove first N CPUs, and greedily drain other.ngpus (possibly
-            # fractional) across ids in canonical order.
+            # Remove first N CPUs, and take other.ngpus via the shared
+            # planner so a fraction never straddles two physical devices
+            # (see _plan_gpu_take). __contains__ uses the same planner, so
+            # the feasibility check and the subtraction cannot disagree.
             remaining_cpus = self.cpus[other.ncpus :]
-            demand = _round_amount(other.ngpus)
+            plan = _plan_gpu_take(self._gpu_amounts, other.ngpus)
+            if plan is None:
+                raise ValueError(
+                    f"cannot take {other.ngpus} GPUs from {self.gpu_amounts!r}: "
+                    f"no single device has room for the fractional part. "
+                    f"A fraction of a GPU cannot span two devices."
+                )
             remaining_gpus: Dict[GpuId, float] = {}
             for gid, amt in self._gpu_amounts:
-                if demand <= _EPS:
-                    remaining_gpus[gid] = amt
-                    continue
-                take = min(demand, amt)
-                left = _round_amount(amt - take)
-                demand = _round_amount(demand - take)
+                left = _round_amount(amt - plan.get(gid, 0.0))
                 if left > _EPS:
                     remaining_gpus[gid] = left
             return NodeResourceList._from_amounts(remaining_cpus, remaining_gpus)
@@ -449,8 +507,13 @@ class NodeResourceList(NodeResource):
                     return False
             return True
         elif isinstance(other, NodeResourceCount):
-            # Check if we have enough resources (total capacity, not per-id)
-            return other.ncpus <= self.cpu_count and other.ngpus <= self.gpu_count + _EPS
+            # Not a bare total-capacity check: a node with 0.1 free on each
+            # of three devices has 0.3 GPUs free but cannot satisfy a single
+            # 0.3 request, because that fraction has to live on one device.
+            # Defer to the same planner _sub_impl uses.
+            if other.ncpus > self.cpu_count:
+                return False
+            return _plan_gpu_take(self._gpu_amounts, other.ngpus) is not None
         return False
 
     def divide(self, n: int) -> List["NodeResourceList"]:
