@@ -232,6 +232,7 @@ class AsyncMPIExecutor(Executor):
         run_dir: str = os.getcwd(),
         stdout_file: Optional[str] = None,
         stderr_file: Optional[str] = None,
+        **kwargs,
     ):
         task_id = str(uuid.uuid4())
         asyncio_task = asyncio.create_task(
