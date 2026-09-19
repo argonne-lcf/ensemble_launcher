@@ -61,6 +61,11 @@ class Task(BaseModel):
     stdout_file: Optional[str] = None
     stderr_file: Optional[str] = None
     serialize_executable_by_value: bool = True
+    driver_only: bool = False
+    """Reserve nnodes but run a single driver process on one node.
+    The driver launches across the reservation itself (e.g. an ASE calculator
+    that shells out to mpiexec). The full reservation — node list and per-node
+    CPU/GPU ids — is exported to the driver through the environment."""
 
     _packed: bool = PrivateAttr(default=False)
     _raw_deep: Optional[bytes] = PrivateAttr(default=None)

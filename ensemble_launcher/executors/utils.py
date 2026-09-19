@@ -33,16 +33,18 @@ def run_callable_with_affinity(
     original_env = os.environ.copy()
     os.environ.update(env)
 
-    result = fn(*args, **kwargs)
-    os.environ.clear()
-    os.environ.update(original_env)
-    # Reset affinity
-    if cpu_id is not None and original_affinity is not None:
-        try:
-            os.sched_setaffinity(0, original_affinity)
-        except Exception:
-            pass
-            # print(f"Resetting affinity failed with exception {e}")
+    try:
+        result = fn(*args, **kwargs)
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+        # Reset affinity
+        if cpu_id is not None and original_affinity is not None:
+            try:
+                os.sched_setaffinity(0, original_affinity)
+            except Exception:
+                pass
+                # print(f"Resetting affinity failed with exception {e}")
     return result
 
 
