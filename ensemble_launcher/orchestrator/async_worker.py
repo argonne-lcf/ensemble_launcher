@@ -7,7 +7,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
@@ -338,22 +338,17 @@ class AsyncWorker(Node):
         self.logger.debug(f"Pending tasks size {len(self._scheduler._pending_tasks)}")
 
         ##lazy executor creation
-        if isinstance(self._config.task_executor_name, list):
-            assert all(
-                [
-                    executor_name in executor_registry.async_executors
-                    for executor_name in self._config.task_executor_name
-                ]
-            ), (
-                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
-            )
-        else:
-            assert (
-                self._config.task_executor_name in executor_registry.async_executors
-            ), (
-                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+        for executor_name in executor_names:
+            assert executor_name in executor_registry.async_executors, (
+                f"Executor {executor_name} not found in async executors {executor_registry.async_executors}"
             )
 
+        self._warn_unused_executor_configs(executor_names)
+
+        # Arguments every executor may take, derived from this worker's own allocation.
+        # `executor_kwargs` merges the per-executor config over these, so an executor that
+        # wants something different -- a pool sized by GPU rather than by core -- says so in
+        # `executor_configs` rather than here.
         kwargs = {}
         kwargs["logger"] = self.logger.getChild("executor")
         kwargs["gpu_selector"] = self._config.gpu_selector
@@ -363,7 +358,61 @@ class AsyncWorker(Node):
         ##Async mpi specific options
         kwargs["mpi_config"] = self._config.mpi_config
 
-        # Async mpi pool specific options
+        # Async mpi pool specific options. Only that executor reads them, and building
+        # `cpu_to_pid` walks every core of every node, so skip it when it is not in play.
+        if "async_mpi_processpool" in executor_names:
+            kwargs.update(self._mpi_pool_kwargs(original_head_node))
+
+        self._executor = {}
+        for exec_name in executor_names:
+            self._executor[exec_name] = executor_registry.create_executor(
+                exec_name, kwargs=self._config.executor_kwargs(exec_name, **kwargs)
+            )
+        self._default_executor_name = executor_names[0]
+
+        self.logger.info(
+            f"Created {self._config.task_executor_name} executors (Default = {self._default_executor_name})"
+        )
+
+        # Start global monitor tasks
+        self._create_monitor_tasks()
+
+    def _warn_unused_executor_configs(self, executor_names: List[str]) -> None:
+        """Log configured executors this worker will not build, and unrecognised fields.
+
+        ``executor_configs`` is keyed by name and ``ExecutorConfig`` allows extra fields, so
+        both a misspelled executor name and a misspelled field are accepted in silence and
+        simply never take effect. Say so once at startup rather than leaving the user to work
+        out why their setting did nothing.
+        """
+        for name, config in self._config.executor_configs.items():
+            if name not in executor_names:
+                self.logger.warning(
+                    f"{self.node_id}: executor_configs has an entry for {name!r}, which is "
+                    f"not among this worker's task executors {executor_names}. Ignoring it."
+                )
+            extra = config.model_extra or {}
+            if extra:
+                self.logger.warning(
+                    f"{self.node_id}: executor_configs[{name!r}] has fields not declared by "
+                    f"{type(config).__name__}: {sorted(extra)}. They will be passed to the "
+                    "executor's constructor as-is."
+                )
+
+    def _mpi_pool_kwargs(self, original_head_node) -> Dict[str, Any]:
+        """Constructor arguments only ``async_mpi_processpool`` reads.
+
+        The pool launches one long-lived MPI job over the whole allocation and addresses ranks
+        by ``(host, cpu)``, so it needs the launch geometry and the rank map up front.
+
+        Args:
+            original_head_node: The head node's resources *before* the gateway core was
+                trimmed off. The trimmed core is still part of the MPI job -- it runs the
+                gateway rank -- so the geometry has to count it.
+        Returns:
+            ``mpi_info`` and ``cpu_to_pid`` keyword arguments
+        """
+        kwargs: Dict[str, Any] = {}
         np = sum(
             [original_head_node.cpu_count]
             + [node.cpu_count for node in self.nodes.resources[1:]]
@@ -381,17 +430,12 @@ class AsyncWorker(Node):
                     list(map(str, original_head_node.cpus))
                 )
         else:
-            # if (
-            #     "async_mpi_processpool" in executor_names
-            #     and self._config.mpi_config.rankfile_flag is None
-            # ):
             ## TODO: implement rankfile
-            if "async_mpi_processpool" in executor_names:
-                raise ValueError(
-                    f"{self.node_id}: Not all nodes are identical"
-                    f" and MPI flavour {self._config.mpi_config.flavor} doesn't support rankfile."
-                    f"Impossible to initialize async_mpi_processpool."
-                )
+            raise ValueError(
+                f"{self.node_id}: Not all nodes are identical"
+                f" and MPI flavour {self._config.mpi_config.flavor} doesn't support rankfile."
+                f"Impossible to initialize async_mpi_processpool."
+            )
 
         kwargs["cpu_to_pid"] = {}
         pid = 0
@@ -401,28 +445,7 @@ class AsyncWorker(Node):
             for cpu_id in res.cpus:
                 kwargs["cpu_to_pid"][(host, cpu_id)] = pid
                 pid += 1
-
-        if isinstance(self._config.task_executor_name, list):
-            self._executor = {}
-            for exec_name in self._config.task_executor_name:
-                self._executor[exec_name] = executor_registry.create_executor(
-                    exec_name, kwargs=kwargs
-                )
-            self._default_executor_name = self._config.task_executor_name[0]
-        else:
-            self._executor = {
-                self._config.task_executor_name: executor_registry.create_executor(
-                    self._config.task_executor_name, kwargs=kwargs
-                )
-            }
-            self._default_executor_name = self._config.task_executor_name
-
-        self.logger.info(
-            f"Created {self._config.task_executor_name} executors (Default = {self._default_executor_name})"
-        )
-
-        # Start global monitor tasks
-        self._create_monitor_tasks()
+        return kwargs
 
     # --------------------------------------------------------------------------
     #                               Checkpointing

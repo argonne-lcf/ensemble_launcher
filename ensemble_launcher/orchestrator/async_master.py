@@ -781,9 +781,14 @@ class AsyncMaster(Node):
         if self._config.child_executor_name == "async_mpi":
             kwargs["mpi_config"] = self._config.mpi_config
 
-        # Create executor
+        # Create executor. The child executor launches sub-masters and workers rather than
+        # tasks, but it is built from the same registry, so it takes its configuration from
+        # the same place -- `executor_configs` keyed by the executor's name.
         self._executor: Executor = executor_registry.create_executor(
-            self._config.child_executor_name, kwargs=kwargs
+            self._config.child_executor_name,
+            kwargs=self._config.executor_kwargs(
+                self._config.child_executor_name, **kwargs
+            ),
         )
         self.logger.info(f"Created {self._config.child_executor_name} executor")
 

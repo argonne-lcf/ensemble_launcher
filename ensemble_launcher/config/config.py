@@ -2,10 +2,17 @@ import logging
 import multiprocessing as mp
 import secrets
 from collections import Counter
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    field_validator,
+)
 
+from .executor_config import ExecutorConfig, coerce_executor_config
 from .mpi_config import MPIConfig
 
 
@@ -146,6 +153,53 @@ class LauncherConfig(BaseModel):
     mpi_config: MPIConfig = MPIConfig(
         flavor="mpich"
     )  ## Configuration to help build mpi options like -np, -ppn etc
+
+    executor_configs: Dict[str, SerializeAsAny[ExecutorConfig]] = Field(
+        default_factory=dict
+    )
+    """Per-executor constructor arguments, keyed by the executor's registered name.
+
+    The arguments an executor is built with are otherwise either derived at runtime by the
+    orchestrator node constructing it (its logger, its node's core count) or taken from the
+    top-level scalars above, which every executor shares.  An entry here overrides both, so
+    one executor can be configured without disturbing the others -- ``{"async_pinned":
+    {"gpus": [0, 1, 2, 3]}}``.
+
+    ``SerializeAsAny`` is required: annotated as the base class alone, pydantic would serialize
+    to :class:`ExecutorConfig` and silently drop every subclass field on the way to a worker.
+    """
+
+    @field_validator("executor_configs", mode="before")
+    @classmethod
+    def _coerce_executor_configs(cls, value):
+        """Build each entry as the subclass registered for its key.
+
+        The dict key is the discriminator -- an executor name already identifies its
+        configuration class -- so the entries need no tag field of their own.
+        """
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: coerce_executor_config(name, entry) for name, entry in value.items()
+        }
+
+    def executor_kwargs(self, name: str, **runtime: Any) -> Dict[str, Any]:
+        """Constructor arguments for one executor.
+
+        Args:
+            name: The executor's registered name, e.g. ``"async_loky"``
+            runtime: Arguments derived by the caller -- the logger, the node's core count,
+                anything else that cannot be written into a config ahead of time
+        Returns:
+            ``runtime``, with this executor's configured fields merged over it.  With no
+            entry for ``name`` this is ``runtime`` unchanged, so a config that sets no
+            ``executor_configs`` behaves exactly as before.
+        """
+        kwargs = dict(runtime)
+        config = self.executor_configs.get(name)
+        if config is not None:
+            kwargs.update(config.overrides())
+        return kwargs
 
     def model_post_init(self, _) -> None:
         if self.cluster and self.cluster_secret is None:
