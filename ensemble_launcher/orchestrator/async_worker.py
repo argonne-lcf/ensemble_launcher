@@ -354,6 +354,8 @@ class AsyncWorker(Node):
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
+        # async_pinned builds one pool per device, so it needs the ids rather than a count.
+        kwargs["gpus"] = self.nodes.resources[0].gpus
 
         ##Async mpi specific options
         kwargs["mpi_config"] = self._config.mpi_config

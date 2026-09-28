@@ -18,7 +18,7 @@ import *this* package (e.g. ``AsyncMPIExecutor`` needs :class:`MPIConfig`), so t
 table has to live on the config side to keep the two packages acyclic.
 """
 
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 from pydantic import BaseModel, ConfigDict, model_serializer
 
@@ -99,6 +99,24 @@ class AsyncLokyConfig(PoolExecutorConfig):
     """Seconds an idle worker survives before loky reaps it"""
 
 
+class AsyncPinnedConfig(PoolExecutorConfig):
+    """Configuration for ``async_pinned`` (:class:`AsyncPinnedExecutor`)"""
+
+    gpus: Optional[List[Union[int, str]]] = None
+    """Devices to build one pinned pool each for.
+
+    Defaults to the ids of the worker's own node allocation. Set it to restrict the executor
+    to a subset, or to spell ids the allocation does not describe (Aurora's tiles, say).
+
+    Spell the ids the way the system does, as ``SystemConfig.gpus`` has them: polaris
+    describes its devices as ``[0, 1, 2, 3]`` and aurora as ``["0", ..., "11"]``. A grant
+    carries the system's spelling and the executor matches it exactly, so aurora's devices
+    written as ints would match no pool.
+    """
+    timeout: Optional[float] = None
+    """Seconds an idle worker survives before loky reaps it"""
+
+
 class AsyncMPIConfig(ExecutorConfig):
     """Configuration for ``async_mpi`` (:class:`AsyncMPIExecutor`)"""
 
@@ -136,6 +154,7 @@ def get_executor_config_class(name: str) -> Type[ExecutorConfig]:
 register_executor_config("async_processpool", AsyncProcessPoolConfig)
 register_executor_config("async_threadpool", AsyncThreadPoolConfig)
 register_executor_config("async_loky", AsyncLokyConfig)
+register_executor_config("async_pinned", AsyncPinnedConfig)
 register_executor_config("async_mpi", AsyncMPIConfig)
 register_executor_config("async_mpi_processpool", AsyncMPIPoolConfig)
 
@@ -167,6 +186,7 @@ __all__ = [
     "AsyncProcessPoolConfig",
     "AsyncThreadPoolConfig",
     "AsyncLokyConfig",
+    "AsyncPinnedConfig",
     "AsyncMPIConfig",
     "AsyncMPIPoolConfig",
     "register_executor_config",
