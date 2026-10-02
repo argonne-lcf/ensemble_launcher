@@ -1,8 +1,9 @@
+import copy
 import logging
 from abc import ABC, abstractmethod
 from itertools import accumulate
 from logging import Logger
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 
@@ -21,7 +22,73 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class Policy(ABC):
+class PolicyStateMixin:
+    """Externally readable/writable key-value state, shared by both policy ABCs.
+
+    The state is a plain ``dict`` that policies read from inside their decision
+    methods (``get_score``, ``get_children_tasks``, ...). It is seeded from
+    :attr:`PolicyConfig.initial_state` and can be updated at runtime from outside
+    the orchestrator through ``PolicyClient``, which lets a policy react to
+    *workflow* state and not just to the scheduler state it is handed per call.
+
+    Contract for policy authors: :meth:`set_policy_state` and
+    :meth:`on_state_update` run on the orchestrator's event loop and must be
+    synchronous and non-blocking. No file I/O, no network, no ``time.sleep``.
+    """
+
+    def _init_policy_state(self, initial: Optional[Dict[str, Any]] = None) -> None:
+        self._policy_state: Dict[str, Any] = dict(initial) if initial else {}
+
+    @property
+    def state(self) -> Dict[str, Any]:
+        """The live state dict. Read this from inside decision methods."""
+        # Subclasses may forget to call _init_policy_state(); don't make that fatal.
+        if not hasattr(self, "_policy_state"):
+            self._policy_state = {}
+        return self._policy_state
+
+    def get_policy_state(self, keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Return a deep copy of the state, optionally restricted to ``keys``.
+
+        A copy, so a caller (including the endpoint's rollback snapshot) cannot
+        mutate policy state by holding on to the returned dict.
+        """
+        state = self.state
+        if keys is None:
+            return copy.deepcopy(state)
+        return copy.deepcopy({k: state[k] for k in keys if k in state})
+
+    def set_policy_state(
+        self, state: Dict[str, Any], merge: bool = True
+    ) -> Dict[str, Any]:
+        """Update the state and return a deep copy of the result.
+
+        Args:
+            state: New keys/values.
+            merge: ``True`` updates only the supplied keys; ``False`` replaces
+                the whole state.
+        """
+        if not isinstance(state, dict):
+            raise TypeError(f"policy state must be a dict, got {type(state).__name__}")
+        current = self.state
+        if merge:
+            current.update(copy.deepcopy(state))
+        else:
+            current.clear()
+            current.update(copy.deepcopy(state))
+        self.on_state_update(copy.deepcopy(state))
+        return copy.deepcopy(current)
+
+    def on_state_update(self, changed: Dict[str, Any]) -> None:
+        """Hook for recomputing values derived from the state.
+
+        Called after every :meth:`set_policy_state`. MUST be synchronous and
+        non-blocking -- see the class docstring.
+        """
+        pass
+
+
+class Policy(PolicyStateMixin, ABC):
     def __init__(
         self,
         policy_config: PolicyConfig = PolicyConfig(),
@@ -29,6 +96,7 @@ class Policy(ABC):
     ):
         self.policy_config = policy_config
         self.logger = logger if logger is not None else logging.getLogger(__name__)
+        self._init_policy_state(getattr(policy_config, "initial_state", None))
 
     @abstractmethod
     def get_score(
@@ -70,7 +138,7 @@ class Policy(ABC):
         pass
 
 
-class ChildrenPolicy(ABC):
+class ChildrenPolicy(PolicyStateMixin, ABC):
     def __init__(
         self,
         policy_config: PolicyConfig = PolicyConfig(),
@@ -80,6 +148,7 @@ class ChildrenPolicy(ABC):
         self.policy_config = policy_config
         self.node_id = node_id
         self.logger = logger if logger is not None else logging.getLogger(__name__)
+        self._init_policy_state(getattr(policy_config, "initial_state", None))
 
     @abstractmethod
     def get_children_resources(

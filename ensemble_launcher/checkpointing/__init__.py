@@ -3,6 +3,7 @@ from .checkpointer import (
     CommCheckpointData,
     TasksCheckpointData,
     ResultCheckpointData,
+    PolicyStateCheckpointData,
     Checkpointer,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "CommCheckpointData",
     "TasksCheckpointData",
     "ResultCheckpointData",
+    "PolicyStateCheckpointData",
     "Checkpointer",
 ]

@@ -22,6 +22,14 @@ class PolicyConfig(BaseModel):
     nchildren: int = 1
     leaf_nodes: int = 1
     strict_priority: bool = False  # If True, tasks are scheduled in strict priority order (no lower-priority task runs before a higher-priority one)
+    initial_state: Dict[str, Any] = Field(default_factory=dict)
+    """Seeds ``policy.state``, the mutable key-value state exposed by ``PolicyStateMixin``.
+
+    Unlike the fields above -- which configure the policy once, at construction -- this is
+    read by the policy on every decision and can be rewritten at runtime from outside the
+    orchestrator via ``PolicyClient``. Put anything a controller or autotuner might want to
+    adjust mid-run here (weights, thresholds, pinning hints).
+    """
 
 
 def _reject_duplicates(field_name: str, ids: list) -> list:
@@ -113,6 +121,13 @@ class LauncherConfig(BaseModel):
         False  ##If True, master will listen for task requests from worker children
     )
     cluster: bool = False  # Eager result delivery + submit() API
+    enable_policy_client: bool = False
+    """Serve each node's scheduling-policy state over a ZMQ endpoint for ``PolicyClient``.
+
+    Gated separately from ``cluster`` because tuning a policy is useful in a plain blocking
+    ``run()`` too. Requires ``checkpoint_dir`` -- clients discover the endpoint from disk.
+    Implied by ``cluster=True``.
+    """
     checkpoint_dir: Optional[str] = (
         None  # Directory for checkpoints; None disables checkpointing
     )

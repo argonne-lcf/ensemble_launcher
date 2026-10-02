@@ -106,6 +106,7 @@ launcher_config = LauncherConfig(
 | `cluster` | `bool` | `False` | Enable cluster mode |
 | `checkpoint_dir` | `str` or `None` | `None` | Checkpoint directory for cluster mode |
 | `enable_workstealing` | `bool` | `False` | Enable work-stealing scheduler |
+| `enable_policy_client` | `bool` | `False` | Serve policy state for `PolicyClient`. Implied by `cluster=True`; needs `checkpoint_dir` either way. |
 | `children_scheduler_policy` | `str` | `"simple_split_children_policy"` | Policy for partitioning resources across children |
 | `task_scheduler_policy` | `str` | `"large_resource_policy"` | Policy for task scoring/priority |
 | `policy_config` | `PolicyConfig` | `PolicyConfig()` | Configuration passed to scheduling policies |
@@ -134,8 +135,12 @@ policy_config = PolicyConfig(
 | `nchildren` | `int` | `1` | Number of children per master |
 | `leaf_nodes` | `int` | `1` | Target number of leaf (worker) nodes |
 | `strict_priority` | `bool` | `False` | If `True`, tasks are scheduled in strict priority order |
+| `initial_state` | `Dict[str, Any]` | `{}` | Seeds the policy's mutable `self.state`, readable and updatable at runtime via `PolicyClient` |
 
 `PolicyConfig` accepts extra fields (`extra="allow"`) so custom policies can define their own parameters.
+
+See [Custom Scheduling](custom-scheduling.md#stateful--auto-tunable-policies) for how
+`initial_state` and `PolicyClient` combine to let a policy be retuned mid-run.
 
 ## Resource Pinning
 

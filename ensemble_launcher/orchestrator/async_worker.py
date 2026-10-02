@@ -39,6 +39,7 @@ from ensemble_launcher.executors import (
 )
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.profiling import EventRegistry, get_registry
+from ensemble_launcher.orchestrator.policy_endpoint import KIND_TASK, PolicyEndpoint
 from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -109,6 +110,10 @@ class AsyncWorker(Node):
         # Cached checkpoint data — populated early in _lazy_init() before sockets are set up.
         self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
         self._ckpt_results: Optional[dict] = None  # {task_id: Result}
+
+        # Externally tunable task-policy state (see policy_endpoint.py).
+        self._policy_endpoint: Optional[PolicyEndpoint] = None
+        self._policy_version_written: int = -1
 
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
@@ -332,6 +337,8 @@ class AsyncWorker(Node):
         # Restore scheduler state from cached checkpoint data (comm already restored).
         self._restore_scheduler_checkpoint()
 
+        await self._create_policy_endpoint()
+
         self._scheduler.start_monitoring()  # start the scheduler monitoring
 
         self.logger.info(f"Running {list(self.tasks.keys())} tasks")
@@ -517,10 +524,59 @@ class AsyncWorker(Node):
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
 
+    async def _create_policy_endpoint(self) -> None:
+        """Serve this worker's task-policy state to external ``PolicyClient``s.
+
+        Created before ``start_monitoring`` so a tune that lands immediately after
+        startup cannot race the first dispatch, and started here rather than in
+        ``_create_monitor_tasks`` so the address file exists before the node reports
+        ready.
+
+        Unlike the master, a worker registers a ``rescore_cb``: task priorities are
+        cached in the pending heap at push time, so without it a tune would only
+        affect tasks submitted afterwards.
+        """
+        if not (self._config.cluster or self._config.enable_policy_client):
+            return
+        if self._checkpointer is None:
+            self.logger.warning(
+                f"{self.node_id}: policy endpoint requested but checkpoint_dir is "
+                "unset; PolicyClient discovery is file-based, so none will be served"
+            )
+            return
+
+        self._policy_endpoint = PolicyEndpoint(
+            self.node_id,
+            self._checkpointer,
+            self.logger.getChild("policy"),
+        )
+        self._policy_endpoint.register(
+            KIND_TASK,
+            self._scheduler.policy,
+            rescore_cb=self._scheduler.reprioritize_pending,
+        )
+        self._policy_endpoint.restore(await self._checkpointer.read_policy_state())
+        await self._policy_endpoint.start()
+
+    async def _write_policy_checkpoint(self) -> None:
+        """Persist tuned policy state, skipping the write when nothing changed.
+
+        ``version`` only advances on a successful ``set``, so an untuned run never
+        pays for this on top of every report interval.
+        """
+        if self._policy_endpoint is None:
+            return
+        version = self._policy_endpoint.version
+        if version == self._policy_version_written:
+            return
+        await self._checkpointer.write_policy_state(self._policy_endpoint.snapshot())
+        self._policy_version_written = version
+
     async def _write_checkpoint(self) -> None:
         """Write scheduler state, comm state, and completed results to checkpoint."""
         if self._checkpointer is None:
             return
+        await self._write_policy_checkpoint()
         await self._checkpointer.write_checkpoint(
             scheduler_state=self._scheduler.get_state(self.node_id),
             comm_state=self._comm.get_state(),
@@ -1099,6 +1155,9 @@ class AsyncWorker(Node):
         if self._checkpointer:
             await self._write_checkpoint()
             self.logger.info(f"{self.node_id}: Final checkpoint written")
+
+        if self._policy_endpoint is not None:
+            await self._policy_endpoint.stop()
 
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()

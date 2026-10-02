@@ -81,14 +81,14 @@ class MyCustomPolicy(ChildrenPolicy):
 
 ## Writing a Custom Task Scoring Policy
 
-Subclass `Policy` and implement the `score` method:
+Subclass `Policy` and implement the `get_score` method:
 
 ```python
 from ensemble_launcher.scheduler import Policy, policy_registry
 
 @policy_registry.register("my_scoring_policy")
 class MyScoringPolicy(Policy):
-    def score(self, task, scheduler_state):
+    def get_score(self, task, scheduler_state=None):
         """Return a numeric score; higher = higher priority."""
         return task.nnodes * task.ppn
 
@@ -96,6 +96,116 @@ class MyScoringPolicy(Policy):
         """Optional: react to task completions."""
         pass
 ```
+
+## Stateful / Auto-tunable Policies
+
+Every policy -- both families -- carries a mutable `self.state` dict. Policies can
+therefore react to **workflow** state, not just to the `SchedulerState` snapshot they are
+handed on each call. An external process reads and updates that state while the run is in
+flight, via `PolicyClient`.
+
+### Reading state inside a policy
+
+Seed the state from `PolicyConfig.initial_state` and read it wherever you make a decision:
+
+```python
+@policy_registry.register("gpu_weighted_policy")
+class GPUWeightedPolicy(Policy):
+    def get_score(self, task, scheduler_state=None):
+        # self.state is live -- it reflects the most recent set_state.
+        gpus = task.ngpus_per_process * task.ppn * task.nnodes
+        return gpus * self.state.get("gpu_weight", 1.0)
+
+    def on_state_update(self, changed):
+        """Optional hook, called after every state update.
+
+        Use it to recompute anything derived from the state. MUST be synchronous
+        and non-blocking -- see the contract below.
+        """
+        self._threshold = self.state.get("gpu_weight", 1.0) * 2
+```
+
+```python
+launcher_config = LauncherConfig(
+    task_scheduler_policy="gpu_weighted_policy",
+    policy_config=PolicyConfig(initial_state={"gpu_weight": 1.0}),
+    checkpoint_dir="/scratch/my_run",
+    enable_policy_client=True,
+)
+```
+
+### Tuning it from outside
+
+```python
+from ensemble_launcher.orchestrator import ClusterClient, PolicyClient
+
+with ClusterClient(checkpoint_dir=ckpt) as cc, \
+     PolicyClient(ckpt, node_id="main.w0") as pc:
+
+    print(pc.get_state())                       # {'gpu_weight': 1.0}
+    pc.set_state({"gpu_weight": 8.0})           # merge by default
+    futs = [cc.submit(t) for t in next_round]
+```
+
+`PolicyClient` requires `checkpoint_dir` to be set, plus either `cluster=True` or
+`enable_policy_client=True`. Discovery is file-based: each node publishes its endpoint
+address to `{node_id}_policy.ckpt` in its checkpoint directory.
+
+| Method | Notes |
+|---|---|
+| `get_state(keys=None)` | Returns a deep copy. `keys` filters; absent keys are omitted, not `None`. |
+| `set_state(state, merge=True, rescore=False)` | `merge=False` replaces the whole state. Returns the resulting state. |
+| `get_state_async` / `set_state_async` | Same, returning a `concurrent.futures.Future`. |
+| `PolicyClient.discover_nodes(ckpt)` | Lists every node serving an endpoint. |
+| `PolicyGroupClient(ckpt, node_ids=None)` | Fans out; returns `{node_id: state}`. |
+
+A `PolicyGroupClient` call is **not** atomic across nodes, though each individual node's
+update is all-or-nothing.
+
+### Which policy gets tuned
+
+Each node hosts exactly one policy, so `policy_kind` defaults to `"auto"`:
+
+- a **worker** hosts its task policy, kind `"task"`
+- a **master** hosts its children policy, kind `"children"`
+
+Passing a `policy_kind` the node does not host is an error, never a silent write to the
+wrong policy.
+
+### `rescore` -- and why it defaults to off
+
+A task's priority is computed **once**, when it enters the worker's pending heap. The heap
+is a cache of scores, so changing policy state does nothing to work already queued:
+by default `set_state` only affects tasks submitted *afterwards*.
+
+`set_state(..., rescore=True)` invalidates that cache, re-scoring every pending task
+against the new state. It is off by default because reordering a live queue is a visible
+scheduling change that costs one `get_score` per pending task, run synchronously on the
+orchestrator's event loop -- it should never happen as a side effect of a tune the caller
+thought was passive.
+
+Scope: the pending heap only. Running tasks are already dispatched and are not reordered;
+completed and failed tasks are untouched. Rescoring is worker-only -- on a master the
+response reports `rescored: None`, and the new children-policy state takes effect at the
+next natural assignment point instead.
+
+### Safety guarantees
+
+- **Atomic with respect to policy decisions.** Everything runs on one event loop and the
+  endpoint's apply path is fully synchronous, so a `set_state` can never land in the middle
+  of a scoring or assignment decision.
+- **A failed tune is a no-op.** If the new state makes `get_score` raise -- which surfaces
+  during the rescore -- both the state and the pending heap are rolled back and the client
+  gets a `PolicyStateError`. Without this, one bad `set_state` would wedge the worker,
+  since every subsequent submission calls `get_score`.
+- **Tuned state is durable.** It is checkpointed and restored, so it survives a node
+  restart rather than silently reverting to `initial_state`.
+
+### Contract for policy authors
+
+`set_policy_state` and `on_state_update` run on the orchestrator's event loop. They **must
+be synchronous and non-blocking**: no file I/O, no network calls, no `time.sleep`. The
+atomicity guarantee above depends on it.
 
 ## Loading External Policies
 

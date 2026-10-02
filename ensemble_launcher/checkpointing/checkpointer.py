@@ -7,6 +7,9 @@ Each component is written to its own file so they can be updated independently:
   ``{node_id}_comm.json``       — CommCheckpointData (type name + serialised state)
   ``{node_id}_tasks.json``      — TasksCheckpointData (cloudpickled task dict)
   ``{node_id}_results.json``    — ResultCheckpointData (cloudpickled result dict)
+  ``{node_id}_policy.ckpt``     — PolicyEndpoint ROUTER address (for PolicyClient)
+  ``{node_id}_policy_secret``   — PolicyEndpoint shared secret (mode 0600)
+  ``{node_id}_policy_state.json`` — PolicyStateCheckpointData (cloudpickled, per kind)
 
 All arguments to ``write_checkpoint`` are optional; only the provided components
 are written.  ``read_checkpoint`` returns ``None`` when no metadata file exists,
@@ -29,7 +32,7 @@ import stat
 import tempfile
 import time
 from logging import Logger
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import cloudpickle
 from pydantic import BaseModel
@@ -85,6 +88,12 @@ class ResultCheckpointData(BaseModel):
     """Written to ``{node_id}_results.json``."""
 
     results_b64: str
+
+
+class PolicyStateCheckpointData(BaseModel):
+    """Written to ``{node_id}_policy_state.json``."""
+
+    state_b64: str
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +187,27 @@ class Checkpointer:
     def secret_path(self) -> str:
         return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_secret")
 
+    @property
+    def policy_endpoint_path(self) -> str:
+        """ZMQ address of this node's ``PolicyEndpoint``, for ``PolicyClient`` discovery."""
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_policy.ckpt")
+
+    @property
+    def policy_secret_path(self) -> str:
+        """Shared secret authenticating policy clients.
+
+        Deliberately distinct from ``secret_path``: that one is the cluster secret,
+        which only exists when ``cluster=True`` and carries the capability to submit
+        arbitrary tasks. Tuning a policy should not require it.
+        """
+        return os.path.join(self.checkpoint_sub_dir, f"{self.node_id}_policy_secret")
+
+    @property
+    def policy_state_path(self) -> str:
+        return os.path.join(
+            self.checkpoint_sub_dir, f"{self.node_id}_policy_state.json"
+        )
+
     # ------------------------------------------------------------------
     # Synchronous I/O helpers (dispatched to a thread via run_in_executor)
     # ------------------------------------------------------------------
@@ -219,8 +249,9 @@ class Checkpointer:
         with open(path, "r") as fh:
             return fh.read()
 
-    def _write_secret(self, cluster_secret: str) -> None:
-        target_dir = os.path.dirname(self.secret_path)
+    def _write_secret(self, cluster_secret: str, path: Optional[str] = None) -> None:
+        path = path or self.secret_path
+        target_dir = os.path.dirname(path)
         os.makedirs(target_dir, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
         try:
@@ -231,13 +262,14 @@ class Checkpointer:
         except Exception:
             os.close(fd)
             raise
-        os.replace(tmp, self.secret_path)
-        os.chmod(self.secret_path, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, path)
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
 
-    def _read_secret(self) -> Optional[str]:
-        if not os.path.exists(self.secret_path):
+    def _read_secret(self, path: Optional[str] = None) -> Optional[str]:
+        path = path or self.secret_path
+        if not os.path.exists(path):
             return None
-        with open(self.secret_path, "r") as fh:
+        with open(path, "r") as fh:
             return fh.read().strip()
 
     def _delete_file(self, path: str) -> None:
@@ -451,6 +483,85 @@ class Checkpointer:
         return results
 
     # ------------------------------------------------------------------
+    # Policy endpoint primitives (for PolicyClient discovery)
+    # ------------------------------------------------------------------
+
+    def write_policy_endpoint(self, state_json: str, secret: str) -> None:
+        """Publish the policy endpoint's address and its authentication secret.
+
+        Synchronous: this runs once at node startup, before the serve loop accepts
+        anything, so there is no loop to keep responsive yet.
+
+        The secret is written first. ``PolicyClient`` waits on the address file and
+        then reads the secret, so the reverse order would leave a window in which a
+        client sees an endpoint it cannot authenticate to.
+
+        Args:
+            state_json: Serialized ``ServerConnectionState`` of the endpoint's ROUTER.
+            secret: Shared secret clients must present.
+        """
+        self._write_secret(secret, path=self.policy_secret_path)
+        self._write_json_atomic(self.policy_endpoint_path, state_json)
+        self.logger.info(
+            f"[Checkpointer] Policy endpoint published at {self.policy_endpoint_path}"
+        )
+
+    async def write_policy_state(self, state: Dict[str, Any]) -> None:
+        """Non-blocking write of tuned policy state, keyed by policy kind.
+
+        Cloudpickled rather than dumped as JSON because policy state values are
+        arbitrary Python objects, same as ``write_results``.
+
+        Args:
+            state: ``{policy_kind: state_dict}``.
+        """
+        data = PolicyStateCheckpointData(
+            state_b64=base64.b64encode(cloudpickle.dumps(state)).decode("ascii")
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self._write_json_atomic,
+            self.policy_state_path,
+            data.model_dump_json(),
+        )
+        self.logger.debug(
+            f"[Checkpointer] Policy state written for {self.node_id} "
+            f"({list(state.keys())})"
+        )
+
+    async def read_policy_state(self) -> Optional[Dict[str, Any]]:
+        """Non-blocking read of the policy state checkpoint.
+
+        Returns:
+            ``{policy_kind: state_dict}``, or ``None`` if nothing was written.
+        """
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None, self._read_json, self.policy_state_path
+        )
+        if raw is None:
+            return None
+        try:
+            data = PolicyStateCheckpointData.model_validate_json(raw)
+            state: Dict[str, Any] = cloudpickle.loads(
+                base64.b64decode(data.state_b64)
+            )
+        except Exception as e:
+            # A corrupt policy checkpoint must not stop the node from starting;
+            # the policy just falls back to its configured initial_state.
+            self.logger.warning(
+                f"[Checkpointer] Ignoring unreadable policy state for "
+                f"{self.node_id}: {e}"
+            )
+            return None
+        self.logger.debug(
+            f"[Checkpointer] Policy state restored for {self.node_id} "
+            f"({list(state.keys())})"
+        )
+        return state
+
+    # ------------------------------------------------------------------
     # Utility methods
     # ------------------------------------------------------------------
 
@@ -471,6 +582,9 @@ class Checkpointer:
             self.comm_path,
             self.tasks_path,
             self.secret_path,
+            self.policy_endpoint_path,
+            self.policy_secret_path,
+            self.policy_state_path,
         ):
             await loop.run_in_executor(None, self._delete_file, path)
         self.logger.debug(f"[Checkpointer] Checkpoint deleted for {self.node_id}")

@@ -35,6 +35,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
+from ensemble_launcher.orchestrator.policy_endpoint import KIND_CHILDREN, PolicyEndpoint
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
 from ensemble_launcher.scheduler.child_state import ChildState
@@ -126,6 +127,10 @@ class AsyncMaster(Node):
         self._checkpointer: Optional[Checkpointer] = None
         # Cached checkpoint data — populated early in _run() before sockets are set up.
         self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
+
+        # Externally tunable children-policy state (see policy_endpoint.py).
+        self._policy_endpoint: Optional[PolicyEndpoint] = None
+        self._policy_version_written: int = -1
 
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
@@ -770,6 +775,8 @@ class AsyncMaster(Node):
         if ckpt_restored and len(self._scheduler.unassigned_task_ids):
             self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
+        await self._create_policy_endpoint()
+
         # Check executor validity
         assert self._config.child_executor_name in executor_registry.async_executors, (
             f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
@@ -924,6 +931,36 @@ class AsyncMaster(Node):
         )
         return True
 
+    async def _create_policy_endpoint(self) -> None:
+        """Serve this master's children-policy state to external ``PolicyClient``s.
+
+        Started here rather than in ``_create_monitor_tasks`` so the address file is
+        on disk before the node reports ready — a client that races node startup then
+        blocks on the file rather than finding a half-initialized endpoint.
+
+        No ``rescore_cb`` is registered: the children-policy analogue of re-scoring a
+        queue is re-running resource/task assignment, which can revoke allocations and
+        recycle live child processes. New children-policy state instead takes effect at
+        the next natural assignment point.
+        """
+        if not (self._config.cluster or self._config.enable_policy_client):
+            return
+        if self._checkpointer is None:
+            self.logger.warning(
+                f"{self.node_id}: policy endpoint requested but checkpoint_dir is "
+                "unset; PolicyClient discovery is file-based, so none will be served"
+            )
+            return
+
+        self._policy_endpoint = PolicyEndpoint(
+            self.node_id,
+            self._checkpointer,
+            self.logger.getChild("policy"),
+        )
+        self._policy_endpoint.register(KIND_CHILDREN, self._scheduler.policy)
+        self._policy_endpoint.restore(await self._checkpointer.read_policy_state())
+        await self._policy_endpoint.start()
+
     async def _write_checkpoint(self) -> None:
         """Write scheduler state and comm state to checkpoint."""
         if self._checkpointer is None:
@@ -932,6 +969,21 @@ class AsyncMaster(Node):
             scheduler_state=self._scheduler.get_state(self.node_id),
             comm_state=self._comm.get_state(),
         )
+        await self._write_policy_checkpoint()
+
+    async def _write_policy_checkpoint(self) -> None:
+        """Persist tuned policy state, skipping the write when nothing changed.
+
+        ``version`` only advances on a successful ``set``, so an untuned run never
+        pays for this on top of every report interval.
+        """
+        if self._policy_endpoint is None:
+            return
+        version = self._policy_endpoint.version
+        if version == self._policy_version_written:
+            return
+        await self._checkpointer.write_policy_state(self._policy_endpoint.snapshot())
+        self._policy_version_written = version
 
     # --------------------------------------------------------------------------
     #                               Parent Synchronization
@@ -1859,6 +1911,9 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
             self.logger.info("Stopped parent task update monitor")
+
+        if self._policy_endpoint is not None:
+            await self._policy_endpoint.stop()
 
         # Tear down children and wait for them to be done
         for child_name in self._scheduler.children_names:

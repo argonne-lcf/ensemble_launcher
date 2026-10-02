@@ -36,13 +36,22 @@ A layered, transport-agnostic messaging system for node-to-node communication:
 
 Parent-child links are created via `transport.create_child_pipe()`, which returns a paired server and client connection. Each node runs a separate `HeartBeatProcess` for dead-connection detection. Transports are registered via a `TransportRegistry` for extensibility.
 
-Messages are typed dataclasses defined in `comm/messages.py`: `Task`, `Result`, `ResultBatch`, `Status`, `Action`, `NodeUpdate`, `TaskUpdate`, `HeartBeat`, `Stop`.
+Messages are typed dataclasses defined in `comm/messages.py`: `Message`, `Status`, `Result`, `ResultBatch`, `IResultBatch`, `TaskUpdate`, `NodeUpdate`, `Ready`, `Stop`, `TaskRequest`, `NodeRequest`. Heartbeats are not a message type; they are handled by `HeartBeatProcess` in `comm/hb.py`.
 
 ### 3. Scheduler
 
 **Location:** `ensemble_launcher/scheduler/`
 
-Assigns tasks to worker nodes. `WorkerScheduler` wraps a `LocalClusterResource` and a pluggable `ChildrenPolicy`. The default policy is `greedy_children_policy`.
+Assigns tasks to worker nodes. The live async path is `AsyncChildrenScheduler` / `AsyncTaskScheduler` in `scheduler/async_scheduler.py`; `WorkerScheduler` is the legacy sync class, used only by `orchestrator/master.py`.
+
+There are two pluggable policy families, each with its own registry namespace:
+
+| Family | Base class | Key method | Default |
+|---|---|---|---|
+| Task scoring | `Policy` | `get_score` | `large_resource_policy` |
+| Child layout / distribution | `ChildrenPolicy` | `get_children_resources`, `get_children_tasks` | `simple_split_children_policy` |
+
+Every policy carries a mutable `self.state` dict, seeded from `PolicyConfig.initial_state` and tunable at runtime through `PolicyClient`.
 
 Custom policies can be loaded at runtime via environment variables -- see [Custom Scheduling](custom-scheduling.md).
 

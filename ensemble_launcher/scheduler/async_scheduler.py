@@ -5,7 +5,7 @@ import os
 from asyncio import Queue
 from collections import Counter
 from logging import Logger
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
@@ -700,12 +700,41 @@ class PendingTaskHeap:
             self._tasks_available.clear()
         self._sorted = False
 
+    def rescore(self, scores: Dict[str, float]) -> None:
+        """Re-prioritize every entry in place. Ids absent from *scores* are dropped.
+
+        Each entry keeps its original sequence number, so the FIFO tiebreak among
+        equal priorities survives -- which also means the iteration order here is
+        irrelevant and a plain dict is a safe argument. ``clear()`` + ``push()``
+        would not have either property: it resets ``_seq`` to 0 and renumbers in
+        whatever order it is handed.
+
+        ``_tasks_available`` is deliberately not ``set()``: membership only ever
+        shrinks here, so an already-set event must stay set and a heap that empties
+        out must clear it.
+        """
+        self._heap = [
+            (scores[task_id], seq, task_id)
+            for _p, seq, task_id in self._heap
+            if task_id in scores
+        ]
+        heapq.heapify(self._heap)
+        self._task_ids = {task_id for _p, _s, task_id in self._heap}
+        if not self._task_ids:
+            self._tasks_available.clear()
+        self._sorted = False
+
     def sorted_items(self) -> List[Tuple[float, int, str]]:
-        """Return all items sorted by priority, then insertion order (non-destructive)."""
+        """Return all items sorted by priority, then insertion order (non-destructive).
+
+        The returned list is a copy: callers iterate it across ``await`` points and
+        a concurrent ``push`` into the live heap would otherwise let the loop visit
+        the same task twice.
+        """
         if not self._sorted:
             self._heap = sorted(self._heap)
             self._sorted = True
-        return self._heap
+        return list(self._heap)
 
     def __contains__(self, task_id: str) -> bool:
         return task_id in self._task_ids
@@ -772,12 +801,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._failed_tasks: Set[str] = set()
         self._successful_tasks: Set[str] = set()
         self._pending_tasks = PendingTaskHeap()
-        for task_id in self.tasks:
-            score = self.scheduler_policy.get_score(
-                self.tasks[task_id],
-                scheduler_state=self._build_scheduler_state(),
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self._seed_pending(self.tasks.keys())
         self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
 
         self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
@@ -792,10 +816,66 @@ class AsyncTaskScheduler(AsyncScheduler):
         if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
 
+    @property
+    def policy(self) -> Policy:
+        """Alias for ``scheduler_policy``, matching ``AsyncChildrenScheduler.policy``.
+
+        Lets callers that hold either scheduler (notably ``PolicyEndpoint``) reach the
+        policy without branching on the scheduler type.
+        """
+        return self.scheduler_policy
+
     @staticmethod
     def _priority_from_score(score: float) -> float:
         """Convert a policy score (higher=better) to a heap priority (lower=better)."""
         return -score
+
+    def _seed_pending(self, task_ids: Iterable[str]) -> int:
+        """Replace the pending heap with freshly scored entries for *task_ids*.
+
+        Used when the set of pending tasks itself is being established (construction,
+        checkpoint restore). To re-score the tasks already queued without changing
+        membership, use :meth:`reprioritize_pending` instead.
+        """
+        sched_state = self._build_scheduler_state()
+        self._pending_tasks.clear()
+        for task_id in task_ids:
+            if task_id not in self.tasks:
+                continue
+            score = self.scheduler_policy.get_score(
+                self.tasks[task_id], scheduler_state=sched_state
+            )
+            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        return len(self._pending_tasks)
+
+    def reprioritize_pending(self) -> int:
+        """Re-score every pending task against the policy's current state.
+
+        A task's priority is computed once, when it enters the pending heap, so the
+        heap is a cache of scores: mutating policy state does nothing to work already
+        queued. This invalidates that cache. Scope is the pending heap only -- running
+        tasks are already dispatched and completed ones are untouched.
+
+        Two phases on purpose. Every new priority is computed first, where a raising
+        ``get_score`` leaves the heap untouched; only then is the result published in a
+        single call that cannot fail. Callers (``PolicyEndpoint.apply``) rely on this to
+        roll a rejected state change back cleanly.
+
+        Returns:
+            Number of tasks re-scored.
+        """
+        sched_state = self._build_scheduler_state()
+        scores = {
+            task_id: self._priority_from_score(
+                self.scheduler_policy.get_score(
+                    self.tasks[task_id], scheduler_state=sched_state
+                )
+            )
+            for task_id in self._pending_tasks.task_ids()
+            if task_id in self.tasks
+        }
+        self._pending_tasks.rescore(scores)
+        return len(scores)
 
     def _build_scheduler_state(self) -> SchedulerState:
         """Build a lightweight state snapshot for passing to policy methods."""
@@ -874,13 +954,7 @@ class AsyncTaskScheduler(AsyncScheduler):
 
         # 3. Rebuild pending heap with only pending tasks
         pending = set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
-        self._pending_tasks.clear()
-        sched_state = self._build_scheduler_state()
-        for task_id in pending:
-            score = self.scheduler_policy.get_score(
-                self.tasks[task_id], scheduler_state=sched_state
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self._seed_pending(pending)
 
         restored = len(state.completed_tasks) + len(state.failed_tasks)
         self.logger.info(
