@@ -157,7 +157,10 @@ class AsyncConnection(ABC):
         if not success:
             self.logger.warning("Raw send failed")
             if self._req_res:
-                self._ack_futures.pop(self._msg_counter, None)
+                # `msg_id`, not `self._msg_counter`: concurrent senders on this connection
+                # advance the counter between this send and its failure, so popping the
+                # counter would discard another in-flight send's ACK future and hang it.
+                self._ack_futures.pop(msg_id, None)
             return False
 
         if self._req_res:

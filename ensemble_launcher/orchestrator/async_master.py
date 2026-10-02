@@ -1465,12 +1465,24 @@ class AsyncMaster(Node):
             requeue.extend(results)
 
     async def _periodic_flush_loop(self) -> None:
-        """Flush buffered results on a fixed interval with jitter."""
+        """Flush buffered results on a fixed interval with jitter.
+
+        The per-destination flushes run concurrently. Awaiting them in sequence made each
+        destination wait for every ACK ahead of it in the iteration, so with `n` destinations
+        the last one saw `n` round-trips of added latency on every cycle -- a serial fan-out
+        inside a hierarchy whose purpose is to avoid one. The queues are independent and
+        `_flush_dest_queue` handles its own failures, so there is no ordering constraint
+        between them.
+        """
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
             await asyncio.sleep(self._config.result_flush_interval + jitter)
-            for dest_id in list(self._iresult_q.keys()):
-                await self._flush_dest_queue(dest_id)
+            dest_ids = list(self._iresult_q.keys())
+            if dest_ids:
+                await asyncio.gather(
+                    *(self._flush_dest_queue(dest_id) for dest_id in dest_ids),
+                    return_exceptions=True,
+                )
 
     async def _flush_child_task_queue(self, child_id: str) -> None:
         """Send all buffered tasks for child_id to that child as a single TaskUpdate."""
@@ -1520,8 +1532,15 @@ class AsyncMaster(Node):
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.task_flush_interval
             await asyncio.sleep(self._config.task_flush_interval + jitter)
-            for child_id in list(self._itask_q.keys()):
-                await self._flush_child_task_queue(child_id)
+            # Concurrent for the same reason as `_periodic_flush_loop`: a sequential await
+            # per child serialized every child's dispatch behind the ACKs of the children
+            # before it, which is where most of the per-task dispatch latency came from.
+            child_ids = list(self._itask_q.keys())
+            if child_ids:
+                await asyncio.gather(
+                    *(self._flush_child_task_queue(child_id) for child_id in child_ids),
+                    return_exceptions=True,
+                )
 
     async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
         """Buffer a result for its destination; the periodic flush loop sends it."""

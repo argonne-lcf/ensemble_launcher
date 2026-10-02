@@ -237,6 +237,11 @@ class AsyncLokyExecutor:
         self._executor = loky.get_reusable_executor(
             max_workers=max_workers, timeout=self._timeout
         )
+
+        for i in range(os.cpu_count()):
+            f = self._executor.submit(dummy_task)
+            f.result()
+
         self._event_registry: Optional[EventRegistry] = None
         if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
@@ -380,6 +385,10 @@ class AsyncPinnedExecutor:
                     max_workers=per_pool, timeout=self._timeout, env=env
                 )
             )
+
+        for pool in self._pools:
+            f = pool.submit(dummy_task)
+            f.result()
 
         self._pool_of_gpu: Dict[GpuId, int] = {
             gpu: i for i, gpu in enumerate(self._gpus)
