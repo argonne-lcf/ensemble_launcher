@@ -131,6 +131,9 @@ class LauncherConfig(BaseModel):
     checkpoint_dir: Optional[str] = (
         None  # Directory for checkpoints; None disables checkpointing
     )
+    checkpoint_interval: Optional[float] = (
+        None  # Seconds between checkpoints; None follows report_interval
+    )
     heartbeat_interval: float = 1.0  # heart beat interval
 
     heartbeat_dead_threshold: float = (

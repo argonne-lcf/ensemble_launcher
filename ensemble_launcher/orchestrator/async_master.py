@@ -152,6 +152,10 @@ class AsyncMaster(Node):
         # Intermediate task buffer: batches tasks dispatched to children (fan-out)
         self._itask_q: Dict[str, deque] = {}
         self._task_flush_task: Optional[asyncio.Task] = None
+        # Periodic checkpointing, on its own cadence rather than the status loop's. The
+        # in-flight handle keeps a slow write from overlapping the next one.
+        self._checkpoint_task: Optional[asyncio.Task] = None
+        self._checkpoint_write: Optional[asyncio.Task] = None
         # Batch mode root: accumulates results streamed via IResultBatch during execution
         self._batch_streaming_results: List[Result] = []
 
@@ -431,6 +435,11 @@ class AsyncMaster(Node):
         children (including any recreated ones) have been registered.
         """
         self._reporting_task = asyncio.create_task(self._report_status())
+
+        if self._checkpointer is not None:
+            self._checkpoint_task = asyncio.create_task(
+                self._periodic_checkpoint_loop()
+            )
 
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
@@ -1453,10 +1462,6 @@ class AsyncMaster(Node):
                     self.logger.info(status)
                 else:
                     self.logger.info(status)
-
-                # Periodic checkpoint: scheduler state, comm state, and collected results.
-                if self._checkpointer is not None:
-                    asyncio.create_task(self._write_checkpoint())
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
                     jitter = random.uniform(-0.05, 0.05) * self._config.report_interval
@@ -1471,6 +1476,68 @@ class AsyncMaster(Node):
                 break
             except Exception as e:
                 self.logger.info(f"Reporting loop failed with error {e}")
+                await asyncio.sleep(0.1)
+
+    @property
+    def _checkpoint_interval(self) -> float:
+        """How often to checkpoint, defaulting to the status cadence.
+
+        Checkpointing used to ride the status loop, which tied how fresh a peer's view of this
+        node is to how much state gets serialised and fsynced. They scale differently: a
+        ``Status`` is a handful of integers, while a checkpoint rewrites every task id this
+        node has handled. Leaving the interval at ``None`` keeps the old coupled behaviour.
+        """
+        if self._config.checkpoint_interval is None:
+            return self._config.report_interval
+        return self._config.checkpoint_interval
+
+    def _start_checkpoint_write(self) -> None:
+        """Start a checkpoint write unless the previous one is still running.
+
+        A checkpoint is a snapshot of the moment it is taken, so a tick skipped because the
+        last write is still in flight costs nothing -- the next one captures a newer state
+        anyway. Skipping also keeps writes from overlapping, which would race on the shared
+        metadata file that each write reads before rewriting.
+        """
+        if self._checkpoint_write is not None and not self._checkpoint_write.done():
+            self.logger.debug(
+                f"{self.node_id}: Checkpoint still writing, skipping this interval"
+            )
+            return
+        self._checkpoint_write = asyncio.create_task(self._write_checkpoint())
+        self._checkpoint_write.add_done_callback(self._checkpoint_write_done)
+
+    def _checkpoint_write_done(self, task: asyncio.Task) -> None:
+        """Surface a failed checkpoint write, which is otherwise silent."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"{self.node_id}: Checkpoint write failed: {exc}")
+
+    async def _periodic_checkpoint_loop(self) -> None:
+        """Write checkpoints on their own interval, independent of status reporting.
+
+        Writes before waiting, not after. A ``ClusterClient`` blocks on this node's comm file
+        appearing before it can connect, so the first checkpoint has to land as promptly as it
+        did when this rode the status loop -- not one (possibly much longer) interval later.
+        """
+        while not self._stop_reporting_event.is_set():
+            try:
+                self._start_checkpoint_write()
+                jitter = random.uniform(-0.05, 0.05) * self._checkpoint_interval
+                try:
+                    await asyncio.wait_for(
+                        self._stop_reporting_event.wait(),
+                        timeout=self._checkpoint_interval + jitter,
+                    )
+                    break  # Exit if stop event was set
+                except asyncio.TimeoutError:
+                    pass  # Continue loop after interval
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.info(f"Checkpoint loop failed with error {e}")
                 await asyncio.sleep(0.1)
 
     async def _client_request_monitor(self) -> None:
@@ -1893,6 +1960,21 @@ class AsyncMaster(Node):
             try:
                 await self._flush_task
             except asyncio.CancelledError:
+                pass
+
+        if self._checkpoint_task and not self._checkpoint_task.done():
+            self._checkpoint_task.cancel()
+            try:
+                await self._checkpoint_task
+            except asyncio.CancelledError:
+                pass
+
+        # Let any write already running finish before the final checkpoint below, so the two
+        # do not race to replace the same files.
+        if self._checkpoint_write and not self._checkpoint_write.done():
+            try:
+                await self._checkpoint_write
+            except Exception:
                 pass
 
         if self._client_monitor_task and not self._client_monitor_task.done():
