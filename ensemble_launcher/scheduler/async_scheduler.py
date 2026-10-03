@@ -371,6 +371,15 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Read-only view of the unassigned task pool (insertion-ordered)."""
         return dict(self._unassigned_tasks)
 
+    def has_unassigned_tasks(self) -> bool:
+        """Whether the unassigned pool holds anything, without copying it.
+
+        :attr:`unassigned_task_ids` copies the pool to hand out a read-only view, which is
+        the wrong thing to pay for merely to ask whether it is empty -- and a work-stealing
+        master is asked exactly that on every task request from every child.
+        """
+        return bool(self._unassigned_tasks)
+
     def discard_unassigned(self, task_id: str) -> None:
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
         self._unassigned_tasks.pop(task_id, None)

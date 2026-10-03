@@ -134,13 +134,24 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         f"{self.node_id}: Received task request from {child_id} for {task_request.ntasks} tasks"
                     )
 
-                    child_assignments, _, _ = self._scheduler.assign_task_ids(
-                        self._scheduler.unassigned_task_ids,
-                        ntask=task_request.ntasks,
-                        child_ids=[child_id],
-                    )
+                    # Run the policy only when there is something to hand out. Workers ask
+                    # on a fixed interval, so that request latency has a ceiling rather than
+                    # depending on when tasks happen to finish -- which means they keep
+                    # asking while the pool is empty. Reading `unassigned_task_ids` alone
+                    # copies the whole pool, before `assign_task_ids` can discover it has
+                    # nothing to do, so emptiness is checked before either happens.
+                    if self._scheduler.has_unassigned_tasks():
+                        child_assignments, _, _ = self._scheduler.assign_task_ids(
+                            self._scheduler.unassigned_task_ids,
+                            ntask=task_request.ntasks,
+                            child_ids=[child_id],
+                        )
+                        assigned_task_ids = child_assignments.get(child_id, [])
+                    else:
+                        # Falls through to the no-tasks branch below, which still sends the
+                        # child a Stop when this master is not in cluster mode.
+                        assigned_task_ids = []
 
-                    assigned_task_ids = child_assignments.get(child_id, [])
                     if not assigned_task_ids:
                         if not self._config.cluster:
                             self.logger.warning(
