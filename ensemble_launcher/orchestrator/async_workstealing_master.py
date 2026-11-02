@@ -160,7 +160,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
                             stop_msg = Stop(
                                 sender=self.node_id, type=StopType.TERMINATE
                             )
-                            await self._comm.send_message_to_child(child_id, stop_msg)
+                            await self._comm.send_message_to_child(
+                                child_id, stop_msg, retries=self._config.send_retries
+                            )
                         else:
                             self.logger.debug(f"{self.node_id}: No tasks to assign.")
                     else:
@@ -170,7 +172,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         task_update = TaskUpdate(
                             sender=self.node_id, added_tasks=available_tasks
                         )
-                        success = await self._comm.send_message_to_child(child_id, task_update)
+                        success = await self._comm.send_message_to_child(
+                            child_id, task_update, retries=self._config.send_retries
+                        )
                         if success:
                             self.logger.info(
                                 f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
@@ -250,7 +254,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
         for child_id in list(self.children.keys()):
             try:
                 await self._comm.send_message_to_child(
-                    child_id, Stop(sender=self.node_id, type=StopType.TERMINATE)
+                    child_id,
+                    Stop(sender=self.node_id, type=StopType.TERMINATE),
+                    retries=self._config.send_retries,
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to send Stop to {child_id}: {e}")

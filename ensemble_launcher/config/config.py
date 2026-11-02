@@ -141,7 +141,8 @@ class LauncherConfig(BaseModel):
     )
 
     req_res: bool = True  # Enable ACK-based guaranteed delivery
-    send_retries: int = 10  # Retry count on ACK timeout (req_res=True only)
+    send_retries: int = 10  # Retries on ACK timeout for one-shot control messages (Ready, Stop, NodeUpdate, initial TaskUpdate, final ResultBatch); req_res=True only
+    max_inflight_flushes: int = 4  # Max concurrent result/task flush sends per destination; a failed send is resent on the next flush
     send_timeout: float = 1.0  # Per-attempt ACK timeout in seconds (req_res=True only)
 
     overload_orchestrator_core: bool = True  # Setting this to false reserves the first core of the head compute node for EL orchestrator
