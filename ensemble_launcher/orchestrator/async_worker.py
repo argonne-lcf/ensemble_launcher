@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import random
@@ -7,7 +8,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
@@ -38,8 +39,8 @@ from ensemble_launcher.executors import (
     executor_registry,
 )
 from ensemble_launcher.logging import setup_logger
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.orchestrator.policy_endpoint import KIND_TASK, PolicyEndpoint
+from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -130,6 +131,11 @@ class AsyncWorker(Node):
         # Intermediate result batch queue
         self._iresult_q: Dict[str, deque] = {}
         self._streamed_task_ids: set = set()
+        # Flush sends in flight per destination (capped at max_inflight_flushes), and the
+        # messages whose send failed. A failed message is resent as the same object so it
+        # keeps its message_id and the receiver can drop the copy if only the ACK was lost.
+        self._result_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
+        self._result_retry_q: Dict[str, deque] = {}
 
         # Parent-ready handshake: set when parent sends a Ready message
         self._parent_ready_event = asyncio.Event()
@@ -684,42 +690,91 @@ class AsyncWorker(Node):
 
         return done_callback
 
-    async def _flush_dest_queue(self, dest_id: str) -> float:
-        """Send all buffered results for dest_id as an IResultBatch (or nothing if empty)."""
-        result_q = self._iresult_q.get(dest_id)
-        if not result_q:
-            return time.time()
-        results = []
-        while result_q:
-            results.append(result_q.popleft())
-        if not results:
-            return
-        msg = IResultBatch(sender=self.node_id, data=results)
+    def _send_result_batch(self, dest_id: str, msg: IResultBatch, retries: int = 1):
+        """Return the send coroutine for an IResultBatch bound for `dest_id`."""
         if dest_id.startswith("client-"):
-            self.logger.info(f"Flushing queue of size {len(results)} to {dest_id}")
-            success = await self._comm.send_message_to_child(dest_id, msg)
-        else:
-            success = await self._comm.send_message_to_parent(msg)
+            return self._comm.send_message_to_child(dest_id, msg, retries=retries)
+        return self._comm.send_message_to_parent(msg, retries=retries)
 
-        if not success:
-            self.logger.warning(
-                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
+    def _schedule_result_flush(self, dest_id: str) -> None:
+        """Start sends for dest_id's buffered results, up to max_inflight_flushes at once.
+
+        Never awaits. Each send is its own task, so a slow destination or a dropped ACK
+        holds up only its own window, never other destinations or the caller.
+        Messages are popped here, synchronously, so concurrent batches never overlap.
+        """
+        inflight = self._result_flush_inflight.setdefault(dest_id, set())
+        retry_q, result_q = self._result_retry_q.get(dest_id), self._iresult_q.get(dest_id)
+        while len(inflight) < self._config.max_inflight_flushes:
+            if retry_q:
+                msg = retry_q.popleft()
+            elif result_q:
+                msg = IResultBatch(sender=self.node_id, data=list(result_q))
+                result_q.clear()
+            else:
+                break
+            t = asyncio.create_task(self._send_result_batch(dest_id, msg))
+            inflight.add(t)
+            t.add_done_callback(functools.partial(self._result_flush_done, dest_id, msg))
+
+    def _result_flush_done(
+        self, dest_id: str, msg: IResultBatch, task: asyncio.Task
+    ) -> None:
+        """Free the window slot; on failure, queue the same message for the next flush."""
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight is not None:
+            inflight.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None and task.result():
+            return
+        self.logger.warning(
+            f"Failed to send IResultBatch of size {len(msg.data)} to {dest_id}"
+            f"{f' ({exc})' if exc else ''}, re-queuing"
+        )
+        # Same object, same message_id: if only the ACK was lost, the receiver drops the copy.
+        self._result_retry_q.setdefault(dest_id, deque()).appendleft(msg)
+
+    async def _drain_results(self, dest_id: str) -> None:
+        """Wait out in-flight result sends for dest_id, then send everything left.
+
+        Runs at teardown, where no later flush tick will come, so this is the one result
+        path that opts into comm-level retries. Results that still cannot be sent are
+        dropped from `_streamed_task_ids` so the final ResultBatch carries them instead.
+        """
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight:
+            await asyncio.gather(*list(inflight), return_exceptions=True)
+        retry_q = self._result_retry_q.pop(dest_id, None) or deque()
+        result_q = self._iresult_q.get(dest_id)
+        if result_q:
+            retry_q.append(IResultBatch(sender=self.node_id, data=list(result_q)))
+            result_q.clear()
+        for msg in retry_q:
+            success = await self._send_result_batch(
+                dest_id, msg, retries=self._config.send_retries
             )
-            requeue = self._iresult_q.setdefault(dest_id, deque())
-            requeue.extend(results)
-
-        return time.time()
+            if not success:
+                self.logger.error(
+                    f"Failed to drain IResultBatch of size {len(msg.data)} to {dest_id}, "
+                    f"moving it to the final ResultBatch"
+                )
+                self._streamed_task_ids.difference_update(r.task_id for r in msg.data)
 
     async def _periodic_flush_loop(self) -> None:
         """Background task: flush all buffered intermediate result queues on a fixed interval.
 
-        Sleep duration is jittered ±5% to avoid thundering herd across workers.
+        Sleep duration is jittered ±5% to avoid thundering herd across workers. Only
+        schedules sends, so one slow destination cannot delay the others or the next tick.
+        Destinations with a pending resend are included so a failed batch is retried even
+        when nothing new has arrived.
         """
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
             await asyncio.sleep(self._config.result_flush_interval + jitter)
-            for dest_id in list(self._iresult_q.keys()):
-                await self._flush_dest_queue(dest_id)
+            for dest_id in set(self._iresult_q) | set(self._result_retry_q):
+                self._schedule_result_flush(dest_id)
 
     def _task_callback(self, task: Task, future: AsyncFuture) -> None:
         """Process a completed task future: record status, free resources, forward result."""
@@ -771,7 +826,7 @@ class AsyncWorker(Node):
         result_q.append(result)
         self._streamed_task_ids.add(task_id)
         if len(result_q) >= self._config.result_buffer_size:
-            asyncio.create_task(self._flush_dest_queue(dest_id))
+            self._schedule_result_flush(dest_id)
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -1137,6 +1192,16 @@ class AsyncWorker(Node):
                 except asyncio.CancelledError:
                     pass
 
+        # Results were drained in `_send_final_results_and_status`; anything still in
+        # flight here (e.g. the parent died) is abandoned.
+        inflight_flushes = [
+            t for inflight in self._result_flush_inflight.values() for t in inflight
+        ]
+        for t in inflight_flushes:
+            t.cancel()
+        if inflight_flushes:
+            await asyncio.gather(*inflight_flushes, return_exceptions=True)
+
         # Let any write already running finish, so it cannot race the final checkpoint in
         # `stop()` to replace the same files.
         if self._checkpoint_write and not self._checkpoint_write.done():
@@ -1155,9 +1220,13 @@ class AsyncWorker(Node):
         status send fails the status is also written to a local JSON file as
         a fallback.
         """
-        # Flush any remaining buffered intermediate results before final teardown.
-        for dest_id in list(self._iresult_q.keys()):
-            await self._flush_dest_queue(dest_id)
+        # Flush any remaining buffered intermediate results before final teardown. Waiting
+        # for the in-flight sends matters: `_streamed_task_ids` already excludes their
+        # results from the final batch below.
+        for dest_id in set(self._iresult_q) | set(self._result_retry_q) | set(
+            self._result_flush_inflight
+        ):
+            await self._drain_results(dest_id)
 
         async with self._timer("final_status"):
             final_status = self.get_status()
@@ -1195,7 +1264,9 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Parent is ready; sleeping {jitter:.2f}s before sending results"
             )
             await asyncio.sleep(jitter)
-            success = await self._comm.send_message_to_parent(result_batch)
+            success = await self._comm.send_message_to_parent(
+                result_batch, retries=self._config.send_retries
+            )
             if success:
                 self.logger.info(
                     f"{self.node_id}: Successfully sent results to parent"
