@@ -114,7 +114,7 @@ class LauncherConfig(BaseModel):
         "simple_split_children_policy"  ##Policy to use for children scheduler
     )
     task_scheduler_policy: str = (
-        "large_resource_policy"  ##Policy to use for children scheduler
+        "fifo_policy"  ##Policy to use for the worker's task scheduler (unscored deque)
     )
     policy_config: PolicyConfig = Field(default_factory=PolicyConfig)
     enable_workstealing: bool = (

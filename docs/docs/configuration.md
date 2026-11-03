@@ -108,7 +108,7 @@ launcher_config = LauncherConfig(
 | `enable_workstealing` | `bool` | `False` | Enable work-stealing scheduler |
 | `enable_policy_client` | `bool` | `False` | Serve policy state for `PolicyClient`. Implied by `cluster=True`; needs `checkpoint_dir` either way. |
 | `children_scheduler_policy` | `str` | `"simple_split_children_policy"` | Policy for partitioning resources across children |
-| `task_scheduler_policy` | `str` | `"large_resource_policy"` | Policy for task scoring/priority |
+| `task_scheduler_policy` | `str` | `"fifo_policy"` | Policy for task scoring/priority. `fifo_policy` uses an unscored deque; any other policy scores tasks into a priority heap |
 | `policy_config` | `PolicyConfig` | `PolicyConfig()` | Configuration passed to scheduling policies |
 | `req_res` | `bool` | `True` | Enable ACK-based guaranteed delivery for task messages |
 | `send_retries` | `int` | `10` | Retry count on ACK timeout (`req_res=True` only) |

@@ -241,10 +241,7 @@ class AsyncLocalClusterResource(LocalClusterResource):
     
     async def signal_resource_available(self):
         """Signal that resources might be available. Used for waking up blocked waiters."""
-        try:
-            self._loop.call_soon_threadsafe(self._resource_available.set)
-        except RuntimeError:
-            self._resource_available.set()
+        self._resource_available.set()
 
     def allocate(self, job_resource):
         allocated,allocated_resource = super().allocate(job_resource)
@@ -268,30 +265,30 @@ class AsyncLocalClusterResource(LocalClusterResource):
         return allocated, allocated_resource
 
     def deallocate(self, job_resource):
-        """Deallocate resources and return them to the queue."""
+        """Deallocate resources and return them to the queue.
+
+        Must be called on the event loop thread (both schedulers' ``free`` are).
+        The event is set synchronously, in the same step that frees the
+        resources, so it always describes the cluster as it is now. Deferring the
+        set with ``call_soon_threadsafe`` let it fire after the freed slot had
+        already been refilled, leaving the event set on a full cluster.
+        """
         if not job_resource.nodes:
             self.logger.error("Deallocation failed: JobResource must have nodes specified")
             raise ValueError("JobResource must have nodes specified for deallocation")
-        
+
         # Call parent's deallocate to update internal state
         result = super().deallocate(job_resource)
-        
+
         if result:
-            # Signal that resources are now available - instant notification
             if self._min_resources is None:
                 self.logger.debug("No minimum resource requirement set, setting resource available event")
-                try:
-                    self._loop.call_soon_threadsafe(self._resource_available.set)
-                except RuntimeError:
-                    self._resource_available.set()
+                self._resource_available.set()
             else:
                 can_allocate = self._can_allocate(self._min_resources)
                 if can_allocate:
                     self.logger.debug(f"Minimum resource requirement met, setting resource available event. Requirement: {self._min_resources}, Available nodes: {can_allocate}")
-                    try:
-                        self._loop.call_soon_threadsafe(self._resource_available.set)
-                    except RuntimeError:
-                        self._resource_available.set()
+                    self._resource_available.set()
         return result
     
     def set_resource_available(self):
