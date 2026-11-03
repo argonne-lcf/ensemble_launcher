@@ -15,6 +15,7 @@ from ensemble_launcher.comm import AsyncCommState, ClientConnection, transport_r
 from ensemble_launcher.comm.messages import IResultBatch, Message, Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
+from ensemble_launcher.orchestrator.discovery import _resolve_node_id, _wait_for_path
 
 # ---------------------------------------------------------------------------
 # Worker pipeline
@@ -173,45 +174,6 @@ class _WorkerPipeline:
             self._loop.call_soon_threadsafe(self._recv_task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
-
-
-# ---------------------------------------------------------------------------
-# Node resolution
-# ---------------------------------------------------------------------------
-
-
-def _wait_for_path(path: str, timeout: float, poll_interval: float = 1.0) -> None:
-    """Block until *path* exists (file or non-empty directory), or raise TimeoutError."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if os.path.isfile(path):
-            return
-        if os.path.isdir(path) and os.listdir(path):
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"Timed out after {timeout:.0f}s waiting for checkpoint path: {path}"
-            )
-        time.sleep(min(poll_interval, remaining))
-
-
-def _resolve_node_id(checkpoint_dir: str, node_id: str) -> str:
-    """Resolve a symbolic node_id to a concrete node_id.
-
-    ``"global"`` resolves to the shortest node_id found in *checkpoint_dir*
-    (the global master always has the shortest name, e.g. ``"main"``).
-    Any other value is returned unchanged.
-    """
-    if node_id not in ["global", "local"]:
-        return node_id
-    else:
-        if node_id == "global":
-            return os.listdir(checkpoint_dir)[0]
-        elif node_id == "local":
-            raise NotImplementedError("local connection is not implemented")
-        else:
-            raise ValueError(f"Unknown node_id {node_id}")
 
 
 # ---------------------------------------------------------------------------

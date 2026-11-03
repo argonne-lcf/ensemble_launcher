@@ -134,13 +134,24 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         f"{self.node_id}: Received task request from {child_id} for {task_request.ntasks} tasks"
                     )
 
-                    child_assignments, _, _ = self._scheduler.assign_task_ids(
-                        self._scheduler.unassigned_task_ids,
-                        ntask=task_request.ntasks,
-                        child_ids=[child_id],
-                    )
+                    # Run the policy only when there is something to hand out. Workers ask
+                    # on a fixed interval, so that request latency has a ceiling rather than
+                    # depending on when tasks happen to finish -- which means they keep
+                    # asking while the pool is empty. Reading `unassigned_task_ids` alone
+                    # copies the whole pool, before `assign_task_ids` can discover it has
+                    # nothing to do, so emptiness is checked before either happens.
+                    if self._scheduler.has_unassigned_tasks():
+                        child_assignments, _, _ = self._scheduler.assign_task_ids(
+                            self._scheduler.unassigned_task_ids,
+                            ntask=task_request.ntasks,
+                            child_ids=[child_id],
+                        )
+                        assigned_task_ids = child_assignments.get(child_id, [])
+                    else:
+                        # Falls through to the no-tasks branch below, which still sends the
+                        # child a Stop when this master is not in cluster mode.
+                        assigned_task_ids = []
 
-                    assigned_task_ids = child_assignments.get(child_id, [])
                     if not assigned_task_ids:
                         if not self._config.cluster:
                             self.logger.warning(
@@ -149,7 +160,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
                             stop_msg = Stop(
                                 sender=self.node_id, type=StopType.TERMINATE
                             )
-                            await self._comm.send_message_to_child(child_id, stop_msg)
+                            await self._comm.send_message_to_child(
+                                child_id, stop_msg, retries=self._config.send_retries
+                            )
                         else:
                             self.logger.debug(f"{self.node_id}: No tasks to assign.")
                     else:
@@ -159,7 +172,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
                         task_update = TaskUpdate(
                             sender=self.node_id, added_tasks=available_tasks
                         )
-                        success = await self._comm.send_message_to_child(child_id, task_update)
+                        success = await self._comm.send_message_to_child(
+                            child_id, task_update, retries=self._config.send_retries
+                        )
                         if success:
                             self.logger.info(
                                 f"{self.node_id}: Sent {len(available_tasks)} tasks to {child_id} (requested {task_request.ntasks})"
@@ -239,7 +254,9 @@ class AsyncWorkStealingMaster(AsyncMaster):
         for child_id in list(self.children.keys()):
             try:
                 await self._comm.send_message_to_child(
-                    child_id, Stop(sender=self.node_id, type=StopType.TERMINATE)
+                    child_id,
+                    Stop(sender=self.node_id, type=StopType.TERMINATE),
+                    retries=self._config.send_retries,
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to send Stop to {child_id}: {e}")

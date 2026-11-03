@@ -15,8 +15,6 @@ from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from .hb import HeartBeatProcess
 from .messages import Message, all_messages
-
-_CRITICAL_MSG_TYPES = frozenset({5, 3, 9, 8, 6})  # TaskUpdate, ResultBatch, Stop, Ready, NodeUpdate
 from .nodeinfo import NodeInfo
 from .pipe import (
     AsyncConnection,
@@ -213,6 +211,8 @@ class AsyncComm:
         self._hb_parent_conn = hb_parent_conn
         self._child_transport = child_transport
         self._req_res = req_res
+        # Not used by the send path itself, which makes one attempt unless the caller passes
+        # `retries`. Kept as the default callers opt into, and carried through checkpoints.
         self._send_retries = send_retries
         self._send_timeout = send_timeout
         self._seen_message_ids: collections.OrderedDict = collections.OrderedDict()
@@ -404,27 +404,33 @@ class AsyncComm:
         self,
         send_coro_factory: Callable,
         description: str,
-        msg: Message = None,
+        retries: int = 1,
     ) -> bool:
-        use_retry = self._req_res and (
-            msg is None or msg.MSG_TYPE_ID in _CRITICAL_MSG_TYPES
-        )
-        if not use_retry:
+        """Send once, or up to `retries` times on ACK timeout when the caller asks for it.
+
+        Retrying is opt-in so a send's worst-case duration is visible at the call site. Every
+        attempt resends the same packed message, so the receiver's duplicate check discards
+        the copy when only the ACK was lost.
+        """
+        if not self._req_res or retries <= 1:
             return await send_coro_factory()
 
-        for attempt in range(self._send_retries):
+        for attempt in range(retries):
             success = await send_coro_factory()
             if success:
                 return True
             self.logger.warning(
                 f"{self._node_info.node_id}: {description} failed attempt "
-                f"{attempt + 1}/{self._send_retries}"
+                f"{attempt + 1}/{retries}"
             )
         self.logger.error(
-            f"{self._node_info.node_id}: {description} failed after "
-            f"{self._send_retries} retries"
+            f"{self._node_info.node_id}: {description} failed after {retries} retries"
         )
         return False
+
+    @property
+    def send_retries(self) -> int:
+        return self._send_retries
 
     # -----------------------------------------------------------------
     #  Monitors
@@ -717,7 +723,7 @@ class AsyncComm:
     # Send / recv                                                         #
     # ------------------------------------------------------------------ #
 
-    async def send_message_to_parent(self, msg: Message) -> bool:
+    async def send_message_to_parent(self, msg: Message, retries: int = 1) -> bool:
         if self._node_info.parent_id is None:
             self.logger.warning(
                 f"{self._node_info.node_id}: No parent connection available"
@@ -731,7 +737,7 @@ class AsyncComm:
                 return await self._parent_conn.send(packed, timeout=self._send_timeout)
 
             success = await self._send_with_retry(
-                _do_send, f"send {type(msg).__name__} to parent", msg=msg
+                _do_send, f"send {type(msg).__name__} to parent", retries=retries
             )
             if success:
                 self.logger.debug(
@@ -763,7 +769,9 @@ class AsyncComm:
             await asyncio.get_running_loop().run_in_executor(None, msg.unpack)
         return msg
 
-    async def send_message_to_child(self, child_id: str, msg: Message) -> bool:
+    async def send_message_to_child(
+        self, child_id: str, msg: Message, retries: int = 1
+    ) -> bool:
         if (
             not child_id.startswith("client-")
             and child_id not in self._node_info.children_ids
@@ -791,7 +799,9 @@ class AsyncComm:
                 return await conn.send(packed, target_id, timeout=self._send_timeout)
 
             success = await self._send_with_retry(
-                _do_send, f"send {type(msg).__name__} to child {child_id}", msg=msg
+                _do_send,
+                f"send {type(msg).__name__} to child {child_id}",
+                retries=retries,
             )
             if success:
                 self.logger.debug(

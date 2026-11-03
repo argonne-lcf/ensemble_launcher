@@ -9,7 +9,10 @@ from .async_worker import AsyncWorker
 from .async_workstealing_master import AsyncWorkStealingMaster
 from .async_workstealing_worker import AsyncWorkStealingWorker
 from .cluster_client import ClusterClient
+from .discovery import PolicyEndpointInfo, discover_policy_nodes, read_policy_endpoint
 from .node import Node
+from .policy_client import PolicyClient, PolicyGroupClient, PolicyStateError
+from .policy_endpoint import PolicyEndpoint
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:

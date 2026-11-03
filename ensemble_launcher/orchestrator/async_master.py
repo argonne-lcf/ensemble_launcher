@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import random
@@ -9,7 +10,7 @@ import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Set, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
@@ -35,6 +36,7 @@ from ensemble_launcher.config import LauncherConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
+from ensemble_launcher.orchestrator.policy_endpoint import KIND_CHILDREN, PolicyEndpoint
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
 from ensemble_launcher.scheduler.child_state import ChildState
@@ -127,6 +129,10 @@ class AsyncMaster(Node):
         # Cached checkpoint data — populated early in _run() before sockets are set up.
         self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
 
+        # Externally tunable children-policy state (see policy_endpoint.py).
+        self._policy_endpoint: Optional[PolicyEndpoint] = None
+        self._policy_version_written: int = -1
+
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
         self._task_update_task: Optional[asyncio.Task] = None
@@ -147,6 +153,17 @@ class AsyncMaster(Node):
         # Intermediate task buffer: batches tasks dispatched to children (fan-out)
         self._itask_q: Dict[str, deque] = {}
         self._task_flush_task: Optional[asyncio.Task] = None
+        # Flush sends in flight per destination (capped at max_inflight_flushes), and the
+        # messages whose send failed. A failed message is resent as the same object so it
+        # keeps its message_id and the receiver can drop the copy if only the ACK was lost.
+        self._result_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
+        self._result_retry_q: Dict[str, deque] = {}
+        self._task_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
+        self._task_retry_q: Dict[str, deque] = {}
+        # Periodic checkpointing, on its own cadence rather than the status loop's. The
+        # in-flight handle keeps a slow write from overlapping the next one.
+        self._checkpoint_task: Optional[asyncio.Task] = None
+        self._checkpoint_write: Optional[asyncio.Task] = None
         # Batch mode root: accumulates results streamed via IResultBatch during execution
         self._batch_streaming_results: List[Result] = []
 
@@ -426,6 +443,11 @@ class AsyncMaster(Node):
         children (including any recreated ones) have been registered.
         """
         self._reporting_task = asyncio.create_task(self._report_status())
+
+        if self._checkpointer is not None:
+            self._checkpoint_task = asyncio.create_task(
+                self._periodic_checkpoint_loop()
+            )
 
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
@@ -770,6 +792,8 @@ class AsyncMaster(Node):
         if ckpt_restored and len(self._scheduler.unassigned_task_ids):
             self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
+        await self._create_policy_endpoint()
+
         # Check executor validity
         assert self._config.child_executor_name in executor_registry.async_executors, (
             f"Executor {self._config.child_executor_name} not found in async executors {executor_registry.async_executors}"
@@ -781,9 +805,14 @@ class AsyncMaster(Node):
         if self._config.child_executor_name == "async_mpi":
             kwargs["mpi_config"] = self._config.mpi_config
 
-        # Create executor
+        # Create executor. The child executor launches sub-masters and workers rather than
+        # tasks, but it is built from the same registry, so it takes its configuration from
+        # the same place -- `executor_configs` keyed by the executor's name.
         self._executor: Executor = executor_registry.create_executor(
-            self._config.child_executor_name, kwargs=kwargs
+            self._config.child_executor_name,
+            kwargs=self._config.executor_kwargs(
+                self._config.child_executor_name, **kwargs
+            ),
         )
         self.logger.info(f"Created {self._config.child_executor_name} executor")
 
@@ -842,7 +871,9 @@ class AsyncMaster(Node):
         # All children are launched and synced — signal each one that the master
         # is ready so they can send their final ResultBatch when done.
         for child_id in list(self._child_result_batch_task.keys()):
-            await self._comm.send_message_to_child(child_id, Ready(sender=self.node_id))
+            await self._comm.send_message_to_child(
+                child_id, Ready(sender=self.node_id), retries=self._config.send_retries
+            )
             self.logger.info(f"{self.node_id}: Sent Ready to {child_id}")
 
         # Create aggregate task once, after all children (including recreated ones) are registered.
@@ -919,6 +950,36 @@ class AsyncMaster(Node):
         )
         return True
 
+    async def _create_policy_endpoint(self) -> None:
+        """Serve this master's children-policy state to external ``PolicyClient``s.
+
+        Started here rather than in ``_create_monitor_tasks`` so the address file is
+        on disk before the node reports ready — a client that races node startup then
+        blocks on the file rather than finding a half-initialized endpoint.
+
+        No ``rescore_cb`` is registered: the children-policy analogue of re-scoring a
+        queue is re-running resource/task assignment, which can revoke allocations and
+        recycle live child processes. New children-policy state instead takes effect at
+        the next natural assignment point.
+        """
+        if not (self._config.cluster or self._config.enable_policy_client):
+            return
+        if self._checkpointer is None:
+            self.logger.warning(
+                f"{self.node_id}: policy endpoint requested but checkpoint_dir is "
+                "unset; PolicyClient discovery is file-based, so none will be served"
+            )
+            return
+
+        self._policy_endpoint = PolicyEndpoint(
+            self.node_id,
+            self._checkpointer,
+            self.logger.getChild("policy"),
+        )
+        self._policy_endpoint.register(KIND_CHILDREN, self._scheduler.policy)
+        self._policy_endpoint.restore(await self._checkpointer.read_policy_state())
+        await self._policy_endpoint.start()
+
     async def _write_checkpoint(self) -> None:
         """Write scheduler state and comm state to checkpoint."""
         if self._checkpointer is None:
@@ -927,6 +988,21 @@ class AsyncMaster(Node):
             scheduler_state=self._scheduler.get_state(self.node_id),
             comm_state=self._comm.get_state(),
         )
+        await self._write_policy_checkpoint()
+
+    async def _write_policy_checkpoint(self) -> None:
+        """Persist tuned policy state, skipping the write when nothing changed.
+
+        ``version`` only advances on a successful ``set``, so an untuned run never
+        pays for this on top of every report interval.
+        """
+        if self._policy_endpoint is None:
+            return
+        version = self._policy_endpoint.version
+        if version == self._policy_version_written:
+            return
+        await self._checkpointer.write_policy_state(self._policy_endpoint.snapshot())
+        self._policy_version_written = version
 
     # --------------------------------------------------------------------------
     #                               Parent Synchronization
@@ -1101,7 +1177,9 @@ class AsyncMaster(Node):
 
         # Send NodeUpdate (now triggered by child's request)
         if node_update is not None:
-            await self._comm.send_message_to_child(child_id, node_update)
+            await self._comm.send_message_to_child(
+                child_id, node_update, retries=self._config.send_retries
+            )
             self.logger.info(
                 f"{self.node_id}: Sent node update to {child_id} containing {len(node_update.nodes.nodes)} nodes"
             )
@@ -1136,7 +1214,9 @@ class AsyncMaster(Node):
         if task_req is not None:
             task_update = self._build_init_task_update(child_id)
             if task_update is not None:
-                await self._comm.send_message_to_child(child_id, task_update)
+                await self._comm.send_message_to_child(
+                    child_id, task_update, retries=self._config.send_retries
+                )
                 self.logger.info(
                     f"{self.node_id}: Sent initial task update to {child_id} "
                     f"containing {len(task_update.added_tasks)} tasks"
@@ -1183,7 +1263,7 @@ class AsyncMaster(Node):
             self._routed_task_ids.setdefault(child_id, set()).update(added_tasks)
             self.logger.debug(f"Buffering {len(added_tasks)} Tasks for {child_id}")
             if len(task_q) >= self._config.task_buffer_size or not self._config.cluster:
-                await self._flush_child_task_queue(child_id)
+                self._schedule_task_flush(child_id)
 
         for task_id in unassigned_tasks:
             self.logger.warning(f"Can't route task {task_id} to any child")
@@ -1356,7 +1436,9 @@ class AsyncMaster(Node):
             self._comm.parent_dead_event is None
             or not self._comm.parent_dead_event.is_set()
         ):
-            success = await self._comm.send_message_to_parent(result_batch)
+            success = await self._comm.send_message_to_parent(
+                result_batch, retries=self._config.send_retries
+            )
             if success:
                 self.logger.info(
                     f"{self.node_id}: Successfully sent results to parent"
@@ -1396,10 +1478,6 @@ class AsyncMaster(Node):
                     self.logger.info(status)
                 else:
                     self.logger.info(status)
-
-                # Periodic checkpoint: scheduler state, comm state, and collected results.
-                if self._checkpointer is not None:
-                    asyncio.create_task(self._write_checkpoint())
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
                     jitter = random.uniform(-0.05, 0.05) * self._config.report_interval
@@ -1414,6 +1492,68 @@ class AsyncMaster(Node):
                 break
             except Exception as e:
                 self.logger.info(f"Reporting loop failed with error {e}")
+                await asyncio.sleep(0.1)
+
+    @property
+    def _checkpoint_interval(self) -> float:
+        """How often to checkpoint, defaulting to the status cadence.
+
+        Checkpointing used to ride the status loop, which tied how fresh a peer's view of this
+        node is to how much state gets serialised and fsynced. They scale differently: a
+        ``Status`` is a handful of integers, while a checkpoint rewrites every task id this
+        node has handled. Leaving the interval at ``None`` keeps the old coupled behaviour.
+        """
+        if self._config.checkpoint_interval is None:
+            return self._config.report_interval
+        return self._config.checkpoint_interval
+
+    def _start_checkpoint_write(self) -> None:
+        """Start a checkpoint write unless the previous one is still running.
+
+        A checkpoint is a snapshot of the moment it is taken, so a tick skipped because the
+        last write is still in flight costs nothing -- the next one captures a newer state
+        anyway. Skipping also keeps writes from overlapping, which would race on the shared
+        metadata file that each write reads before rewriting.
+        """
+        if self._checkpoint_write is not None and not self._checkpoint_write.done():
+            self.logger.debug(
+                f"{self.node_id}: Checkpoint still writing, skipping this interval"
+            )
+            return
+        self._checkpoint_write = asyncio.create_task(self._write_checkpoint())
+        self._checkpoint_write.add_done_callback(self._checkpoint_write_done)
+
+    def _checkpoint_write_done(self, task: asyncio.Task) -> None:
+        """Surface a failed checkpoint write, which is otherwise silent."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"{self.node_id}: Checkpoint write failed: {exc}")
+
+    async def _periodic_checkpoint_loop(self) -> None:
+        """Write checkpoints on their own interval, independent of status reporting.
+
+        Writes before waiting, not after. A ``ClusterClient`` blocks on this node's comm file
+        appearing before it can connect, so the first checkpoint has to land as promptly as it
+        did when this rode the status loop -- not one (possibly much longer) interval later.
+        """
+        while not self._stop_reporting_event.is_set():
+            try:
+                self._start_checkpoint_write()
+                jitter = random.uniform(-0.05, 0.05) * self._checkpoint_interval
+                try:
+                    await asyncio.wait_for(
+                        self._stop_reporting_event.wait(),
+                        timeout=self._checkpoint_interval + jitter,
+                    )
+                    break  # Exit if stop event was set
+                except asyncio.TimeoutError:
+                    pass  # Continue loop after interval
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.info(f"Checkpoint loop failed with error {e}")
                 await asyncio.sleep(0.1)
 
     async def _client_request_monitor(self) -> None:
@@ -1436,87 +1576,166 @@ class AsyncMaster(Node):
                 self.logger.error(f"Client task update monitor failed with error: {e}")
                 await asyncio.sleep(0.5)
 
-    async def _flush_dest_queue(self, dest_id: str) -> None:
-        """Send all buffered results for dest_id as a single IResultBatch."""
-        result_q = self._iresult_q.get(dest_id)
-        if not result_q:
-            return
-        results = []
-        while result_q:
-            results.append(result_q.popleft())
-        msg = IResultBatch(sender=self.node_id, data=results)
+    def _send_result_batch(self, dest_id: str, msg: IResultBatch, retries: int = 1):
+        """Return the send coroutine for an IResultBatch bound for `dest_id`."""
         if dest_id.startswith("client-"):
-            self._total_streamed += len(results)
-            success = await self._comm.send_message_to_child(dest_id, msg)
-        else:
-            success = await self._comm.send_message_to_parent(msg)
-        if not success:
-            self.logger.warning(
-                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
-            )
+            return self._comm.send_message_to_child(dest_id, msg, retries=retries)
+        return self._comm.send_message_to_parent(msg, retries=retries)
+
+    def _schedule_result_flush(self, dest_id: str) -> None:
+        """Start sends for dest_id's buffered results, up to max_inflight_flushes at once.
+
+        Never awaits. Each send is its own task, so a slow destination or a dropped ACK
+        holds up only its own window, never other destinations or the caller's loop.
+        Messages are popped here, synchronously, so concurrent batches never overlap.
+        """
+        inflight = self._result_flush_inflight.setdefault(dest_id, set())
+        retry_q, result_q = self._result_retry_q.get(dest_id), self._iresult_q.get(dest_id)
+        while len(inflight) < self._config.max_inflight_flushes:
+            if retry_q:
+                msg = retry_q.popleft()
+            elif result_q:
+                msg = IResultBatch(sender=self.node_id, data=list(result_q))
+                result_q.clear()
+            else:
+                break
+            t = asyncio.create_task(self._send_result_batch(dest_id, msg))
+            inflight.add(t)
+            t.add_done_callback(functools.partial(self._result_flush_done, dest_id, msg))
+
+    def _result_flush_done(
+        self, dest_id: str, msg: IResultBatch, task: asyncio.Task
+    ) -> None:
+        """Free the window slot; on failure, queue the same message for the next flush."""
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight is not None:
+            inflight.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None and task.result():
             if dest_id.startswith("client-"):
-                self._total_streamed -= len(results)
-            requeue = self._iresult_q.setdefault(dest_id, deque())
-            requeue.extend(results)
+                self._total_streamed += len(msg.data)
+            return
+        self.logger.warning(
+            f"Failed to send IResultBatch of size {len(msg.data)} to {dest_id}"
+            f"{f' ({exc})' if exc else ''}, re-queuing"
+        )
+        # Same object, same message_id: if only the ACK was lost, the receiver drops the copy.
+        self._result_retry_q.setdefault(dest_id, deque()).appendleft(msg)
+
+    async def _drain_results(self, dest_id: str) -> None:
+        """Wait out in-flight result sends for dest_id, then send everything left.
+
+        Runs at teardown, where no later flush tick will come, so this is the one result
+        path that opts into comm-level retries.
+        """
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight:
+            await asyncio.gather(*list(inflight), return_exceptions=True)
+        retry_q = self._result_retry_q.pop(dest_id, None) or deque()
+        result_q = self._iresult_q.get(dest_id)
+        if result_q:
+            retry_q.append(IResultBatch(sender=self.node_id, data=list(result_q)))
+            result_q.clear()
+        for msg in retry_q:
+            success = await self._send_result_batch(
+                dest_id, msg, retries=self._config.send_retries
+            )
+            if success and dest_id.startswith("client-"):
+                self._total_streamed += len(msg.data)
+            elif not success:
+                self.logger.error(
+                    f"Failed to drain IResultBatch of size {len(msg.data)} to {dest_id}"
+                )
 
     async def _periodic_flush_loop(self) -> None:
-        """Flush buffered results on a fixed interval with jitter."""
+        """Flush buffered results on a fixed interval with jitter.
+
+        Only schedules sends; `_schedule_result_flush` never awaits, so one slow destination
+        cannot delay the others or the next tick. Destinations with a pending resend are
+        included so a failed batch is retried even when nothing new has arrived.
+        """
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
             await asyncio.sleep(self._config.result_flush_interval + jitter)
-            for dest_id in list(self._iresult_q.keys()):
-                await self._flush_dest_queue(dest_id)
+            for dest_id in set(self._iresult_q) | set(self._result_retry_q):
+                self._schedule_result_flush(dest_id)
 
-    async def _flush_child_task_queue(self, child_id: str) -> None:
-        """Send all buffered tasks for child_id to that child as a single TaskUpdate."""
-        task_q = self._itask_q.get(child_id)
-        if not task_q:
+    def _schedule_task_flush(self, child_id: str) -> None:
+        """Start sends for child_id's buffered tasks, up to max_inflight_flushes at once.
+
+        Same windowed pattern as `_schedule_result_flush`. Nothing is sent while the child
+        is RECOVERING; recovery owns its tasks then.
+        """
+        if self._scheduler.get_child_state(child_id) == ChildState.RECOVERING:
             return
-
-        state = self._scheduler.get_child_state(child_id)
-        if state == ChildState.RECOVERING:
-            return
-
-        tasks = []
-        while task_q:
-            tasks.append(task_q.popleft())
-        success = await self._comm.send_message_to_child(
-            child_id,
-            TaskUpdate(sender=self.node_id, added_tasks=tasks),
-        )
-        if success:
-            self.logger.info(f"Sent TaskUpdate of size {len(tasks)} to {child_id}")
-        else:
-            state = self._scheduler.get_child_state(child_id)
-            if self._scheduler.is_child_terminal(child_id):
-                self.logger.error(
-                    f"Failed to send TaskUpdate of size {len(tasks)} to {child_id} (state={state})"
-                )
-                for task in tasks:
-                    result = Result(
-                        sender=self.node_id,
-                        task_id=task.task_id,
-                        success=False,
-                        exception=f"Send to {child_id} failed at {self.node_id}",
-                    )
-                    self._create_forward_task(result)
+        inflight = self._task_flush_inflight.setdefault(child_id, set())
+        retry_q, task_q = self._task_retry_q.get(child_id), self._itask_q.get(child_id)
+        while len(inflight) < self._config.max_inflight_flushes:
+            if retry_q:
+                msg = retry_q.popleft()
+            elif task_q:
+                msg = TaskUpdate(sender=self.node_id, added_tasks=list(task_q))
+                task_q.clear()
             else:
-                self.logger.info(
-                    f"Send to {child_id} failed (state={state}), re-queuing {len(tasks)} tasks"
+                break
+            t = asyncio.create_task(self._comm.send_message_to_child(child_id, msg))
+            inflight.add(t)
+            t.add_done_callback(functools.partial(self._task_flush_done, child_id, msg))
+
+    def _task_flush_done(
+        self, child_id: str, msg: TaskUpdate, task: asyncio.Task
+    ) -> None:
+        """Free the window slot; on failure, resend the same TaskUpdate or fail its tasks.
+
+        Synchronous, so the child-state check and the requeue are atomic with respect to
+        the event loop.
+        """
+        inflight = self._task_flush_inflight.get(child_id)
+        if inflight is not None:
+            inflight.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None and task.result():
+            self.logger.info(
+                f"Sent TaskUpdate of size {len(msg.added_tasks)} to {child_id}"
+            )
+            return
+        state = self._scheduler.get_child_state(child_id)
+        if self._scheduler.is_child_terminal(child_id):
+            self.logger.error(
+                f"Failed to send TaskUpdate of size {len(msg.added_tasks)} to {child_id} (state={state})"
+            )
+            for t in msg.added_tasks:
+                result = Result(
+                    sender=self.node_id,
+                    task_id=t.task_id,
+                    success=False,
+                    exception=f"Send to {child_id} failed at {self.node_id}",
                 )
-                task_q = self._itask_q.setdefault(child_id, deque())
-                task_q.extend(tasks)
+                self._create_forward_task(result)
+            return
+        self.logger.info(
+            f"Send to {child_id} failed (state={state}){f' ({exc})' if exc else ''}, "
+            f"re-queuing {len(msg.added_tasks)} tasks"
+        )
+        # Same object, same message_id: if only the ACK was lost, the child drops the
+        # copy instead of running the tasks twice.
+        self._task_retry_q.setdefault(child_id, deque()).appendleft(msg)
 
     async def _periodic_task_flush_loop(self) -> None:
         """Flush buffered child-bound tasks on a fixed interval with jitter.
 
         Runs on all masters that have children (i.e. there are tasks to dispatch downward).
+        Only schedules sends, for the same reason as `_periodic_flush_loop`.
         """
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.task_flush_interval
             await asyncio.sleep(self._config.task_flush_interval + jitter)
-            for child_id in list(self._itask_q.keys()):
-                await self._flush_child_task_queue(child_id)
+            for child_id in set(self._itask_q) | set(self._task_retry_q):
+                self._schedule_task_flush(child_id)
 
     async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
         """Buffer a result for its destination; the periodic flush loop sends it."""
@@ -1548,7 +1767,7 @@ class AsyncMaster(Node):
             result_q = self._iresult_q.setdefault(dest_id, deque())
             result_q.extend(results)
             if len(result_q) >= self._config.result_buffer_size:
-                await self._flush_dest_queue(dest_id)
+                self._schedule_result_flush(dest_id)
 
     async def _child_result_monitor(self, child_id: str) -> None:
         """Receive IResultBatch messages from child and forward to client or parent."""
@@ -1596,8 +1815,8 @@ class AsyncMaster(Node):
                     exc_info=True,
                 )
         # Flush any buffered results that didn't reach the buffer threshold.
-        for dest_id in list(self._iresult_q.keys()):
-            await self._flush_dest_queue(dest_id)
+        for dest_id in set(self._iresult_q) | set(self._result_retry_q):
+            await self._drain_results(dest_id)
 
     async def _child_status_monitor(self, child_id: str) -> None:
         """Continuously collect status messages from a single child and update scheduler."""
@@ -1649,7 +1868,9 @@ class AsyncMaster(Node):
                             )
                             # Signal the recovered child that the master is ready.
                             await self._comm.send_message_to_child(
-                                child_id, Ready(sender=self.node_id)
+                                child_id,
+                                Ready(sender=self.node_id),
+                                retries=self._config.send_retries,
                             )
                             self.logger.info(
                                 f"{self.node_id}: Sent Ready to recovered child {child_id}"
@@ -1776,6 +1997,9 @@ class AsyncMaster(Node):
             if t is not None:
                 t.cancel()
                 tasks_to_cancel.append(t)
+        for t in self._task_flush_inflight.pop(child_id, set()):
+            t.cancel()
+            tasks_to_cancel.append(t)
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
@@ -1786,6 +2010,7 @@ class AsyncMaster(Node):
         self._routed_task_ids.pop(child_id, None)
         self._iresult_q.pop(child_id, None)
         self._itask_q.pop(child_id, None)
+        self._task_retry_q.pop(child_id, None)
         self._comm.update_node_info(self.info())
 
     async def stop(self) -> None:
@@ -1812,11 +2037,40 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
 
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
+        for loop_task in (self._flush_task, self._task_flush_task):
+            if loop_task and not loop_task.done():
+                loop_task.cancel()
+                try:
+                    await loop_task
+                except asyncio.CancelledError:
+                    pass
+
+        inflight_flushes = [
+            t
+            for inflight in (
+                *self._result_flush_inflight.values(),
+                *self._task_flush_inflight.values(),
+            )
+            for t in inflight
+        ]
+        for t in inflight_flushes:
+            t.cancel()
+        if inflight_flushes:
+            await asyncio.gather(*inflight_flushes, return_exceptions=True)
+
+        if self._checkpoint_task and not self._checkpoint_task.done():
+            self._checkpoint_task.cancel()
             try:
-                await self._flush_task
+                await self._checkpoint_task
             except asyncio.CancelledError:
+                pass
+
+        # Let any write already running finish before the final checkpoint below, so the two
+        # do not race to replace the same files.
+        if self._checkpoint_write and not self._checkpoint_write.done():
+            try:
+                await self._checkpoint_write
+            except Exception:
                 pass
 
         if self._client_monitor_task and not self._client_monitor_task.done():
@@ -1835,6 +2089,9 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
             self.logger.info("Stopped parent task update monitor")
+
+        if self._policy_endpoint is not None:
+            await self._policy_endpoint.stop()
 
         # Tear down children and wait for them to be done
         for child_name in self._scheduler.children_names:
@@ -1955,7 +2212,9 @@ class AsyncMaster(Node):
             for child_id in list(self.children.keys()):
                 try:
                     await self._comm.send_message_to_child(
-                        child_id, Stop(sender=self.node_id, type=stop_type)
+                        child_id,
+                        Stop(sender=self.node_id, type=stop_type),
+                        retries=self._config.send_retries,
                     )
                 except Exception:
                     pass

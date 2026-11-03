@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import random
@@ -7,7 +8,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
@@ -38,6 +39,7 @@ from ensemble_launcher.executors import (
     executor_registry,
 )
 from ensemble_launcher.logging import setup_logger
+from ensemble_launcher.orchestrator.policy_endpoint import KIND_TASK, PolicyEndpoint
 from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.resource import (
@@ -110,6 +112,10 @@ class AsyncWorker(Node):
         self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
         self._ckpt_results: Optional[dict] = None  # {task_id: Result}
 
+        # Externally tunable task-policy state (see policy_endpoint.py).
+        self._policy_endpoint: Optional[PolicyEndpoint] = None
+        self._policy_version_written: int = -1
+
         # Cluster mode state
         self._stop_task_update = asyncio.Event()
         self._task_update_task = None
@@ -125,12 +131,21 @@ class AsyncWorker(Node):
         # Intermediate result batch queue
         self._iresult_q: Dict[str, deque] = {}
         self._streamed_task_ids: set = set()
+        # Flush sends in flight per destination (capped at max_inflight_flushes), and the
+        # messages whose send failed. A failed message is resent as the same object so it
+        # keeps its message_id and the receiver can drop the copy if only the ACK was lost.
+        self._result_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
+        self._result_retry_q: Dict[str, deque] = {}
 
         # Parent-ready handshake: set when parent sends a Ready message
         self._parent_ready_event = asyncio.Event()
         self._parent_ready_monitor_task: Optional[asyncio.Task] = None
 
         self._flush_task: Optional[asyncio.Task] = None
+        # Periodic checkpointing, on its own cadence rather than the status loop's. The
+        # in-flight handle keeps a slow write from overlapping the next one.
+        self._checkpoint_task: Optional[asyncio.Task] = None
+        self._checkpoint_write: Optional[asyncio.Task] = None
 
     @asynccontextmanager
     async def _timer(self, event_name: str):
@@ -237,6 +252,11 @@ class AsyncWorker(Node):
         if self.parent or self._config.cluster:
             self._flush_task = asyncio.create_task(self._periodic_flush_loop())
 
+        if self._checkpointer is not None:
+            self._checkpoint_task = asyncio.create_task(
+                self._periodic_checkpoint_loop()
+            )
+
     async def _lazy_init(self) -> None:
         """Set up all resources needed before task execution begins.
 
@@ -332,38 +352,91 @@ class AsyncWorker(Node):
         # Restore scheduler state from cached checkpoint data (comm already restored).
         self._restore_scheduler_checkpoint()
 
+        await self._create_policy_endpoint()
+
         self._scheduler.start_monitoring()  # start the scheduler monitoring
 
         self.logger.info(f"Running {list(self.tasks.keys())} tasks")
         self.logger.debug(f"Pending tasks size {len(self._scheduler._pending_tasks)}")
 
         ##lazy executor creation
-        if isinstance(self._config.task_executor_name, list):
-            assert all(
-                [
-                    executor_name in executor_registry.async_executors
-                    for executor_name in self._config.task_executor_name
-                ]
-            ), (
-                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
-            )
-        else:
-            assert (
-                self._config.task_executor_name in executor_registry.async_executors
-            ), (
-                f"Executor {self._config.task_executor_name} not found in async executors {executor_registry.async_executors}"
+        for executor_name in executor_names:
+            assert executor_name in executor_registry.async_executors, (
+                f"Executor {executor_name} not found in async executors {executor_registry.async_executors}"
             )
 
+        self._warn_unused_executor_configs(executor_names)
+
+        # Arguments every executor may take, derived from this worker's own allocation.
+        # `executor_kwargs` merges the per-executor config over these, so an executor that
+        # wants something different -- a pool sized by GPU rather than by core -- says so in
+        # `executor_configs` rather than here.
         kwargs = {}
         kwargs["logger"] = self.logger.getChild("executor")
         kwargs["gpu_selector"] = self._config.gpu_selector
         kwargs["max_workers"] = self.nodes.resources[0].cpu_count
         kwargs["return_stdout"] = self._config.return_stdout
+        # async_pinned builds one pool per device, so it needs the ids rather than a count.
+        kwargs["gpus"] = self.nodes.resources[0].gpus
 
         ##Async mpi specific options
         kwargs["mpi_config"] = self._config.mpi_config
 
-        # Async mpi pool specific options
+        # Async mpi pool specific options. Only that executor reads them, and building
+        # `cpu_to_pid` walks every core of every node, so skip it when it is not in play.
+        if "async_mpi_processpool" in executor_names:
+            kwargs.update(self._mpi_pool_kwargs(original_head_node))
+
+        self._executor = {}
+        for exec_name in executor_names:
+            self._executor[exec_name] = executor_registry.create_executor(
+                exec_name, kwargs=self._config.executor_kwargs(exec_name, **kwargs)
+            )
+        self._default_executor_name = executor_names[0]
+
+        self.logger.info(
+            f"Created {self._config.task_executor_name} executors (Default = {self._default_executor_name})"
+        )
+
+        # Start global monitor tasks
+        self._create_monitor_tasks()
+
+    def _warn_unused_executor_configs(self, executor_names: List[str]) -> None:
+        """Log configured executors this worker will not build, and unrecognised fields.
+
+        ``executor_configs`` is keyed by name and ``ExecutorConfig`` allows extra fields, so
+        both a misspelled executor name and a misspelled field are accepted in silence and
+        simply never take effect. Say so once at startup rather than leaving the user to work
+        out why their setting did nothing.
+        """
+        for name, config in self._config.executor_configs.items():
+            if name not in executor_names:
+                self.logger.warning(
+                    f"{self.node_id}: executor_configs has an entry for {name!r}, which is "
+                    f"not among this worker's task executors {executor_names}. Ignoring it."
+                )
+            extra = config.model_extra or {}
+            if extra:
+                self.logger.warning(
+                    f"{self.node_id}: executor_configs[{name!r}] has fields not declared by "
+                    f"{type(config).__name__}: {sorted(extra)}. They will be passed to the "
+                    "executor's constructor as-is."
+                )
+
+    def _mpi_pool_kwargs(self, original_head_node) -> Dict[str, Any]:
+        """Constructor arguments only ``async_mpi_processpool`` reads.
+
+        The pool launches one long-lived MPI job over the whole allocation and addresses ranks
+        by ``(host, cpu)``, so it needs the launch geometry and the rank map up front.
+
+        Args:
+            original_head_node: The head node's resources *before* the gateway core was
+                trimmed off. The trimmed core is still part of the MPI job -- it runs the
+                gateway rank -- so the geometry has to count it.
+        Returns:
+            ``mpi_info`` and ``cpu_to_pid`` keyword arguments
+        """
+        kwargs: Dict[str, Any] = {}
         np = sum(
             [original_head_node.cpu_count]
             + [node.cpu_count for node in self.nodes.resources[1:]]
@@ -381,17 +454,12 @@ class AsyncWorker(Node):
                     list(map(str, original_head_node.cpus))
                 )
         else:
-            # if (
-            #     "async_mpi_processpool" in executor_names
-            #     and self._config.mpi_config.rankfile_flag is None
-            # ):
             ## TODO: implement rankfile
-            if "async_mpi_processpool" in executor_names:
-                raise ValueError(
-                    f"{self.node_id}: Not all nodes are identical"
-                    f" and MPI flavour {self._config.mpi_config.flavor} doesn't support rankfile."
-                    f"Impossible to initialize async_mpi_processpool."
-                )
+            raise ValueError(
+                f"{self.node_id}: Not all nodes are identical"
+                f" and MPI flavour {self._config.mpi_config.flavor} doesn't support rankfile."
+                f"Impossible to initialize async_mpi_processpool."
+            )
 
         kwargs["cpu_to_pid"] = {}
         pid = 0
@@ -401,28 +469,7 @@ class AsyncWorker(Node):
             for cpu_id in res.cpus:
                 kwargs["cpu_to_pid"][(host, cpu_id)] = pid
                 pid += 1
-
-        if isinstance(self._config.task_executor_name, list):
-            self._executor = {}
-            for exec_name in self._config.task_executor_name:
-                self._executor[exec_name] = executor_registry.create_executor(
-                    exec_name, kwargs=kwargs
-                )
-            self._default_executor_name = self._config.task_executor_name[0]
-        else:
-            self._executor = {
-                self._config.task_executor_name: executor_registry.create_executor(
-                    self._config.task_executor_name, kwargs=kwargs
-                )
-            }
-            self._default_executor_name = self._config.task_executor_name
-
-        self.logger.info(
-            f"Created {self._config.task_executor_name} executors (Default = {self._default_executor_name})"
-        )
-
-        # Start global monitor tasks
-        self._create_monitor_tasks()
+        return kwargs
 
     # --------------------------------------------------------------------------
     #                               Checkpointing
@@ -492,10 +539,59 @@ class AsyncWorker(Node):
         self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
         return True
 
+    async def _create_policy_endpoint(self) -> None:
+        """Serve this worker's task-policy state to external ``PolicyClient``s.
+
+        Created before ``start_monitoring`` so a tune that lands immediately after
+        startup cannot race the first dispatch, and started here rather than in
+        ``_create_monitor_tasks`` so the address file exists before the node reports
+        ready.
+
+        Unlike the master, a worker registers a ``rescore_cb``: task priorities are
+        cached in the pending heap at push time, so without it a tune would only
+        affect tasks submitted afterwards.
+        """
+        if not (self._config.cluster or self._config.enable_policy_client):
+            return
+        if self._checkpointer is None:
+            self.logger.warning(
+                f"{self.node_id}: policy endpoint requested but checkpoint_dir is "
+                "unset; PolicyClient discovery is file-based, so none will be served"
+            )
+            return
+
+        self._policy_endpoint = PolicyEndpoint(
+            self.node_id,
+            self._checkpointer,
+            self.logger.getChild("policy"),
+        )
+        self._policy_endpoint.register(
+            KIND_TASK,
+            self._scheduler.policy,
+            rescore_cb=self._scheduler.reprioritize_pending,
+        )
+        self._policy_endpoint.restore(await self._checkpointer.read_policy_state())
+        await self._policy_endpoint.start()
+
+    async def _write_policy_checkpoint(self) -> None:
+        """Persist tuned policy state, skipping the write when nothing changed.
+
+        ``version`` only advances on a successful ``set``, so an untuned run never
+        pays for this on top of every report interval.
+        """
+        if self._policy_endpoint is None:
+            return
+        version = self._policy_endpoint.version
+        if version == self._policy_version_written:
+            return
+        await self._checkpointer.write_policy_state(self._policy_endpoint.snapshot())
+        self._policy_version_written = version
+
     async def _write_checkpoint(self) -> None:
         """Write scheduler state, comm state, and completed results to checkpoint."""
         if self._checkpointer is None:
             return
+        await self._write_policy_checkpoint()
         await self._checkpointer.write_checkpoint(
             scheduler_state=self._scheduler.get_state(self.node_id),
             comm_state=self._comm.get_state(),
@@ -594,42 +690,91 @@ class AsyncWorker(Node):
 
         return done_callback
 
-    async def _flush_dest_queue(self, dest_id: str) -> float:
-        """Send all buffered results for dest_id as an IResultBatch (or nothing if empty)."""
-        result_q = self._iresult_q.get(dest_id)
-        if not result_q:
-            return time.time()
-        results = []
-        while result_q:
-            results.append(result_q.popleft())
-        if not results:
-            return
-        msg = IResultBatch(sender=self.node_id, data=results)
+    def _send_result_batch(self, dest_id: str, msg: IResultBatch, retries: int = 1):
+        """Return the send coroutine for an IResultBatch bound for `dest_id`."""
         if dest_id.startswith("client-"):
-            self.logger.info(f"Flushing queue of size {len(results)} to {dest_id}")
-            success = await self._comm.send_message_to_child(dest_id, msg)
-        else:
-            success = await self._comm.send_message_to_parent(msg)
+            return self._comm.send_message_to_child(dest_id, msg, retries=retries)
+        return self._comm.send_message_to_parent(msg, retries=retries)
 
-        if not success:
-            self.logger.warning(
-                f"Failed to send IResultBatch of size {len(results)} to {dest_id}, re-queuing"
+    def _schedule_result_flush(self, dest_id: str) -> None:
+        """Start sends for dest_id's buffered results, up to max_inflight_flushes at once.
+
+        Never awaits. Each send is its own task, so a slow destination or a dropped ACK
+        holds up only its own window, never other destinations or the caller.
+        Messages are popped here, synchronously, so concurrent batches never overlap.
+        """
+        inflight = self._result_flush_inflight.setdefault(dest_id, set())
+        retry_q, result_q = self._result_retry_q.get(dest_id), self._iresult_q.get(dest_id)
+        while len(inflight) < self._config.max_inflight_flushes:
+            if retry_q:
+                msg = retry_q.popleft()
+            elif result_q:
+                msg = IResultBatch(sender=self.node_id, data=list(result_q))
+                result_q.clear()
+            else:
+                break
+            t = asyncio.create_task(self._send_result_batch(dest_id, msg))
+            inflight.add(t)
+            t.add_done_callback(functools.partial(self._result_flush_done, dest_id, msg))
+
+    def _result_flush_done(
+        self, dest_id: str, msg: IResultBatch, task: asyncio.Task
+    ) -> None:
+        """Free the window slot; on failure, queue the same message for the next flush."""
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight is not None:
+            inflight.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None and task.result():
+            return
+        self.logger.warning(
+            f"Failed to send IResultBatch of size {len(msg.data)} to {dest_id}"
+            f"{f' ({exc})' if exc else ''}, re-queuing"
+        )
+        # Same object, same message_id: if only the ACK was lost, the receiver drops the copy.
+        self._result_retry_q.setdefault(dest_id, deque()).appendleft(msg)
+
+    async def _drain_results(self, dest_id: str) -> None:
+        """Wait out in-flight result sends for dest_id, then send everything left.
+
+        Runs at teardown, where no later flush tick will come, so this is the one result
+        path that opts into comm-level retries. Results that still cannot be sent are
+        dropped from `_streamed_task_ids` so the final ResultBatch carries them instead.
+        """
+        inflight = self._result_flush_inflight.get(dest_id)
+        if inflight:
+            await asyncio.gather(*list(inflight), return_exceptions=True)
+        retry_q = self._result_retry_q.pop(dest_id, None) or deque()
+        result_q = self._iresult_q.get(dest_id)
+        if result_q:
+            retry_q.append(IResultBatch(sender=self.node_id, data=list(result_q)))
+            result_q.clear()
+        for msg in retry_q:
+            success = await self._send_result_batch(
+                dest_id, msg, retries=self._config.send_retries
             )
-            requeue = self._iresult_q.setdefault(dest_id, deque())
-            requeue.extend(results)
-
-        return time.time()
+            if not success:
+                self.logger.error(
+                    f"Failed to drain IResultBatch of size {len(msg.data)} to {dest_id}, "
+                    f"moving it to the final ResultBatch"
+                )
+                self._streamed_task_ids.difference_update(r.task_id for r in msg.data)
 
     async def _periodic_flush_loop(self) -> None:
         """Background task: flush all buffered intermediate result queues on a fixed interval.
 
-        Sleep duration is jittered ±5% to avoid thundering herd across workers.
+        Sleep duration is jittered ±5% to avoid thundering herd across workers. Only
+        schedules sends, so one slow destination cannot delay the others or the next tick.
+        Destinations with a pending resend are included so a failed batch is retried even
+        when nothing new has arrived.
         """
         while True:
             jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
             await asyncio.sleep(self._config.result_flush_interval + jitter)
-            for dest_id in list(self._iresult_q.keys()):
-                await self._flush_dest_queue(dest_id)
+            for dest_id in set(self._iresult_q) | set(self._result_retry_q):
+                self._schedule_result_flush(dest_id)
 
     def _task_callback(self, task: Task, future: AsyncFuture) -> None:
         """Process a completed task future: record status, free resources, forward result."""
@@ -681,7 +826,7 @@ class AsyncWorker(Node):
         result_q.append(result)
         self._streamed_task_ids.add(task_id)
         if len(result_q) >= self._config.result_buffer_size:
-            asyncio.create_task(self._flush_dest_queue(dest_id))
+            self._schedule_result_flush(dest_id)
 
     # -------------------------------------------------------------------------
     #                               Monitors
@@ -882,10 +1027,6 @@ class AsyncWorker(Node):
                 else:
                     self.logger.info(status)
 
-                # Periodic checkpoint: scheduler state, comm state, and completed results.
-                if self._checkpointer is not None:
-                    asyncio.create_task(self._write_checkpoint())
-
                 # Use wait with timeout so we can exit quickly when stopped
                 try:
                     jitter = random.uniform(-0.05, 0.05) * self._config.report_interval
@@ -900,6 +1041,68 @@ class AsyncWorker(Node):
                 break
             except Exception as e:
                 self.logger.info(f"Reporting loop failed with error {e}")
+                await asyncio.sleep(0.1)
+
+    @property
+    def _checkpoint_interval(self) -> float:
+        """How often to checkpoint, defaulting to the status cadence.
+
+        Checkpointing used to ride the status loop, which tied how fresh the parent's view of
+        this worker is to how much state gets serialised and fsynced. They scale very
+        differently here: a ``Status`` is a handful of integers, while a checkpoint rewrites
+        every task id this worker has seen *and* re-pickles every result it has produced.
+        Leaving the interval at ``None`` keeps the old coupled behaviour.
+        """
+        if self._config.checkpoint_interval is None:
+            return self._config.report_interval
+        return self._config.checkpoint_interval
+
+    def _start_checkpoint_write(self) -> None:
+        """Start a checkpoint write unless the previous one is still running.
+
+        A checkpoint is a snapshot of the moment it is taken, so a tick skipped because the
+        last write is still in flight costs nothing -- the next one captures a newer state
+        anyway. Skipping also keeps writes from overlapping, which would race on the shared
+        metadata file that each write reads before rewriting.
+        """
+        if self._checkpoint_write is not None and not self._checkpoint_write.done():
+            self.logger.debug(
+                f"{self.node_id}: Checkpoint still writing, skipping this interval"
+            )
+            return
+        self._checkpoint_write = asyncio.create_task(self._write_checkpoint())
+        self._checkpoint_write.add_done_callback(self._checkpoint_write_done)
+
+    def _checkpoint_write_done(self, task: asyncio.Task) -> None:
+        """Surface a failed checkpoint write, which is otherwise silent."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"{self.node_id}: Checkpoint write failed: {exc}")
+
+    async def _periodic_checkpoint_loop(self) -> None:
+        """Write checkpoints on their own interval, independent of status reporting.
+
+        Writes before waiting, so the first checkpoint lands as promptly as it did when this
+        rode the status loop rather than one (possibly much longer) interval later.
+        """
+        while not self._stop_reporting.is_set():
+            try:
+                self._start_checkpoint_write()
+                jitter = random.uniform(-0.05, 0.05) * self._checkpoint_interval
+                try:
+                    await asyncio.wait_for(
+                        self._stop_reporting.wait(),
+                        timeout=self._checkpoint_interval + jitter,
+                    )
+                    break  # Exit if stop event was set
+                except asyncio.TimeoutError:
+                    pass  # Continue loop after interval
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.info(f"Checkpoint loop failed with error {e}")
                 await asyncio.sleep(0.1)
 
     async def _wait_for_stop_condition(self) -> None:
@@ -979,6 +1182,7 @@ class AsyncWorker(Node):
             self._node_update_task,
             self._client_handler_task,
             self._flush_task,
+            self._checkpoint_task,
             self._parent_ready_monitor_task,
         ]:
             if task is not None and not task.done():
@@ -987,6 +1191,24 @@ class AsyncWorker(Node):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # Results were drained in `_send_final_results_and_status`; anything still in
+        # flight here (e.g. the parent died) is abandoned.
+        inflight_flushes = [
+            t for inflight in self._result_flush_inflight.values() for t in inflight
+        ]
+        for t in inflight_flushes:
+            t.cancel()
+        if inflight_flushes:
+            await asyncio.gather(*inflight_flushes, return_exceptions=True)
+
+        # Let any write already running finish, so it cannot race the final checkpoint in
+        # `stop()` to replace the same files.
+        if self._checkpoint_write and not self._checkpoint_write.done():
+            try:
+                await self._checkpoint_write
+            except Exception:
+                pass
 
     async def _send_final_results_and_status(self) -> ResultBatch:
         """Package completed task results, send them to the parent, then send the final status.
@@ -998,9 +1220,13 @@ class AsyncWorker(Node):
         status send fails the status is also written to a local JSON file as
         a fallback.
         """
-        # Flush any remaining buffered intermediate results before final teardown.
-        for dest_id in list(self._iresult_q.keys()):
-            await self._flush_dest_queue(dest_id)
+        # Flush any remaining buffered intermediate results before final teardown. Waiting
+        # for the in-flight sends matters: `_streamed_task_ids` already excludes their
+        # results from the final batch below.
+        for dest_id in set(self._iresult_q) | set(self._result_retry_q) | set(
+            self._result_flush_inflight
+        ):
+            await self._drain_results(dest_id)
 
         async with self._timer("final_status"):
             final_status = self.get_status()
@@ -1038,7 +1264,9 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Parent is ready; sleeping {jitter:.2f}s before sending results"
             )
             await asyncio.sleep(jitter)
-            success = await self._comm.send_message_to_parent(result_batch)
+            success = await self._comm.send_message_to_parent(
+                result_batch, retries=self._config.send_retries
+            )
             if success:
                 self.logger.info(
                     f"{self.node_id}: Successfully sent results to parent"
@@ -1072,8 +1300,26 @@ class AsyncWorker(Node):
         """
 
         if self._checkpointer:
+            # Stop the periodic loop and let any write it already started finish, so the
+            # final checkpoint below is not racing one of them to replace the same files.
+            self._stop_reporting.set()
+            if self._checkpoint_task and not self._checkpoint_task.done():
+                self._checkpoint_task.cancel()
+                try:
+                    await self._checkpoint_task
+                except asyncio.CancelledError:
+                    pass
+            if self._checkpoint_write and not self._checkpoint_write.done():
+                try:
+                    await self._checkpoint_write
+                except Exception:
+                    pass
+
             await self._write_checkpoint()
             self.logger.info(f"{self.node_id}: Final checkpoint written")
+
+        if self._policy_endpoint is not None:
+            await self._policy_endpoint.stop()
 
         ##stop scheduler monitoring first
         await self._scheduler.stop_monitoring()

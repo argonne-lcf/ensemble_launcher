@@ -99,3 +99,44 @@ client = ClusterClient(
 | `main.m0.w0` | Worker under sub-master 0 |
 
 `node_id="global"` always resolves to the root master (shortest name in the checkpoint directory).
+
+## Tuning Scheduling Policies with PolicyClient
+
+Alongside the task-submission endpoint, each node serves its **scheduling policy state** on
+a separate endpoint. `PolicyClient` reads and updates it while the run is in flight, which
+is how a controller or autotuner steers scheduling based on workflow state it knows about
+and the scheduler does not.
+
+```python
+from ensemble_launcher.orchestrator import ClusterClient, PolicyClient
+
+ckpt = "/scratch/my_job/ckpt"
+
+with ClusterClient(checkpoint_dir=ckpt) as cc, \
+     PolicyClient(ckpt, node_id="main.w0") as pc:
+
+    print(pc.get_state())
+    pc.set_state({"gpu_weight": 8.0})        # affects tasks submitted from here on
+    futures = [cc.submit(t) for t in tasks]
+```
+
+**Prerequisites.** Discovery is file-based, so `checkpoint_dir` must be set, and the
+endpoint must be enabled with either `cluster=True` (which implies it) or
+`enable_policy_client=True` on its own -- the latter lets you tune a plain blocking `run()`.
+
+Node ids are the same as for `ClusterClient`, including `"global"`. To find out which nodes
+are serving an endpoint, or to tune several at once:
+
+```python
+from ensemble_launcher.orchestrator import PolicyGroupClient
+
+nodes = PolicyClient.discover_nodes(ckpt)     # ['main', 'main.w0', 'main.w1']
+
+with PolicyGroupClient(ckpt, node_ids=nodes) as group:
+    group.set_state({"gpu_weight": 8.0})      # -> {node_id: resulting state}
+```
+
+A group update is not atomic across nodes, though each node's own update is
+all-or-nothing. Already-queued tasks keep their priorities unless you pass `rescore=True`.
+See [Custom Scheduling](custom-scheduling.md#stateful--auto-tunable-policies) for the full
+semantics.

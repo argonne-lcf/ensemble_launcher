@@ -373,6 +373,56 @@ async def test_req_res_state_roundtrip():
     assert rebuilt._send_timeout == 10.0
 
 
+class _FailingParentConn:
+    """Parent connection whose every send times out, recording what it was asked to send."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, packed, timeout=None):
+        self.sent.append(packed)
+        return False
+
+
+def _comm_with_failing_parent(req_res: bool) -> tuple:
+    """An AsyncComm wired only far enough to exercise send_message_to_parent."""
+    comm = object.__new__(AsyncComm)
+    comm.logger = logger
+    comm._node_info = NodeInfo(node_id="child", secret_id="s", parent_id="parent")
+    comm._req_res = req_res
+    comm._send_retries = 5
+    comm._send_timeout = 0.01
+    conn = _FailingParentConn()
+    comm._parent_conn = conn
+    return comm, conn
+
+
+@pytest.mark.asyncio
+async def test_send_makes_one_attempt_by_default():
+    """The comm layer no longer retries on its own; send_retries is only a default for callers."""
+    comm, conn = _comm_with_failing_parent(req_res=True)
+    assert await comm.send_message_to_parent(Result(sender="child")) is False
+    assert len(conn.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_retries_reuse_message_id():
+    comm, conn = _comm_with_failing_parent(req_res=True)
+    msg = Result(sender="child")
+    assert await comm.send_message_to_parent(msg, retries=3) is False
+    assert len(conn.sent) == 3
+    # Every attempt is the same packed message, so the receiver can dedup on message_id.
+    assert msg.message_id is not None
+    assert all(packed is conn.sent[0] for packed in conn.sent)
+
+
+@pytest.mark.asyncio
+async def test_send_without_req_res_ignores_retries():
+    comm, conn = _comm_with_failing_parent(req_res=False)
+    assert await comm.send_message_to_parent(Result(sender="child"), retries=3) is False
+    assert len(conn.sent) == 1
+
+
 if __name__ == "__main__":
     # msgs = test_zmq_comm()
     # print("zmq done")

@@ -3,9 +3,19 @@ import copy
 import heapq
 import os
 from asyncio import Queue
-from collections import Counter
+from collections import Counter, deque
 from logging import Logger
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
@@ -25,6 +35,9 @@ if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Result, Status
 
 # self.logger = logging.getself.logger(__name__)
+
+# Task policy that is special-cased by name: unscored, deque-backed pending queue.
+FIFO_POLICY_NAME = "fifo_policy"
 
 
 class AsyncScheduler(Scheduler):
@@ -371,6 +384,15 @@ class AsyncChildrenScheduler(AsyncScheduler):
         """Read-only view of the unassigned task pool (insertion-ordered)."""
         return dict(self._unassigned_tasks)
 
+    def has_unassigned_tasks(self) -> bool:
+        """Whether the unassigned pool holds anything, without copying it.
+
+        :attr:`unassigned_task_ids` copies the pool to hand out a read-only view, which is
+        the wrong thing to pay for merely to ask whether it is empty -- and a work-stealing
+        master is asked exactly that on every task request from every child.
+        """
+        return bool(self._unassigned_tasks)
+
     def discard_unassigned(self, task_id: str) -> None:
         """Remove a task from the unassigned pool (e.g. after work-stealing dispatch)."""
         self._unassigned_tasks.pop(task_id, None)
@@ -659,53 +681,30 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return False
 
 
-class PendingTaskHeap:
-    """Priority-ordered collection of pending tasks with async notification.
+PendingEntry = Tuple[float, int, str]  # (priority, seq, task_id)
 
-    Backed by a heapq list so items can be iterated non-destructively in
-    priority order without the drain-and-refill dance required by
-    ``asyncio.PriorityQueue``.
+
+class _PendingTasksBase:
+    """Membership + async notification shared by the pending-task containers.
+
+    Subclasses own the ordering structure and implement ``push`` / ``pop`` /
+    ``requeue`` / ``remove`` / ``remove_many`` / ``rescore`` / ``sorted_items``
+    / ``clear``. The scheduler's dispatch pass is ``pop()`` until something does
+    not fit, then ``requeue(skipped)`` -- per-cycle cost proportional to the
+    tasks examined, never to the queue length.
+
+    ``_tasks_available`` must never be replaced: ``_monitor_resources`` parks on
+    that exact Event object, and swapping it out silently deadlocks dispatch.
     """
 
     def __init__(self) -> None:
-        self._heap: List[Tuple[float, int, str]] = []
         self._task_ids: Set[str] = set()
         self._seq: int = 0
         self._tasks_available: asyncio.Event = asyncio.Event()
-        self._sorted = False
 
-    def push(self, priority: float, task_id: str) -> None:
-        heapq.heappush(self._heap, (priority, self._seq, task_id))
-        self._seq += 1
-        self._task_ids.add(task_id)
-        self._tasks_available.set()
-        self._sorted = False
-
-    def remove(self, task_id: str) -> bool:
-        if task_id not in self._task_ids:
-            return False
-        self._task_ids.discard(task_id)
-        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid != task_id]
-        heapq.heapify(self._heap)
+    def _after_shrink(self) -> None:
         if not self._task_ids:
             self._tasks_available.clear()
-        self._sorted = False
-        return True
-
-    def remove_many(self, task_ids: Set[str]) -> None:
-        self._task_ids -= task_ids
-        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid in self._task_ids]
-        heapq.heapify(self._heap)
-        if not self._task_ids:
-            self._tasks_available.clear()
-        self._sorted = False
-
-    def sorted_items(self) -> List[Tuple[float, int, str]]:
-        """Return all items sorted by priority, then insertion order (non-destructive)."""
-        if not self._sorted:
-            self._heap = sorted(self._heap)
-            self._sorted = True
-        return self._heap
 
     def __contains__(self, task_id: str) -> bool:
         return task_id in self._task_ids
@@ -719,15 +718,163 @@ class PendingTaskHeap:
     def task_ids(self) -> Set[str]:
         return set(self._task_ids)
 
+    async def wait_for_tasks(self) -> None:
+        """Block until at least one task is pending."""
+        await self._tasks_available.wait()
+
+
+class PendingTaskQueue(_PendingTasksBase):
+    """FIFO collection of pending tasks, backed by a deque.
+
+    Used for ``fifo_policy``: tasks are never scored, so ``push`` ignores its
+    priority argument and every operation on the hot path is O(1). Entries keep
+    the ``(priority, seq, task_id)`` shape of :class:`PendingTaskHeap` so the two
+    are interchangeable.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: Deque[PendingEntry] = deque()
+
+    def push(self, priority: float, task_id: str) -> None:
+        self._queue.append((0.0, self._seq, task_id))
+        self._seq += 1
+        self._task_ids.add(task_id)
+        self._tasks_available.set()
+
+    def pop(self) -> Optional[PendingEntry]:
+        """Remove and return the oldest entry, or ``None`` if empty."""
+        if not self._queue:
+            return None
+        entry = self._queue.popleft()
+        self._task_ids.discard(entry[2])
+        self._after_shrink()
+        return entry
+
+    def requeue(self, entries: List[PendingEntry]) -> None:
+        """Put popped-but-not-dispatched entries back at the front, in order."""
+        if not entries:
+            return
+        self._queue.extendleft(reversed(entries))
+        self._task_ids.update(tid for _p, _s, tid in entries)
+        self._tasks_available.set()
+
+    def remove(self, task_id: str) -> bool:
+        if task_id not in self._task_ids:
+            return False
+        self._task_ids.discard(task_id)
+        self._queue = deque(e for e in self._queue if e[2] != task_id)
+        self._after_shrink()
+        return True
+
+    def remove_many(self, task_ids: Set[str]) -> None:
+        self._task_ids -= task_ids
+        self._queue = deque(e for e in self._queue if e[2] in self._task_ids)
+        self._after_shrink()
+
+    def rescore(self, scores: Dict[str, float]) -> None:
+        """FIFO has no priorities: only drop ids absent from *scores*, keep order."""
+        self._queue = deque(e for e in self._queue if e[2] in scores)
+        self._task_ids = {tid for _p, _s, tid in self._queue}
+        self._after_shrink()
+
+    def sorted_items(self) -> List[PendingEntry]:
+        """All entries in dispatch order (a copy)."""
+        return list(self._queue)
+
+    def clear(self) -> None:
+        self._queue.clear()
+        self._task_ids.clear()
+        self._seq = 0
+        self._tasks_available.clear()
+
+
+class PendingTaskHeap(_PendingTasksBase):
+    """Priority-ordered collection of pending tasks with async notification.
+
+    Lower priority value dispatches first; ties break on insertion order.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._heap: List[PendingEntry] = []
+
+    def push(self, priority: float, task_id: str) -> None:
+        heapq.heappush(self._heap, (priority, self._seq, task_id))
+        self._seq += 1
+        self._task_ids.add(task_id)
+        self._tasks_available.set()
+
+    def pop(self) -> Optional[PendingEntry]:
+        """Remove and return the highest-priority entry, or ``None`` if empty."""
+        if not self._heap:
+            return None
+        entry = heapq.heappop(self._heap)
+        self._task_ids.discard(entry[2])
+        self._after_shrink()
+        return entry
+
+    def requeue(self, entries: List[PendingEntry]) -> None:
+        """Push popped-but-not-dispatched entries back with their original
+        ``(priority, seq)``, so their place -- including the FIFO tiebreak -- is
+        unchanged."""
+        if not entries:
+            return
+        for entry in entries:
+            heapq.heappush(self._heap, entry)
+            self._task_ids.add(entry[2])
+        self._tasks_available.set()
+
+    def remove(self, task_id: str) -> bool:
+        if task_id not in self._task_ids:
+            return False
+        self._task_ids.discard(task_id)
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid != task_id]
+        heapq.heapify(self._heap)
+        self._after_shrink()
+        return True
+
+    def remove_many(self, task_ids: Set[str]) -> None:
+        self._task_ids -= task_ids
+        self._heap = [(p, s, tid) for p, s, tid in self._heap if tid in self._task_ids]
+        heapq.heapify(self._heap)
+        self._after_shrink()
+
+    def rescore(self, scores: Dict[str, float]) -> None:
+        """Re-prioritize every entry in place. Ids absent from *scores* are dropped.
+
+        Each entry keeps its original sequence number, so the FIFO tiebreak among
+        equal priorities survives -- which also means the iteration order here is
+        irrelevant and a plain dict is a safe argument. ``clear()`` + ``push()``
+        would not have either property: it resets ``_seq`` to 0 and renumbers in
+        whatever order it is handed.
+
+        ``_tasks_available`` is deliberately not ``set()``: membership only ever
+        shrinks here, so an already-set event must stay set and a heap that empties
+        out must clear it.
+        """
+        self._heap = [
+            (scores[task_id], seq, task_id)
+            for _p, seq, task_id in self._heap
+            if task_id in scores
+        ]
+        heapq.heapify(self._heap)
+        self._task_ids = {task_id for _p, _s, task_id in self._heap}
+        self._after_shrink()
+
+    def sorted_items(self) -> List[PendingEntry]:
+        """All entries in dispatch order (a sorted copy; the heap is untouched).
+
+        O(n log n) -- for introspection and tests only. The dispatch loop uses
+        ``pop`` / ``requeue``.
+        """
+        return sorted(self._heap)
+
     def clear(self) -> None:
         self._heap.clear()
         self._task_ids.clear()
         self._seq = 0
         self._tasks_available.clear()
-
-    async def wait_for_tasks(self) -> None:
-        """Block until at least one task is pending."""
-        await self._tasks_available.wait()
 
 
 class AsyncTaskScheduler(AsyncScheduler):
@@ -739,7 +886,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         logger: Logger,
         tasks: Dict[str, Task],
         nodes: JobResource,
-        policy: Union[str, Policy] = "large_resource_policy",
+        policy: Union[str, Policy] = FIFO_POLICY_NAME,
         policy_config: PolicyConfig = PolicyConfig(),
     ) -> None:
         """Initialise the task scheduler.
@@ -749,6 +896,9 @@ class AsyncTaskScheduler(AsyncScheduler):
             tasks: Initial task dict to schedule.
             nodes: Available cluster resources for this worker.
             policy: Policy name or instance used to score/prioritise tasks.
+                ``"fifo_policy"`` (the default) is special-cased: tasks go into
+                a deque and are never scored. Any other policy scores each task
+                into a priority heap.
             policy_config: Configuration passed to the policy constructor
                 when *policy* is given as a string.
         """
@@ -771,13 +921,15 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._done_tasks: Counter[str] = Counter()
         self._failed_tasks: Set[str] = set()
         self._successful_tasks: Set[str] = set()
-        self._pending_tasks = PendingTaskHeap()
-        for task_id in self.tasks:
-            score = self.scheduler_policy.get_score(
-                self.tasks[task_id],
-                scheduler_state=self._build_scheduler_state(),
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self._fifo: bool = self._policy_name(policy) == FIFO_POLICY_NAME
+        self._pending_tasks: Union[PendingTaskQueue, PendingTaskHeap] = (
+            PendingTaskQueue() if self._fifo else PendingTaskHeap()
+        )
+        # Running per-dimension minimum (nnodes, ppn, ngpus) over enqueued tasks.
+        # Only lowered on enqueue, reset when the queue empties -- so it may be
+        # stale-low (a spurious wakeup) but never too high (which would stall).
+        self._min_req: Optional[Tuple[int, int, float]] = None
+        self._seed_pending(self.tasks.keys())
         self.logger.debug(f"Pending tasks: {len(self._pending_tasks)}")
 
         self._task_to_client: Dict[str, str] = {}  # task_id -> client_id
@@ -792,10 +944,112 @@ class AsyncTaskScheduler(AsyncScheduler):
         if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
             self._event_registry = get_registry()
 
+    @property
+    def policy(self) -> Policy:
+        """Alias for ``scheduler_policy``, matching ``AsyncChildrenScheduler.policy``.
+
+        Lets callers that hold either scheduler (notably ``PolicyEndpoint``) reach the
+        policy without branching on the scheduler type.
+        """
+        return self.scheduler_policy
+
+    @staticmethod
+    def _policy_name(policy: Union[str, Policy]) -> Optional[str]:
+        """Registered name of *policy*.
+
+        Instances resolve by exact class, so a subclass of a built-in policy
+        (which may override ``get_score``) never inherits its fast path.
+        """
+        if isinstance(policy, str):
+            return policy
+        for name, cls in policy_registry.available_policies.items():
+            if type(policy) is cls:
+                return name
+        return None
+
     @staticmethod
     def _priority_from_score(score: float) -> float:
         """Convert a policy score (higher=better) to a heap priority (lower=better)."""
         return -score
+
+    def _update_min_req(self, task: Task) -> None:
+        shape = (task.nnodes, task.ppn, task.ngpus_per_process * task.ppn)
+        if self._min_req is None:
+            self._min_req = shape
+        else:
+            self._min_req = tuple(map(min, self._min_req, shape))
+
+    def _enqueue(
+        self, task: Task, sched_state: Optional[SchedulerState] = None
+    ) -> None:
+        """The single place a task enters the pending container.
+
+        FIFO pushes without scoring. Any other policy is scored, and the
+        O(total tasks) ``SchedulerState`` is only built when the policy declares
+        ``needs_scheduler_state`` (callers enqueuing a batch pass one in).
+        """
+        if self._fifo:
+            self._pending_tasks.push(0.0, task.task_id)
+        else:
+            if sched_state is None and self.scheduler_policy.needs_scheduler_state:
+                sched_state = self._build_scheduler_state()
+            score = self.scheduler_policy.get_score(task, scheduler_state=sched_state)
+            self._pending_tasks.push(self._priority_from_score(score), task.task_id)
+        self._update_min_req(task)
+
+    def _seed_pending(self, task_ids: Iterable[str]) -> int:
+        """Replace the pending container with fresh entries for *task_ids*.
+
+        Used when the set of pending tasks itself is being established (construction,
+        checkpoint restore). To re-score the tasks already queued without changing
+        membership, use :meth:`reprioritize_pending` instead.
+        """
+        sched_state = None
+        if not self._fifo and self.scheduler_policy.needs_scheduler_state:
+            sched_state = self._build_scheduler_state()
+        self._pending_tasks.clear()
+        self._min_req = None
+        for task_id in task_ids:
+            if task_id not in self.tasks:
+                continue
+            self._enqueue(self.tasks[task_id], sched_state)
+        return len(self._pending_tasks)
+
+    def reprioritize_pending(self) -> int:
+        """Re-score every pending task against the policy's current state.
+
+        A task's priority is computed once, when it enters the pending heap, so the
+        heap is a cache of scores: mutating policy state does nothing to work already
+        queued. This invalidates that cache. Scope is the pending heap only -- running
+        tasks are already dispatched and completed ones are untouched.
+
+        Two phases on purpose. Every new priority is computed first, where a raising
+        ``get_score`` leaves the heap untouched; only then is the result published in a
+        single call that cannot fail. Callers (``PolicyEndpoint.apply``) rely on this to
+        roll a rejected state change back cleanly.
+
+        Returns:
+            Number of tasks re-scored.
+        """
+        if self._fifo:
+            # Nothing to score: FIFO order is the submission order.
+            return len(self._pending_tasks)
+        sched_state = (
+            self._build_scheduler_state()
+            if self.scheduler_policy.needs_scheduler_state
+            else None
+        )
+        scores = {
+            task_id: self._priority_from_score(
+                self.scheduler_policy.get_score(
+                    self.tasks[task_id], scheduler_state=sched_state
+                )
+            )
+            for task_id in self._pending_tasks.task_ids()
+            if task_id in self.tasks
+        }
+        self._pending_tasks.rescore(scores)
+        return len(scores)
 
     def _build_scheduler_state(self) -> SchedulerState:
         """Build a lightweight state snapshot for passing to policy methods."""
@@ -874,13 +1128,7 @@ class AsyncTaskScheduler(AsyncScheduler):
 
         # 3. Rebuild pending heap with only pending tasks
         pending = set(self.tasks.keys()) - self._successful_tasks - self._failed_tasks
-        self._pending_tasks.clear()
-        sched_state = self._build_scheduler_state()
-        for task_id in pending:
-            score = self.scheduler_policy.get_score(
-                self.tasks[task_id], scheduler_state=sched_state
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task_id)
+        self._seed_pending(pending)
 
         restored = len(state.completed_tasks) + len(state.failed_tasks)
         self.logger.info(
@@ -891,32 +1139,98 @@ class AsyncTaskScheduler(AsyncScheduler):
         # Signal completion immediately if no tasks remain
         self._check_all_tasks_done()
 
-    def _find_min_resource_req(self) -> JobResource:
-        """
-        Find the minimum resource requirement among PENDING tasks only.
+    def _find_min_resource_req(self) -> Optional[JobResource]:
+        """Per-dimension minimum resource requirement among pending tasks, in O(1).
+
+        Read from the running minimum kept by :meth:`_enqueue`. After small tasks
+        have been dispatched it can be lower than the true minimum of what is
+        left; that only causes an early wakeup, never a missed one.
         """
         if self._pending_tasks.empty():
+            self._min_req = None
+        if self._min_req is None:
             return None
 
-        pending_tasks = [
-            self.tasks[tid]
-            for tid in self._pending_tasks.task_ids()
-            if tid in self.tasks
-        ]
-
-        if not pending_tasks:
-            return None
-
-        min_nnodes = min(task.nnodes for task in pending_tasks)
-        min_ppn = min(task.ppn for task in pending_tasks)
-        min_ngpus = min(task.ngpus_per_process * task.ppn for task in pending_tasks)
-
+        min_nnodes, min_ppn, min_ngpus = self._min_req
         return JobResource(
             resources=[
                 NodeResourceCount(ncpus=min_ppn, ngpus=min_ngpus)
                 for _ in range(min_nnodes)
             ]
         )
+
+    def _allocate_pending(self) -> int:
+        """One dispatch pass: pop pending tasks in order and allocate what fits.
+
+        Tasks that don't fit are set aside and requeued at the end with their
+        original ``(priority, seq)``, so they keep their place. Strict priority
+        stops at the first task that doesn't fit; otherwise smaller tasks behind
+        it may backfill until the cluster reports no free resources.
+
+        Cost is O(k log n) for k tasks examined (O(k) for FIFO) -- never a sort
+        or scan of the whole queue. Deliberately synchronous (``put_nowait`` on
+        the unbounded ready queue), so no ``add_task`` / ``delete_task`` / policy
+        rescore can interleave with a half-finished pass.
+
+        Returns:
+            Number of tasks moved to ``ready_tasks``.
+        """
+        allocated = 0
+        skipped: List[PendingEntry] = []
+        # Exact minimum over the skipped tasks; becomes the new running minimum
+        # when the pass saw everything that is still pending (see below).
+        skipped_min: Optional[Tuple[int, int, float]] = None
+        exact = False
+        try:
+            while not self._stop_monitoring.is_set():
+                entry = self._pending_tasks.pop()
+                if entry is None:
+                    exact = True  # every remaining task was examined
+                    break
+                task_id = entry[2]
+                task = self.tasks.get(task_id)
+                if task is None:
+                    continue  # stale entry -> dropped
+
+                req = task.get_resource_requirements()
+                ok, resource = self.cluster.allocate(req)
+                if ok:
+                    self._running_tasks[task_id] = resource
+                    self.ready_tasks.put_nowait((task_id, resource))
+                    allocated += 1
+                    continue
+
+                skipped.append(entry)
+                shape = (task.nnodes, task.ppn, task.ngpus_per_process * task.ppn)
+                skipped_min = (
+                    shape if skipped_min is None else tuple(map(min, skipped_min, shape))
+                )
+                if self._strict_priority:
+                    # Nothing can run until this head task fits, so its own
+                    # requirement is the exact wake-up threshold.
+                    exact = True
+                    self.logger.debug(
+                        f"Strict priority: blocking on task {task_id} until resources available. "
+                        f"Resources requested: {req}. Free resources: {self.cluster.get_status()}"
+                    )
+                    break
+                # Backfill relies on this event being accurate: a failed
+                # allocate never clears it, so if it were set on a full cluster
+                # the pass would test every pending task. deallocate() sets it
+                # synchronously to keep it accurate (see its docstring).
+                if not self.cluster._resource_available.is_set():
+                    self.logger.debug("No more free resources available")
+                    break
+        finally:
+            self._pending_tasks.requeue(skipped)
+        if exact:
+            # Tighten the running minimum (it only ever drifts low otherwise),
+            # which stops deallocations from waking the loop for tasks that
+            # still cannot fit.
+            self._min_req = skipped_min
+        if allocated:
+            self.logger.debug(f"Dispatched {allocated} tasks")
+        return allocated
 
     async def _monitor_resources(self) -> None:
         """Monitors free resources, allocates tasks from the pending heap, and
@@ -958,48 +1272,9 @@ class AsyncTaskScheduler(AsyncScheduler):
                         self.logger.info("Stop signal received while waiting for tasks")
                         break
 
-                # Non-destructive sorted iteration over pending tasks
-                allocated_ids: List[str] = []
-                stale_ids: List[str] = []
+                allocated = self._allocate_pending()
 
-                for _priority, _seq, task_id in self._pending_tasks.sorted_items():
-                    if self._stop_monitoring.is_set():
-                        break
-
-                    if task_id not in self.tasks:
-                        stale_ids.append(task_id)
-                        continue
-
-                    task = self.tasks[task_id]
-                    req = task.get_resource_requirements()
-                    allocated, resource = self.cluster.allocate(req)
-
-                    if allocated:
-                        self._running_tasks[task_id] = resource
-                        allocated_ids.append(task_id)
-                        self.logger.debug(f"Task {task_id} ready for execution")
-                        await self.ready_tasks.put((task_id, resource))
-                    else:
-                        if self._strict_priority:
-                            self.logger.debug(
-                                f"Strict priority: blocking on task {task_id} until resources available. "
-                                f"Resources requested: {req}. Free resources: {self.cluster.get_status()}"
-                            )
-                            break
-                        if not self.cluster._resource_available.is_set():
-                            self.logger.debug("No more free resources available")
-                            break
-                        self.logger.debug(
-                            f"Insufficient resources for task {task_id}. "
-                            f"Resources requested: {req}. Free resources: {self.cluster.get_status()}"
-                        )
-
-                # Remove allocated and stale tasks from the heap
-                to_remove = set(allocated_ids) | set(stale_ids)
-                if to_remove:
-                    self._pending_tasks.remove_many(to_remove)
-
-                if not allocated_ids:
+                if not allocated:
                     self.logger.debug(
                         "No tasks allocated in this cycle. Clearing resource available event to wait for new resources."
                     )
@@ -1049,6 +1324,10 @@ class AsyncTaskScheduler(AsyncScheduler):
 
         Thread-safe — called from executor callbacks via call_soon_threadsafe.
         """
+        # Fast path: called on every task completion, and the exact check below is
+        # O(total tasks). Anything still pending or running means not done.
+        if self._running_tasks or not self._pending_tasks.empty():
+            return
         remaining = set(self.tasks.keys()) - (
             self._successful_tasks | self._failed_tasks
         )
@@ -1085,10 +1364,7 @@ class AsyncTaskScheduler(AsyncScheduler):
             self.tasks[task.task_id] = task
             if client_id is not None:
                 self._task_to_client[task.task_id] = client_id
-            score = self.scheduler_policy.get_score(
-                task, scheduler_state=self._build_scheduler_state()
-            )
-            self._pending_tasks.push(self._priority_from_score(score), task.task_id)
+            self._enqueue(task)
             return True
         except Exception as e:
             self.logger.error(f"Failed to add task {task.task_id}: {e}")
@@ -1108,8 +1384,10 @@ class AsyncTaskScheduler(AsyncScheduler):
             # Remove from tasks dict
             del self.tasks[task.task_id]
 
-            # Remove from pending tasks heap
+            # Remove from pending tasks
             self._pending_tasks.remove(task.task_id)
+            if self._pending_tasks.empty():
+                self._min_req = None
 
             # Remove from ready tasks queue if present
             temp_ready = []
@@ -1132,8 +1410,8 @@ class AsyncTaskScheduler(AsyncScheduler):
             if task.task_id in self._running_tasks:
                 self.cluster.deallocate(self._running_tasks[task.task_id])
 
-            # Remove from running and status sets
-            del self._running_tasks[task.task_id]
+            # Remove from running and status sets (a pending task was never running)
+            self._running_tasks.pop(task.task_id, None)
 
             # Remove all occurrences from done_tasks
             if task.task_id in self._done_tasks:
@@ -1173,12 +1451,17 @@ class AsyncTaskScheduler(AsyncScheduler):
 
             self.logger.debug(f"Freed {task_id}")
 
-            # Notify the policy about the completed task
-            self.scheduler_policy.on_task_complete(
-                task=self.tasks[task_id],
-                status=status,
-                scheduler_state=self._build_scheduler_state(),
-            )
+            # Notify the policy about the completed task. Building the state is
+            # O(total tasks), so skip it entirely for policies without the hook.
+            if (
+                type(self.scheduler_policy).on_task_complete
+                is not Policy.on_task_complete
+            ):
+                self.scheduler_policy.on_task_complete(
+                    task=self.tasks[task_id],
+                    status=status,
+                    scheduler_state=self._build_scheduler_state(),
+                )
 
         self._check_all_tasks_done()
         return None
