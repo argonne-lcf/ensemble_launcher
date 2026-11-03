@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import shutil
 import socket
 import time
@@ -10,7 +11,12 @@ from collections import deque
 import pytest
 
 from ensemble_launcher.comm.messages import Result
-from ensemble_launcher.config import LauncherConfig, MPIConfig, SystemConfig
+from ensemble_launcher.config import (
+    LauncherConfig,
+    MPIConfig,
+    PolicyConfig,
+    SystemConfig,
+)
 from ensemble_launcher.ensemble import AsyncTask, Task
 from ensemble_launcher.orchestrator import AsyncWorker
 from ensemble_launcher.scheduler.resource import (
@@ -77,6 +83,81 @@ async def test_async_worker(task_executor="async_processpool", ntasks_per_core=1
             for task_id, result in results.items()
         ]
     ), f"{[result for task_id, result in results.items()]}"
+
+
+def timed_sleep(task_id: str, sleep_time: float):
+    start = time.time()
+    time.sleep(sleep_time)
+    return (task_id, start, time.time())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True], ids=["backfill", "strict"])
+@pytest.mark.parametrize("policy", ["fifo_policy", "large_resource_policy"])
+async def test_async_worker_heterogeneous(policy, strict):
+    """Mixed-size tasks end to end through a real worker and process pool.
+
+    Each task reports its wall-clock execution window. A task only runs while its
+    cores are allocated, so at every instant the cores of the tasks running
+    together must fit on the node -- checked with a sweep over those windows.
+    Whole-node tasks are included so starvation behind small tasks would hang.
+    """
+    ncpus = 12
+    rng = random.Random(0)
+    sizes = {f"task-{i}": rng.choice([1, 1, 1, 2, 4, 6, 12]) for i in range(60)}
+    tasks = {
+        tid: Task(
+            task_id=tid,
+            nnodes=1,
+            ppn=ppn,
+            executable=timed_sleep,
+            args=(tid, 0.05),
+        )
+        for tid, ppn in sizes.items()
+    }
+
+    sys_info = NodeResourceList.from_config(
+        SystemConfig(name="local", ncpus=ncpus, cpus=list(range(1, ncpus + 1)))
+    )
+    job_resource = JobResource(resources=[sys_info], nodes=[socket.gethostname()])
+
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name="async_processpool",
+            comm_name="async_zmq",
+            report_interval=100.0,
+            log_level=logging.INFO,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
+            task_scheduler_policy=policy,
+            policy_config=PolicyConfig(strict_priority=strict),
+        ),
+        job_resource,
+        tasks,
+    )
+
+    res = await asyncio.wait_for(w.run(), timeout=120)
+    results = {r.task_id: r for r in res.data}
+
+    assert sorted(results) == sorted(sizes)
+    assert all(r.success for r in results.values()), [
+        r.exception for r in results.values() if not r.success
+    ]
+
+    # Sweep the execution windows; ends sort before starts at the same instant.
+    events = []
+    for tid, r in results.items():
+        _tid, start, end = r.data
+        assert _tid == tid
+        events.append((start, 1, sizes[tid]))
+        events.append((end, 0, -sizes[tid]))
+    in_use = peak = 0
+    for _t, _kind, delta in sorted(events):
+        in_use += delta
+        peak = max(peak, in_use)
+        assert in_use <= ncpus, f"{in_use} cores in use on a {ncpus}-core node"
+    assert peak > 1  # tasks really ran concurrently
 
 
 @pytest.mark.asyncio

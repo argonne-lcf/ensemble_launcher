@@ -8,7 +8,12 @@ from .policy import (
     PolicyStateMixin,
 )
 from .scheduler import WorkerScheduler, TaskScheduler, Scheduler
-from .async_scheduler import AsyncTaskScheduler, AsyncChildrenScheduler, PendingTaskHeap
+from .async_scheduler import (
+    AsyncTaskScheduler,
+    AsyncChildrenScheduler,
+    PendingTaskHeap,
+    PendingTaskQueue,
+)
 from .state import SchedulerState, ChildrenAssignment
 
 __all__ = [
@@ -21,6 +26,7 @@ __all__ = [
     "AsyncTaskScheduler",
     "AsyncChildrenScheduler",
     "PendingTaskHeap",
+    "PendingTaskQueue",
     "policy_registry",
     "Policy",
     "ChildrenPolicy",

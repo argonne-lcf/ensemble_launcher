@@ -182,7 +182,7 @@ LauncherConfig(
     enable_workstealing: bool = False,
     enable_policy_client: bool = False,
     children_scheduler_policy: str = "simple_split_children_policy",
-    task_scheduler_policy: str = "large_resource_policy",
+    task_scheduler_policy: str = "fifo_policy",
     policy_config: PolicyConfig = PolicyConfig(),
 )
 ```

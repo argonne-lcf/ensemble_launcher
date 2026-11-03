@@ -20,8 +20,17 @@ Task scoring policies determine the priority order in which tasks are assigned t
 
 | Policy Name | Description |
 |---|---|
-| `large_resource_policy` | Prioritizes tasks that require more resources (nodes, GPUs). |
-| `fifo_policy` | First-in, first-out ordering. |
+| `fifo_policy` | **Default.** First-in, first-out ordering. The worker special-cases this name: pending tasks live in a plain deque and are never scored, so enqueue and dispatch are O(1). |
+| `large_resource_policy` | Prioritizes tasks that require more resources (nodes, GPUs). Pending tasks live in a heap ordered by score, FIFO among ties. |
+
+With `PolicyConfig(strict_priority=False)` (the default) a task at the head of the queue that
+does not fit the free resources is skipped and keeps its place, so smaller tasks behind it can
+backfill. Set `strict_priority=True` to block on the head instead.
+
+Backfill has a cost with mixed task sizes: to find a task that fits a small free slot, the
+worker may examine every larger task queued ahead of it, so dispatch slows as the queue grows
+(about 20-35% lower throughput at 10k pending tasks in our benchmarks). With uniform task
+sizes, or with `strict_priority=True`, dispatch cost does not depend on queue length.
 
 ## Writing a Custom Children Policy
 
@@ -96,6 +105,18 @@ class MyScoringPolicy(Policy):
         """Optional: react to task completions."""
         pass
 ```
+
+Building the `SchedulerState` snapshot costs O(total tasks) and happens on every
+`get_score` call. If your `get_score` never reads `scheduler_state`, opt out so the worker
+passes `None` instead:
+
+```python
+class MyScoringPolicy(Policy):
+    needs_scheduler_state = False
+```
+
+The default is `True`, so existing policies are unaffected. Likewise, the snapshot for
+`on_task_complete` is only built when your policy actually overrides that method.
 
 ## Stateful / Auto-tunable Policies
 

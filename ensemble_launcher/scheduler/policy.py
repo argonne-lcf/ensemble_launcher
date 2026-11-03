@@ -3,7 +3,7 @@ import logging
 from abc import ABC, abstractmethod
 from itertools import accumulate
 from logging import Logger
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 
@@ -89,6 +89,18 @@ class PolicyStateMixin:
 
 
 class Policy(PolicyStateMixin, ABC):
+    """Task scoring policy.
+
+    Class attributes:
+        needs_scheduler_state: Whether :meth:`get_score` reads its
+            ``scheduler_state`` argument. Building that snapshot costs
+            O(total tasks), and the task scheduler would otherwise do it on every
+            enqueue. Set to ``False`` when ``get_score`` ignores it, and the
+            scheduler will pass ``None`` instead.
+    """
+
+    needs_scheduler_state: ClassVar[bool] = True
+
     def __init__(
         self,
         policy_config: PolicyConfig = PolicyConfig(),
@@ -289,6 +301,7 @@ class LargeResourcePolicy(Policy):
 
     cpu_weight: float = 1.0
     gpu_weight: float = 2.0
+    needs_scheduler_state: ClassVar[bool] = False
 
     def __init__(
         self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None
@@ -307,12 +320,20 @@ class LargeResourcePolicy(Policy):
 
 @policy_registry.register("fifo_policy")
 class FIFOPolicy(Policy):
-    """Schedules tasks in submission order (FIFO).
+    """Schedules tasks in submission order (FIFO). The default task policy.
 
-    Score is the negative of the current pending-task count so that
-    earlier-added tasks always have a higher score than later ones.
-    Best used with ``strict_priority=True`` in PolicyConfig.
+    ``AsyncTaskScheduler`` special-cases this policy by its registered name
+    ``"fifo_policy"``: pending tasks go into a plain deque and ``get_score`` is
+    never called. With ``strict_priority=False`` (the default) a head task that
+    does not fit is skipped and keeps its place, letting smaller tasks backfill.
+
+    ``get_score`` is kept for the legacy sync ``WorkerScheduler``: the negative
+    pending-task count, so earlier-added tasks score higher.
     """
+
+    # Only matters on the heap path (e.g. a subclass): without state every score
+    # is 0, and the heap's sequence-number tiebreak already yields FIFO order.
+    needs_scheduler_state: ClassVar[bool] = False
 
     def __init__(
         self, policy_config: PolicyConfig = PolicyConfig(), logger: Logger = None

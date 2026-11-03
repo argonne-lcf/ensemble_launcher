@@ -48,7 +48,7 @@ There are two pluggable policy families, each with its own registry namespace:
 
 | Family | Base class | Key method | Default |
 |---|---|---|---|
-| Task scoring | `Policy` | `get_score` | `large_resource_policy` |
+| Task scoring | `Policy` | `get_score` | `fifo_policy` |
 | Child layout / distribution | `ChildrenPolicy` | `get_children_resources`, `get_children_tasks` | `simple_split_children_policy` |
 
 Every policy carries a mutable `self.state` dict, seeded from `PolicyConfig.initial_state` and tunable at runtime through `PolicyClient`.

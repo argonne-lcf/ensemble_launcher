@@ -68,9 +68,28 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    legacy sync class, used only by `orchestrator/master.py`.
    Two policy families, registered in separate namespaces by
    `policy_registry.register(name, type="policy"|"children_policy")`:
-   - task policies (`Policy.get_score`) — `large_resource_policy` (default), `fifo_policy`
+   - task policies (`Policy.get_score`) — `fifo_policy` (default), `large_resource_policy`
    - children policies (`ChildrenPolicy`) — `simple_split_children_policy` (default),
      `bin_packing_children_policy`, `fixed_leafs_children_policy`
+
+   **Pending-task containers.** `AsyncTaskScheduler` picks its pending container by policy
+   *name*: `"fifo_policy"` gets `PendingTaskQueue` (deque, tasks never scored); everything
+   else gets `PendingTaskHeap` (scored). An instance resolves to its name by exact-class
+   lookup in the registry, so a `FIFOPolicy` subclass is scored like any custom policy.
+   `_monitor_resources` dispatches with a synchronous `pop()` / `requeue(skipped)` pass --
+   never sort or scan the whole pending set per cycle; that was O(n log n) per cycle and
+   made throughput fall as the queue grew. `Policy.needs_scheduler_state = False` skips
+   building the (pydantic, O(total tasks)) `SchedulerState` on every `get_score`.
+
+   The pass trusts `AsyncLocalClusterResource._resource_available`: a failed allocate never
+   clears it, so if it is ever set on a full cluster, backfill tests *every* pending task.
+   `deallocate()` therefore sets it **synchronously** (it always runs on the loop thread).
+   Deferring the set with `call_soon_threadsafe` let it fire after the freed slot was
+   refilled, and that O(pending)-per-completion scan was the main cause of throughput
+   falling with batch size. Known, accepted cost: with *mixed* task sizes, backfill still
+   scans past big tasks parked at the head to find one that fits (O(pending) per dispatch);
+   strict priority does not. Per-shape sub-queues were rejected as too complex given
+   per-task affinity.
 
    Custom policies can be loaded at runtime via env vars `EL_EXTERNAL_POLICY_MODULE` /
    `EL_EXTERNAL_POLICY_PATH` (honoured by `orchestrator/__init__.py` at import time, so
@@ -172,7 +191,7 @@ Gotchas worth knowing before touching this code:
 - `enable_workstealing`: switches to `AsyncWorkStealingMaster`
 - `enable_policy_client`: serves the `PolicyEndpoint` without requiring `cluster=True`
 - `children_scheduler_policy` / `task_scheduler_policy`: policy names (defaults
-  `simple_split_children_policy` / `large_resource_policy`)
+  `simple_split_children_policy` / `fifo_policy`)
 - `policy_config`: `PolicyConfig(nlevels, nchildren, leaf_nodes, strict_priority, initial_state)`
 - `req_res`: enables ACK-based guaranteed delivery at the comm layer (default `True`)
 - `send_retries`: number of retry attempts on ACK timeout, only when `req_res=True` (default `10`)
