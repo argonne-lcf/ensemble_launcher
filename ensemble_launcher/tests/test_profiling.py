@@ -11,8 +11,8 @@ import pytest
 
 from ensemble_launcher.checkpointing import CheckpointData
 from ensemble_launcher.orchestrator.discovery import NodeProcess, read_node_processes
-from ensemble_launcher.profiling import PySpyProfiler, merge_traces
-from ensemble_launcher.profiling.merge_traces import node_events, node_pid, read_trace, select
+from ensemble_launcher.profiling import PySpyProfiler
+from ensemble_launcher.profiling.merge_traces import merge_traces, node_events, node_pid, read_trace, select
 from ensemble_launcher.profiling.pyspy import select_nodes
 
 pytestmark = pytest.mark.core
@@ -143,7 +143,7 @@ def test_merge_aligns_and_separates_nodes(tmp_path):
     }  # fmt: skip
     assert {e["pid"] for e in main} == {node_pid("main")}
     # py-spy's relative timestamps land on the shared wall-clock timeline.
-    assert [e["ts"] for e in main[1:]] == [1_000_000, 1_000_500]
+    assert [e["ts"] for e in main if e["ph"] in ("B", "E")] == [1_000_000, 1_000_500]
 
     assert select(paths, ["main", "main.m1"]) == sorted(
         str(tmp_path / f"{n}_pyspy.json") for n in ["main", "main.m1"]
@@ -152,8 +152,34 @@ def test_merge_aligns_and_separates_nodes(tmp_path):
     out = tmp_path / "merged.json"
     count = merge_traces(select(paths, None), str(out))
     merged = json.loads(out.read_text())
-    assert count == len(merged) == 9
+    # per node: process_name, thread_name, thread_sort_index, and the B/E pair
+    assert count == len(merged) == 3 * 5
     assert {e["pid"] for e in merged} == {node_pid(n) for n in ["main", "main.m0", "main.m1"]}
+
+
+def test_merge_splits_threads_with_huge_pthread_ids(tmp_path):
+    """py-spy's raw pthread ids exceed 32 bits; Perfetto would fold them onto one track."""
+    loop_tid, pool_tid = 22725463062336, 22723105142464
+
+    def stack(tid, names, t0, t1):
+        return [{"name": n, "cat": "py-spy", "ph": "B", "pid": 9, "tid": tid, "ts": t0} for n in names] + [
+            {"name": n, "cat": "py-spy", "ph": "E", "pid": 9, "tid": tid, "ts": t1} for n in reversed(names)
+        ]
+
+    events = stack(pool_tid, ["Thread.run", "_worker", "_WorkItem.run"], 0, 10) + stack(
+        loop_tid, ["<module>", "run", "uv_run", "epoll_pwait"], 0, 10
+    )
+    (tmp_path / "main_pyspy.json").write_text(json.dumps(events))
+    out = tmp_path / "merged.json"
+    merge_traces([str(tmp_path / "main_pyspy.json")], str(out))
+    merged = json.loads(out.read_text())
+
+    names = {e["tid"]: e["args"]["name"] for e in merged if e.get("name") == "thread_name"}
+    assert sorted(names) == [1, 2]
+    assert names[1] == f"event-loop (pthread {loop_tid})"  # listed first
+    assert names[2] == f"thread-pool 1 (pthread {pool_tid})"
+    sample_tids = {e["tid"] for e in merged if e.get("ph") in ("B", "E")}
+    assert sample_tids == {1, 2}
 
 
 # ---------------------------------------------------------------------------

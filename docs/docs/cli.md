@@ -125,7 +125,13 @@ python -m ensemble_launcher.profiling.merge_traces --input-dir profiles \
 ```
 
 Open `merged_perfetto.json` at [ui.perfetto.dev](https://ui.perfetto.dev). Each node is one
-process track labelled with its node id and host, on a shared wall-clock timeline. Merge a
+process track labelled with its node id and host, on a shared wall-clock timeline, with one
+track per thread: `event-loop` first, then `thread-pool N` and the rest.
+
+!!! note
+    Always open the merged file, even for a single node. Raw py-spy output uses 64-bit thread
+    ids that Perfetto folds onto one track, so the threads' stacks appear nested inside each
+    other. Merge a
 subset with `--nodes`: thousands of nodes are more than the UI can load at once.
 
 The same is available from Python:
