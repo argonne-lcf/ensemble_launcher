@@ -101,7 +101,6 @@ launcher_config = LauncherConfig(
 | `return_stdout` | `bool` | `False` | Capture task stdout |
 | `worker_logs` | `bool` | `False` | Enable worker logging |
 | `master_logs` | `bool` | `False` | Enable master logging |
-| `profile` | `Literal["perfetto"]` or `None` | `None` | Perfetto profiling for timeline visualization |
 | `gpu_selector` | `str` | `"ZE_AFFINITY_MASK"` | Environment variable for GPU affinity |
 | `cluster` | `bool` | `False` | Enable cluster mode |
 | `checkpoint_dir` | `str` or `None` | `None` | Checkpoint directory for cluster mode |

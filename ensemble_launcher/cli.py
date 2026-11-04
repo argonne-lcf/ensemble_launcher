@@ -1,7 +1,7 @@
 import json
 import os
 import signal
-from typing import Optional
+from typing import List, Optional
 
 import typer
 
@@ -89,6 +89,58 @@ def stop():
         print(f"Process {pid} not found. It may have already exited.")
     finally:
         os.remove(_PID_FILE)
+
+
+@el.command()
+def profile(
+    checkpoint_dir: str = typer.Option(..., help="The run's LauncherConfig.checkpoint_dir"),
+    node: List[str] = typer.Option(
+        ["main"], help="Node-id glob to profile; repeat for several, e.g. --node 'main.m2*'"
+    ),
+    output_dir: str = typer.Option("profiles", help="Shared directory for the traces"),
+    rate: int = typer.Option(100, help="Samples per second"),
+    native: bool = typer.Option(False, help="Include C frames"),
+    gil: bool = typer.Option(False, help="Keep only samples of threads holding the GIL"),
+    idle: bool = typer.Option(True, help="Keep samples of idle threads"),
+    duration: Optional[int] = typer.Option(None, help="Seconds to record; default until nodes exit"),
+    wait_timeout: float = typer.Option(120.0, help="Seconds to wait for the nodes to checkpoint"),
+    pyspy: Optional[str] = typer.Option(None, help="py-spy executable (default: from PATH)"),
+):
+    """Attach py-spy to running orchestrator nodes, found through their checkpoints.
+
+    Run it inside the job once the launcher is up. Each matched node's trace is written when
+    the node exits, or when this command is interrupted. Merge them with
+    `python -m ensemble_launcher.profiling.merge_traces`.
+    """
+    from ensemble_launcher.profiling import PySpyProfiler
+
+    profiler = PySpyProfiler(
+        checkpoint_dir,
+        nodes=node,
+        output_dir=output_dir,
+        rate=rate,
+        idle=idle,
+        gil=gil,
+        native=native,
+        duration=duration,
+        pyspy=pyspy,
+        wait_timeout=wait_timeout,
+    )
+    started = profiler.start()
+    for session in profiler.sessions:
+        status = "attached" if session.error is None else f"FAILED: {session.error}"
+        print(f"{session.node.node_id} ({session.node.hostname}, pid {session.node.pid}): {status}")
+    if not started:
+        raise typer.Exit(1)
+
+    # A batch scheduler stops a job step with SIGTERM; treat it like Ctrl-C so traces flush.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    try:
+        profiler.wait()
+    except KeyboardInterrupt:
+        print("Stopping py-spy sessions...")
+        profiler.stop()
+    print(f"Traces in {profiler.output_dir}")
 
 
 if __name__ == "__main__":

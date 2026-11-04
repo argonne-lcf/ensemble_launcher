@@ -1,7 +1,6 @@
 import asyncio
 import collections
 import multiprocessing
-import os
 import queue
 import time
 import uuid
@@ -11,7 +10,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, SerializeAsAny
 
-from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from .hb import HeartBeatProcess
 from .messages import Message, all_messages
@@ -244,10 +242,6 @@ class AsyncComm:
 
         self.parent_dead_event: Optional[asyncio.Event] = asyncio.Event()
         self._child_dead_events: Dict[str, asyncio.Event] = {}
-
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry: EventRegistry = get_registry()
 
         # Heartbeat state
         self._hb_process: Optional[multiprocessing.Process] = None

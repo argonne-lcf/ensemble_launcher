@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import loky
 
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -62,9 +61,6 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         super().submit(dummy_task)
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry: EventRegistry = get_registry()
         self.logger.info("Initialized AsyncProcessPool Executor!")
 
     def submit(
@@ -242,9 +238,6 @@ class AsyncLokyExecutor:
             f = self._executor.submit(dummy_task)
             f.result()
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info("Initialized AsyncLoky Executor!")
 
     def submit(
@@ -395,9 +388,6 @@ class AsyncPinnedExecutor:
         }
         self._next_pool = 0  # round-robin cursor for tasks that ask for no GPU
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info(
             f"Initialized AsyncPinned Executor! {npools} pool(s), {max_workers} worker(s), "
             f"{gpu_selector} pinned to {self._gpus or 'nothing'}"

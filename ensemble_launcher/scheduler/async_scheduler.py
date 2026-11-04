@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import heapq
-import os
 from asyncio import Queue
 from collections import Counter, deque
 from logging import Logger
@@ -19,7 +18,6 @@ from typing import (
 
 from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
-from ensemble_launcher.profiling import EventRegistry, get_registry
 
 from .child_state import ChildState
 from .policy import ChildrenPolicy, Policy, policy_registry
@@ -939,10 +937,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._consecutive_failed_allocations = 0
         self._monitoring_task = None
         self._event_loop = None  # Will be set when monitoring starts
-
-        self._event_registry: Optional[EventRegistry] = None
-        if os.environ.get("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
 
     @property
     def policy(self) -> Policy:

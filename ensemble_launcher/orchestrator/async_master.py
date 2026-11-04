@@ -9,7 +9,6 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
-from contextlib import asynccontextmanager
 from typing import Callable, Dict, List, Optional, Set, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
@@ -37,7 +36,6 @@ from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator.policy_endpoint import KIND_CHILDREN, PolicyEndpoint
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
 from ensemble_launcher.scheduler.child_state import ChildState
 from ensemble_launcher.scheduler.resource import (
@@ -98,8 +96,6 @@ class AsyncMaster(Node):
 
         self.logger = None
 
-        # Initialize event registry for perfetto profiling
-        self._event_registry: Optional[EventRegistry] = None
 
         # asyncio event
         # _all_children_done_event is owned by the scheduler after _lazy_init;
@@ -186,17 +182,6 @@ class AsyncMaster(Node):
         exc = task.exception()
         if exc is not None:
             self.logger.error(f"{self.node_id}: _forward_result failed: {exc}")
-
-    @asynccontextmanager
-    async def _timer(self, event_name: str):
-        """Timer that records to event registry for Perfetto export."""
-        if self._event_registry is not None:
-            with self._event_registry.measure(
-                event_name, "async_master", node_id=self.node_id, pid=os.getpid()
-            ):
-                yield
-        else:
-            yield
 
     @property
     def _all_children_done_event(self) -> asyncio.Event:
@@ -724,10 +709,6 @@ class AsyncMaster(Node):
         In order: logging, event loop capture, comm, parent sync, scheduler,
         executor, children creation/launch, and monitor task creation.
         """
-        if self._config.profile == "perfetto":
-            self._event_registry = get_registry()
-            self._event_registry.enable()
-            os.environ["EL_ENABLE_PROFILING"] = "1"
 
         # Store event loop for thread-safe event signaling from callbacks
         self._event_loop = asyncio.get_event_loop()
@@ -1019,10 +1000,9 @@ class AsyncMaster(Node):
             self._parent_ready_monitor()
         )
 
-        async with self._timer("heartbeat_sync"):
-            if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         max_retries = 100
         for attempt in range(max_retries):
@@ -1376,60 +1356,58 @@ class AsyncMaster(Node):
         self.logger.info(f"{self.node_id}: Stopped reporting loop")
 
         # Report final status to parent (or write to file if root / parent dead)
-        async with self._timer("report_to_parent"):
-            if self.parent and (
-                self._comm.parent_dead_event is None
-                or not self._comm.parent_dead_event.is_set()
-            ):
-                final_status = self._scheduler.aggregate_status()
-                final_status.tag = "final"
-                success = await self._comm.send_message_to_parent(final_status)
-                if success:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully reported final status to parent"
-                    )
-                else:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
+        if self.parent and (
+            self._comm.parent_dead_event is None
+            or not self._comm.parent_dead_event.is_set()
+        ):
+            final_status = self._scheduler.aggregate_status()
+            final_status.tag = "final"
+            success = await self._comm.send_message_to_parent(final_status)
+            if success:
+                self.logger.info(
+                    f"{self.node_id}: Successfully reported final status to parent"
+                )
             else:
-                try:
-                    status = self._scheduler.aggregate_status()
-                    status.tag = "final"
-                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                    status.to_file(fname)
-                    self.logger.info(
-                        f"{self.node_id}: Successfully dumped final status to {fname}"
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"{self.node_id}: Reporting final status failed with exception {e}"
-                    )
+                self.logger.warning(
+                    f"{self.node_id}: Failed to send final status to parent"
+                )
+        else:
+            try:
+                status = self._scheduler.aggregate_status()
+                status.tag = "final"
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                status.to_file(fname)
+                self.logger.info(
+                    f"{self.node_id}: Successfully dumped final status to {fname}"
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"{self.node_id}: Reporting final status failed with exception {e}"
+                )
 
         # Aggregate results
-        async with self._timer("aggregate_results"):
-            if len(self._scheduler.unassigned_task_ids) > 0:
-                failed_results = [
-                    Result(
-                        sender=self.node_id,
-                        task_id=task_id,
-                        success=False,
-                        exception=f"Failed to assign to children at {self.node_id}",
-                    )
-                    for task_id in self._scheduler.unassigned_task_ids
-                ]
-            else:
-                failed_results = []
-            result_batch = ResultBatch(sender=self.node_id, data=failed_results)
-            # Include results streamed during execution (batch mode root master only)
-            for r in self._batch_streaming_results:
-                result_batch.add_result(r)
-            for child_id, child_results in self._results.items():
-                for rb in child_results:
-                    result_batch += rb
-            self.logger.info(
-                f"{self.node_id}: Aggregated results from {len(self._results)} children"
-            )
+        if len(self._scheduler.unassigned_task_ids) > 0:
+            failed_results = [
+                Result(
+                    sender=self.node_id,
+                    task_id=task_id,
+                    success=False,
+                    exception=f"Failed to assign to children at {self.node_id}",
+                )
+                for task_id in self._scheduler.unassigned_task_ids
+            ]
+        else:
+            failed_results = []
+        result_batch = ResultBatch(sender=self.node_id, data=failed_results)
+        # Include results streamed during execution (batch mode root master only)
+        for r in self._batch_streaming_results:
+            result_batch.add_result(r)
+        for child_id, child_results in self._results.items():
+            for rb in child_results:
+                result_batch += rb
+        self.logger.info(
+            f"{self.node_id}: Aggregated results from {len(self._results)} children"
+        )
 
         # Send to parent (skip if parent is dead)
         if self.parent and (
@@ -2120,21 +2098,6 @@ class AsyncMaster(Node):
             self._executor.shutdown()
         self.logger.info("Done Shutting down executor")
 
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
-            # Export to Perfetto format
-            fname = os.path.join(
-                os.getcwd(), "profiles", f"{self.node_id}_perfetto.json"
-            )
-            self.logger.info(f"Exporting Perfetto trace to {fname}")
-            self._event_registry.export_perfetto(fname)
-
-            # Also export statistics
-            stats = self._event_registry.get_statistics()
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
-            self.logger.info(f"Exporting event statistics to {fname}")
-            with open(fname, "w") as f:
-                json.dump(stats, f, indent=2)
         self.logger.info(f"Done stopping {self.node_id}")
         for handler in self.logger.handlers[:]:
             handler.close()
@@ -2243,8 +2206,7 @@ class AsyncMaster(Node):
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, wait for all work to finish, stop, return results."""
         try:
-            async with self._timer("init"):
-                await self._lazy_init()
+            await self._lazy_init()
 
             # Wait for aggregation to complete
             await self._wait_for_finish()

@@ -1,5 +1,6 @@
-"""Profiling and event tracking for ensemble launcher."""
+"""Profile orchestrator nodes with py-spy, located through the checkpoint directory."""
 
-from .event_registry import Event, EventRegistry, get_registry
+from .merge_traces import merge_traces
+from .pyspy import PySpyProfiler
 
-__all__ = ['Event', 'EventRegistry', 'get_registry']
+__all__ = ["PySpyProfiler", "merge_traces"]
