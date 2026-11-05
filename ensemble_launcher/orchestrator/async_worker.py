@@ -7,7 +7,6 @@ import secrets
 import signal
 import time
 from collections import deque
-from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
@@ -40,7 +39,6 @@ from ensemble_launcher.executors import (
 )
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator.policy_endpoint import KIND_TASK, PolicyEndpoint
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -94,8 +92,6 @@ class AsyncWorker(Node):
 
         self.logger = None
 
-        # Initialize event registry for perfetto profiling
-        self._event_registry: Optional[EventRegistry] = None
 
         self._stop_submission = asyncio.Event()
         self._stop_reporting = asyncio.Event()
@@ -146,17 +142,6 @@ class AsyncWorker(Node):
         # in-flight handle keeps a slow write from overlapping the next one.
         self._checkpoint_task: Optional[asyncio.Task] = None
         self._checkpoint_write: Optional[asyncio.Task] = None
-
-    @asynccontextmanager
-    async def _timer(self, event_name: str):
-        """Timer that records to event registry for Perfetto export."""
-        if self._event_registry is not None:
-            with self._event_registry.measure(
-                event_name, "async_worker", node_id=self.node_id, pid=os.getpid()
-            ):
-                yield
-        else:
-            yield
 
     @property
     def nodes(self) -> JobResource:
@@ -263,9 +248,6 @@ class AsyncWorker(Node):
         In order: logging, event loop capture, comm, parent sync (heartbeat +
         node/task updates), scheduler, executor, and monitor task creation.
         """
-        if self._config.profile == "perfetto":
-            self._event_registry = get_registry()
-            self._event_registry.enable()
 
         self._event_loop = asyncio.get_running_loop()
         self._event_loop.add_signal_handler(
@@ -647,10 +629,9 @@ class AsyncWorker(Node):
             self._parent_ready_monitor()
         )
         # sync heart beat with parent
-        async with self._timer("heartbeat_sync"):
-            if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         max_retries = 100
         for attempt in range(max_retries):
@@ -780,14 +761,6 @@ class AsyncWorker(Node):
         """Process a completed task future: record status, free resources, forward result."""
 
         task_id = task.task_id
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            self._event_registry.record_async_end(
-                name=task.task_id,
-                category="task_execution",
-                node_id=self.node_id,
-                pid=os.getpid(),
-                async_id=task.task_id,
-            )
         if task_id in self.tasks:
             exception = future.exception()
             task.end_time = time.time()
@@ -941,24 +914,6 @@ class AsyncWorker(Node):
                 task = self.tasks[task_id]
                 task.status = TaskStatus.READY
                 task.start_time = time.time()
-                if (
-                    self._config.profile == "perfetto"
-                    and self._event_registry is not None
-                ):
-                    self._event_registry.record_async_begin(
-                        name=task.task_id,
-                        category="task_execution",
-                        node_id=self.node_id,
-                        pid=os.getpid(),
-                        async_id=task.task_id,
-                    )
-                    self._event_registry.record_counter(
-                        name="tasks_submitted",
-                        category="task_execution",
-                        value=1,
-                        pid=os.getpid(),
-                        node_id=self.node_id,
-                    )
 
                 set_exception = False
                 task.status = TaskStatus.RUNNING
@@ -1228,20 +1183,19 @@ class AsyncWorker(Node):
         ):
             await self._drain_results(dest_id)
 
-        async with self._timer("final_status"):
-            final_status = self.get_status()
-            final_status.tag = "final"
-            if self.parent:
-                success = await self._comm.send_message_to_parent(final_status)
-                if success:
-                    self.logger.info(f"{self.node_id}: Sent final status to parent")
-                else:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
-                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                    self.logger.info(f"{final_status}")
-                    final_status.to_file(fname)
+        final_status = self.get_status()
+        final_status.tag = "final"
+        if self.parent:
+            success = await self._comm.send_message_to_parent(final_status)
+            if success:
+                self.logger.info(f"{self.node_id}: Sent final status to parent")
+            else:
+                self.logger.warning(
+                    f"{self.node_id}: Failed to send final status to parent"
+                )
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                self.logger.info(f"{final_status}")
+                final_status.to_file(fname)
         result_batch = ResultBatch(sender=self.node_id)
         for task_id, task in self.tasks.items():
             if task_id in self._streamed_task_ids:
@@ -1325,22 +1279,6 @@ class AsyncWorker(Node):
         await self._scheduler.stop_monitoring()
         await self._stop_monitor_tasks()
 
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
-            # Export to Perfetto format
-            fname = os.path.join(
-                os.getcwd(), "profiles", f"{self.node_id}_perfetto.json"
-            )
-            self.logger.info(f"Exporting Perfetto trace to {fname}")
-            self._event_registry.export_perfetto(fname)
-
-            # Also export statistics
-            stats = self._event_registry.get_statistics()
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
-            self.logger.info(f"Exporting event statistics to {fname}")
-            with open(fname, "w") as f:
-                json.dump(stats, f, indent=2)
-
         await self._comm.close()
         for executor in self._executor.values():
             if hasattr(executor, "ashutdown"):
@@ -1360,19 +1298,17 @@ class AsyncWorker(Node):
     async def run(self) -> ResultBatch:
         """Main entry point: initialise, execute tasks, collect results, stop."""
         try:
-            async with self._timer("init"):
-                ##lazy init
-                await self._lazy_init()
+            ##lazy init
+            await self._lazy_init()
 
             self.logger.info("Started waiting for stop condition")
             await self._wait_for_stop_condition()
 
-            async with self._timer("result_collection"):
-                if (
-                    self._comm.parent_dead_event is None
-                    or not self._comm.parent_dead_event.is_set()
-                ):
-                    all_results = await self._send_final_results_and_status()
+            if (
+                self._comm.parent_dead_event is None
+                or not self._comm.parent_dead_event.is_set()
+            ):
+                all_results = await self._send_final_results_and_status()
         finally:
             await self.stop()
 

@@ -99,4 +99,4 @@ When `launcher_config=None`, `EnsembleLauncher` auto-selects settings:
 
 - **Checkpoints** are written to `checkpoint_dir/` (ZMQ addresses for cluster discovery)
 - **Logs** are written to `logs/master-*.log` and `logs/worker-*.log`
-- **Profiling:** Set `LauncherConfig(profile="perfetto")` to output `profiles/*_perfetto.json` and `profiles/*_stats.json`
+- **Profiling:** attach py-spy to running nodes with `el profile`; see [CLI Reference](cli.md#el-profile)

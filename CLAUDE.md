@@ -213,7 +213,14 @@ SSH tunnel helpers for HPC login→compute node are in `ensemble_launcher/mcp/ut
   `{node}_policy.ckpt` / `{node}_policy_secret` / `{node}_policy_state.json` for the
   policy endpoint. Secret files are written `chmod 0600`.
 - Logs written to `logs/master-*.log` and `logs/worker-*.log`
-- Profiling: set `LauncherConfig(profile="perfetto")` → outputs `profiles/*_perfetto.json` and `profiles/*_stats.json`
+- Profiling is external, via py-spy: `el profile --checkpoint-dir X --node main --node 'main.m*'`
+  (`profiling/pyspy.py`) reads each node's host/pid from `{node}_meta.json` and runs
+  `py-spy record` on that host, over ssh when remote. Traces land in
+  `profiles/{node}_pyspy.json`; `python -m ensemble_launcher.profiling.merge_traces` shifts
+  py-spy's relative timestamps by each sidecar's `start_us`, gives every node its own pid, and
+  remaps py-spy's 64-bit pthread ids to small tids named by role (`event-loop`, `thread-pool N`)
+  -- Perfetto's JSON importer folds raw ones onto a single track.
+  There is no in-process profiler (`EventRegistry` / `LauncherConfig.profile` were removed).
 
 ### Auto-configuration logic
 

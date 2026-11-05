@@ -37,6 +37,7 @@ hpc = ["mpi4py"]
 mcp = ["mcp", "paramiko"]
 inference = ["vllm", "uvloop", "uvicorn", "fastapi"]
 docs = ["mkdocs-material"]
+profiling = ["py-spy"]
 dev-core = [
     "pytest",
     "pytest-timeout",
@@ -44,7 +45,7 @@ dev-core = [
     "ensemble_launcher[hpc]",
 ]
 dev-extensions = ["ensemble_launcher[dev-core,mcp,inference]"]
-all = ["ensemble_launcher[hpc,mcp,inference]"]
+all = ["ensemble_launcher[hpc,mcp,inference,profiling]"]
 
 [project.scripts]
 el = "ensemble_launcher.cli:el"

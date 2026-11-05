@@ -104,9 +104,6 @@ class LauncherConfig(BaseModel):
     sequential_child_launch: Optional[bool] = (
         None  ##If True, launch children one by one even for MPI executor
     )
-    profile: Optional[Literal["perfetto"]] = (
-        None  ##Enable profiling with event registry and Perfetto export for timeline visualization
-    )
     gpu_selector: str = "ZE_AFFINITY_MASK"
     log_dir: str = "logs"  # Directory for log files
     log_level: int = logging.INFO

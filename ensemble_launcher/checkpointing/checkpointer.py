@@ -35,7 +35,7 @@ from logging import Logger
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import cloudpickle
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ensemble_launcher.comm.async_base import AsyncCommState
 from ensemble_launcher.scheduler.state import SchedulerState
@@ -63,8 +63,10 @@ class CheckpointData(BaseModel):
     has_scheduler: bool = False
     has_comm: bool = False
     has_tasks: bool = False
-    pid: int = os.getpid()
-    hostname: str = socket.gethostname()
+    # Factories, not plain defaults: a default is evaluated once at import, which records
+    # the importing process rather than the node writing the checkpoint.
+    pid: int = Field(default_factory=os.getpid)
+    hostname: str = Field(default_factory=socket.gethostname)
 
 
 class CommCheckpointData(BaseModel):
