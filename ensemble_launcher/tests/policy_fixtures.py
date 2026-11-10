@@ -23,10 +23,10 @@ class TunableScorePolicy(Policy):
     fail-atomicity tests inject a poison tune.
     """
 
-    def get_score(self, task, scheduler_state=None) -> float:
+    def get_score(self, uid, scheduler_state=None) -> float:
         if self.state.get("boom"):
             raise RuntimeError("poison state: get_score refuses to score")
-        return float(task.nnodes) * float(self.state.get("node_weight", 1.0))
+        return float(self.tasks[uid].nnodes) * float(self.state.get("node_weight", 1.0))
 
 
 @policy_registry.register("tunable_index_policy")
@@ -38,9 +38,9 @@ class TunableIndexPolicy(Policy):
     FIFO tiebreak survived a rescore.
     """
 
-    def get_score(self, task, scheduler_state=None) -> float:
+    def get_score(self, uid, scheduler_state=None) -> float:
         scores = self.state.get("scores") or {}
-        return float(scores.get(task.task_id, self.state.get("default", 0.0)))
+        return float(scores.get(self.tasks[uid].task_id, self.state.get("default", 0.0)))
 
 
 @policy_registry.register("tunable_children_policy", type="children_policy")

@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "cloudpickle",
-    "pydantic",
+    "pydantic>=2.10",
     "pyzmq",
     "loky",
     "typer",
@@ -58,3 +58,15 @@ Issues = "https://github.com/argonne-lcf/ensemble_launcher/issues"
 
 [tool.setuptools.packages.find]
 include = ["ensemble_launcher*"]
+
+[tool.ruff.lint]
+# Allow typing.Dict / List / Tuple / Set / Optional / Union.
+ignore = [
+    "UP006",  # use `dict` instead of `Dict`
+    "UP007",  # use `X | Y` instead of `Union`
+    "UP035",  # `typing.Dict` etc. are deprecated
+    "UP045",  # use `X | None` instead of `Optional`
+    "RUF012",
+    "G201",
+    "B008",
+]

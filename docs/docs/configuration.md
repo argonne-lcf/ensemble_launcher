@@ -112,6 +112,12 @@ launcher_config = LauncherConfig(
 | `req_res` | `bool` | `True` | Enable ACK-based guaranteed delivery for task messages |
 | `send_retries` | `int` | `10` | Retry count on ACK timeout (`req_res=True` only) |
 | `send_timeout` | `float` | `1.0` | Per-attempt ACK timeout in seconds (`req_res=True` only) |
+| `assign_chunk_size` | `int` | `4096` | A master places tasks this many at a time, yielding to the event loop between chunks, so a large update never blocks heartbeats or results |
+| `max_inflight_flushes` | `int` | `1` | Result sends in flight per destination; a failed send is resent in its slot. Masters forward results as they arrive; `result_flush_interval` and `result_buffer_size` only affect workers |
+| `max_inflight_task_sends` | `int` | `1` | `TaskUpdate`s in flight per child; a failed send is resent in its slot before anything newer. Masters send tasks as soon as they are placed, so `task_flush_interval` and `task_buffer_size` no longer affect them |
+| `task_store` | `str` | `"segment"` | `TaskStore` implementation each node keeps its tasks in |
+| `task_store_hot_bytes` | `int` | `1073741824` | Task bytes a node keeps in memory (1 GB); the rest is offloaded to disk |
+| `task_store_dir` | `str` or `None` | `None` | Where offloaded tasks go; `None` = node-local `$TMPDIR`. On Aurora, point it at local scratch |
 
 
 ### PolicyConfig

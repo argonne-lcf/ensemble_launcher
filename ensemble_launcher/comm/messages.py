@@ -1,13 +1,23 @@
 import enum
 import json
+import pickle
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type, Union
 
 import cloudpickle
+import numpy as np
 
-from ensemble_launcher.ensemble import Task
+from ensemble_launcher.comm import blob
+from ensemble_launcher.ensemble import Task, TaskMeta
+from ensemble_launcher.ensemble.ensemble import (
+    META_FIELDS,
+    build_task,
+    decode_deep,
+    encode_deep,
+    encode_meta,
+)
 from ensemble_launcher.scheduler.resource import JobResource
 
 
@@ -189,6 +199,7 @@ class Result(Message):
     task_id: str = None
     success: bool = True
     exception: Optional[str] = None
+    uid: Optional[bytes] = None
 
     def to_dict(self):
         ret_dict = super().to_dict()
@@ -202,373 +213,254 @@ class Result(Message):
         )
         return ret_dict
 
-    def pack(self):
-        if self._packed:
-            return self
-        self._raw_deep = cloudpickle.dumps({"data": self.data})
-        self.data = None
-        self._packed = True
-        return self
 
-    def unpack(self) -> None:
-        if not self._packed:
-            return
-        deep = cloudpickle.loads(self._raw_deep)
-        self.data = deep["data"]
-        self._raw_deep = None
-        self._packed = False
+# --------------------------------------------------------------------------- #
+#  Blob-backed messages                                                       #
+# --------------------------------------------------------------------------- #
+#
+# TaskUpdate and the result batches carry their items as columns (comm/blob.py) instead of one
+# Python object per item. Frames on the wire:
+#
+#   [header] [container] [column 0] [column 1] ...
+#
+# ``header`` is ``!HI`` (type id, container length), as for every other message, and
+# ``container`` pickles the message's own dataclass fields (sender, message_id, ...). Receiving
+# one only wraps the frames: nothing is decoded per item until someone asks for it.
+
+_SKIP_FIELDS = ("MSG_TYPE_ID", "_packed", "_raw_deep")
+
+
+class _BlobMessage:
+    """Shared frame layout for messages whose payload is a fixed list of columns."""
+
+    _COLUMNS: tuple = ()  # attribute names, in frame order; "*_off" ones are int64 offsets
+
+    def _container(self) -> dict:
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name not in _SKIP_FIELDS
+        }
+
+    def _frames(self) -> list:
+        out = []
+        for name in self._COLUMNS:
+            col = getattr(self, name)
+            out.append(col.tobytes() if isinstance(col, np.ndarray) else bytes(col))
+        return out
+
+    def to_byte_array(self) -> list:
+        container = pickle.dumps(self._container(), protocol=pickle.HIGHEST_PROTOCOL)
+        header = struct.pack("!HI", self.MSG_TYPE_ID, len(container))
+        return [header, container] + self._frames()
+
+    @classmethod
+    def _from_frames(cls, container_blob, columns: list):
+        msg = cls.__new__(cls)
+        msg.__dict__.update(pickle.loads(container_blob))
+        msg._packed = False
+        msg._raw_deep = None
+        for name, frame in zip(cls._COLUMNS, columns):
+            setattr(msg, name, blob.offsets_from_frame(frame) if name.endswith("_off") else frame)
+        msg._post_decode()
+        return msg
+
+    def _post_decode(self) -> None:
+        pass
+
+    @classmethod
+    def from_byte_array(cls, frames: list):
+        return cls._from_frames(frames[1], frames[2:])
+
+    def to_bytes(self) -> bytes:
+        """One buffer: ``!HI`` (type id, frame count), ``!Q`` per frame length, then the frames."""
+        frames = self.to_byte_array()[1:]
+        head = struct.pack("!HI", self.MSG_TYPE_ID, len(frames))
+        lengths = struct.pack(f"!{len(frames)}Q", *(len(f) for f in frames))
+        return b"".join([head, lengths] + frames)
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        (_, nframes) = struct.unpack_from("!HI", data, 0)
+        lengths = struct.unpack_from(f"!{nframes}Q", data, 6)
+        mv, pos, frames = memoryview(data), 6 + 8 * nframes, []
+        for n in lengths:
+            frames.append(mv[pos : pos + n])
+            pos += n
+        return cls._from_frames(frames[0], frames[1:])
+
+    @property
+    def nbytes(self) -> int:
+        return sum(len(getattr(self, name)) * (8 if name.endswith("_off") else 1)
+                   for name in self._COLUMNS)  # fmt: skip
 
 
 @dataclass
-class ResultBatch(Message):
+class _ResultColumns(_BlobMessage):
+    """Results as columns: ``uids`` (16 B each), ``success`` (1 B each), and a payload record
+    ``cloudpickle((task_id, data, exception))`` per result.
+
+    Masters route on the two fixed-width columns alone (`rows()`); only the final consumer
+    decodes payloads (`to_results()`, or the `data` property kept for user code).
+    """
+
+    _COLUMNS = ("_uids", "_success", "_payload", "_payload_off")
+
+    def __post_init__(self):
+        self._uids, self._success = b"", b""
+        self._payload, self._payload_off = b"", blob.EMPTY_OFFSETS
+        self._decoded = None
+
+    def _post_decode(self) -> None:
+        self._decoded = None
+
+    @classmethod
+    def from_results(cls, results: List[Result], **msg_fields):
+        """Encode Result objects (each needs ``uid``; a missing one is sent as zeros)."""
+        msg = cls(**msg_fields)
+        zero = bytes(blob.UID_BYTES)
+        msg._uids = b"".join(r.uid or zero for r in results)
+        msg._success = bytes(1 if r.success else 0 for r in results)
+        msg._payload, msg._payload_off = blob.encode_column(
+            cloudpickle.dumps((r.task_id, r.data, r.exception)) for r in results
+        )
+        msg._decoded = list(results)
+        return msg
+
+    @property
+    def nresults(self) -> int:
+        return len(self._success)
+
+    def uids(self) -> List[bytes]:
+        return blob.split_fixed(self._uids, blob.UID_BYTES)
+
+    def rows(self):
+        """``(uid, success)`` per result, read from the fixed-width columns only."""
+        return zip(self.uids(), (bool(b) for b in bytes(self._success)))
+
+    def to_results(self) -> List[Result]:
+        if self._decoded is None:
+            out = []
+            for i, (uid, ok) in enumerate(self.rows()):
+                task_id, data, exception = cloudpickle.loads(
+                    blob.record(self._payload, self._payload_off, i)
+                )
+                out.append(Result(sender=self.sender, uid=uid, task_id=task_id, data=data,
+                                  success=ok, exception=exception))  # fmt: skip
+            self._decoded = out
+        return self._decoded
+
+    @property
+    def data(self) -> List[Result]:
+        """Decoded results, for user code (``res.data[i].data``). Masters never touch this."""
+        return self.to_results()
+
+    def to_dict(self):
+        return {r.task_id: r.to_dict() for r in self.data}
+
+    def select(self, rows, **msg_fields):
+        rows = np.asarray(rows, dtype=np.int64)
+        msg = type(self)(**msg_fields)
+        msg._uids = blob.gather_fixed(self._uids, blob.UID_BYTES, rows)
+        msg._success = blob.gather_fixed(self._success, 1, rows)
+        msg._payload, msg._payload_off = blob.gather(self._payload, self._payload_off, rows)
+        return msg
+
+    @classmethod
+    def concat(cls, batches: list, **msg_fields):
+        msg = cls(**msg_fields)
+        msg._uids = b"".join(bytes(b._uids) for b in batches)
+        msg._success = b"".join(bytes(b._success) for b in batches)
+        msg._payload, msg._payload_off = blob.concat(
+            [(b._payload, b._payload_off) for b in batches]
+        )
+        return msg
+
+
+@dataclass
+class ResultBatch(_ResultColumns, Message):
     MSG_TYPE_ID: int = field(default=3, init=False, repr=False)
 
-    data: List[Result] = field(default_factory=list)
 
-    def add_result(self, result: Result):
-        self.data.append(result)
-
-    def to_dict(self):
-        return {r.task_id: r.to_dict() for r in self.data}
-
-    def __add__(self, other) -> "ResultBatch":
-        if not isinstance(other, ResultBatch):
-            raise TypeError(
-                f"Cannot add ResultBatch and {type(other)}"
-            )
-        packed = self._packed or other._packed
-        if packed:
-            if not self._packed:
-                self.pack()
-            if not other._packed:
-                other.pack()
-        new = ResultBatch(
-            sender=self.sender, receiver=self.receiver, data=self.data + other.data
-        )
-        new._packed = packed
-        return new
-
-    def __radd__(self, other) -> "ResultBatch":
-        return self.__add__(other)
-
-    def pack(self):
-        if self._packed:
-            return self
-        for r in self.data:
-            r.pack()
-        self._packed = True
-        return self
-
-    def unpack(self) -> None:
-        if not self._packed:
-            return
-        for r in self.data:
-            r.unpack()
-        self._packed = False
-
-    def to_byte_array(self) -> list:
-        if not self._packed:
-            self.pack()
-        items = []
-        deep_parts = []
-        offset = 0
-        for r in self.data:
-            deep = r._raw_deep or b""
-            start = offset
-            end = offset + len(deep)
-            offset = end
-            inner_shallow = {
-                k: v
-                for k, v in r.__dict__.items()
-                if k not in ("_packed", "_raw_deep", "MSG_TYPE_ID")
-            }
-            items.append((start, end, inner_shallow))
-            deep_parts.append(deep)
-        container_shallow = {
-            k: v
-            for k, v in self.__dict__.items()
-            if k not in ("_packed", "_raw_deep", "MSG_TYPE_ID", "data")
-        }
-        container_shallow["items"] = items
-        shallow_blob = cloudpickle.dumps(container_shallow)
-        header = struct.pack("!HI", self.MSG_TYPE_ID, len(shallow_blob))
-        return [header, shallow_blob, b"".join(deep_parts)]
-
-    @classmethod
-    def _rebuild_results(cls, items: list, deep_mv) -> List[Result]:
-        results = []
-        for start, end, inner_shallow in items:
-            r = Result.__new__(Result)
-            r.__dict__.update(inner_shallow)
-            r._packed = True
-            r._raw_deep = (
-                deep_mv[start:end] if deep_mv is not None and start < end else None
-            )
-            r.MSG_TYPE_ID = 2
-            results.append(r)
-        return results
-
-    @classmethod
-    def from_byte_array(cls, frames: list) -> "ResultBatch":
-        header = frames[0]
-        (type_id,) = struct.unpack_from("!H", header, 0)
-        container_shallow = cloudpickle.loads(frames[1])
-        items = container_shallow.pop("items")
-        deep_mv = memoryview(frames[2]) if len(frames) > 2 else None
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.data = cls._rebuild_results(items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
-        return msg
-
-    def to_bytes(self) -> bytes:
-        return b"".join(self.to_byte_array())
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "ResultBatch":
-        (type_id,) = struct.unpack_from("!H", data, 0)
-        (shallow_len,) = struct.unpack_from("!I", data, 2)
-        container_shallow = cloudpickle.loads(data[6 : 6 + shallow_len])
-        items = container_shallow.pop("items")
-        deep_mv = memoryview(data)[6 + shallow_len :]
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.data = cls._rebuild_results(items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
-        return msg
-
-
-# I got lazy and didn't want to change the work done logic in the orchestrator.
+# Results as they travel between nodes. `ResultBatch` (same layout) is what `run()` returns and
+# what the parent-dead fallback file holds; it is no longer sent between nodes (see `Done`).
 @dataclass
-class IResultBatch(Message):
+class IResultBatch(_ResultColumns, Message):
     MSG_TYPE_ID: int = field(default=4, init=False, repr=False)
 
-    data: List[Result] = field(default_factory=list)
-
-    def add_result(self, result: Result):
-        self.data.append(result)
-
-    def to_dict(self):
-        return {r.task_id: r.to_dict() for r in self.data}
-
-    def __add__(self, other) -> "ResultBatch":
-        if not isinstance(other, ResultBatch):
-            raise TypeError(
-                f"Cannot add ResultBatch and {type(other)}"
-            )
-        packed = self._packed or other._packed
-        if packed:
-            if not self._packed:
-                self.pack()
-            if not other._packed:
-                other.pack()
-        new = ResultBatch(
-            sender=self.sender, receiver=self.receiver, data=self.data + other.data
-        )
-        new._packed = packed
-        return new
-
-    def __radd__(self, other) -> "ResultBatch":
-        return self.__add__(other)
-
-    def pack(self):
-        if self._packed:
-            return self
-        for r in self.data:
-            r.pack()
-        self._packed = True
-        return self
-
-    def unpack(self) -> None:
-        if not self._packed:
-            return
-        for r in self.data:
-            r.unpack()
-        self._packed = False
-
-    def to_byte_array(self) -> list:
-        if not self._packed:
-            self.pack()
-        items = []
-        deep_parts = []
-        offset = 0
-        for r in self.data:
-            deep = r._raw_deep or b""
-            start = offset
-            end = offset + len(deep)
-            offset = end
-            inner_shallow = {
-                k: v
-                for k, v in r.__dict__.items()
-                if k not in ("_packed", "_raw_deep", "MSG_TYPE_ID")
-            }
-            items.append((start, end, inner_shallow))
-            deep_parts.append(deep)
-        container_shallow = {
-            k: v
-            for k, v in self.__dict__.items()
-            if k not in ("_packed", "_raw_deep", "MSG_TYPE_ID", "data")
-        }
-        container_shallow["items"] = items
-        shallow_blob = cloudpickle.dumps(container_shallow)
-        header = struct.pack("!HI", self.MSG_TYPE_ID, len(shallow_blob))
-        return [header, shallow_blob, b"".join(deep_parts)]
-
-    @classmethod
-    def from_byte_array(cls, frames: list) -> "IResultBatch":
-        header = frames[0]
-        (type_id,) = struct.unpack_from("!H", header, 0)
-        container_shallow = cloudpickle.loads(frames[1])
-        items = container_shallow.pop("items")
-        deep_mv = memoryview(frames[2]) if len(frames) > 2 else None
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.data = ResultBatch._rebuild_results(items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
-        return msg
-
-    def to_bytes(self) -> bytes:
-        return b"".join(self.to_byte_array())
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "IResultBatch":
-        (type_id,) = struct.unpack_from("!H", data, 0)
-        (shallow_len,) = struct.unpack_from("!I", data, 2)
-        container_shallow = cloudpickle.loads(data[6 : 6 + shallow_len])
-        items = container_shallow.pop("items")
-        deep_mv = memoryview(data)[6 + shallow_len :]
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.data = ResultBatch._rebuild_results(items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
-        return msg
-
 
 @dataclass
-class TaskUpdate(Message):
+class TaskUpdate(_BlobMessage, Message):
+    """Tasks as columns: ``uids`` (16 B each), a metadata record per task (every non-deep
+    field, `ensemble.META_FIELDS`) and a deep record per task (executable, args, kwargs, env,
+    result). Built with `from_tasks`; masters split and join it with `select` / `concat`
+    without decoding; only a worker turns rows back into `Task`s (`task`, `to_tasks`).
+    """
+
     MSG_TYPE_ID: int = field(default=5, init=False, repr=False)
 
-    added_tasks: List[Task] = field(default_factory=list)
-    deleted_tasks: List[Task] = field(default_factory=list)
+    deleted_uids: List[bytes] = field(default_factory=list)
 
-    def pack(self):
-        if self._packed:
-            return self
-        for t in self.added_tasks:
-            t.pack()
-        for t in self.deleted_tasks:
-            t.pack()
-        self._packed = True
-        return self
+    _COLUMNS = ("_uids", "_meta", "_meta_off", "_deep", "_deep_off")
 
-    def unpack(self) -> None:
-        if not self._packed:
-            return
-        for t in self.added_tasks:
-            t.unpack()
-        for t in self.deleted_tasks:
-            t.unpack()
-        self._packed = False
-
-    @staticmethod
-    def _pack_task_list(tasks, deep_parts, offset):
-        items = []
-        for t in tasks:
-            deep = t._raw_deep or b""
-            start = offset
-            end = offset + len(deep)
-            offset = end
-            items.append((start, end, t.__dict__.copy()))
-            deep_parts.append(deep)
-        return items, offset
-
-    @staticmethod
-    def _rebuild_tasks(items, deep_mv) -> List[Task]:
-        tasks = []
-        for start, end, inner_dict in items:
-            t = Task.__new__(Task)
-            object.__setattr__(t, "__dict__", inner_dict)
-            object.__setattr__(t, "__pydantic_fields_set__", set())
-            raw_deep = (
-                deep_mv[start:end] if deep_mv is not None and start < end else None
-            )
-            t.__pydantic_private__ = {"_packed": True, "_raw_deep": raw_deep}
-            tasks.append(t)
-        return tasks
-
-    def to_byte_array(self) -> list:
-        if not self._packed:
-            self.pack()
-        deep_parts = []
-        offset = 0
-        added_items, offset = self._pack_task_list(
-            self.added_tasks, deep_parts, offset
-        )
-        deleted_items, offset = self._pack_task_list(
-            self.deleted_tasks, deep_parts, offset
-        )
-        container_shallow = {
-            k: v
-            for k, v in self.__dict__.items()
-            if k
-            not in (
-                "_packed",
-                "_raw_deep",
-                "MSG_TYPE_ID",
-                "added_tasks",
-                "deleted_tasks",
-            )
-        }
-        container_shallow["added"] = added_items
-        container_shallow["deleted"] = deleted_items
-        shallow_blob = cloudpickle.dumps(container_shallow)
-        header = struct.pack("!HI", self.MSG_TYPE_ID, len(shallow_blob))
-        return [header, shallow_blob, b"".join(deep_parts)]
+    def __post_init__(self):
+        self._uids = b""
+        self._meta, self._meta_off = b"", blob.EMPTY_OFFSETS
+        self._deep, self._deep_off = b"", blob.EMPTY_OFFSETS
 
     @classmethod
-    def from_byte_array(cls, frames: list) -> "TaskUpdate":
-        header = frames[0]
-        (type_id,) = struct.unpack_from("!H", header, 0)
-        container_shallow = cloudpickle.loads(frames[1])
-        added_items = container_shallow.pop("added")
-        deleted_items = container_shallow.pop("deleted")
-        deep_mv = memoryview(frames[2]) if len(frames) > 2 else None
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.added_tasks = cls._rebuild_tasks(added_items, deep_mv)
-        msg.deleted_tasks = cls._rebuild_tasks(deleted_items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
+    def from_tasks(cls, tasks, **msg_fields) -> "TaskUpdate":
+        """Encode Task objects. The Tasks themselves are left untouched."""
+        tasks = list(tasks)
+        msg = cls(**msg_fields)
+        msg._uids = b"".join(t.uid for t in tasks)
+        msg._meta, msg._meta_off = blob.encode_column(encode_meta(t) for t in tasks)
+        msg._deep, msg._deep_off = blob.encode_column(encode_deep(t) for t in tasks)
         return msg
 
-    def to_bytes(self) -> bytes:
-        return b"".join(self.to_byte_array())
+    @property
+    def ntasks(self) -> int:
+        return len(self._uids) // blob.UID_BYTES
+
+    def uids(self) -> List[bytes]:
+        return blob.split_fixed(self._uids, blob.UID_BYTES)
+
+    def uid_at(self, row: int) -> bytes:
+        return bytes(memoryview(self._uids)[row * blob.UID_BYTES : (row + 1) * blob.UID_BYTES])
+
+    def meta_values(self, row: int) -> tuple:
+        return pickle.loads(blob.record(self._meta, self._meta_off, row))
+
+    def meta(self, row: int) -> TaskMeta:
+        return TaskMeta(self.uid_at(row), self.meta_values(row))
+
+    def task(self, row: int) -> Task:
+        values = self.meta_values(row)
+        by_value = values[_BY_VALUE_INDEX]
+        deep = decode_deep(blob.record(self._deep, self._deep_off, row), by_value)
+        return build_task(self.uid_at(row), values, deep)
+
+    def to_tasks(self) -> List[Task]:
+        return [self.task(i) for i in range(self.ntasks)]
+
+    def select(self, rows, **msg_fields) -> "TaskUpdate":
+        rows = np.asarray(rows, dtype=np.int64)
+        msg = TaskUpdate(**msg_fields)
+        msg._uids = blob.gather_fixed(self._uids, blob.UID_BYTES, rows)
+        msg._meta, msg._meta_off = blob.gather(self._meta, self._meta_off, rows)
+        msg._deep, msg._deep_off = blob.gather(self._deep, self._deep_off, rows)
+        return msg
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "TaskUpdate":
-        (type_id,) = struct.unpack_from("!H", data, 0)
-        (shallow_len,) = struct.unpack_from("!I", data, 2)
-        container_shallow = cloudpickle.loads(data[6 : 6 + shallow_len])
-        added_items = container_shallow.pop("added")
-        deleted_items = container_shallow.pop("deleted")
-        deep_mv = memoryview(data)[6 + shallow_len :]
-        msg = cls.__new__(cls)
-        msg.__dict__.update(container_shallow)
-        msg.MSG_TYPE_ID = type_id
-        msg.added_tasks = cls._rebuild_tasks(added_items, deep_mv)
-        msg.deleted_tasks = cls._rebuild_tasks(deleted_items, deep_mv)
-        msg._packed = True
-        msg._raw_deep = None
+    def concat(cls, updates: list, **msg_fields) -> "TaskUpdate":
+        msg = cls(**msg_fields)
+        msg._uids = b"".join(bytes(u._uids) for u in updates)
+        msg._meta, msg._meta_off = blob.concat([(u._meta, u._meta_off) for u in updates])
+        msg._deep, msg._deep_off = blob.concat([(u._deep, u._deep_off) for u in updates])
         return msg
+
+
+_BY_VALUE_INDEX = META_FIELDS.index("serialize_executable_by_value")
 
 
 @dataclass
@@ -603,6 +495,14 @@ class NodeRequest(Message):
     MSG_TYPE_ID: int = field(default=11, init=False, repr=False)
 
 
+# A child is finished: sent to its parent after every one of its results was delivered (all
+# result sends ACKed). Results are buffered by type on the receiver, so they are all there by the
+# time Done is read. (A child's final ResultBatch used to carry this meaning.)
+@dataclass
+class Done(Message):
+    MSG_TYPE_ID: int = field(default=12, init=False, repr=False)
+
+
 all_messages = [
     Message,
     Status,
@@ -615,6 +515,7 @@ all_messages = [
     TaskRequest,
     NodeRequest,
     IResultBatch,
+    Done,
 ]
 
 _MSG_REGISTRY.update(

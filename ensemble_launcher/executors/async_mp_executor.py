@@ -117,9 +117,17 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         return asyncio.wrap_future(future)
 
-    def shutdown(self, wait=True, **kwargs):
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        """``kill_workers=True`` kills the pool's processes first, so a running task does not
+        hold up the shutdown (the worker passes it: it has already failed its running tasks).
+        Without it, running tasks are waited for -- the master's child executor runs each child
+        node as a task here, and killing it mid-stop would orphan that child's own pool."""
         processes = dict(self._processes) if self._processes else {}
         kwargs.setdefault("cancel_futures", True)
+        if kill_workers:
+            for p in processes.values():
+                if p.is_alive():
+                    p.kill()
         super().shutdown(wait=wait, **kwargs)
         for p in processes.values():
             if p.is_alive():
@@ -141,6 +149,11 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
             self._return_stdout = kwargs["return_stdout"]
         super().__init__(max_workers=kwargs.get("max_workers", None))
         self.logger.info("Initialized threadpool executor")
+
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        # Threads cannot be killed; kill_workers is accepted so callers can pass it to any
+        # executor.
+        super().shutdown(wait=wait, **kwargs)
 
     def submit(
         self,
