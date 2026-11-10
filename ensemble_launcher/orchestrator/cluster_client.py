@@ -107,22 +107,22 @@ class _WorkerPipeline:
             self._seen_message_ids[msg.message_id] = None
             if len(self._seen_message_ids) > self._seen_message_ids_max:
                 self._seen_message_ids.popitem(last=False)
-        await loop.run_in_executor(None, msg.unpack)
+        results = await loop.run_in_executor(None, msg.to_results)
         t1 = time.perf_counter()
-        for result in msg.data:
+        for result in results:
             self.set_result(result)
-        self.total_results += len(msg.data)
+        self.total_results += len(results)
         self.deser_time += t1 - t0
         self.set_result_time += time.perf_counter() - t1
         if self._logger is not None:
             self._logger.info(
-                f"{self.worker_id}: received {len(msg.data)} results "
+                f"{self.worker_id}: received {len(results)} results "
                 f"(total={self.total_results})"
             )
 
     def set_result(self, result: Result) -> None:
         with self.lock:
-            fut = self.pending.pop(result.task_id, None)
+            fut = self.pending.pop(result.uid, None)
         if fut is None or fut.done():
             return
         if result.success:
@@ -157,9 +157,9 @@ class _WorkerPipeline:
             self._logger.error(
                 f"{self.worker_id}: send failed after {self._send_retries} retries"
             )
-        for task_id in task_ids:
+        for uid in task_ids:
             self.set_result(Result(
-                task_id=task_id,
+                uid=uid,
                 success=False,
                 exception=f"Send failed after {self._send_retries} retries",
             ))
@@ -401,17 +401,17 @@ class ClusterClient:
                 continue
             pipeline = self._pipelines[i % self._n_workers]
             with pipeline.lock:
-                pipeline.pending[task.task_id] = fut
+                pipeline.pending[task.uid] = fut
             pipeline_batches[i % self._n_workers].append(task)
 
         for pipeline, batch in zip(self._pipelines, pipeline_batches):
             if batch:
-                msg = TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
+                msg = TaskUpdate.from_tasks(batch, sender=pipeline.worker_id)
                 if self._req_res:
                     msg.message_id = uuid.uuid4().hex
                 pipeline.send(
                     msg.to_byte_array(),
-                    task_ids=[t.task_id for t in batch],
+                    task_ids=[t.uid for t in batch],
                 )
         self.logger.info(
             f"Flushed {len(items) - len(remaining)} tasks across {self._n_workers} pipeline(s)"

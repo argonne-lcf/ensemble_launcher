@@ -25,6 +25,24 @@ from .helper_functions import get_nodes
 logger = logging.getLogger(__name__)
 
 
+async def run_batch(node):
+    """Run a root node until every task it was given has a result, then stop it.
+
+    This is the only place batch mode differs from cluster mode: nodes never decide by
+    themselves that they are finished. ``wait_drained()`` reports that nothing is left;
+    ``request_stop()`` then stops the node exactly as SIGTERM does, and ``run()`` returns the
+    aggregated results.
+    """
+    run = asyncio.create_task(node.run())
+    drained = asyncio.create_task(node.wait_drained())
+    done, _ = await asyncio.wait({run, drained}, return_when=asyncio.FIRST_COMPLETED)
+    if drained in done:
+        node.request_stop()
+    else:  # run() ended (or failed) on its own
+        drained.cancel()
+    return await run
+
+
 class EnsembleLauncher:
     def __init__(
         self,
@@ -172,12 +190,16 @@ class EnsembleLauncher:
                 raise ValueError("Sync Master version is no longer supported")
 
     def run(self):
-        """Simply blocks until all the tasks are done."""
+        """Batch mode: block until every task is done and return the results. Cluster mode:
+        serve until stopped (SIGTERM, e.g. from ``stop()``)."""
         if not self.async_orchestrator:
             raise RuntimeError("Sync orchestrator is deprecated")
         try:
             from ensemble_launcher.loop import run
-            results = run(self._launcher.run())
+            if self.launcher_config.cluster:
+                results = run(self._launcher.run())
+            else:
+                results = run(run_batch(self._launcher))
         except BaseException:
             logger.exception("EnsembleLauncher.run() failed, stopping launcher")
             raise

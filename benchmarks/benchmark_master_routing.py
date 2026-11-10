@@ -6,15 +6,20 @@ set up as ``main.m0``, a sub-master with a parent and ``--nchildren`` workers, a
 goes through what that node does in a real run:
 
 - ``decode_tasks``   ``TaskUpdate.from_byte_array`` on frames as they arrive from the parent
-- ``route``          ``_route_tasks``: scheduler bookkeeping and the per-child queues
-- ``task_flush``     one ``TaskUpdate`` per child, encoded with ``to_byte_array``
+- ``route``          ``_route_tasks`` plus the scheduler's assigner placing the batch (in
+                     chunks of ``assign_chunk_size``) onto the children's outboxes
+- ``task_flush``     each child's sender: one ``TaskUpdate`` per child, encoded with
+                     ``to_byte_array``
 - ``decode_results`` ``IResultBatch.from_byte_array`` on one batch per child
-- ``forward``        ``_forward_result``: status updates and the queue to the parent
-- ``result_flush``   the ``IResultBatch`` to the parent, encoded with ``to_byte_array``
+- ``forward``        ``scheduler.queue_result``: finish the tasks, split per destination,
+                     onto the parent outbox
+- ``result_flush``   the parent's result sender (everything queued, as one ``IResultBatch``),
+                     encoded with ``to_byte_array``, until every result is delivered
 
-The master keeps every task it routes, as in a real run, so the live heap -- and with it
-the cost of each full collection -- grows batch by batch. Per stage it prints wall time,
-the number of GC collections and the time spent in them::
+The master holds its tasks in its TaskStore, as in a real run, until their results come
+back ("held" per batch); "routed" counts every task so far. Per stage it prints wall time,
+the number of GC collections and the time spent in them, plus the longest the event loop was
+blocked during routing (placement yields between chunks, so this should be about one chunk)::
 
     python benchmark_master_routing.py --ntasks 100000 --nbatches 10 --nchildren 128
 
@@ -43,6 +48,7 @@ from ensemble_launcher.comm import IResultBatch, Message, NodeInfo, Result, Task
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster
+from ensemble_launcher.scheduler import ChildState
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
 
 STAGES = ("decode_tasks", "route", "task_flush", "decode_results", "forward", "result_flush")
@@ -112,6 +118,7 @@ class EncodingComm:
     """
 
     def __init__(self):
+        self.parent_dead_event = None  # the parent never dies here
         self.messages = 0
         self.bytes = 0
 
@@ -138,7 +145,7 @@ def make_master(nchildren: int, cpus_per_node: int) -> AsyncMaster:
     config = LauncherConfig(
         nlevels=2,
         policy_config=PolicyConfig(nlevels=2, nchildren=nchildren),
-        cluster=False,  # _route_tasks flushes every batch straight away
+        cluster=False,
         overload_orchestrator_core=True,
     )
     parent = NodeInfo(node_id="main", secret_id="bench", level=0)
@@ -152,9 +159,14 @@ def make_master(nchildren: int, cpus_per_node: int) -> AsyncMaster:
     m.logger = logging.getLogger("bench.master")
     m._comm = EncodingComm()
     m._scheduler = m._create_scheduler()
-    m._scheduler.assign_resources(m.level, m.node_id)  # registers children as READY
-    for child_id in m._scheduler.children_names:
-        m._scheduler.mark_child_running(child_id)
+    m._scheduler.create_children(m.level, m.node_id)  # registers children as READY
+    for child_id in m._scheduler.state.children:
+        # What _init_child and a successful sync do for each child.
+        m._task_window[child_id] = asyncio.Semaphore(max(1, config.max_inflight_task_sends))
+        m._child_sender_task[child_id] = asyncio.create_task(m._child_sender(child_id))
+        m._scheduler.transition(child_id, ChildState.RUNNING)
+    m._scheduler.start()
+    m._start_result_sender("parent", m._scheduler.parent_outbox)  # as _create_monitor_tasks
     return m
 
 
@@ -164,21 +176,22 @@ def task_update_frames(batch: int, ntasks: int) -> list:
         Task(task_id=f"b{batch}-t{i}", nnodes=1, ppn=1, executable=noop)
         for i in range(ntasks)
     ]
-    return TaskUpdate(sender="main", added_tasks=tasks).to_byte_array()
+    return TaskUpdate.from_tasks(tasks, sender="main").to_byte_array()
 
 
-def result_frames(m: AsyncMaster, task_ids) -> list:
-    """One encoded IResultBatch per child, covering the tasks it was given."""
-    by_child = defaultdict(list)
-    for tid in task_ids:
-        by_child[m._scheduler._task_to_child[tid]].append(tid)
-    return [
-        IResultBatch(
-            sender=child_id,
-            data=[Result(sender=child_id, task_id=tid, data=None) for tid in tids],
-        ).to_byte_array()
-        for child_id, tids in by_child.items()
-    ]
+def result_frames(m: AsyncMaster, uids) -> list:
+    """``(child_id, frames)``: one encoded IResultBatch per child, covering its tasks."""
+    wanted = set(uids)
+    out = []
+    for child_id, assignment in m._scheduler.state.children.items():
+        child_uids = [uid for uid in assignment.uids if uid in wanted]
+        if child_uids:
+            batch = IResultBatch.from_results(
+                [Result(uid=uid, task_id=uid.hex(), data=None) for uid in child_uids],
+                sender=child_id,
+            )
+            out.append((child_id, batch.to_byte_array()))
+    return out
 
 
 async def drain(inflight: dict) -> None:
@@ -189,6 +202,38 @@ async def drain(inflight: dict) -> None:
             return
         await asyncio.gather(*pending, return_exceptions=True)
         await asyncio.sleep(0)  # let the done-callbacks remove them
+
+
+async def drain_tasks(m: AsyncMaster) -> None:
+    """Wait until every child's sender has sent its outbox."""
+    while True:
+        await asyncio.sleep(0)
+        busy = any(not c.outbox.empty() for c in m._scheduler.state.children.values())
+        if not busy and not any(m._task_flush_inflight.values()):
+            return
+        await drain(m._task_flush_inflight)
+
+
+class LoopLag:
+    """Longest stretch the event loop went without running this ticker."""
+
+    def __init__(self):
+        self.longest = 0.0
+        self._task = None
+
+    async def _tick(self):
+        last = time.perf_counter()
+        while True:
+            await asyncio.sleep(0)
+            now = time.perf_counter()
+            self.longest = max(self.longest, now - last)
+            last = now
+
+    def start(self):
+        self._task = asyncio.create_task(self._tick())
+
+    def stop(self):
+        self._task.cancel()
 
 
 # --------------------------------------------------------------------------- #
@@ -244,9 +289,10 @@ class SelfProfile:
 # --------------------------------------------------------------------------- #
 
 
-async def run_batches(m: AsyncMaster, frames: list, timer: Timer, gc_stats: GCStats):
+async def run_batches(
+    m: AsyncMaster, frames: list, timer: Timer, gc_stats: GCStats, lag: LoopLag, hold=False
+):
     rows = []
-    parent_id = m.parent.node_id
     for batch, task_frames in enumerate(frames):
         before_wall = dict(timer.wall)
         before_gc = dict(gc_stats.seconds)
@@ -254,37 +300,41 @@ async def run_batches(m: AsyncMaster, frames: list, timer: Timer, gc_stats: GCSt
         with timer.stage("decode_tasks"):
             msg = Message.from_byte_array(task_frames)
         with timer.stage("route"):
-            await m._route_tasks(msg.added_tasks)
+            lag.start()
+            await m._route_tasks(msg)
+            await m._scheduler._input.join()
+            lag.stop()
         with timer.stage("task_flush"):
-            await drain(m._task_flush_inflight)
+            await drain_tasks(m)
 
         # Children report back. Building their frames is the children's work, not the
         # master's, so it happens outside every stage.
-        task_ids = [t.task_id for t in msg.added_tasks]
+        task_ids = msg.uids()
         del msg
-        replies = result_frames(m, task_ids)
+        replies = [] if hold else result_frames(m, task_ids)
+        results = None
 
-        for reply in replies:
+        for child_id, reply in replies:
             with timer.stage("decode_results"):
                 results = Message.from_byte_array(reply)
             with timer.stage("forward"):
-                await m._forward_result(results)
+                m._scheduler.queue_result(results, child_id)
         with timer.stage("result_flush"):
-            m._schedule_result_flush(parent_id)
-            await drain(m._result_flush_inflight)
+            await m._flush_results()
         del replies, results
 
         wall = sum(timer.wall.values()) - sum(before_wall.values())
         gc_s = sum(gc_stats.seconds.values()) - sum(before_gc.values())
-        rows.append((batch, len(m.tasks), wall, gc_s))
+        routed = m._scheduler.state.ntasks_added
+        rows.append((batch, routed, wall, gc_s))
         print(
-            f"  batch {batch:3d}  live tasks {len(m.tasks):>10,d}  "
+            f"  batch {batch:3d}  routed {routed:>10,d}  held {len(m.tasks):>9,d}  "
             f"{wall:8.3f}s  gc {gc_s:7.3f}s ({100 * gc_s / wall if wall else 0:4.1f}%)"
         )
     return rows
 
 
-def report(timer: Timer, gc_stats: GCStats, comm: EncodingComm, ntotal: int) -> None:
+def report(timer: Timer, gc_stats: GCStats, comm: EncodingComm, ntotal: int, lag: LoopLag) -> None:
     print()
     print(f"  {'stage':16s} {'wall':>9s} {'us/task':>8s} {'gc':>9s} {'gc %':>6s}"
           f" {'colls':>6s} {'full':>5s} {'longest':>9s}")  # fmt: skip
@@ -303,13 +353,14 @@ def report(timer: Timer, gc_stats: GCStats, comm: EncodingComm, ntotal: int) -> 
         f" {100 * total_gc / total_wall if total_wall else 0:5.1f}%"
     )
     print(f"  sent {comm.messages} messages, {comm.bytes / 1e6:.1f} MB")
+    print(f"  longest event-loop block while routing: {1e3 * lag.longest:.1f} ms")
 
 
 async def main(args) -> None:
     logging.basicConfig(level=logging.ERROR)
     m = make_master(args.nchildren, args.cpus_per_node)
     print(
-        f"main.m0: {len(m._scheduler.children_names)} children, "
+        f"main.m0: {len(m._scheduler.state.children)} children, "
         f"{args.nbatches} batches x {args.ntasks:,d} tasks, gc={args.gc}, "
         f"python {sys.version.split()[0]}"
     )
@@ -324,14 +375,15 @@ async def main(args) -> None:
     profile = SelfProfile(args.pyspy, args.rate, args.native) if args.pyspy else None
     gc_stats = GCStats()
     timer = Timer(gc_stats)
+    lag = LoopLag()
     try:
-        await run_batches(m, frames, timer, gc_stats)
+        await run_batches(m, frames, timer, gc_stats, lag, hold=args.hold)
     finally:
         gc_stats.close()
         gc.enable()
         if profile:
             profile.stop()
-    report(timer, gc_stats, m._comm, args.ntasks * args.nbatches)
+    report(timer, gc_stats, m._comm, args.ntasks * args.nbatches, lag)
 
 
 def parse_args():
@@ -341,6 +393,8 @@ def parse_args():
     p.add_argument("--nchildren", type=int, default=128)
     p.add_argument("--cpus-per-node", type=int, default=102)
     p.add_argument("--gc", choices=("on", "off", "freeze"), default="on")
+    p.add_argument("--hold", action="store_true",
+                   help="send no results back, so the master keeps every task it routes")
     p.add_argument("--pyspy", metavar="DIR", help="profile the batches with py-spy into DIR")
     p.add_argument("--rate", type=int, default=200, help="py-spy samples per second")
     p.add_argument("--native", action="store_true", help="py-spy --native")

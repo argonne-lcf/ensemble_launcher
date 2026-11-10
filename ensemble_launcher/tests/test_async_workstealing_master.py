@@ -8,6 +8,7 @@ import uuid
 import pytest
 from utils import echo
 
+from ensemble_launcher.ensemble_launcher import run_batch
 from ensemble_launcher.config import (
     LauncherConfig,
     PolicyConfig,
@@ -54,7 +55,7 @@ async def test_workstealing_master(ntask_per_core=1):
         tasks,
     )
 
-    resultbatch = await m.run()
+    resultbatch = await run_batch(m)
     results = {r.task_id: r.data for r in resultbatch.data}
 
     assert len(results) == len(tasks) and all(
