@@ -54,9 +54,30 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
 
 2. **Communication** (`ensemble_launcher/comm/`) — message passing between nodes.
    `AsyncComm` (`comm/async_base.py`) is the base; `AsyncZMQComm` (`comm/async_zmq.py`) is
-   the ZMQ implementation. Below it, `comm/pipe/` holds the connection layer
-   (`AsyncZMQRouterConnection` / `AsyncZMQDealerConnection`) that both the comm layer and
-   the standalone endpoints (actors, policy) build on.
+   the ZMQ implementation. Below it, `comm/pipe/` holds the connection layer that both the
+   comm layer and the standalone endpoints (actors, policy) build on: the shared bases at the
+   top (`async_connection.py` front ends, `io_process.py` IOProcess + queues,
+   `async_transport.py`, `registry.py`), and one subpackage per transport, each with
+   `connection.py` / `io_process.py` / `transport.py` -- `comm/pipe/zmq/`
+   (`AsyncZMQRouterConnection` / `AsyncZMQDealerConnection`, `ZMQRouterIOProcess` /
+   `ZMQDealerIOProcess`, `AsyncZMQTransport`) and `comm/pipe/mp/` (multiprocessing.Pipe).
+   **Connections are a front end plus an `IOProcess`, joined by two queues.**
+   `AsyncConnection` (and `ServerConnection` / `ClientConnection`, the ZMQ router/dealer and MP
+   classes) is only the API: `send` puts `("send", req_id, target, timeout, frames)` on the
+   input queue and awaits `("sent", req_id, ok)`; `recv` reads `("data", frames)` the IOProcess
+   put on the output queue; `add/remove_expected_remote` and `set_unknown_sender_validator`
+   become `("control", ...)` items. **All ACK handling lives in the `IOProcess`**
+   (`comm/pipe/io_process.py`; the per-transport subclasses in `zmq/io_process.py` /
+   `mp/io_process.py` hold the socket code): its receive loop verifies the sender, ACKs at once and forwards; its
+   sends assign msg ids and wait for the peer's ACK with the timeout. The IOProcess runs on the
+   caller's loop (`LocalIOQueue` = `asyncio.Queue`), or with `io_process=True` + `req_res=True`
+   on a ZMQ connection, in its own spawned process (`ZMQIOQueue` = PUSH/PULL over `ipc://`), so
+   a busy event loop can't delay ACKs -- the 2048-node failure in #69. `LauncherConfig.comm_io_process`
+   turns that on for every node's data transport (heartbeats, `PolicyEndpoint`, clients and
+   actors stay in process); it is carried in the transport and connection states, so a child's
+   parent connection runs out of process in the child too. Out of process the unknown-sender
+   validator must be a `SenderRule` (prefix + secret), not a closure. The IOProcess exits when
+   its owner dies. Tests: `EL_TEST_COMM_IO_PROCESS=1 pytest -m core` runs the suite with it on.
    Messages are typed dataclasses in `comm/messages.py`: `Message`, `Status`, `Result`,
    `ResultBatch`, `IResultBatch`, `TaskUpdate`, `NodeUpdate`, `Ready`, `Stop`, `Done`, `TaskRequest`,
    `NodeRequest`. (Heartbeats are not a message type — they live in `comm/hb.py` as
@@ -275,13 +296,14 @@ Gotchas worth knowing before touching this code:
 - `PendingTaskHeap.rescore` mutates `self._heap` in place rather than swapping in a fresh
   heap, because the heap owns the `asyncio.Event` that `_monitor_resources` parks on.
   Replacing the object orphans that Event and silently deadlocks dispatch.
-- `AsyncConnection._recv_loop` only runs when `req_res=True`, and in that mode it auto-ACKs
-  and strips the msg_id frame. So the policy wire format carries no msg_id, correlating
+- The IOProcess receive loop (`IOProcess._recv_loop`) only verifies and ACKs when
+  `req_res=True`, and in that mode it auto-ACKs and strips the msg_id frame. So the policy wire format carries no msg_id, correlating
   replies by an explicit `request_id` instead.
 - `ServerConnection.verify_sender` short-circuits to `True` when no expected remotes are
   configured, which is exactly this endpoint's situation — so the shared-secret check is
   enforced at the application layer in `PolicyEndpoint._handle`, not by the connection.
-- `AsyncConnection.send()` does **not** retry internally; it returns `False` on ACK timeout.
+- `AsyncConnection.send()` (really `IOProcess._send`) does **not** retry internally; it
+  returns `False` on ACK timeout.
   Retrying is the caller's job.
 
 ### Key configuration types (`ensemble_launcher/config/config.py`)
@@ -303,6 +325,8 @@ Gotchas worth knowing before touching this code:
 - `req_res`: enables ACK-based guaranteed delivery at the comm layer (default `True`)
 - `send_retries`: number of retry attempts on ACK timeout, only when `req_res=True` (default `10`)
 - `send_timeout`: per-attempt ACK timeout in seconds, only when `req_res=True` (default `1.0`)
+- `comm_io_process`: run each node's data connections (socket, ACKs, sends) in a process of
+  their own, so a busy event loop can't delay ACKs (default `False`; `req_res=True` only)
 
 ### Cluster / MCP mode
 

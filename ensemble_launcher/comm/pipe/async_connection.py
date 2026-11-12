@@ -1,6 +1,17 @@
+"""Connections: a front end (`AsyncConnection`) plus an `IOProcess` that owns the socket.
+
+This module holds the transport-independent front ends; each transport has its own
+``<transport>_connection.py`` (front ends) and ``<transport>_io_process.py`` (IOProcesses).
+
+The front end is the API the rest of the code uses -- ``open`` / ``send`` / ``recv`` / state /
+expected remotes. It knows nothing about sockets or ACKs: ``send`` puts a request on the
+IOProcess's input queue and awaits its result; ``recv`` reads messages the IOProcess put on its
+output queue. The IOProcess (``io_process.py``) runs on the same event loop, or -- with
+``io_process=True`` and ``req_res=True`` on the ZMQ connections -- in its own process, so a busy
+event loop can't delay ACKs.
+"""
+
 import asyncio
-import os
-import random
 import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type, TypeVar, Union
@@ -9,9 +20,18 @@ from pydantic import BaseModel, Field
 
 from ensemble_launcher.logging import setup_logger
 
-T = TypeVar("T", bound="AsyncConnectionState")
+from .io_process import (
+    _ACK,  # noqa: F401  (re-exported for older imports)
+    IOProcess,
+    LocalIOQueue,
+    SenderRule,
+    decode_identity,
+    start_io_process,
+    verify_client_sender,
+    verify_server_sender,
+)
 
-_ACK = b"_ACK"
+T = TypeVar("T", bound="AsyncConnectionState")
 
 
 class IdentityVerificationError(Exception):
@@ -45,20 +65,39 @@ class ClientConnectionState(AsyncConnectionState):
 
 
 class AsyncConnection(ABC):
-    transport_type: str = ""
+    """The front end: puts requests on its IOProcess's input queue and listens to its output
+    queue. Subclasses say how to build their IOProcess (`_make_io`)."""
 
-    def __init__(self, identity: str, secret_id: str, req_res: bool = False):
+    transport_type: str = ""
+    # Whether this connection's IOProcess can be spawned in its own process.
+    supports_io_process: bool = False
+
+    def __init__(
+        self,
+        identity: str,
+        secret_id: str,
+        req_res: bool = False,
+        io_process: bool = False,
+    ):
         self._identity = identity
         self._secret_id = secret_id
         self._is_open = False
         self._req_res = req_res
-        self._ack_futures: Dict[int, asyncio.Future] = {}
+        self._io_process = io_process
         self._msg_queue: asyncio.Queue = None
-        self._close: asyncio.Event = None
         self._loop: asyncio.AbstractEventLoop = None
         self._loop_thread: threading.Thread = None
-        self._msg_counter: int = 0
-        self._recv_task: asyncio.Task = None
+        self.logger = None
+        # The IOProcess and the two queues to it.
+        self._in_q = None
+        self._out_q = None
+        self._io_task: Optional[asyncio.Task] = None  # in process
+        self._proc = None  # out of process
+        self._io_ctx = None
+        self._io_paths: List[str] = []
+        self._listen_task: Optional[asyncio.Task] = None
+        self._pending: Dict[int, asyncio.Future] = {}  # req_id -> send result
+        self._req_counter = 0
 
     @property
     def is_open(self) -> bool:
@@ -72,108 +111,174 @@ class AsyncConnection(ABC):
     def secret_id(self):
         return self._secret_id
 
+    @property
+    def out_of_process(self) -> bool:
+        """The IOProcess runs in its own process (only req_res connections that support it)."""
+        return self._io_process and self._req_res and self.supports_io_process
+
+    # ------------------------------------------------------------------ #
+    #  Open / close                                                        #
+    # ------------------------------------------------------------------ #
+
     async def open(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._msg_queue = asyncio.Queue()
-        self._ack_futures = {}
-        self._close = asyncio.Event()
+        self._pending = {}
         self.logger = setup_logger(
             name=f"connection-{self.identity}",
             subdir="connections",
         )
-        await self._raw_open()
+        io = self._make_io()
+        if self.out_of_process:
+            self._proc, self._in_q, self._out_q, self._io_ctx, self._io_paths = (
+                start_io_process(io)
+            )
+        else:
+            io.logger = self.logger
+            self._in_q, self._out_q = LocalIOQueue(), LocalIOQueue()
+            self._io_task = self._loop.create_task(io.run(self._in_q, self._out_q))
+        address = await self._wait_ready(timeout=60.0)
+        self._on_started(address)
         self._is_open = True
-        if self._req_res:
-            self._recv_task = self._loop.create_task(self._recv_loop())
+        self._listen_task = self._loop.create_task(self._listen())
+        if self._io_task is not None:
+            self._io_task.add_done_callback(self._on_io_task_done)
+
+    async def _wait_ready(self, timeout: float) -> Optional[str]:
+        """Wait for the IOProcess's ``ready``; raise if it died first."""
+        deadline = self._loop.time() + timeout
+        while self._loop.time() < deadline:
+            item = await self._out_q.get(timeout=0.5)
+            if item is not None:
+                if item[0] == "ready":
+                    return item[1]
+                continue
+            if self._io_task is not None and self._io_task.done():
+                await self._teardown_io()
+                self._io_task.result()  # raises what the IOProcess raised
+                raise RuntimeError(f"{self.identity}: IOProcess ended before it was ready")
+            if self._proc is not None and not self._proc.is_alive():
+                code = self._proc.exitcode
+                await self._teardown_io()
+                raise RuntimeError(f"{self.identity}: IOProcess exited ({code}) before ready")
+        await self._teardown_io()
+        raise TimeoutError(f"{self.identity}: IOProcess not ready after {timeout}s")
 
     async def close(self):
-        self._close.set()
-        if self._recv_task:
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
+        if self._in_q is None:
+            return
         self._is_open = False
-        await self._raw_close()
-
-    async def _recv_loop(self):
-        while not self._close.is_set():
+        try:
+            self._in_q.put_nowait(("control", "close", ()))
+        except Exception:
+            pass
+        if self._io_task is not None and not self._io_task.done():
             try:
-                frames = await asyncio.wait_for(self._raw_recv(), timeout=1.0)
-                _, sender_id, sender_secret = decode_identity(frames[0])
-                if not self.verify_sender(sender_id, sender_secret):
-                    self.logger.warning(
-                        f"{self._identity}: Discarding message from {sender_id} "
-                        f"— secret_id mismatch (stale connection)"
-                    )
-                    continue
+                await asyncio.wait_for(asyncio.shield(self._io_task), timeout=5.0)
+            except (asyncio.TimeoutError, TimeoutError, Exception):
+                self._io_task.cancel()
+        if self._proc is not None:
+            for _ in range(100):  # up to 5 s
+                if not self._proc.is_alive():
+                    break
+                await asyncio.sleep(0.05)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                await asyncio.to_thread(self._proc.join, 1.0)
+        await self._teardown_io()
 
-                if self._req_res and frames[-1] == _ACK:
-                    msg_id = int.from_bytes(frames[-2], "big")
-                    fut = self._ack_futures.pop(msg_id, None)
-                    if fut is not None and not fut.done():
-                        fut.set_result(True)
-                    elif fut is None:
-                        self.logger.warning(
-                            f"Received ACK for unknown msg_id={msg_id} from {sender_id}"
-                        )
-                elif self._req_res:
-                    msg_id_bytes = frames[1]
-                    sender_full_id = frames[0].decode()
-                    await self._raw_send(
-                        _ACK,
-                        msg_id=int.from_bytes(msg_id_bytes, "big"),
-                        target_id=sender_full_id,
-                    )
-                    await self._msg_queue.put([frames[0]] + frames[2:])
-                else:
-                    await self._msg_queue.put(frames)
-
-            except (TimeoutError, asyncio.TimeoutError):
+    async def _teardown_io(self) -> None:
+        if self._listen_task is not None:
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except (asyncio.CancelledError, Exception):
                 pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger.warning(f"_recv_loop failed with exception {e}")
+            self._listen_task = None
+        self._fail_pending()
+        for q in (self._in_q, self._out_q):
+            if q is not None:
+                q.close()
+        self._in_q = self._out_q = None
+        if self._io_ctx is not None:
+            self._io_ctx.term()
+            self._io_ctx = None
+        import os
+
+        for path in self._io_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._io_paths = []
+
+    # ------------------------------------------------------------------ #
+    #  The output queue                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def _listen(self) -> None:
+        """Received messages go to ``_msg_queue``; send results resolve their futures. Out of
+        process, also notice the IOProcess dying."""
+        timeout = 1.0 if self._proc is not None else None
+        while True:
+            item = await self._out_q.get(timeout=timeout)
+            if item is None:
+                if self._proc is not None and not self._proc.is_alive():
+                    self._on_io_dead(f"IOProcess exited ({self._proc.exitcode})")
+                    return
+                continue
+            kind = item[0]
+            if kind == "data":
+                self._msg_queue.put_nowait(item[1])
+            elif kind == "sent":
+                fut = self._pending.pop(item[1], None)
+                if fut is not None and not fut.done():
+                    fut.set_result(item[2])
+
+    def _on_io_task_done(self, task: asyncio.Task) -> None:
+        if self._is_open and not task.cancelled():
+            exc = task.exception()
+            self._on_io_dead(f"IOProcess ended: {exc!r}" if exc else "IOProcess ended")
+
+    def _on_io_dead(self, why: str) -> None:
+        if self.logger is not None:
+            self.logger.error(f"{self.identity}: {why}")
+        self._is_open = False
+        self._fail_pending()
+
+    def _fail_pending(self) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_result(False)
+        self._pending.clear()
+
+    # ------------------------------------------------------------------ #
+    #  API                                                                 #
+    # ------------------------------------------------------------------ #
 
     async def recv(self, timeout: Optional[float] = None) -> List[bytes]:
-        if self._req_res:
-            return await asyncio.wait_for(self._msg_queue.get(), timeout=timeout)
-        return await asyncio.wait_for(self._raw_recv(), timeout=timeout)
+        return await asyncio.wait_for(self._msg_queue.get(), timeout=timeout)
 
     async def send(
         self, msg: Union[bytes, List[bytes]], target_id: Optional[str] = None, timeout: float = 5.0
     ) -> bool:
-        self._msg_counter += 1
-
-        if self._req_res:
-            msg_id = self._msg_counter
-            self._ack_futures[msg_id] = self._loop.create_future()
-            success = await self._raw_send(msg, msg_id=msg_id, target_id=target_id)
-        else:
-            success = await self._raw_send(msg, target_id=target_id)
-
-        if not success:
-            self.logger.warning("Raw send failed")
-            if self._req_res:
-                # `msg_id`, not `self._msg_counter`: concurrent senders on this connection
-                # advance the counter between this send and its failure, so popping the
-                # counter would discard another in-flight send's ACK future and hang it.
-                self._ack_futures.pop(msg_id, None)
+        """Send ``msg``; with req_res, True once the peer ACKed it within ``timeout``. The
+        IOProcess does the send and the ACK wait; this only waits for its answer."""
+        if self._in_q is None or not self._is_open:
+            if self.logger is not None:
+                self.logger.warning(f"{self.identity}: send on a closed connection")
             return False
+        self._req_counter += 1
+        req_id = self._req_counter
+        fut = self._loop.create_future()
+        self._pending[req_id] = fut
+        frames = msg if isinstance(msg, list) else [msg]
+        self._in_q.put_nowait(("send", req_id, target_id, timeout, frames))
+        return await fut
 
-        if self._req_res:
-            try:
-                return await asyncio.wait_for(
-                    self._ack_futures[msg_id], timeout=timeout
-                )
-            except (TimeoutError, asyncio.TimeoutError):
-                self._ack_futures.pop(msg_id, None)
-                self.logger.warning(f"ACK timeout for msg_id={msg_id} to {target_id}")
-                return False
-        else:
-            return True
+    def _control(self, op: str, *args) -> None:
+        if self._in_q is not None and self._is_open:
+            self._in_q.put_nowait(("control", op, args))
 
     # ---------------------- Sync wrappers ----------------------------------
     def sopen(self):
@@ -198,28 +303,14 @@ class AsyncConnection(ABC):
             self.send(msg=msg, target_id=target_id, timeout=timeout), self._loop
         ).result()
 
-    # ----------------------- Abstract methods ---------------------------------
+    # ----------------------- For subclasses ---------------------------------
 
     @abstractmethod
-    async def _raw_open(self):
-        pass
+    def _make_io(self) -> IOProcess:
+        """This connection's IOProcess, built from its fields."""
 
-    @abstractmethod
-    async def _raw_close(self) -> None:
-        pass
-
-    @abstractmethod
-    async def _raw_send(
-        self,
-        data: bytes,
-        msg_id: Optional[int] = None,
-        target_id: Optional[str] = None,
-    ) -> bool:
-        pass
-
-    @abstractmethod
-    async def _raw_recv(self) -> List[bytes]:
-        pass
+    def _on_started(self, address: Optional[str]) -> None:
+        """The IOProcess is up; ``address`` is what it actually bound to (servers)."""
 
     @abstractmethod
     def get_state(self) -> AsyncConnectionState:
@@ -235,12 +326,6 @@ class AsyncConnection(ABC):
         pass
 
 
-def decode_identity(raw: bytes):
-    full_id = raw.decode()
-    parts = full_id.split(":", 1)
-    return full_id, parts[0], parts[1] if len(parts) > 1 else None
-
-
 class ServerConnection(AsyncConnection):
     def __init__(
         self,
@@ -248,8 +333,11 @@ class ServerConnection(AsyncConnection):
         secret_id: str,
         expected_remotes: Optional[Dict[str, str]] = None,
         req_res: bool = False,
+        io_process: bool = False,
     ):
-        super().__init__(identity=identity, secret_id=secret_id, req_res=req_res)
+        super().__init__(
+            identity=identity, secret_id=secret_id, req_res=req_res, io_process=io_process
+        )
         self._expected_remotes: Dict[str, str] = dict(expected_remotes or {})
         self._unknown_sender_validator: Optional[
             Callable[[str, Optional[str]], bool]
@@ -265,26 +353,35 @@ class ServerConnection(AsyncConnection):
 
     def add_expected_remote(self, node_id: str, secret_id: str) -> None:
         self._expected_remotes[node_id] = secret_id
+        self._control("add_remote", node_id, secret_id)
 
     def remove_expected_remote(self, node_id: str) -> None:
         self._expected_remotes.pop(node_id, None)
+        self._control("remove_remote", node_id)
 
     def set_unknown_sender_validator(
         self, validator: Callable[[str, Optional[str]], bool]
     ) -> None:
+        """Out of process, this must be a `SenderRule` (it has to reach the IOProcess). May be
+        called after ``open()``: the running IOProcess gets the new rule."""
         self._unknown_sender_validator = validator
+        if self._in_q is not None and self._is_open:
+            if self.out_of_process:
+                if not isinstance(validator, SenderRule):
+                    raise TypeError(
+                        "An out-of-process connection needs a SenderRule as its "
+                        f"unknown-sender validator, not {type(validator).__name__}"
+                    )
+                self._control("set_rule", validator.model_dump())
+            else:
+                self._control("set_rule", validator)
 
     def verify_sender(
         self, sender_id: str, sender_secret: Optional[str] = None
     ) -> bool:
-        if not self._expected_remotes:
-            return True
-        expected_secret = self._expected_remotes.get(sender_id)
-        if expected_secret is None:
-            if self._unknown_sender_validator is not None:
-                return self._unknown_sender_validator(sender_id, sender_secret)
-            return False
-        return sender_secret == expected_secret
+        return verify_server_sender(
+            self._expected_remotes, self._unknown_sender_validator, sender_id, sender_secret
+        )
 
 
 class ClientConnection(AsyncConnection):
@@ -295,8 +392,11 @@ class ClientConnection(AsyncConnection):
         remote_identity: Optional[str] = None,
         remote_secret_id: Optional[str] = None,
         req_res: bool = False,
+        io_process: bool = False,
     ):
-        super().__init__(identity=identity, secret_id=secret_id, req_res=req_res)
+        super().__init__(
+            identity=identity, secret_id=secret_id, req_res=req_res, io_process=io_process
+        )
         self._remote_identity = remote_identity
         self._remote_secret_id = remote_secret_id
 
@@ -319,315 +419,19 @@ class ClientConnection(AsyncConnection):
     def verify_sender(
         self, sender_id: str, sender_secret: Optional[str] = None
     ) -> bool:
-        if self._remote_identity is None:
-            return True
-        if sender_id != self._remote_identity:
-            return False
-        if (
-            self._remote_secret_id is not None
-            and sender_secret != self._remote_secret_id
-        ):
-            return False
-        return True
-
-
-# ---------------------------------------------------------------------------
-#  ZMQ ROUTER (Server) implementation
-# ---------------------------------------------------------------------------
-
-
-class AsyncZMQRouterConnectionState(ServerConnectionState):
-    transport_type: str = "zmq"
-    address: str
-    lightweight: bool = False
-
-
-class AsyncZMQRouterConnection(ServerConnection):
-    transport_type: str = "zmq"
-
-    def __init__(
-        self,
-        identity: str,
-        secret_id: str,
-        address: str,
-        expected_remotes: Optional[Dict[str, str]] = None,
-        req_res: bool = False,
-        lightweight: bool = False,
-    ):
-        super().__init__(
-            identity=identity,
-            secret_id=secret_id,
-            expected_remotes=expected_remotes,
-            req_res=req_res,
-        )
-        self._address = address
-        self._lightweight = lightweight
-        self._context = None
-        self._socket = None
-
-    @property
-    def address(self) -> str:
-        return self._address
-
-    async def _raw_open(self) -> None:
-        import zmq
-        from zmq.asyncio import Context, Socket
-
-        self._context = Context()
-        self._socket = self._context.socket(zmq.ROUTER, socket_class=Socket)
-        self._socket.setsockopt(
-            zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
-        )
-
-        if self._lightweight:
-            self._context.set(zmq.IO_THREADS, 1)
-            self._socket.setsockopt(zmq.SNDHWM, 100)
-            self._socket.setsockopt(zmq.RCVHWM, 100)
-            self._socket.setsockopt(zmq.SNDTIMEO, 100)
-        else:
-            self._context.set(zmq.IO_THREADS, 4)
-            self._socket.setsockopt(zmq.SNDHWM, 10000)
-            self._socket.setsockopt(zmq.RCVHWM, 10000)
-            self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
-            self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
-            self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
-            self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-
-        try:
-            self._socket.bind(f"tcp://{self._address}")
-        except zmq.error.ZMQError as e:
-            if "Address already in use" in str(e):
-                max_attempts = 10
-                for attempt in range(max_attempts):
-                    try:
-                        port = int(self._address.split(":")[-1]) + random.randint(
-                            1, 1000
-                        )
-                        self._address = f"{self._address.rsplit(':', 1)[0]}:{port}"
-                        self._socket.bind(f"tcp://{self._address}")
-                        break
-                    except zmq.error.ZMQError as retry_error:
-                        if (
-                            "Address already in use" in str(retry_error)
-                            and attempt < max_attempts - 1
-                        ):
-                            continue
-                        else:
-                            raise retry_error
-            else:
-                raise e
-        endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
-        self._address = endpoint.replace("tcp://", "")
-        self.logger.info(f"Server bound to {self._address}")
-
-    async def _raw_close(self) -> None:
-        import zmq
-
-        if self._socket:
-            self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.close()
-            self._socket = None
-        if self._context:
-            self._context.term()
-            self._context = None
-
-    async def _raw_send(
-        self,
-        data: Union[bytes, List[bytes]],
-        msg_id: Optional[int] = None,
-        target_id: Optional[str] = None,
-    ) -> bool:
-        """Send frames via ZMQ Router.
-
-        Sends: [target_id, identity_frame, msg_id(8B)?, *data_frames]
-        """
-        identity_frame = f"{self._identity}:{self._secret_id}".encode()
-        if msg_id is not None:
-            frames = [
-                target_id.encode(),
-                identity_frame,
-                msg_id.to_bytes(8, "big"),
-            ]
-        else:
-            frames = [target_id.encode(), identity_frame]
-        if isinstance(data, list):
-            frames.extend(data)
-        else:
-            frames.append(data)
-        try:
-            await self._socket.send_multipart(frames)
-        except Exception:
-            if self._lightweight:
-                return False
-            raise
-        return True
-
-    async def _raw_recv(self) -> List[bytes]:
-        """Receive frames via ZMQ Router.
-
-        Returns: [dealer_routing_id, msg_id(8B)?, *data_frames]
-        ZMQ prepends the dealer's routing id automatically.
-        """
-        return await self._socket.recv_multipart()
-
-    def get_state(self) -> AsyncZMQRouterConnectionState:
-        return AsyncZMQRouterConnectionState(
-            identity=self._identity,
-            secret_id=self._secret_id,
-            address=self._address,
-            expected_remotes=self.expected_remotes,
-            req_res=self._req_res,
-            lightweight=self._lightweight,
-        )
-
-    @classmethod
-    def set_state(
-        cls, state: AsyncZMQRouterConnectionState
-    ) -> "AsyncZMQRouterConnection":
-        return cls(
-            identity=state.identity,
-            secret_id=state.secret_id,
-            address=state.address,
-            expected_remotes=state.expected_remotes,
-            req_res=state.req_res,
-            lightweight=state.lightweight,
+        return verify_client_sender(
+            self._remote_identity, self._remote_secret_id, sender_id, sender_secret
         )
 
 
-# ---------------------------------------------------------------------------
-#  ZMQ DEALER (Client) implementation
-# ---------------------------------------------------------------------------
-
-
-class AsyncZMQDealerConnectionState(ClientConnectionState):
-    transport_type: str = "zmq"
-    remote_address: str
-    lightweight: bool = False
-
-
-class AsyncZMQDealerConnection(ClientConnection):
-    transport_type: str = "zmq"
-
-    def __init__(
-        self,
-        identity: str,
-        secret_id: str,
-        remote_address: str,
-        remote_identity: Optional[str] = None,
-        remote_secret_id: Optional[str] = None,
-        req_res: bool = False,
-        lightweight: bool = False,
-    ):
-        super().__init__(
-            identity=identity,
-            secret_id=secret_id,
-            remote_identity=remote_identity,
-            remote_secret_id=remote_secret_id,
-            req_res=req_res,
-        )
-        self._remote_address = remote_address
-        self._lightweight = lightweight
-        self._context = None
-        self._socket = None
-
-    @property
-    def remote_address(self) -> str:
-        return self._remote_address
-
-    async def _raw_open(self) -> None:
-        import zmq
-        from zmq.asyncio import Context, Socket
-
-        self._context = Context()
-        self._socket = self._context.socket(zmq.DEALER, socket_class=Socket)
-        self._socket.setsockopt(
-            zmq.IDENTITY, f"{self._identity}:{self._secret_id}".encode()
-        )
-
-        if self._lightweight:
-            self._context.set(zmq.IO_THREADS, 1)
-            self._socket.setsockopt(zmq.SNDHWM, 100)
-            self._socket.setsockopt(zmq.RCVHWM, 100)
-        else:
-            self._context.set(zmq.IO_THREADS, 4)
-            self._socket.setsockopt(zmq.SNDHWM, 10000)
-            self._socket.setsockopt(zmq.RCVHWM, 10000)
-            self._socket.setsockopt(zmq.HEARTBEAT_IVL, 5000)
-            self._socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 15000)
-            self._socket.setsockopt(zmq.HEARTBEAT_TTL, 15000)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 10)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-
-        self._socket.connect(f"tcp://{self._remote_address}")
-        self.logger.info(f"Connected to {self.remote_address}")
-
-    async def _raw_close(self) -> None:
-        import zmq
-
-        if self._socket:
-            self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.close()
-            self._socket = None
-        if self._context:
-            self._context.term()
-            self._context = None
-
-    async def _raw_send(
-        self,
-        data: Union[bytes, List[bytes]],
-        msg_id: Optional[int] = None,
-        target_id: Optional[str] = None,
-    ) -> bool:
-        """Send frames via ZMQ Dealer.
-
-        Sends: [msg_id(8B)?, *data_frames]
-        """
-        if msg_id is not None:
-            frames = [msg_id.to_bytes(8, "big")]
-        else:
-            frames = []
-        if isinstance(data, list):
-            frames.extend(data)
-        else:
-            frames.append(data)
-        await self._socket.send_multipart(frames)
-        return True
-
-    async def _raw_recv(self) -> List[bytes]:
-        """Receive frames via ZMQ Dealer.
-
-        Returns: [identity_frame, msg_id(8B)?, *data_frames]
-        ZMQ strips the routing id; the first frame is the sender's identity.
-        """
-        return await self._socket.recv_multipart()
-
-    def get_state(self) -> AsyncZMQDealerConnectionState:
-        return AsyncZMQDealerConnectionState(
-            identity=self._identity,
-            secret_id=self._secret_id,
-            remote_address=self._remote_address,
-            remote_identity=self._remote_identity,
-            remote_secret_id=self._remote_secret_id,
-            req_res=self._req_res,
-            lightweight=self._lightweight,
-        )
-
-    @classmethod
-    def set_state(
-        cls, state: AsyncZMQDealerConnectionState
-    ) -> "AsyncZMQDealerConnection":
-        return cls(
-            identity=state.identity,
-            secret_id=state.secret_id,
-            remote_address=state.remote_address,
-            remote_identity=state.remote_identity,
-            remote_secret_id=state.remote_secret_id,
-            req_res=state.req_res,
-            lightweight=state.lightweight,
-        )
+__all__ = [
+    "AsyncConnection",
+    "AsyncConnectionState",
+    "ServerConnection",
+    "ServerConnectionState",
+    "ClientConnection",
+    "ClientConnectionState",
+    "IdentityVerificationError",
+    "SenderRule",
+    "decode_identity",
+]

@@ -142,6 +142,7 @@ class LauncherConfig(BaseModel):
     max_inflight_flushes: int = 1  # Max result sends in flight per destination (masters and workers)
     max_inflight_task_sends: int = 1  # Max TaskUpdates in flight per child; a failed send is resent in its slot
     assign_chunk_size: int = 4096  # Masters place tasks this many at a time, yielding to the event loop between chunks
+    comm_io_process: bool = False  # Data connections (req_res) run their socket, ACKs and sends in a process of their own, so a busy event loop can't delay ACKs
     send_timeout: float = 1.0  # Per-attempt ACK timeout in seconds (req_res=True only)
 
     overload_orchestrator_core: bool = True  # Setting this to false reserves the first core of the head compute node for EL orchestrator

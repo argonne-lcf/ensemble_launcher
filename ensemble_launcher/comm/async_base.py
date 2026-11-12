@@ -20,6 +20,7 @@ from .pipe import (
     AsyncTransportState,
     ClientConnection,
     ClientConnectionState,
+    SenderRule,
     transport_registry,
 )
 
@@ -37,6 +38,7 @@ class AsyncCommState(BaseModel):
     req_res: bool = False
     send_retries: int = 3
     send_timeout: float = 5.0
+    io_process: bool = False
 
     def serialize(self, *args, **kwargs) -> str:
         return self.model_dump_json(*args, **kwargs)
@@ -197,8 +199,12 @@ class AsyncComm:
         req_res: bool = False,
         send_retries: int = 3,
         send_timeout: float = 5.0,
+        io_process: bool = False,
     ):
         self.logger = logger
+        # Data connections (parent / children / clients) run their socket, ACKs and sends in a
+        # process of their own (req_res only); heartbeats stay in process.
+        self._io_process = io_process
         self._skip_hb = skip_hb
         self._node_info = node_info
         self._cluster_secret = cluster_secret
@@ -223,7 +229,10 @@ class AsyncComm:
                 f"Available: {transport_registry.available}"
             )
         transport_cls = entry["transport"]
-        self._data_transport: AsyncTransport = transport_cls()
+        try:
+            self._data_transport: AsyncTransport = transport_cls(io_process=io_process)
+        except TypeError:
+            self._data_transport: AsyncTransport = transport_cls()
         try:
             self._hb_transport: AsyncTransport = transport_cls(lightweight=True)
         except TypeError:
@@ -298,16 +307,8 @@ class AsyncComm:
     # -----------------------------------------------------------------
 
     def _make_client_validator(self):
-        cluster_secret = self._cluster_secret
-
-        def validator(sender_id: str, sender_secret: Optional[str]) -> bool:
-            if not sender_id.startswith("client-"):
-                return False
-            if cluster_secret is not None:
-                return sender_secret == cluster_secret
-            return True
-
-        return validator
+        # A SenderRule, not a closure: it may have to reach an out-of-process IOProcess.
+        return SenderRule(prefix="client-", secret=self._cluster_secret)
 
     async def create_child_pipe(
         self, child_id: str, child_secret_id: str
@@ -861,6 +862,7 @@ class AsyncComm:
             req_res=self._req_res,
             send_retries=self._send_retries,
             send_timeout=self._send_timeout,
+            io_process=self._io_process,
         )
 
     @classmethod
@@ -892,6 +894,7 @@ class AsyncComm:
             req_res=state.req_res,
             send_retries=state.send_retries,
             send_timeout=state.send_timeout,
+            io_process=state.io_process,
         )
         if state.data_transport_state is not None:
             ret._data_transport = child_entry["transport"].set_state(
