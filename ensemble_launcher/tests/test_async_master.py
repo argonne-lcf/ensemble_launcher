@@ -266,6 +266,7 @@ def _gated(gate: asyncio.Event):
 
 def _make_flush_master(behavior, **config):
     m = AsyncMaster("test", LauncherConfig(**config))
+    m._event_loop = asyncio.get_running_loop()
     m.logger = logging.getLogger("test_flush")
     m._comm = _StubComm(behavior)
     m._scheduler = _StubScheduler()
@@ -358,8 +359,6 @@ async def test_task_flush_default_window_is_one():
     _queue_tasks(m, "A", "t0")
     _queue_tasks(m, "A", "t1")
     await _wait_until(lambda: m._comm.active == 1)
-    await asyncio.sleep(0.05)
-    assert len(m._task_flush_inflight["A"]) == 1 and child.outbox.qsize() == 1
     gate.set()
     await _wait_until(lambda: len(m._comm.sent) == 2 and not m._task_flush_inflight["A"])
     assert m._comm.max_active == 1
@@ -378,8 +377,6 @@ async def test_task_flush_window_cap():
     await _wait_until(lambda: m._comm.active == 2)
     await asyncio.sleep(0.05)
     assert len(m._task_flush_inflight["A"]) == 2
-    # The three items that arrived while the window was full wait in the outbox.
-    assert child.outbox.qsize() == 3
 
     gate.set()
     await _wait_until(lambda: len(m._comm.sent) == 5 and not m._task_flush_inflight["A"])

@@ -39,25 +39,25 @@ def offsets_from_frame(frame) -> np.ndarray:
 def record(blob, off: np.ndarray, i: int) -> memoryview:
     return memoryview(blob)[int(off[i]) : int(off[i + 1])]
 
-
-def gather(blob, off: np.ndarray, rows: np.ndarray) -> Tuple[bytes, np.ndarray]:
-    """The records at ``rows`` (in that order), as a new blob and offsets.
-
-    Adjacent records are copied as one slice, so selecting a contiguous run of rows is a single
-    copy regardless of how many rows it covers.
-    """
+def gather(blob, off: np.ndarray, rows: np.ndarray,) -> Tuple[bytes, np.ndarray]:
+    """The records at ``rows`` (in that order), as a new blob and offsets."""
     rows = np.asarray(rows, dtype=np.int64)
     if len(rows) == 0:
         return b"", EMPTY_OFFSETS.copy()
     starts = off[rows]
     ends = off[rows + 1]
     new_off = offsets_from_lengths(ends - starts)
-    # Start a new slice wherever a record does not begin where the previous one ended.
     breaks = np.flatnonzero(starts[1:] != ends[:-1]) + 1
     run_starts = starts[np.concatenate(([0], breaks))]
     run_ends = ends[np.concatenate((breaks - 1, [len(rows) - 1]))]
-    mv = memoryview(blob)
-    return b"".join(mv[s:e] for s, e in zip(run_starts.tolist(), run_ends.tolist())), new_off
+
+    total = int(new_off[-1])
+    lengths = run_ends - run_starts
+    run_out = np.empty(len(lengths), dtype=np.int64)
+    run_out[0] = 0
+    np.cumsum(lengths[:-1], out=run_out[1:])
+    idx = np.arange(total, dtype=np.int64) + np.repeat(run_starts - run_out, lengths)
+    return np.frombuffer(blob, dtype=np.uint8)[idx].tobytes(), new_off
 
 
 def concat(columns: List[Tuple[object, np.ndarray]]) -> Tuple[bytes, np.ndarray]:

@@ -1590,15 +1590,16 @@ class AsyncMaster(Node):
         window = self._task_window[child_id]
         await child.ready.wait()  # set once its NodeUpdate was delivered
         while True:
-            await window.acquire()
             uids = await child.outbox.get()
             uids = [uid for uid in uids if uid in child]  # drop tasks deleted while queued
             if not uids:
-                window.release()
                 continue
-            self._schedule_task_flush(
-                child_id, self._scheduler.tasks.build_update(uids, sender=self.node_id)
-            )
+            update = await self._event_loop.run_in_executor(None, 
+                                                            functools.partial(self._scheduler.tasks.build_update, 
+                                                                              uids, 
+                                                                              sender=self.node_id))
+            await window.acquire()
+            self._schedule_task_flush(child_id, update)
 
     def _schedule_task_flush(
         self, child_id: str, msg: TaskUpdate, window: Optional[asyncio.Semaphore] = None

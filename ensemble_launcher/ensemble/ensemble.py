@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import enum
 import os
+import pickle
 import struct
 from typing import (
     TYPE_CHECKING,
@@ -15,8 +15,6 @@ from typing import (
     TypedDict,
     Union,
 )
-
-import pickle
 
 import cloudpickle
 import numpy as np
@@ -36,9 +34,36 @@ class TaskStatus(enum.Enum):
 
 UID_BYTES = 16
 
-_DEEP_FIELDS = ("executable", "args", "kwargs", "env", "result")
-_DEEP_FIELDS_NO_EXEC = ("args", "kwargs", "env", "result")
+_DEEP_FIELDS = ("executable", 
+                "args", 
+                "kwargs", 
+                "env", 
+                "exception", 
+                "cpu_affinity", 
+                "gpu_affinity", 
+                "run_dir",  
+                "stdout_file", 
+                "stderr_file",
+                "status",
+                "result",
+                "exception",
+                "start_time",
+                "end_time",)
 
+_DEEP_FIELDS_NO_EXEC = ("args", 
+                        "kwargs", 
+                        "env", 
+                        "exception", 
+                        "cpu_affinity", 
+                        "gpu_affinity", 
+                        "run_dir",  
+                        "stdout_file", 
+                        "stderr_file",
+                        "status",
+                        "result",
+                        "exception",
+                        "start_time",
+                        "end_time",)
 
 class Task(BaseModel):
     task_id: str
@@ -84,8 +109,8 @@ def resource_requirements(
     nnodes: int,
     ppn: int,
     ngpus_per_process: Union[int, float],
-    cpu_affinity: List[int],
-    gpu_affinity: List[Union[int, str]],
+    cpu_affinity: Optional[List[int]] = None,
+    gpu_affinity: Optional[List[Union[int, str]]] = None,
 ) -> "JobResource":
     """The JobResource a task with these fields needs. Shared by `Task` and `TaskMeta`."""
     from ensemble_launcher.scheduler.resource import (
@@ -100,6 +125,8 @@ def resource_requirements(
             for i in range(nnodes)
         ]
     )
+    cpu_affinity = cpu_affinity or []
+    gpu_affinity = gpu_affinity or []
     if len(cpu_affinity) > 0 or len(gpu_affinity) > 0:
         ncpus = ppn * nnodes
         ngpus = ncpus * ngpus_per_process
@@ -203,7 +230,7 @@ class TaskMeta:
 
     def get_resource_requirements(self) -> "JobResource":
         return resource_requirements(
-            self.nnodes, self.ppn, self.ngpus_per_process, self.cpu_affinity, self.gpu_affinity
+            self.nnodes, self.ppn, self.ngpus_per_process
         )
 
     def __repr__(self) -> str:

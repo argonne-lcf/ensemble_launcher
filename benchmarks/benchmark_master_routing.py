@@ -47,6 +47,7 @@ from utils import noop
 from ensemble_launcher.comm import IResultBatch, Message, NodeInfo, Result, TaskUpdate
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task
+from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator import AsyncMaster
 from ensemble_launcher.scheduler import ChildState
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
@@ -156,7 +157,8 @@ def make_master(nchildren: int, cpus_per_node: int) -> AsyncMaster:
         resources=[node] * nchildren, nodes=[f"node{i}" for i in range(nchildren)]
     )
     m = AsyncMaster("main.m0", config, Nodes=nodes, parent=parent)
-    m.logger = logging.getLogger("bench.master")
+    m._event_loop = asyncio.get_running_loop()
+    m.logger = setup_logger("bench.master")
     m._comm = EncodingComm()
     m._scheduler = m._create_scheduler()
     m._scheduler.create_children(m.level, m.node_id)  # registers children as READY

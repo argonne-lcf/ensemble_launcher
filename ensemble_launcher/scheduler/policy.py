@@ -639,8 +639,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         fits: Dict[tuple, bool] = {}
         for task_id in uids:
             task = self.tasks[task_id]
-            shape = (task.nnodes, task.ppn, task.ngpus_per_process,
-                     tuple(task.cpu_affinity), tuple(task.gpu_affinity))  # fmt: skip
+            shape = (task.nnodes, task.ppn, task.ngpus_per_process)  # fmt: skip
             task_resource = requirements.get(shape)
             if task_resource is None:
                 task_resource = requirements[shape] = task.get_resource_requirements()
