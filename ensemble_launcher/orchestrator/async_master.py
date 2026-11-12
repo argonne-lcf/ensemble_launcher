@@ -260,6 +260,7 @@ class AsyncMaster(Node):
             req_res=self._config.req_res,
             send_retries=self._config.send_retries,
             send_timeout=self._config.send_timeout,
+            io_process=self._config.comm_io_process,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
