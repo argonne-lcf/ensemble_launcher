@@ -39,8 +39,19 @@ def offsets_from_frame(frame) -> np.ndarray:
 def record(blob, off: np.ndarray, i: int) -> memoryview:
     return memoryview(blob)[int(off[i]) : int(off[i + 1])]
 
-def gather(blob, off: np.ndarray, rows: np.ndarray,) -> Tuple[bytes, np.ndarray]:
-    """The records at ``rows`` (in that order), as a new blob and offsets."""
+# Average run length (bytes) from which `gather` copies run by run instead of byte by byte. A run
+# costs ~70-100 ns as a slice in ``b"".join``; the byte-indexed copy costs ~1-1.5 ns per byte plus
+# its index arrays. They cross at ~48-64 B per run (measured for 100-5000 runs).
+GATHER_JOIN_MIN_RUN_BYTES = 64
+
+
+def gather(blob, off: np.ndarray, rows: np.ndarray) -> Tuple[bytes, np.ndarray]:
+    """The records at ``rows`` (in that order), as a new blob and offsets.
+
+    Adjacent records are copied as one run. Long runs (e.g. task payloads) are joined as
+    memoryview slices, one memcpy each; many short runs (e.g. small results) are copied
+    through a byte index in numpy, which has no per-run Python cost.
+    """
     rows = np.asarray(rows, dtype=np.int64)
     if len(rows) == 0:
         return b"", EMPTY_OFFSETS.copy()
@@ -50,8 +61,12 @@ def gather(blob, off: np.ndarray, rows: np.ndarray,) -> Tuple[bytes, np.ndarray]
     breaks = np.flatnonzero(starts[1:] != ends[:-1]) + 1
     run_starts = starts[np.concatenate(([0], breaks))]
     run_ends = ends[np.concatenate((breaks - 1, [len(rows) - 1]))]
-
     total = int(new_off[-1])
+
+    if total >= GATHER_JOIN_MIN_RUN_BYTES * len(run_starts):
+        mv = memoryview(blob)
+        return b"".join([mv[s:e] for s, e in zip(run_starts.tolist(), run_ends.tolist())]), new_off
+
     lengths = run_ends - run_starts
     run_out = np.empty(len(lengths), dtype=np.int64)
     run_out[0] = 0

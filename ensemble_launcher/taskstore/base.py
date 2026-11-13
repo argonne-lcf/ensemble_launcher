@@ -11,9 +11,9 @@ it and drop it; do not keep many alive.
 
 from abc import abstractmethod
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Type
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Type
 
-from ensemble_launcher.ensemble import Task, TaskMeta, TaskStatus
+from ensemble_launcher.ensemble import Task, TaskMeta
 
 if TYPE_CHECKING:  # messages imports the scheduler package, which imports this one
     import numpy as np
@@ -42,15 +42,7 @@ class TaskStore(Mapping):
     @abstractmethod
     def meta_columns(self, uids: Iterable[bytes]) -> "np.ndarray":
         """The tasks' metadata records as one ``META_DTYPE`` array; row i is ``uids[i]``.
-        Policies with ``columnar = True`` read these columns instead of ``store[uid]``."""
-
-    @abstractmethod
-    def get_status(self, uid: bytes, default: Optional[TaskStatus] = None) -> Optional[TaskStatus]:
-        ...
-
-    @abstractmethod
-    def set_status(self, uids: Iterable[bytes], status: TaskStatus) -> None:
-        ...
+        Policies' column entry points read these instead of ``store[uid]``."""
 
     @abstractmethod
     def mark_delivered(self, uids: Iterable[bytes]) -> None:
@@ -59,7 +51,9 @@ class TaskStore(Mapping):
 
     @abstractmethod
     def release(self, uids: Iterable[bytes]) -> None:
-        """These tasks are finished; the store may drop their bytes. Status is kept."""
+        """These tasks are finished: they leave the index at once (``uid in store`` is False
+        afterwards) and the store may drop their bytes. The store keeps no record of how they
+        ended -- unknown and already released uids are ignored."""
 
     @abstractmethod
     def close(self) -> None:

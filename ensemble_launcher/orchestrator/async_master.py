@@ -1585,22 +1585,20 @@ class AsyncMaster(Node):
         """Send this child's outbox, one item per TaskUpdate, once the child is running.
 
         Takes a window slot *before* waiting for an item, so while sends are in flight new
-        items simply wait in the outbox. The slot is released by `_task_flush_done`.
+        items simply wait in the outbox. The slot is released by `_task_flush_done`. The
+        update is built on the loop, like every other store access.
         """
         child = self._scheduler.state.children[child_id]
         window = self._task_window[child_id]
+        build = self._scheduler.tasks.build_update
         await child.ready.wait()  # set once its NodeUpdate was delivered
         while True:
-            uids = await child.outbox.get()
-            uids = [uid for uid in uids if uid in child]  # drop tasks deleted while queued
-            if not uids:
-                continue
-            update = await self._event_loop.run_in_executor(None, 
-                                                            functools.partial(self._scheduler.tasks.build_update, 
-                                                                              uids, 
-                                                                              sender=self.node_id))
             await window.acquire()
-            self._schedule_task_flush(child_id, update)
+            uids = [uid for uid in await child.outbox.get() if uid in child]  # drop deleted ones
+            if not uids:
+                window.release()
+                continue
+            self._schedule_task_flush(child_id, build(uids, sender=self.node_id))
 
     def _schedule_task_flush(
         self, child_id: str, msg: TaskUpdate, window: Optional[asyncio.Semaphore] = None

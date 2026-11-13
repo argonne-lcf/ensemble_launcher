@@ -9,7 +9,7 @@ import pytest
 
 from ensemble_launcher.comm.messages import Message, Status, TaskUpdate
 from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
-from ensemble_launcher.ensemble import Task, TaskStatus
+from ensemble_launcher.ensemble import Task
 from ensemble_launcher.scheduler import (
     AsyncChildrenScheduler,
     Child,
@@ -119,8 +119,8 @@ def test_moves_keep_one_place_rule():
     assert list(state.unassigned) == uids[5:]
     _one_place_rule(state)
 
-    assert state.finish(uids[0], a) == "c" and uids[0] not in a
-    assert state.finish(uids[5]) == "c" and uids[5] not in state.unassigned  # never placed
+    assert state.finish_many([uids[0]], a) == ["c"] and uids[0] not in a
+    assert state.finish_many([uids[5]]) == ["c"] and uids[5] not in state.unassigned  # never placed
     state.forget(uids[3])
     assert uids[3] not in b and uids[3] not in state.task_to_client
     _one_place_rule(state)
@@ -248,7 +248,7 @@ async def test_unplaced_tasks_are_reported_and_drained():
     await sched._input.join()
     assert sched.unplaced.get_nowait() == [big[0].uid]
     assert big[0].uid in sched.state.unassigned and not sched.drained.is_set()
-    sched.finish_tasks([(big[0].uid, False)])  # what the master's failure result does
+    sched.finish_tasks([big[0].uid])  # what the master's failure result does
     assert big[0].uid not in sched.state.unassigned
 
 
@@ -264,7 +264,7 @@ async def test_drained_tracks_unfinished_tasks():
     await sched._input.join()
     assert not sched.drained.is_set()  # held by children
     for cid, c in sched.state.children.items():
-        sched.finish_tasks([(u, True) for u in list(c.uids)], cid)
+        sched.finish_tasks(list(c.uids), cid)
     assert sched.drained.is_set()
     _, more = _update(1, "more")
     await sched.queue(more)
@@ -278,14 +278,22 @@ async def test_finished_tasks_leave_their_child():
     first = list(a.uids)[:3]
     sched.state.task_to_client.update(dict.fromkeys(first[:2], "client-1"))
 
-    clients = sched.finish_tasks([(u, i % 2 == 0) for i, u in enumerate(first)], cid_a)
+    clients = sched.finish_tasks(first, cid_a)
 
     assert clients == ["client-1", "client-1", None]
     assert not any(u in a for u in first) and len(a) + len(b) == len(uids) - 3
     assert not sched.state.task_to_client
     assert not any(u in sched.tasks for u in first)
-    assert sched.tasks.get_status(first[0]) is TaskStatus.SUCCESS
-    assert sched.tasks.get_status(first[1]) is TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_finish_without_clients_returns_none():
+    """A sub-master's tasks all come from its parent: no per-uid client lookup."""
+    sched, uids = await _placed(6)
+    cid, child = next(iter(sched.state.children.items()))
+    mine = list(child.uids)
+    assert sched.finish_tasks(mine, cid) is None
+    assert not any(u in child for u in mine) and not any(u in sched.tasks for u in mine)
 
 
 @pytest.mark.asyncio
@@ -295,7 +303,6 @@ async def test_transitions_and_side_effects():
 
     assert sched.transition(cid_a, R)
     assert a.ready.is_set() and not a.done.is_set()
-    assert all(sched.tasks.get_status(u) is TaskStatus.RUNNING for u in a.uids)
 
     with pytest.raises(RuntimeError):
         sched.transition(cid_a, ChildState.READY)
@@ -303,7 +310,7 @@ async def test_transitions_and_side_effects():
     # SUCCESS while still holding tasks (e.g. placed after the child took Stop): the child is
     # emptied and, without requeue, they go to unplaced (the master fails them).
     first = list(a.uids)[0]
-    sched.finish_tasks([(first, True)], cid_a)
+    sched.finish_tasks([first], cid_a)
     held = set(a.uids)
     free_before = sched.cluster.free_cpus
     assert sched.transition(cid_a, S)

@@ -150,14 +150,20 @@ class SchedulerState:
             pool.pop(uid, None)
         child.add(uids)
 
-    def finish(self, uid: bytes, child: Optional[Child] = None) -> Optional[str]:
-        """A task has a final result: it leaves its child (or the pool, if it never reached
-        one). Returns its submitting client, if any."""
-        if child is not None:
-            child.discard(uid)
-        else:
-            self.unassigned.pop(uid, None)
-        return self.task_to_client.pop(uid, None)
+    def finish_many(
+        self, uids: List[bytes], child: Optional[Child] = None
+    ) -> Optional[List[Optional[str]]]:
+        """These tasks have a final result: they leave ``child`` (or the pool, if they never
+        reached one). Returns each uid's submitting client (None for one from the parent), or
+        None when no task here has a client (a sub-master's tasks all come from its parent),
+        so the caller can skip the per-uid lookup."""
+        pop = child.uids.pop if child is not None else self.unassigned.pop
+        for uid in uids:
+            pop(uid, None)
+        ttc = self.task_to_client
+        if not ttc:
+            return None
+        return [ttc.pop(uid, None) for uid in uids]
 
     def forget(self, uid: bytes) -> None:
         """A task is deleted: drop it from wherever it is."""

@@ -1,9 +1,10 @@
 """`SegmentTaskStore`: received TaskUpdates kept as they arrived, hot in memory up to a budget,
 the rest offloaded to node-local files and read back through ``mmap``.
 
-Per task the store holds one index entry (``uid -> seg << 32 | row``: bytes key, int value) and,
-once set, one status entry (an enum singleton). Neither is a container, so the cyclic GC sees a
-couple of dicts rather than objects per task. A segment's bytes are never decoded as a whole:
+Per task the store holds one index entry (``uid -> seg << 32 | row``: bytes key, int value), and
+only until the task is released. It is not a container, so the cyclic GC sees one dict rather
+than objects per task. The store keeps no task status: workers record outcomes in their scheduler
+state, and on a master "unfinished" is ``uid in store``. A segment's bytes are never decoded as a whole:
 `TaskMeta`s and `Task`s are built one row at a time, on demand.
 """
 
@@ -19,7 +20,7 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
 
-from ensemble_launcher.ensemble import Task, TaskMeta, TaskStatus
+from ensemble_launcher.ensemble import Task, TaskMeta
 from ensemble_launcher.ensemble.ensemble import META_DTYPE, decode_meta_array
 
 from .base import TaskStore, register_task_store
@@ -31,6 +32,22 @@ _ROW_MASK = (1 << _ROW_BITS) - 1
 # 8-byte aligned right after the 32-byte header.
 _FILE_ORDER = ("_deep_off", "_uids", "_meta", "_deep")
 _HEADER = struct.Struct("!4Q")
+
+
+def _group_locs(locs: np.ndarray):
+    """Split index locations (``seg << _ROW_BITS | row``) by segment: ``([(seg_no, rows)],
+    order)``. Rows keep their order within a segment. ``order`` is the stable argsort by
+    segment (positions in ``locs``, group after group), or None when there is at most one
+    segment, so no reordering happened."""
+    if len(locs) == 0:
+        return [], None
+    segs = locs >> _ROW_BITS
+    rows = locs & _ROW_MASK
+    if (segs == segs[0]).all():
+        return [(int(segs[0]), rows)], None
+    order = np.argsort(segs, kind="stable")
+    bounds = np.flatnonzero(np.diff(segs[order])) + 1
+    return [(int(segs[g[0]]), rows[g]) for g in np.split(order, bounds)], order
 
 
 class _Segment:
@@ -69,7 +86,6 @@ class SegmentTaskStore(TaskStore):
         self._segments: Dict[int, _Segment] = {}
         self._seg_ids = count()
         self._index: Dict[bytes, int] = {}
-        self._status: Dict[bytes, TaskStatus] = {}
         self.hot_bytes = 0
         self._pending_spills: set = set()
 
@@ -131,13 +147,9 @@ class SegmentTaskStore(TaskStore):
             return [], None
         index = self._index
         locs = np.fromiter((index[uid] for uid in uids), dtype=np.int64, count=n)
-        segs = locs >> _ROW_BITS
-        rows = locs & _ROW_MASK
-        if (segs == segs[0]).all():
-            return [(int(segs[0]), rows)], None
-        order = np.argsort(segs, kind="stable")
-        bounds = np.flatnonzero(np.diff(segs[order])) + 1
-        groups = [(int(segs[g[0]]), rows[g]) for g in np.split(order, bounds)]  # g: positions in uids
+        groups, order = _group_locs(locs)
+        if order is None:
+            return groups, None
         inv = np.empty(n, dtype=np.int64)
         inv[order] = np.arange(n, dtype=np.int64)
         return groups, inv
@@ -146,6 +158,9 @@ class SegmentTaskStore(TaskStore):
         from ensemble_launcher.comm.messages import TaskUpdate
 
         groups, inv = self._by_segment(list(uids))
+        if len(groups) == 1:  # the common case: no concat, so the bytes are copied once
+            (s, rows), = groups
+            return self._segments[s].update.select(rows, **msg_fields)
         parts = [self._segments[s].update.select(rows) for s, rows in groups]
         update = TaskUpdate.concat(parts, **msg_fields)
         return update if inv is None else update.select(inv, **msg_fields)
@@ -158,16 +173,10 @@ class SegmentTaskStore(TaskStore):
         meta = parts[0] if len(parts) == 1 else np.concatenate(parts)
         return meta if inv is None else meta[inv]
 
-    def get_status(self, uid, default=None):
-        return self._status.get(uid, default)
-
-    def set_status(self, uids: Iterable[bytes], status: TaskStatus) -> None:
-        st = self._status
-        for uid in uids:
-            st[uid] = status
-
     def mark_delivered(self, uids: Iterable[bytes]) -> None:
-        for seg_no, rows in self._rows_by_segment(uids).items():
+        get = self._index.get
+        locs = np.fromiter((get(uid, -1) for uid in uids), dtype=np.int64)
+        for seg_no, rows in _group_locs(locs[locs >= 0])[0]:
             seg = self._segments[seg_no]
             new = rows[~seg.delivered[rows]]
             seg.delivered[new] = True
@@ -177,17 +186,17 @@ class SegmentTaskStore(TaskStore):
     def release(self, uids: Iterable[bytes]) -> None:
         # A released task leaves the index at once (so ``uid in store`` means "still to run",
         # which recovery relies on); its segment's bytes go when the last of its tasks does.
-        uids = list(uids)
-        by_seg = self._rows_by_segment(uids)
-        for uid in uids:
-            self._index.pop(uid, None)
-        for seg_no, rows in by_seg.items():
+        # One pop per uid both finds the row and forgets it; unknown or already released uids
+        # (and repeats) pop nothing.
+        pop = self._index.pop
+        locs = np.fromiter((pop(uid, -1) for uid in uids), dtype=np.int64)
+        for seg_no, rows in _group_locs(locs[locs >= 0])[0]:
             seg = self._segments[seg_no]
             new = rows[~seg.released[rows]]
             seg.released[new] = True
             seg.remaining -= len(new)
             if seg.remaining == 0:
-                self._drop(seg_no)
+                self._drop(seg_no, forget=False)  # its uids all left the index above or before
 
     def close(self) -> None:
         for seg_no in list(self._segments):
@@ -201,19 +210,14 @@ class SegmentTaskStore(TaskStore):
     #  Internals                                                         #
     # ------------------------------------------------------------------ #
 
-    def _rows_by_segment(self, uids: Iterable[bytes]) -> Dict[int, np.ndarray]:
-        out: Dict[int, List[int]] = {}
-        index = self._index
-        for uid in uids:
-            loc = index.get(uid)
-            if loc is not None:
-                out.setdefault(loc >> _ROW_BITS, []).append(loc & _ROW_MASK)
-        return {s: np.asarray(rows, dtype=np.int64) for s, rows in out.items()}
-
-    def _drop(self, seg_no: int, delete_now: bool = False) -> None:
+    def _drop(self, seg_no: int, delete_now: bool = False, forget: bool = True) -> None:
+        """Drop a segment's bytes. ``forget=False`` when every one of its uids is already out
+        of the index (the last of them was just released), to skip a pop per row."""
         seg = self._segments.pop(seg_no)
-        for uid in seg.update.uids():
-            self._index.pop(uid, None)
+        if forget:
+            pop = self._index.pop
+            for uid in seg.update.uids():
+                pop(uid, None)
         if seg.hot:
             self.hot_bytes -= seg.nbytes
         seg.update = None

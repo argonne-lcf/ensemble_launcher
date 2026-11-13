@@ -111,6 +111,12 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    `release(uids)` drops finished tasks from the index at once -- so `uid in store` means
    "still to run", which the master's recovery resend relies on. The store forgets finished
    tasks, so `len(scheduler.tasks)` shrinks; use `scheduler.state.ntasks_added` for totals.
+   It keeps **no task status** (no per-task record outlives the task): how a task ended
+   travels in its result, and workers record outcomes in `state.completed_tasks` /
+   `failed_tasks`. On masters, `queue_result` -> `finish_tasks(uids, child_id)` ->
+   `state.finish_many` + `store.release` is the whole result path: one pop per uid each
+   from the child's `uids` and the store index (plus `task_to_client` only when clients
+   exist), and the batch goes up untouched when no task has a client.
    `taskstore` must not import `comm.messages` at module level (circular import via
    `scheduler.resource`).
 
@@ -133,12 +139,12 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    `scheduler.state`, a `SchedulerState` (`scheduler/state.py`): `children` (one `Child`
    record each -- `wid`, `job_resource`, `state`, `status`, `allocated`, `ready`/`done` events,
    `uids`, the ordered set of its *unfinished* tasks, and `outbox`), `unassigned` (the pool),
-   `task_to_client`, `ntasks_added`, `all_done`. Its moves (`queue`, `assign`, `finish`,
+   `task_to_client`, `ntasks_added`, `all_done`. Its moves (`queue`, `assign`, `finish_many`,
    `forget`, `add_child`, `pop_child`) keep one rule: **every unfinished uid is in the pool or
    in exactly one child's `uids`**. `add_child` claims the child's uids still in the pool and
    gives it a fresh outbox holding all of them; `pop_child` returns its uids to the pool.
    Orchestrators **read** the state; only the scheduler writes it. Don't add parallel
-   per-child dicts -- put fields on `Child`. `finish_tasks(rows, child_id)` gets `child_id`
+   per-child dicts -- put fields on `Child`. `finish_tasks(uids, child_id)` gets `child_id`
    from the loop the results arrived on, so there is no uid -> child map. `SchedulerState` is
    also the checkpoint (`get_state()` = `to_json()`, on the loop); `set_state` adds each
    restored child with `add_child`, so it must run **after** the initial tasks are queued and

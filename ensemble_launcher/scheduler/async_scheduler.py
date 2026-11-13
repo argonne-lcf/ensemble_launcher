@@ -167,25 +167,20 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return uids
 
     def finish_tasks(
-        self, rows: Iterable[Tuple[bytes, bool]], child_id: Optional[str] = None
-    ) -> List[Optional[str]]:
-        """Record the final status of ``(uid, success)`` rows and forget the tasks.
+        self, uids: List[bytes], child_id: Optional[str] = None
+    ) -> Optional[List[Optional[str]]]:
+        """These tasks have a final result: forget them.
 
         ``child_id`` is the child the results came from -- the one the tasks were assigned
         to, since results travel back up the same branch; None for tasks failed before they
-        reached a child (they leave the pool). Sets SUCCESS/FAILED in the store and releases
-        the tasks' bytes. Returns each row's submitting client (None if it came from the
-        parent), in row order.
+        reached a child (they leave the pool). Releases the tasks from the store (no status is
+        kept: how a task ended travels in its result). Returns each uid's submitting client
+        (None if it came from the parent), in order -- or None when none had a client.
         """
         state = self.state
-        ok, failed, clients = [], [], []
         child = state.children.get(child_id) if child_id is not None else None
-        for uid, success in rows:
-            (ok if success else failed).append(uid)
-            clients.append(state.finish(uid, child))
-        self.tasks.set_status(ok, TaskStatus.SUCCESS)
-        self.tasks.set_status(failed, TaskStatus.FAILED)
-        self.tasks.release(ok + failed)
+        clients = state.finish_many(uids, child)
+        self.tasks.release(uids)
         self._check_drained()
         return clients
 
@@ -205,15 +200,18 @@ class AsyncChildrenScheduler(AsyncScheduler):
         Finishes the tasks, then puts the batch -- split per destination by row, as bytes --
         on the submitting client's outbox, or on ``parent_outbox`` for tasks with no client.
         """
-        rows = list(batch.rows())
-        if not rows:
+        uids = batch.uids()
+        if not uids:
             return
-        clients = self.finish_tasks(rows, child_id)
+        clients = self.finish_tasks(uids, child_id)
+        if clients is None:  # no client tasks: all of it goes up
+            self.parent_outbox.put_nowait(batch)
+            return
         groups: Dict[Optional[str], List[int]] = {}
         for i, client in enumerate(clients):
             groups.setdefault(client, []).append(i)
         for client, picked in groups.items():
-            piece = batch if len(picked) == len(rows) else batch.select(picked)
+            piece = batch if len(picked) == len(uids) else batch.select(picked)
             if client is None:
                 self.parent_outbox.put_nowait(piece)
                 continue
@@ -410,7 +408,6 @@ class AsyncChildrenScheduler(AsyncScheduler):
         if to is ChildState.RUNNING:
             child.done.clear()
             child.ready.set()
-            self.tasks.set_status(child.uids, TaskStatus.RUNNING)
         elif child.terminal:
             self._free(child)
             child.done.set()
@@ -699,8 +696,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         restored ``pending_tasks`` list is only informational -- the store decides.
         """
         finished = restored.completed_tasks | restored.failed_tasks
-        self.tasks.set_status(restored.completed_tasks, TaskStatus.SUCCESS)
-        self.tasks.set_status(restored.failed_tasks, TaskStatus.FAILED)
         self.tasks.release(finished)
 
         restored.pending_tasks = self.state.pending_tasks
@@ -978,7 +973,6 @@ class AsyncTaskScheduler(AsyncScheduler):
             self.state.all_done.clear()  # new work: not drained any more
         if rejected:
             uids = [uid for uid, _ in rejected]
-            self.tasks.set_status(uids, TaskStatus.FAILED)
             self.tasks.release(uids)
         return accepted, rejected
 
@@ -1065,7 +1059,6 @@ class AsyncTaskScheduler(AsyncScheduler):
                     scheduler_state=self.state,
                 )
 
-            self.tasks.set_status((task_id,), status)
             self.tasks.release((task_id,))
 
         self._check_all_tasks_done()
@@ -1086,7 +1079,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         pending = [uid for uid in self.state.pending_tasks.task_ids() if uid in self.tasks]
         self.state.pending_tasks.clear()
         self.state.failed_tasks.update(pending)
-        self.tasks.set_status(pending, TaskStatus.FAILED)
         self.tasks.release(pending)
         self._check_all_tasks_done()
         return running + pending

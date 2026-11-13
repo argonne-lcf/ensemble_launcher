@@ -354,7 +354,7 @@ async def test_checkpoint_round_trip_and_restore():
     assert fresh.state.pending_tasks is container  # the monitor parks on its event
     assert sorted(_name(u) for u in fresh.state.pending_tasks) == ["t2", "t3", "t4"]
     assert _uid("t0") not in fresh.tasks and _uid("t1") not in fresh.tasks
-    assert fresh.tasks.get_status(_uid("t0")) is TaskStatus.SUCCESS
+    assert _uid("t0") in fresh.state.completed_tasks
     assert fresh.state.task_to_client == {_uid("t4"): "client-1"}
 
 
@@ -377,7 +377,6 @@ async def test_fail_unfinished_fails_pending_running_and_ready():
     assert not sched.state.unfinished()
     assert sched.cluster.free_cpus == free_before + 2
     assert {_name(u) for u in sched.state.failed_tasks} == {f"t{i}" for i in range(5)}
-    assert all(sched.tasks.get_status(u) is TaskStatus.FAILED for u in failed)
     assert len(sched.tasks) == 0
     await asyncio.wait_for(sched.wait_for_completion(), timeout=1.0)
 

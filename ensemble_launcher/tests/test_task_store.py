@@ -10,7 +10,7 @@ import os
 import pytest
 
 from ensemble_launcher.comm.messages import Message, TaskUpdate
-from ensemble_launcher.ensemble import Task, TaskMeta, TaskStatus
+from ensemble_launcher.ensemble import Task, TaskMeta
 from ensemble_launcher.taskstore import create_task_store
 from ensemble_launcher.taskstore.base import _REGISTRY
 
@@ -91,15 +91,26 @@ class TestBasics:
         assert msg.uids() == order
         assert [t.task_id for t in msg.to_tasks()] == ["b2", "a0", "a1", "b0", "a3"]
 
-    def test_status_survives_release(self, make_store):
-        store = make_store()
-        tasks, update = _received("a", 3)
-        uids = store.add(update)
-        assert store.get_status(uids[0]) is None
-        store.set_status(uids[:2], TaskStatus.SUCCESS)
-        store.release(uids[:2])
-        assert uids[0] not in store and uids[2] in store
-        assert store.get_status(uids[0]) is TaskStatus.SUCCESS
+    @pytest.mark.parametrize("spill", [False, True])
+    def test_release_across_segments(self, make_store, tmp_path, spill):
+        """Interleaved, repeated, unknown and already released uids: each task leaves the
+        index at once, and a segment's bytes go exactly when its last task does."""
+        store = make_store(hot_bytes=1 if spill else 1 << 30)
+        segs = [store.add(_received(p, 5)[1]) for p in "abc"]
+        held = lambda: len(_spill_files(tmp_path)) if spill else store.hot_bytes  # noqa: E731
+        full = held()
+
+        store.release([segs[0][0], segs[1][0], segs[0][0], b"y" * 16, segs[2][4]])
+        assert len(store) == 12 and segs[0][0] not in store and segs[1][1] in store
+        assert held() == full  # no segment is empty yet
+
+        store.release(segs[0][1:] + [segs[1][0], segs[1][2]])  # a's last rows, a repeat
+        assert all(u not in store for u in segs[0]) and len(store) == 7
+        assert 0 < held() < full  # segment a went
+        assert store[segs[1][1]].task_id == "b1" and store.task(segs[2][0]).args == (0,)
+
+        store.release(segs[1] + segs[2])
+        assert len(store) == 0 and held() == 0
 
     def test_release_is_idempotent(self, make_store):
         store = make_store()
