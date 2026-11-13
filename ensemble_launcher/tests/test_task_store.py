@@ -91,10 +91,14 @@ class TestBasics:
         assert msg.uids() == order
         assert [t.task_id for t in msg.to_tasks()] == ["b2", "a0", "a1", "b0", "a3"]
 
+    @pytest.mark.parametrize("small_batch", [0, 10**6])  # numpy grouping / dict grouping
     @pytest.mark.parametrize("spill", [False, True])
-    def test_release_across_segments(self, make_store, tmp_path, spill):
+    def test_release_across_segments(self, make_store, tmp_path, spill, small_batch, monkeypatch):
         """Interleaved, repeated, unknown and already released uids: each task leaves the
         index at once, and a segment's bytes go exactly when its last task does."""
+        import ensemble_launcher.taskstore.segment as segment
+
+        monkeypatch.setattr(segment, "_SMALL_BATCH", small_batch)
         store = make_store(hot_bytes=1 if spill else 1 << 30)
         segs = [store.add(_received(p, 5)[1]) for p in "abc"]
         held = lambda: len(_spill_files(tmp_path)) if spill else store.hot_bytes  # noqa: E731

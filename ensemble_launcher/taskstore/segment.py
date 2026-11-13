@@ -16,7 +16,7 @@ import shutil
 import struct
 import tempfile
 from itertools import count
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -48,6 +48,26 @@ def _group_locs(locs: np.ndarray):
     order = np.argsort(segs, kind="stable")
     bounds = np.flatnonzero(np.diff(segs[order])) + 1
     return [(int(segs[g[0]]), rows[g]) for g in np.split(order, bounds)], order
+
+
+# Below this many uids, `_rows_by_segment` groups with a dict: numpy's fixed cost per call
+# (~2.5 us) outweighs its per-uid saving until ~50-60 uids. Workers release one task at a time.
+_SMALL_BATCH = 48
+
+
+def _rows_by_segment(uids: Iterable[bytes], take) -> List[Tuple[int, np.ndarray]]:
+    """``[(seg_no, rows)]`` for the uids that ``take(uid, -1)`` (the index's ``get`` or
+    ``pop``) finds; unknown uids are skipped."""
+    uids = uids if isinstance(uids, (list, tuple)) else list(uids)
+    if len(uids) < _SMALL_BATCH:
+        out: Dict[int, List[int]] = {}
+        for uid in uids:
+            loc = take(uid, -1)
+            if loc >= 0:
+                out.setdefault(loc >> _ROW_BITS, []).append(loc & _ROW_MASK)
+        return [(s, np.asarray(rows, dtype=np.int64)) for s, rows in out.items()]
+    locs = np.fromiter((take(uid, -1) for uid in uids), dtype=np.int64, count=len(uids))
+    return _group_locs(locs[locs >= 0])[0]
 
 
 class _Segment:
@@ -174,9 +194,7 @@ class SegmentTaskStore(TaskStore):
         return meta if inv is None else meta[inv]
 
     def mark_delivered(self, uids: Iterable[bytes]) -> None:
-        get = self._index.get
-        locs = np.fromiter((get(uid, -1) for uid in uids), dtype=np.int64)
-        for seg_no, rows in _group_locs(locs[locs >= 0])[0]:
+        for seg_no, rows in _rows_by_segment(uids, self._index.get):
             seg = self._segments[seg_no]
             new = rows[~seg.delivered[rows]]
             seg.delivered[new] = True
@@ -188,9 +206,7 @@ class SegmentTaskStore(TaskStore):
         # which recovery relies on); its segment's bytes go when the last of its tasks does.
         # One pop per uid both finds the row and forgets it; unknown or already released uids
         # (and repeats) pop nothing.
-        pop = self._index.pop
-        locs = np.fromiter((pop(uid, -1) for uid in uids), dtype=np.int64)
-        for seg_no, rows in _group_locs(locs[locs >= 0])[0]:
+        for seg_no, rows in _rows_by_segment(uids, self._index.pop):
             seg = self._segments[seg_no]
             new = rows[~seg.released[rows]]
             seg.released[new] = True
