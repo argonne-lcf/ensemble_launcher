@@ -4,13 +4,16 @@ import enum
 import os
 import pickle
 import struct
+import warnings
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Callable,
     Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
     TypedDict,
     Union,
@@ -18,7 +21,7 @@ from typing import (
 
 import cloudpickle
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints, ValidationInfo
 
 if TYPE_CHECKING:
     from ensemble_launcher.scheduler.resource import JobResource
@@ -33,6 +36,15 @@ class TaskStatus(enum.Enum):
 
 
 UID_BYTES = 16
+STR_BYTES = 32
+
+def _truncate(v: str, info: ValidationInfo) -> str:
+    if len(v) > STR_BYTES:
+        warnings.warn(f"{info.field_name} is longer than {STR_BYTES} characters; truncated")
+        return v[:STR_BYTES]
+    return v
+
+STR_FMT = Annotated[str, StringConstraints(min_length=1, ascii_only=True), AfterValidator(_truncate)]
 
 _DEEP_FIELDS = ("executable", 
                 "args", 
@@ -48,7 +60,8 @@ _DEEP_FIELDS = ("executable",
                 "result",
                 "exception",
                 "start_time",
-                "end_time",)
+                "end_time",
+                "driver_only")
 
 _DEEP_FIELDS_NO_EXEC = ("args", 
                         "kwargs", 
@@ -63,10 +76,11 @@ _DEEP_FIELDS_NO_EXEC = ("args",
                         "result",
                         "exception",
                         "start_time",
-                        "end_time",)
+                        "end_time",
+                        "driver_only")
 
 class Task(BaseModel):
-    task_id: str
+    task_id: STR_FMT
     nnodes: int
     ppn: int
     executable: Union[str, Callable] = None
@@ -83,8 +97,8 @@ class Task(BaseModel):
     run_dir: Optional[Union[str, os.PathLike]] = None
     start_time: Any = None
     end_time: Any = None
-    executor_name: Optional[str] = None
-    tag: Optional[str] = None
+    executor_name: Optional[STR_FMT] = None
+    tag: Optional[STR_FMT] = None
     stdout_file: Optional[str] = None
     stderr_file: Optional[str] = None
     serialize_executable_by_value: bool = True
@@ -174,17 +188,60 @@ def resource_requirements(
 #  Per-task encoding, used by TaskUpdate (comm/messages.py)                    #
 # --------------------------------------------------------------------------- #
 
-# Every field except the deep ones and uid, in a fixed order. A task's metadata record is
-# pickle(tuple of these values); policies and schedulers read them through TaskMeta.
+# Every field except the deep ones and uid, in a fixed order. A task's metadata record is one
+# ``META_DTYPE`` row; policies read whole columns, or one row at a time through TaskMeta.
 META_FIELDS: Tuple[str, ...] = tuple(
     f for f in Task.model_fields if f not in _DEEP_FIELDS and f != "uid"
 )
 
+_META_DTYPE = {
+    "nnodes": "<i4",                          # 4 bytes, little-endian int32
+    "ppn": "<i4",                             # 4 bytes
+    "ngpus_per_process": "<f8",               # 8 bytes, float64 (int or float today)
+    "estimated_runtime": "<f8",               # 8 bytes
+    "serialize_executable_by_value": "?",     # 1 byte, bool
+    "task_id": f"S{STR_BYTES}",           # 32 bytes, null-padded ASCII
+    "executor_name": f"S{STR_BYTES}",        # 32 bytes, empty means None
+    "tag": f"S{STR_BYTES}",                  # 32 bytes, empty means None
+}
+assert set(_META_DTYPE.keys()) == set(META_FIELDS), "All meta fields need a dtype"
 
-def encode_meta(task: Task) -> bytes:
-    """A task's metadata record: everything a policy may read, nothing it may not."""
-    d = task.__dict__
-    return pickle.dumps(tuple(d[f] for f in META_FIELDS), protocol=pickle.HIGHEST_PROTOCOL)
+META_DTYPE = np.dtype([(d, _META_DTYPE[d]) for d in META_FIELDS])  # 153 bytes per task
+
+_OPTIONAL_STR = ("executor_name", "tag")
+_STR_INDEX = tuple(i for i, f in enumerate(META_FIELDS) if META_DTYPE[f].kind == "S")
+_OPTIONAL_INDEX = frozenset(META_FIELDS.index(f) for f in _OPTIONAL_STR)
+_NGPUS_INDEX = META_FIELDS.index("ngpus_per_process")
+
+
+def encode_meta_array(tasks: Sequence[Task]) -> np.ndarray:
+    """The tasks' metadata records as one ``META_DTYPE`` array, row i = tasks[i]."""
+    arr = np.empty(len(tasks), dtype=META_DTYPE)
+    tdict = [t.__dict__ for t in tasks]
+    for name in META_DTYPE.names:
+        col = [t[name] for t in tdict]
+        if name in _OPTIONAL_STR:
+            col = [v or "" for v in col]  # None -> "", decoded back to None
+        arr[name] = col
+    return arr
+
+
+def decode_meta_array(buf, offset: int = 0, count: int = -1) -> np.ndarray:
+    """A ``META_DTYPE`` view of ``buf`` (no copy)."""
+    return np.frombuffer(buf, dtype=META_DTYPE, count=count, offset=offset)
+
+
+def meta_row_values(arr: np.ndarray, row: int) -> tuple:
+    """One record as Python values in ``META_FIELDS`` order: str (``None`` for an empty
+    optional string), int, float, bool -- never numpy scalars or bytes."""
+    values = list(arr[row].item())
+    for i in _STR_INDEX:
+        s = values[i].decode("ascii")
+        values[i] = None if (not s and i in _OPTIONAL_INDEX) else s
+    g = values[_NGPUS_INDEX]
+    if g.is_integer():
+        values[_NGPUS_INDEX] = int(g)
+    return tuple(values)
 
 
 def encode_deep(task: Task) -> bytes:

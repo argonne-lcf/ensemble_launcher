@@ -20,16 +20,17 @@ from typing import Dict, Iterable, Iterator, List, Optional
 import numpy as np
 
 from ensemble_launcher.ensemble import Task, TaskMeta, TaskStatus
+from ensemble_launcher.ensemble.ensemble import META_DTYPE, decode_meta_array
 
 from .base import TaskStore, register_task_store
 
 _ROW_BITS = 32
 _ROW_MASK = (1 << _ROW_BITS) - 1
 
-# Spill file: five u64 lengths, then the columns. The two offset columns come first so they sit
-# 8-byte aligned right after the 40-byte header.
-_FILE_ORDER = ("_meta_off", "_deep_off", "_uids", "_meta", "_deep")
-_HEADER = struct.Struct("!5Q")
+# Spill file: four u64 lengths, then the columns. The offset column comes first so it sits
+# 8-byte aligned right after the 32-byte header.
+_FILE_ORDER = ("_deep_off", "_uids", "_meta", "_deep")
+_HEADER = struct.Struct("!4Q")
 
 
 class _Segment:
@@ -119,21 +120,43 @@ class SegmentTaskStore(TaskStore):
         seg, row = self._locate(uid)
         return seg.update.task(row)
 
+    def _by_segment(self, uids: List[bytes]):
+        """``([(seg_no, rows)], inv)`` for gathering ``uids`` one segment at a time, whatever
+        their order. Rows keep their requested order within a segment (so contiguous ones
+        still gather as one stretch). Concatenating the per-segment results in list order and
+        indexing with ``inv`` restores the order of ``uids``; ``inv`` is None when no
+        reordering is needed (one segment, the common case)."""
+        n = len(uids)
+        if n == 0:
+            return [], None
+        index = self._index
+        locs = np.fromiter((index[uid] for uid in uids), dtype=np.int64, count=n)
+        segs = locs >> _ROW_BITS
+        rows = locs & _ROW_MASK
+        if (segs == segs[0]).all():
+            return [(int(segs[0]), rows)], None
+        order = np.argsort(segs, kind="stable")
+        bounds = np.flatnonzero(np.diff(segs[order])) + 1
+        groups = [(int(segs[g[0]]), rows[g]) for g in np.split(order, bounds)]  # g: positions in uids
+        inv = np.empty(n, dtype=np.int64)
+        inv[order] = np.arange(n, dtype=np.int64)
+        return groups, inv
+
     def build_update(self, uids: Iterable[bytes], **msg_fields):
         from ensemble_launcher.comm.messages import TaskUpdate
 
-        # Consecutive uids from the same segment become one select, so order is kept exactly
-        # and a queue filled from one incoming update is a single gather.
-        runs: List[tuple] = []
-        for uid in uids:
-            loc = self._index[uid]
-            seg_no, row = loc >> _ROW_BITS, loc & _ROW_MASK
-            if runs and runs[-1][0] == seg_no:
-                runs[-1][1].append(row)
-            else:
-                runs.append((seg_no, [row]))
-        parts = [self._segments[s].update.select(rows) for s, rows in runs]
-        return TaskUpdate.concat(parts, **msg_fields)
+        groups, inv = self._by_segment(list(uids))
+        parts = [self._segments[s].update.select(rows) for s, rows in groups]
+        update = TaskUpdate.concat(parts, **msg_fields)
+        return update if inv is None else update.select(inv, **msg_fields)
+
+    def meta_columns(self, uids: Iterable[bytes]) -> np.ndarray:
+        groups, inv = self._by_segment(list(uids))
+        if not groups:
+            return np.empty(0, dtype=META_DTYPE)
+        parts = [self._segments[s].update.meta_columns(rows) for s, rows in groups]
+        meta = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        return meta if inv is None else meta[inv]
 
     def get_status(self, uid, default=None):
         return self._status.get(uid, default)
@@ -333,6 +356,8 @@ def _mapped_update(mm: mmap.mmap):
     for name, n in zip(_FILE_ORDER, lengths):
         if name.endswith("_off"):
             cols[name] = np.frombuffer(mm, dtype=np.int64, count=n // 8, offset=pos)
+        elif name == "_meta":
+            cols[name] = decode_meta_array(mm, offset=pos, count=n // META_DTYPE.itemsize)
         else:
             cols[name] = mv[pos : pos + n]
         pos += n

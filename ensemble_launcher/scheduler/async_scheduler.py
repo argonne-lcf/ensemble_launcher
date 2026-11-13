@@ -3,13 +3,15 @@ from asyncio import Queue
 from logging import Logger
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
+
 from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.taskstore import TaskStore, create_task_store
 
 from .child_state import ChildState
 from .heap import PendingEntry, PendingTaskHeap, PendingTaskQueue
-from .policy import ChildrenPolicy, Policy, policy_registry
+from .policy import ChildrenPolicy, Policy, policy_registry, prefers_columns
 from .resource import (
     AsyncLocalClusterResource,
     JobResource,
@@ -114,6 +116,13 @@ class AsyncChildrenScheduler(AsyncScheduler):
         # Every task this master holds, keyed by uid.
         self.tasks: TaskStore = make_task_store(config, node_id, logger.getChild("taskstore"))
         self.policy.bind_tasks(self.tasks)
+        # Hand the policy whole-chunk columns when it implements the column entry points.
+        self._columns_place = prefers_columns(
+            self.policy, "get_children_tasks", "get_children_tasks_columns"
+        )
+        self._columns_layout = prefers_columns(
+            self.policy, "get_children_resources", "get_children_resources_columns"
+        )
         self._event_loop = asyncio.get_event_loop()
         self.cluster.set_event_loop(self._event_loop)
 
@@ -298,9 +307,18 @@ class AsyncChildrenScheduler(AsyncScheduler):
         children = {child.wid: child for child in targets if not child.terminal}
         if not children:
             return {}, list(uids)
-        by_wid, _, unplaced = self.policy.get_children_tasks(
-            uids=uids, children=children, ntask=ntask, level=state.level
-        )
+        if self._columns_place:
+            by_wid, _, unplaced = self.policy.get_children_tasks_columns(
+                uids=uids,
+                meta=self.tasks.meta_columns(uids),
+                children=children,
+                ntask=ntask,
+                level=state.level,
+            )
+        else:
+            by_wid, _, unplaced = self.policy.get_children_tasks(
+                uids=uids, children=children, ntask=ntask, level=state.level
+            )
         placed: Dict[str, List[bytes]] = {}
         for wid, got in by_wid.items():
             if got:
@@ -353,11 +371,14 @@ class AsyncChildrenScheduler(AsyncScheduler):
         suffix = ".w" if level + 1 == self._config.policy_config.nlevels else ".m"
         wid_offset = state.next_wid()
 
-        layout = self.policy.get_children_resources(
-            uids=list(self.tasks),
-            nodes=nodes if nodes is not None else self.cluster.nodes,
-            level=level,
-        )
+        uids = list(self.tasks)
+        nodes = nodes if nodes is not None else self.cluster.nodes
+        if self._columns_layout:
+            layout = self.policy.get_children_resources_columns(
+                uids=uids, meta=self.tasks.meta_columns(uids), nodes=nodes, level=level
+            )
+        else:
+            layout = self.policy.get_children_resources(uids=uids, nodes=nodes, level=level)
         for orig_wid, job_resource in layout.items():
             wid = orig_wid + wid_offset
             allocated, resource = self.cluster.allocate(job_resource)
@@ -521,6 +542,11 @@ class AsyncTaskScheduler(AsyncScheduler):
             },
         )
         self.scheduler_policy.bind_tasks(self.tasks)
+        self._columns_score = prefers_columns(
+            self.scheduler_policy, "get_score", "get_scores_columns"
+        )
+        # A task's JobResource depends only on its shape: built once per shape.
+        self._req_by_shape: Dict[tuple, JobResource] = {}
         self._strict_priority: bool = self._config.policy_config.strict_priority
         self.ready_tasks: Queue[Tuple[str, JobResource]] = Queue()
         self._fifo: bool = policy == FIFO_POLICY_NAME
@@ -570,25 +596,54 @@ class AsyncTaskScheduler(AsyncScheduler):
         """Convert a policy score (higher=better) to a heap priority (lower=better)."""
         return -score
 
-    def _update_min_req(self, task) -> None:
-        shape = (task.nnodes, task.ppn, task.ngpus_per_process * task.ppn)
+    def _update_min_req(self, meta) -> None:
+        """Fold the column minima of ``meta`` (a ``META_DTYPE`` array) into ``_min_req``."""
+        if len(meta) == 0:
+            return
+        nn, ppn = meta["nnodes"], meta["ppn"]
+        shape = (int(nn.min()), int(ppn.min()), float((meta["ngpus_per_process"] * ppn).min()))
         if self._min_req is None:
             self._min_req = shape
         else:
             self._min_req = tuple(map(min, self._min_req, shape))
 
-    def _enqueue(self, task_id: bytes) -> None:
-        """The single place a task enters the pending container.
+    def _scores(self, task_ids: List[bytes], meta) -> List[float]:
+        """Policy scores for ``task_ids`` (``meta`` = their records), whole batch or per task."""
+        policy = self.scheduler_policy
+        if self._columns_score:
+            return list(policy.get_scores_columns(task_ids, meta, scheduler_state=self.state))
+        return [policy.get_score(t, scheduler_state=self.state) for t in task_ids]
 
-        FIFO pushes without scoring. Any other policy is scored, and gets the live
-        ``self.state`` as its ``scheduler_state``.
+    def _enqueue(self, task_ids: List[bytes], meta=None) -> None:
+        """The single place tasks enter the pending container.
+
+        FIFO pushes without scoring. Any other policy is scored (`_scores`), and gets the
+        live ``self.state`` as its ``scheduler_state``.
         """
+        if not task_ids:
+            return
+        if meta is None:
+            meta = self.tasks.meta_columns(task_ids)
+        push = self.state.pending_tasks.push
         if self._fifo:
-            self.state.pending_tasks.push(0.0, task_id)
-        else:
-            score = self.scheduler_policy.get_score(task_id, scheduler_state=self.state)
-            self.state.pending_tasks.push(self._priority_from_score(score), task_id)
-        self._update_min_req(self.tasks[task_id])
+            for task_id in task_ids:
+                push(0.0, task_id)
+        elif self._columns_score:
+            to_priority = self._priority_from_score
+            for task_id, score in zip(task_ids, self._scores(task_ids, meta)):
+                push(to_priority(score), task_id)
+        else:  # score each task right before pushing it, so it sees the ones before it
+            get_score, to_priority = self.scheduler_policy.get_score, self._priority_from_score
+            for task_id in task_ids:
+                push(to_priority(get_score(task_id, scheduler_state=self.state)), task_id)
+        self._update_min_req(meta)
+
+    def _requirement(self, task) -> JobResource:
+        shape = (task.nnodes, task.ppn, task.ngpus_per_process)
+        req = self._req_by_shape.get(shape)
+        if req is None:
+            req = self._req_by_shape[shape] = task.get_resource_requirements()
+        return req
 
     def _seed_pending(self, task_ids: Iterable[str]) -> int:
         """Replace the pending container with fresh entries for *task_ids*.
@@ -599,10 +654,7 @@ class AsyncTaskScheduler(AsyncScheduler):
         """
         self.state.pending_tasks.clear()
         self._min_req = None
-        for task_id in task_ids:
-            if task_id not in self.tasks:
-                continue
-            self._enqueue(task_id)
+        self._enqueue([task_id for task_id in task_ids if task_id in self.tasks])
         return len(self.state.pending_tasks)
 
     def reprioritize_pending(self) -> int:
@@ -624,12 +676,11 @@ class AsyncTaskScheduler(AsyncScheduler):
         if self._fifo:
             # Nothing to score: FIFO order is the submission order.
             return len(self.state.pending_tasks)
+        task_ids = [t for t in self.state.pending_tasks.task_ids() if t in self.tasks]
+        meta = self.tasks.meta_columns(task_ids) if self._columns_score else None
         scores = {
-            task_id: self._priority_from_score(
-                self.scheduler_policy.get_score(task_id, scheduler_state=self.state)
-            )
-            for task_id in self.state.pending_tasks.task_ids()
-            if task_id in self.tasks
+            task_id: self._priority_from_score(score)
+            for task_id, score in zip(task_ids, self._scores(task_ids, meta))
         }
         self.state.pending_tasks.rescore(scores)
         return len(scores)
@@ -720,7 +771,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                 if task is None:
                     continue  # stale entry -> dropped
 
-                req = task.get_resource_requirements()
+                req = self._requirement(task)
                 ok, resource = self.cluster.allocate(req)
                 if ok:
                     self.state.running_tasks[task_id] = resource
@@ -902,19 +953,27 @@ class AsyncTaskScheduler(AsyncScheduler):
         are skipped.
         """
         nnodes = len(self.cluster.nodes.nodes)
-        accepted, rejected = [], []
-        for task_id in self.tasks.add(update):
-            task = self.tasks[task_id]
-            if task.nnodes > nnodes:
+        new = self.tasks.add(update)
+        meta = self.tasks.meta_columns(new)
+        too_big = meta["nnodes"] > nnodes
+        rejected = []
+        if too_big.any():
+            for row in np.flatnonzero(too_big).tolist():
+                task = self.tasks[new[row]]
                 self.logger.error(
                     f"Task {task.task_id} requires {task.nnodes} nodes, but only {nnodes} are available"
                 )
-                rejected.append((task_id, task.task_id))
-                continue
-            if client_id is not None:
-                self.state.task_to_client[task_id] = client_id
-            self._enqueue(task_id)
-            accepted.append(task_id)
+                rejected.append((new[row], task.task_id))
+            keep = np.flatnonzero(~too_big)
+            accepted = [new[row] for row in keep.tolist()]
+            meta = meta[keep]
+        else:
+            accepted = new
+        if client_id is not None:
+            to_client = self.state.task_to_client
+            for task_id in accepted:
+                to_client[task_id] = client_id
+        self._enqueue(accepted, meta)
         if accepted:
             self.state.all_done.clear()  # new work: not drained any more
         if rejected:

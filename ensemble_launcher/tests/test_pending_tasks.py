@@ -199,15 +199,16 @@ def test_fifo_scheduler_never_scores(monkeypatch):
 
 
 def test_policy_gets_the_live_scheduler_state(monkeypatch):
-    """No snapshot is built: get_score receives the scheduler's own state object."""
+    """No snapshot is built: the policy receives the scheduler's own state object.
+    (LargeResourcePolicy scores whole updates through get_scores_columns.)"""
     seen = []
-    orig = LargeResourcePolicy.get_score
+    orig = LargeResourcePolicy.get_scores_columns
 
-    def spy(self, task, scheduler_state=None):
+    def spy(self, uids, meta, scheduler_state=None):
         seen.append((scheduler_state, len(scheduler_state.pending_tasks)))
-        return orig(self, task, scheduler_state)
+        return orig(self, uids, meta, scheduler_state)
 
-    monkeypatch.setattr(LargeResourcePolicy, "get_score", spy)
+    monkeypatch.setattr(LargeResourcePolicy, "get_scores_columns", spy)
     sched = _make_scheduler(
         logging.getLogger("t"),
         {"a": _task("a")},

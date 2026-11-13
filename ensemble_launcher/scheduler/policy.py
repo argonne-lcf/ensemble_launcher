@@ -19,12 +19,109 @@ import numpy as np
 
 from ensemble_launcher.config import PolicyConfig
 from ensemble_launcher.ensemble import TaskMeta, TaskStatus
+from ensemble_launcher.ensemble.ensemble import resource_requirements
 from ensemble_launcher.scheduler.resource import JobResource
 
 if TYPE_CHECKING:
     from ensemble_launcher.scheduler.state import Child, TaskSchedulerState
 
 logger = logging.getLogger(__name__)
+
+
+def prefers_columns(policy: Any, row_method: str, columns_method: str) -> bool:
+    """Whether to call ``policy.<columns_method>`` (whole-chunk columns) instead of
+    ``policy.<row_method>`` (uids + ``self.tasks[uid]``): whichever of the two is defined
+    furthest down the class's MRO wins. So a plugged-in policy that only implements the row
+    method keeps getting it, and a subclass that overrides the row method of a columnar
+    built-in is not bypassed by the inherited columns method."""
+    for cls in type(policy).__mro__:
+        if columns_method in cls.__dict__:
+            return True
+        if row_method in cls.__dict__:
+            return False
+    return False
+
+
+def _shape_index(meta: np.ndarray) -> Tuple[List[tuple], np.ndarray]:
+    """Distinct ``(nnodes, ppn, ngpus_per_process)`` shapes as Python values, and each row's
+    index into them."""
+    nn, ppn, g = meta["nnodes"], meta["ppn"], meta["ngpus_per_process"]
+    n = len(meta)
+    if n == 0:
+        return [], np.empty(0, dtype=np.int64)
+    if (nn == nn[0]).all() and (ppn == ppn[0]).all() and (g == g[0]).all():
+        shapes = np.array([[nn[0], ppn[0], g[0]]], dtype=np.float64)
+        inv = np.zeros(n, dtype=np.int64)
+    else:
+        stacked = np.stack([nn.astype(np.float64), ppn.astype(np.float64), g], axis=1)
+        shapes, inv = np.unique(stacked, axis=0, return_inverse=True)
+        inv = inv.reshape(-1)
+    out = []
+    for a, b, c in shapes.tolist():
+        out.append((int(a), int(b), int(c) if float(c).is_integer() else c))
+    return out, inv
+
+
+def _round_robin(n: int, order: List[int], counts: Dict[int, int], ntask: Optional[int]) -> np.ndarray:
+    """Children for ``n`` tasks dealt round robin over ``order`` (wids, in rotation order).
+    With ``ntask``, a child takes at most ``ntask - counts[wid]`` more; tasks past the total
+    capacity get -1. Updates ``counts``. Vectorized: no Python work per task."""
+    k = len(order)
+    wids = np.asarray(order, dtype=np.int64)
+    if k == 0 or n == 0:
+        return np.full(n, -1, dtype=np.int64)
+    if ntask is None:
+        out = wids[np.arange(n) % k]
+        per = np.bincount(np.arange(n) % k, minlength=k)
+    else:
+        caps = np.maximum(0, ntask - np.array([counts[w] for w in order], dtype=np.int64))
+        total = int(caps.sum())
+        m = min(n, total)
+        # Smallest number of full rounds R with sum(min(caps, R)) >= m.
+        lo, hi = 0, int(caps.max()) if m else 0
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if int(np.minimum(caps, mid).sum()) >= m:
+                hi = mid
+            else:
+                lo = mid + 1
+        R = lo
+        per = np.minimum(caps, max(R - 1, 0))
+        extra = m - int(per.sum())
+        if extra:
+            last_round = np.flatnonzero(caps >= R)[:extra]  # in rotation order
+            per[last_round] += 1
+        # Slot (round r, position j) is dealt in order r * k + j.
+        j = np.repeat(np.arange(k), per)
+        starts = np.repeat(np.cumsum(per) - per, per)
+        r = np.arange(len(j)) - starts
+        out = np.full(n, -1, dtype=np.int64)
+        out[:m] = wids[j[np.argsort(r * k + j, kind="stable")]]
+    for w, c in zip(order, per.tolist()):
+        counts[w] += c
+    return out
+
+
+def _group_by_child(
+    uids: List[bytes], assign: np.ndarray, worker_ids: List[int]
+) -> Tuple[Dict[int, List[bytes]], List[bytes]]:
+    """``assign[i]`` is uids[i]'s child (-1: unplaced) -> per-child uid lists (in uid order)
+    and the unplaced list."""
+    by_wid: Dict[int, List[bytes]] = {wid: [] for wid in worker_ids}
+    order = np.argsort(assign, kind="stable")
+    sorted_assign = assign[order]
+    bounds = np.flatnonzero(np.diff(sorted_assign)) + 1
+    unplaced: List[bytes] = []
+    for rows in np.split(order, bounds):
+        if len(rows) == 0:
+            continue
+        wid = int(assign[rows[0]])
+        got = [uids[i] for i in rows.tolist()]
+        if wid < 0:
+            unplaced = got
+        else:
+            by_wid[wid] = got
+    return by_wid, unplaced
 
 
 class PolicyStateMixin:
@@ -141,6 +238,21 @@ class Policy(PolicyStateMixin, ABC):
         """
         pass
 
+    def get_scores_columns(
+        self,
+        uids: List[bytes],
+        meta: np.ndarray,
+        scheduler_state: Optional["TaskSchedulerState"] = None,
+    ):
+        """Scores for many tasks at once (higher = higher priority), aligned with ``uids``.
+
+        Override this instead of `get_score` to score a whole update with numpy: ``meta`` is
+        a ``META_DTYPE`` array aligned with ``uids`` (``meta["nnodes"]``, ...). The scheduler
+        calls whichever of the two is defined furthest down the class hierarchy. All tasks of
+        one call see the same ``scheduler_state`` (taken before any of them is queued).
+        """
+        return [self.get_score(uid, scheduler_state=scheduler_state) for uid in uids]
+
     def on_task_complete(
         self,
         uid: bytes,
@@ -241,6 +353,29 @@ class ChildrenPolicy(PolicyStateMixin, ABC):
             - List of uids that could not be assigned to any worker.
         """
         pass
+
+    # ---- Column entry points ------------------------------------------------------------
+    # Override these to get a whole chunk at once: ``meta`` is a ``META_DTYPE`` structured
+    # array aligned with ``uids`` (``meta["nnodes"]``, ``meta["ppn"]``, ...), so a policy can
+    # work with numpy instead of reading ``self.tasks[uid]`` field by field (which is slow at
+    # scale). The scheduler calls whichever of the pair is defined furthest down the class
+    # hierarchy (`prefers_columns`). Same arguments and return values as the row methods.
+
+    def get_children_resources_columns(
+        self, uids: List[bytes], meta: np.ndarray, nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
+        return self.get_children_resources(uids, nodes, level)
+
+    def get_children_tasks_columns(
+        self,
+        uids: List[bytes],
+        meta: np.ndarray,
+        children: Dict[int, "Child"],
+        ntask: Optional[int] = None,
+        level: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+        return self.get_children_tasks(uids, children, ntask=ntask, level=level, **kwargs)
 
 
 class PolicyRegistry:
@@ -344,6 +479,19 @@ class LargeResourcePolicy(Policy):
             * (task.ngpus_per_process * self.gpu_weight + self.cpu_weight)
         )
 
+    def get_scores_columns(
+        self,
+        uids: List[bytes],
+        meta: np.ndarray,
+        scheduler_state: Optional["TaskSchedulerState"] = None,
+    ):
+        scores = (
+            meta["nnodes"].astype(np.float64)
+            * meta["ppn"]
+            * (meta["ngpus_per_process"] * self.gpu_weight + self.cpu_weight)
+        )
+        return scores.tolist()
+
 
 @policy_registry.register("fifo_policy")
 class FIFOPolicy(Policy):
@@ -420,21 +568,27 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
         simply skipped for sizing purposes — they will be caught as unassignable
         in ``get_children_tasks``.
         """
-        if len(uids) == 0:
+        return self._layout([self.tasks[uid].nnodes for uid in uids], nodes, level)
+
+    def get_children_resources_columns(
+        self, uids: List[bytes], meta: np.ndarray, nodes: JobResource, level: int
+    ) -> Dict[int, JobResource]:
+        return self._layout(meta["nnodes"], nodes, level)
+
+    def _layout(self, task_nnodes, nodes: JobResource, level: int) -> Dict[int, JobResource]:
+        if len(task_nnodes) == 0:
             self.logger.error("Bin packing policy needs tasks")
             raise ValueError("Needs Tasks for creating workers")
 
         node_names = nodes.nodes
         node_resources = {name: res for name, res in zip(nodes.nodes, nodes.resources)}
 
-        # Sort tasks by decreasing node requirement; drop tasks that cannot fit.
-        nnodes_of = {uid: self.tasks[uid].nnodes for uid in uids}
-        sorted_tasks = sorted(nnodes_of.items(), key=lambda x: x[1], reverse=True)
-        fitting_tasks = [(uid, n) for uid, n in sorted_tasks if n <= len(node_names)]
+        # Task node requirements, decreasing; drop tasks that cannot fit.
+        sizes = np.sort(np.asarray(task_nnodes, dtype=np.int64))[::-1]
+        fitting = sizes[sizes <= len(node_names)]
 
         # Determine the maximum number of workers that fit given cumulative node use.
-        cum_sum = list(accumulate(n for _, n in fitting_tasks))
-        nworkers_max = sum(1 for c in cum_sum if c <= len(node_names))
+        nworkers_max = int((np.cumsum(fitting) <= len(node_names)).sum())
 
         # Interpolate in log2 space to pick a number of workers for this level.
         if self.nlevels > 1:
@@ -462,7 +616,7 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
             raise RuntimeError
 
         # Distribute nodes based on the first nworkers tasks' node requirements.
-        nnodes_per_worker = [n for _, n in fitting_tasks[:nworkers]]
+        nnodes_per_worker = fitting[:nworkers].tolist()
         # Spread any leftover nodes round-robin.
         remaining = len(node_names) - sum(nnodes_per_worker)
         for i in range(remaining):
@@ -525,6 +679,32 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
                 worker_task_counts[preferred] += 1
 
         return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
+
+    def get_children_tasks_columns(
+        self,
+        uids: List[bytes],
+        meta: np.ndarray,
+        children: Dict[int, "Child"],
+        ntask: Optional[int] = None,
+        level: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+        """`get_children_tasks` on columns: same assignment. Largest first; the i-th task
+        goes to child ``i % k``; with ``ntask`` (every child starts the call at 0) the first
+        ``ntask * k`` are dealt that way and the rest are not placed."""
+        worker_ids = list(children.keys())
+        k = len(worker_ids)
+        n = len(uids)
+        by_wid: Dict[int, List[bytes]] = {wid: [] for wid in worker_ids}
+        if n == 0:
+            return by_wid, {}, []
+        if k == 0:
+            return by_wid, {}, list(uids)
+        order = np.argsort(-meta["nnodes"].astype(np.int64), kind="stable").tolist()
+        m = n if ntask is None else min(n, ntask * k)
+        for j, wid in enumerate(worker_ids):
+            by_wid[wid] = [uids[i] for i in order[j:m:k]]
+        return by_wid, {}, [uids[i] for i in order[m:]]
 
 
 @policy_registry.register("simple_split_children_policy", type="children_policy")
@@ -667,6 +847,44 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
                 # self.logger.warning(f"Task {task_id} does not fit in any worker")
 
         return wid_to_task_id_map, task_id_to_wid_map, removed_tasks
+
+    def get_children_tasks_columns(
+        self,
+        uids: List[bytes],
+        meta: np.ndarray,
+        children: Dict[int, "Child"],
+        ntask: Optional[int] = None,
+        level: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+        """`get_children_tasks` on columns. Round robin per task shape, starting at the
+        least-loaded child, over the children that shape fits; the pointer carries over
+        from one shape to the next. A single-shape chunk is placed exactly as the row
+        version places it; a mixed one is spread as evenly, but not interleaved the same way.
+        """
+        worker_ids = list(children.keys())
+        nchildren = len(worker_ids)
+        n = len(uids)
+        if n == 0 or nchildren == 0:
+            return {wid: [] for wid in worker_ids}, {}, list(uids)
+        pointer = worker_ids.index(min(worker_ids, key=lambda wid: len(children[wid])))
+        counts = {wid: 0 for wid in worker_ids}
+        assign = np.full(n, -1, dtype=np.int64)
+        shapes, inv = _shape_index(meta)
+        for s, (nnodes, ppn, ngpus) in enumerate(shapes):
+            rows = np.flatnonzero(inv == s) if len(shapes) > 1 else np.arange(n)
+            req = resource_requirements(nnodes, ppn, ngpus)
+            rotation = worker_ids[pointer:] + worker_ids[:pointer]
+            fit = [wid for wid in rotation if req in children[wid].job_resource]
+            if not fit:
+                continue
+            got = _round_robin(len(rows), fit, counts, ntask)
+            assign[rows] = got
+            placed = got[got >= 0]
+            if len(placed):
+                pointer = (worker_ids.index(int(placed[-1])) + 1) % nchildren
+        by_wid, unplaced = _group_by_child(uids, assign, worker_ids)
+        return by_wid, {}, unplaced
 
 
 @policy_registry.register("fixed_leafs_children_policy", type="children_policy")

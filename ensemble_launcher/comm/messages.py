@@ -15,8 +15,11 @@ from ensemble_launcher.ensemble.ensemble import (
     META_FIELDS,
     build_task,
     decode_deep,
+    META_DTYPE,
+    decode_meta_array,
     encode_deep,
-    encode_meta,
+    encode_meta_array,
+    meta_row_values,
 )
 from ensemble_launcher.scheduler.resource import JobResource
 
@@ -246,7 +249,7 @@ class _BlobMessage:
         out = []
         for name in self._COLUMNS:
             col = getattr(self, name)
-            out.append(col.tobytes() if isinstance(col, np.ndarray) else bytes(col))
+            out.append(memoryview(col).cast("B") if isinstance(col, np.ndarray) else bytes(col))
         return out
 
     def to_byte_array(self) -> list:
@@ -291,8 +294,11 @@ class _BlobMessage:
 
     @property
     def nbytes(self) -> int:
-        return sum(len(getattr(self, name)) * (8 if name.endswith("_off") else 1)
-                   for name in self._COLUMNS)  # fmt: skip
+        total = 0
+        for name in self._COLUMNS:
+            col = getattr(self, name)
+            total += col.nbytes if isinstance(col, np.ndarray) else len(col)
+        return total
 
 
 @dataclass
@@ -391,8 +397,9 @@ class IResultBatch(_ResultColumns, Message):
 
 @dataclass
 class TaskUpdate(_BlobMessage, Message):
-    """Tasks as columns: ``uids`` (16 B each), a metadata record per task (every non-deep
-    field, `ensemble.META_FIELDS`) and a deep record per task (executable, args, kwargs, env,
+    """Tasks as columns: ``uids`` (16 B each), a fixed-width metadata record per task (every
+    non-deep field, one `ensemble.META_DTYPE` row; read whole columns with `meta_columns`) and
+    a deep record per task (executable, args, kwargs, env,
     result). Built with `from_tasks`; masters split and join it with `select` / `concat`
     without decoding; only a worker turns rows back into `Task`s (`task`, `to_tasks`).
     """
@@ -401,12 +408,16 @@ class TaskUpdate(_BlobMessage, Message):
 
     deleted_uids: List[bytes] = field(default_factory=list)
 
-    _COLUMNS = ("_uids", "_meta", "_meta_off", "_deep", "_deep_off")
+    _COLUMNS = ("_uids", "_meta", "_deep", "_deep_off")
 
     def __post_init__(self):
         self._uids = b""
-        self._meta, self._meta_off = b"", blob.EMPTY_OFFSETS
+        self._meta = np.empty(0, dtype=META_DTYPE)
         self._deep, self._deep_off = b"", blob.EMPTY_OFFSETS
+
+    def meta_columns(self, rows=None) -> np.ndarray:
+        """The metadata records (``META_DTYPE``), all or ``rows``; ``meta["nnodes"]`` etc."""
+        return self._meta if rows is None else self._meta[rows]
 
     @classmethod
     def from_tasks(cls, tasks, **msg_fields) -> "TaskUpdate":
@@ -414,9 +425,12 @@ class TaskUpdate(_BlobMessage, Message):
         tasks = list(tasks)
         msg = cls(**msg_fields)
         msg._uids = b"".join(t.uid for t in tasks)
-        msg._meta, msg._meta_off = blob.encode_column(encode_meta(t) for t in tasks)
+        msg._meta = encode_meta_array(tasks)
         msg._deep, msg._deep_off = blob.encode_column(encode_deep(t) for t in tasks)
         return msg
+
+    def _post_decode(self):
+        self._meta = decode_meta_array(self._meta)
 
     @property
     def ntasks(self) -> int:
@@ -429,7 +443,7 @@ class TaskUpdate(_BlobMessage, Message):
         return bytes(memoryview(self._uids)[row * blob.UID_BYTES : (row + 1) * blob.UID_BYTES])
 
     def meta_values(self, row: int) -> tuple:
-        return pickle.loads(blob.record(self._meta, self._meta_off, row))
+        return meta_row_values(self._meta, row)
 
     def meta(self, row: int) -> TaskMeta:
         return TaskMeta(self.uid_at(row), self.meta_values(row))
@@ -447,7 +461,7 @@ class TaskUpdate(_BlobMessage, Message):
         rows = np.asarray(rows, dtype=np.int64)
         msg = TaskUpdate(**msg_fields)
         msg._uids = blob.gather_fixed(self._uids, blob.UID_BYTES, rows)
-        msg._meta, msg._meta_off = blob.gather(self._meta, self._meta_off, rows)
+        msg._meta = self._meta[rows]
         msg._deep, msg._deep_off = blob.gather(self._deep, self._deep_off, rows)
         return msg
 
@@ -455,7 +469,8 @@ class TaskUpdate(_BlobMessage, Message):
     def concat(cls, updates: list, **msg_fields) -> "TaskUpdate":
         msg = cls(**msg_fields)
         msg._uids = b"".join(bytes(u._uids) for u in updates)
-        msg._meta, msg._meta_off = blob.concat([(u._meta, u._meta_off) for u in updates])
+        if updates:
+            msg._meta = np.concatenate([u._meta for u in updates])
         msg._deep, msg._deep_off = blob.concat([(u._deep, u._deep_off) for u in updates])
         return msg
 

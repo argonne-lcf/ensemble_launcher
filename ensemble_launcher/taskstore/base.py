@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Type
 from ensemble_launcher.ensemble import Task, TaskMeta, TaskStatus
 
 if TYPE_CHECKING:  # messages imports the scheduler package, which imports this one
+    import numpy as np
+
     from ensemble_launcher.comm.messages import TaskUpdate
 
 
@@ -36,6 +38,11 @@ class TaskStore(Mapping):
     @abstractmethod
     def build_update(self, uids: Iterable[bytes], **msg_fields) -> "TaskUpdate":
         """A TaskUpdate carrying these tasks, in this order."""
+
+    @abstractmethod
+    def meta_columns(self, uids: Iterable[bytes]) -> "np.ndarray":
+        """The tasks' metadata records as one ``META_DTYPE`` array; row i is ``uids[i]``.
+        Policies with ``columnar = True`` read these columns instead of ``store[uid]``."""
 
     @abstractmethod
     def get_status(self, uid: bytes, default: Optional[TaskStatus] = None) -> Optional[TaskStatus]:

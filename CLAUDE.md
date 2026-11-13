@@ -114,6 +114,21 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    `taskstore` must not import `comm.messages` at module level (circular import via
    `scheduler.resource`).
 
+   **Task meta is a fixed-width record** (`ensemble.META_DTYPE`, 153 B: numeric fields plus
+   `task_id` / `executor_name` / `tag` as 32-byte ASCII, truncated with a warning; empty
+   means `None`). `TaskUpdate._meta` is a structured array (`np.frombuffer` on receipt).
+   Reading it per row is *slower* than the old pickled tuple (a numpy field read is ~300 ns),
+   so hot paths read **columns**: `store.meta_columns(uids)` returns one array aligned with
+   `uids` (any order; gathered once per segment, then reordered). Policies get it through
+   the optional column entry points `get_children_tasks_columns` /
+   `get_children_resources_columns` (children) and `get_scores_columns` (task); the
+   scheduler calls whichever of a row/column pair is defined furthest down the policy's MRO
+   (`policy.prefers_columns`), so row-only plugged-in policies keep working and a subclass
+   overriding a row method is not bypassed. The built-ins (`SimpleSplit` -- round robin per
+   shape, `BinPacking`, `LargeResourcePolicy`) are vectorized. `TaskMeta` / `build_task`
+   decode one row to Python values with `meta_row_values` -- never hand numpy scalars or
+   bytes to `Task`.
+
    **Master scheduler state.** Everything `AsyncChildrenScheduler` knows is in
    `scheduler.state`, a `SchedulerState` (`scheduler/state.py`): `children` (one `Child`
    record each -- `wid`, `job_resource`, `state`, `status`, `allocated`, `ready`/`done` events,
