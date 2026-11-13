@@ -118,9 +118,10 @@ def test_policy_state_defaults():
 def test_policy_state_affects_score():
     p = TunableScorePolicy(PolicyConfig(initial_state={"node_weight": 1.0}))
     task = Task(task_id="t", nnodes=4, ppn=1, executable=echo, args=("t",))
-    assert p.get_score(task) == 4.0
+    p.bind_tasks({task.uid: task})  # what a scheduler does with its task store
+    assert p.get_score(task.uid) == 4.0
     p.set_policy_state({"node_weight": 10.0})
-    assert p.get_score(task) == 40.0
+    assert p.get_score(task.uid) == 40.0
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,9 @@ def test_policy_endpoint_apply():
 
     def rescore_cb():
         # Mimic reprioritize_pending's compute phase so poison state surfaces here.
-        p.get_score(Task(task_id="t", nnodes=1, ppn=1, executable=echo, args=()))
+        t = Task(task_id="t", nnodes=1, ppn=1, executable=echo, args=())
+        p.bind_tasks({t.uid: t})
+        p.get_score(t.uid)
         rescored_calls.append(1)
         return 7
 
@@ -367,47 +370,61 @@ def test_rescore_reorders_pending():
         _reap(process)
 
 
+def _make_scheduler(logger, tasks, nodes, policy="fifo_policy", policy_config=None, node_id="node"):
+    """An AsyncTaskScheduler built the way the worker builds it (policy by name, from the
+    config), seeded with ``tasks`` (a dict of Tasks)."""
+    config = LauncherConfig(
+        task_scheduler_policy=policy, policy_config=policy_config or PolicyConfig()
+    )
+    sched = AsyncTaskScheduler(logger, nodes, config, node_id=node_id)
+    for task in tasks.values():
+        sched.add_task(task)
+    return sched
+
+
 def test_rescore_default_is_off():
     """A plain set_state must not touch already-queued priorities."""
-    p = TunableIndexPolicy(PolicyConfig(initial_state={"scores": {"a": 1.0}}))
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {
             "a": Task(task_id="a", nnodes=1, ppn=1, executable=echo, args=("a",)),
             "b": Task(task_id="b", nnodes=1, ppn=1, executable=echo, args=("b",)),
         },
         _job_resource(),
-        policy=p,
+        policy="tunable_index_policy",
+        policy_config=PolicyConfig(initial_state={"scores": {"a": 1.0}}),
     )
-    before = sched._pending_tasks.sorted_items()
+    p = sched.scheduler_policy
+    before = sched.state.pending_tasks.sorted_items()
 
     ep = PolicyEndpoint("main.w0", None, logging.getLogger("t"))
     ep.register(KIND_TASK, p, rescore_cb=sched.reprioritize_pending)
 
     # No rescore key at all, and an explicit False: both must leave the heap alone.
     ep.apply("set", {"state": {"scores": {"b": 99.0}}})
-    assert sched._pending_tasks.sorted_items() == before
+    assert sched.state.pending_tasks.sorted_items() == before
     ep.apply("set", {"state": {"scores": {"b": 98.0}}, "rescore": False})
-    assert sched._pending_tasks.sorted_items() == before
+    assert sched.state.pending_tasks.sorted_items() == before
 
     # ...while asking for it does change them.
     assert ep.apply("set", {"state": {}, "rescore": True})["rescored"] == 2
-    assert sched._pending_tasks.sorted_items() != before
+    assert sched.state.pending_tasks.sorted_items() != before
 
 
 def test_poison_state_rolls_back_scheduler():
     """A tune that makes get_score raise must leave both state and heap untouched."""
-    p = TunableScorePolicy(PolicyConfig(initial_state={"node_weight": 1.0}))
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {
             t: Task(task_id=t, nnodes=1, ppn=1, executable=echo, args=(t,))
             for t in ("a", "b", "c")
         },
         _job_resource(),
-        policy=p,
+        policy="tunable_policy",
+        policy_config=PolicyConfig(initial_state={"node_weight": 1.0}),
     )
-    before = sched._pending_tasks.sorted_items()
+    p = sched.scheduler_policy
+    before = sched.state.pending_tasks.sorted_items()
 
     ep = PolicyEndpoint("main.w0", None, logging.getLogger("t"))
     ep.register(KIND_TASK, p, rescore_cb=sched.reprioritize_pending)
@@ -416,8 +433,9 @@ def test_poison_state_rolls_back_scheduler():
         ep.apply("set", {"state": {"boom": True}, "rescore": True})
 
     assert p.state == {"node_weight": 1.0}
-    assert sched._pending_tasks.sorted_items() == before
-    assert sched._pending_tasks.task_ids() == {"a", "b", "c"}
+    assert sched.state.pending_tasks.sorted_items() == before
+    assert sched.state.pending_tasks.task_ids() == set(sched.tasks)  # all three still queued
+    assert len(sched.tasks) == 3
     # and the policy still works
     assert ep.apply("set", {"state": {"node_weight": 3.0}, "rescore": True})[
         "rescored"

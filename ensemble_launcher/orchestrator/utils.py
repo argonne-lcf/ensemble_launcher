@@ -1,3 +1,5 @@
+from typing import Optional
+
 load_str = "import base64, json, socket; "\
            "from datetime import datetime; "\
            "from ensemble_launcher.orchestrator.worker import Worker; "\
@@ -95,3 +97,20 @@ async_simple_load_str_file = "import json; from ensemble_launcher.loop import ru
            "child_obj = class_map[child_dict['type']].fromdict(child_dict); "\
            "run(child_obj.run()); "\
            "print(child_obj.node_id, start, after_deserialization);"
+
+def as_task_update(tasks, sender: Optional[str] = None):
+    """Initial tasks for a node as one TaskUpdate.
+
+    Accepts a TaskUpdate (returned as is), a dict or iterable of Tasks (encoded once), or
+    None / empty (None).
+    """
+    from ensemble_launcher.comm.messages import TaskUpdate
+
+    if tasks is None or isinstance(tasks, TaskUpdate):
+        return tasks
+    if isinstance(tasks, dict):
+        tasks = list(tasks.values())
+    tasks = list(tasks)
+    if not tasks:
+        return None
+    return TaskUpdate.from_tasks(tasks, sender=sender)

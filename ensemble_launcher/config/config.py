@@ -104,9 +104,6 @@ class LauncherConfig(BaseModel):
     sequential_child_launch: Optional[bool] = (
         None  ##If True, launch children one by one even for MPI executor
     )
-    profile: Optional[Literal["perfetto"]] = (
-        None  ##Enable profiling with event registry and Perfetto export for timeline visualization
-    )
     gpu_selector: str = "ZE_AFFINITY_MASK"
     log_dir: str = "logs"  # Directory for log files
     log_level: int = logging.INFO
@@ -141,8 +138,11 @@ class LauncherConfig(BaseModel):
     )
 
     req_res: bool = True  # Enable ACK-based guaranteed delivery
-    send_retries: int = 10  # Retries on ACK timeout for one-shot control messages (Ready, Stop, NodeUpdate, initial TaskUpdate, final ResultBatch); req_res=True only
-    max_inflight_flushes: int = 4  # Max concurrent result/task flush sends per destination; a failed send is resent on the next flush
+    send_retries: int = 10  # Retries on ACK timeout for one-shot control messages (Ready, Stop, NodeUpdate, Done); req_res=True only
+    max_inflight_flushes: int = 1  # Max result sends in flight per destination (masters and workers)
+    max_inflight_task_sends: int = 1  # Max TaskUpdates in flight per child; a failed send is resent in its slot
+    assign_chunk_size: int = 4096  # Masters place tasks this many at a time, yielding to the event loop between chunks
+    comm_io_process: bool = False  # Data connections (req_res) run their socket, ACKs and sends in a process of their own, so a busy event loop can't delay ACKs
     send_timeout: float = 1.0  # Per-attempt ACK timeout in seconds (req_res=True only)
 
     overload_orchestrator_core: bool = True  # Setting this to false reserves the first core of the head compute node for EL orchestrator
@@ -150,16 +150,16 @@ class LauncherConfig(BaseModel):
     restart_children_on_failure: bool = True
 
     result_buffer_size: int = (
-        1000000  # max buffer size of the result queue in cluster mode
+        1000000  # Workers only: flush a destination's results early once this many are buffered
     )
 
-    result_flush_interval: float = 5.0  # Flush result queues every fixed time
+    result_flush_interval: float = 5.0  # Workers only: flush buffered results this often. Masters forward results as they arrive
 
-    task_buffer_size: int = 1000000  # max buffer size of the task queue per child
+    task_buffer_size: int = 1000000  # no longer read by masters (one TaskUpdate per child per incoming update); kept so configs load
 
     cluster_secret: Optional[str] = None
 
-    task_flush_interval: float = 5.0  # Flush task queues every fixed time
+    task_flush_interval: float = 5.0  # no longer read by masters (tasks are sent as soon as they are placed); kept so configs load
 
     task_request_size: Optional[int] = (
         None  # size of the task request in work stealing mode
@@ -168,6 +168,11 @@ class LauncherConfig(BaseModel):
     task_request_interval: float = (
         0.5  # Seconds between periodic task requests in workstealing mode
     )
+
+    # Where each node (master or worker) keeps its tasks; see ensemble_launcher/taskstore.
+    task_store: str = "segment"  # registered TaskStore implementation
+    task_store_hot_bytes: int = 1 << 30  # task bytes kept in memory per node; the rest goes to disk
+    task_store_dir: Optional[str] = None  # where offloaded tasks go; None = node-local $TMPDIR
 
     mpi_config: MPIConfig = MPIConfig(
         flavor="mpich"

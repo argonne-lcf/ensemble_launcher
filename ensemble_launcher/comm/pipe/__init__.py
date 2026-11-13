@@ -1,10 +1,6 @@
 from .async_connection import (
     AsyncConnection,
     AsyncConnectionState,
-    AsyncZMQDealerConnection,
-    AsyncZMQDealerConnectionState,
-    AsyncZMQRouterConnection,
-    AsyncZMQRouterConnectionState,
     ClientConnection,
     ClientConnectionState,
     IdentityVerificationError,
@@ -12,15 +8,20 @@ from .async_connection import (
     ServerConnectionState,
     decode_identity,
 )
-from .async_transport import (
-    AsyncTransport,
-    AsyncTransportState,
+
+from .io_process import IOProcess, LocalIOQueue, SenderRule, ZMQIOQueue
+from .async_transport import AsyncTransport, AsyncTransportState, get_hsn_ip_cli
+from .mp import AsyncMPConnection, AsyncMPTransport, MPIOProcess
+from .zmq import (
+    AsyncZMQDealerConnection,
+    AsyncZMQDealerConnectionState,
+    AsyncZMQRouterConnection,
+    AsyncZMQRouterConnectionState,
     AsyncZMQTransport,
     AsyncZMQTransportState,
-    get_hsn_ip_cli,
+    ZMQDealerIOProcess,
+    ZMQRouterIOProcess,
 )
-from .mp_connection import AsyncMPConnection
-from .mp_transport import AsyncMPTransport
 from .registry import transport_registry
 from .utils import find_free_port
 
@@ -44,4 +45,11 @@ __all__ = [
     "IdentityVerificationError",
     "transport_registry",
     "decode_identity",
+    "IOProcess",
+    "LocalIOQueue",
+    "ZMQIOQueue",
+    "SenderRule",
+    "ZMQRouterIOProcess",
+    "ZMQDealerIOProcess",
+    "MPIOProcess",
 ]

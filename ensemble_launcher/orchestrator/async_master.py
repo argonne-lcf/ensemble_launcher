@@ -7,10 +7,8 @@ import signal
 import socket
 import time
 import uuid
-from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
-from contextlib import asynccontextmanager
-from typing import Callable, Dict, List, Optional, Set, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
@@ -20,8 +18,8 @@ from ensemble_launcher.comm import (
     transport_registry,
 )
 from ensemble_launcher.comm.messages import (
+    Done,
     IResultBatch,
-    NodeRequest,
     NodeUpdate,
     Ready,
     Result,
@@ -29,16 +27,14 @@ from ensemble_launcher.comm.messages import (
     Status,
     Stop,
     StopType,
-    TaskRequest,
     TaskUpdate,
 )
 from ensemble_launcher.config import LauncherConfig
-from ensemble_launcher.ensemble import Task, TaskStatus
+from ensemble_launcher.ensemble import Task
 from ensemble_launcher.executors import Executor, executor_registry
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator.policy_endpoint import KIND_CHILDREN, PolicyEndpoint
-from ensemble_launcher.profiling import EventRegistry, get_registry
-from ensemble_launcher.scheduler import AsyncChildrenScheduler, ChildrenAssignment
+from ensemble_launcher.scheduler import AsyncChildrenScheduler, Child, SchedulerState
 from ensemble_launcher.scheduler.child_state import ChildState
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -48,7 +44,10 @@ from ensemble_launcher.scheduler.resource import (
 
 from .async_worker import AsyncWorker
 from .node import Node
+from ensemble_launcher.taskstore import TaskStore
+
 from .utils import (
+    as_task_update,
     async_load_str_file,
     async_simple_load_str_file,
 )
@@ -65,6 +64,8 @@ class AsyncMaster(Node):
     """
 
     type = "AsyncMaster"
+    # Push: tasks are placed as they arrive. AsyncWorkStealingMaster pulls instead.
+    _placement = AsyncChildrenScheduler.PUSH
 
     def __init__(
         self,
@@ -78,7 +79,10 @@ class AsyncMaster(Node):
         parent_hb_conn: Optional[ClientConnection] = None,
     ):
         super().__init__(id, parent=parent, children=children)
-        self._init_tasks = tasks
+        # Initial tasks as one TaskUpdate (a dict/list of Tasks, e.g. from EnsembleLauncher,
+        # is encoded once here). Only the root is built with tasks: they become its first
+        # `scheduler.queue()`. Every other master gets its tasks pushed by its parent.
+        self._init_tasks: Optional[TaskUpdate] = as_task_update(tasks, sender=id)
         self._init_nodes = Nodes
         self._config = config
         self._parent_data_conn = parent_data_conn
@@ -93,13 +97,10 @@ class AsyncMaster(Node):
         ##maps
         self._children_futures: Dict[str, Union[AsyncFuture, ConcurrentFuture]] = {}
         self._children_results: Dict[str, Result] = {}
-        self._results: Dict[str, List[ResultBatch]] = {}
         self._child_objs: Dict[str, Node] = {}
 
         self.logger = None
 
-        # Initialize event registry for perfetto profiling
-        self._event_registry: Optional[EventRegistry] = None
 
         # asyncio event
         # _all_children_done_event is owned by the scheduler after _lazy_init;
@@ -108,11 +109,8 @@ class AsyncMaster(Node):
         self._stop_reporting_event = asyncio.Event()
         self._event_loop = None  # Will be set in run()
 
-        # result and aggregate tasks
-        self._aggregate_task = None
-        self._child_result_batch_task: Dict[
-            str, asyncio.Task
-        ] = {}  # child_id -> collect task
+        # Per-child tasks: waits for the child's Done, and receives its streamed results.
+        self._child_done_task: Dict[str, asyncio.Task] = {}  # child_id -> Done wait
         self._child_forwarder_task: Dict[
             str, asyncio.Task
         ] = {}  # child_id -> result monitor task
@@ -143,30 +141,31 @@ class AsyncMaster(Node):
         # Per-child task request monitor tasks
         self._child_task_request_task: Dict[str, asyncio.Task] = {}
 
-        # Tasks already sent to children via _route_tasks (before initial sync completes).
-        # Used by _build_init_task_update to avoid double-sending.
-        self._routed_task_ids: Dict[str, set] = {}  # child_id -> set of task_ids
+        # Per-child task sender (consumes the child's outbox) and its send window.
+        self._child_sender_task: Dict[str, asyncio.Task] = {}
+        self._task_window: Dict[str, asyncio.Semaphore] = {}
+        # Fails tasks no child could take (scheduler.unplaced).
+        self._unplaced_task: Optional[asyncio.Task] = None
+        # Set once the initial tasks (if any) are queued; wait_drained() waits for it.
+        self._initial_queued = asyncio.Event()
 
-        # Intermediate result buffer: used when forwarding to a parent master (fan-in aggregation)
-        self._iresult_q: Dict[str, deque] = {}
-        self._flush_task: Optional[asyncio.Task] = None
-        # Intermediate task buffer: batches tasks dispatched to children (fan-out)
-        self._itask_q: Dict[str, deque] = {}
-        self._task_flush_task: Optional[asyncio.Task] = None
-        # Flush sends in flight per destination (capped at max_inflight_flushes), and the
-        # messages whose send failed. A failed message is resent as the same object so it
-        # keeps its message_id and the receiver can drop the copy if only the ACK was lost.
+        # Result senders, one per destination ("parent" or a client id): each consumes a
+        # scheduler result outbox, with its own send window and in-flight sends.
+        self._result_sender_task: Dict[str, asyncio.Task] = {}
+        self._result_window: Dict[str, asyncio.Semaphore] = {}
+        self._result_outbox: Dict[str, asyncio.Queue] = {}  # dest -> the outbox it sends
         self._result_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
-        self._result_retry_q: Dict[str, deque] = {}
+        # Messages a sender took and that are not delivered yet, with the number of outbox
+        # items each holds (they are marked done on delivery, so outbox.join() means "sent").
+        self._result_unacked: Dict[str, List[Tuple[IResultBatch, int]]] = {}
+        # Starts a result sender for each client the scheduler announces.
+        self._new_client_task: Optional[asyncio.Task] = None
+        # TaskUpdate sends in flight per child (capped by its _task_window).
         self._task_flush_inflight: Dict[str, Set[asyncio.Task]] = {}
-        self._task_retry_q: Dict[str, deque] = {}
         # Periodic checkpointing, on its own cadence rather than the status loop's. The
         # in-flight handle keeps a slow write from overlapping the next one.
         self._checkpoint_task: Optional[asyncio.Task] = None
         self._checkpoint_write: Optional[asyncio.Task] = None
-        # Batch mode root: accumulates results streamed via IResultBatch during execution
-        self._batch_streaming_results: List[Result] = []
-
         # Parent-ready handshake: set when parent sends a Ready message
         self._parent_ready_event = asyncio.Event()
         self._parent_ready_monitor_task: Optional[asyncio.Task] = None
@@ -174,35 +173,21 @@ class AsyncMaster(Node):
         self._total_received: int = 0
         self._total_streamed = 0
 
-    def _create_forward_task(self, result: Result) -> asyncio.Task:
-        """Create an asyncio task for _forward_result with error logging."""
-        task = asyncio.create_task(self._forward_result(result))
-        task.add_done_callback(self._forward_result_done)
-        return task
+    def _child_state(self, child_id: str) -> Optional[ChildState]:
+        """The child's lifecycle state, or None once it has been removed."""
+        child = self._scheduler.state.children.get(child_id)
+        return child.state if child is not None else None
 
-    def _forward_result_done(self, task: asyncio.Task) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            self.logger.error(f"{self.node_id}: _forward_result failed: {exc}")
-
-    @asynccontextmanager
-    async def _timer(self, event_name: str):
-        """Timer that records to event registry for Perfetto export."""
-        if self._event_registry is not None:
-            with self._event_registry.measure(
-                event_name, "async_master", node_id=self.node_id, pid=os.getpid()
-            ):
-                yield
-        else:
-            yield
+    def _set_child_status(self, child_id: str, status: Status) -> None:
+        child = self._scheduler.state.children.get(child_id)
+        if child is not None:
+            child.status = status
 
     @property
     def _all_children_done_event(self) -> asyncio.Event:
         """Delegate to scheduler's event once available; use fallback before _lazy_init."""
         if self._scheduler is not None:
-            return self._scheduler._all_children_done_event
+            return self._scheduler.state.all_done
         return self.__fallback_done_event
 
     @property
@@ -238,8 +223,8 @@ class AsyncMaster(Node):
         return self._comm
 
     @property
-    def tasks(self) -> Dict[str, Task]:
-        """All tasks owned by this master's scheduler."""
+    def tasks(self) -> TaskStore:
+        """All tasks this master holds, keyed by uid."""
         return self._scheduler.tasks
 
     @property
@@ -247,7 +232,7 @@ class AsyncMaster(Node):
         return self._init_nodes
 
     @property
-    def init_tasks(self) -> JobResource:
+    def init_tasks(self) -> Optional[TaskUpdate]:
         return self._init_tasks
 
     # -----------------------------------------------------------------
@@ -275,6 +260,7 @@ class AsyncMaster(Node):
             req_res=self._config.req_res,
             send_retries=self._config.send_retries,
             send_timeout=self._config.send_timeout,
+            io_process=self._config.comm_io_process,
         )
         self.logger.info(f"{self.node_id}: Done with comm init")
 
@@ -284,20 +270,17 @@ class AsyncMaster(Node):
             self.logger.getChild("scheduler"),
             self._init_nodes,
             self._config,
-            tasks=self._init_tasks,
             node_id=self.node_id,
             level=self.level,
+            placement=self._placement,
         )
 
     def _get_child_class(
-        self, child_assignment: Optional[ChildrenAssignment] = None
+        self, child_assignment: Optional[Child] = None
     ) -> type:
         """Return the Node class to use for children at the next level."""
-        if (
-            child_assignment is not None
-            and child_assignment.get("child_class", None) is not None
-        ):
-            child_class = child_assignment["child_class"]
+        if child_assignment is not None and child_assignment.child_class is not None:
+            child_class = child_assignment.child_class
             if child_class.lower() == "asyncworker":
                 return AsyncWorker
             elif child_class.lower() == "asyncmaster":
@@ -320,44 +303,33 @@ class AsyncMaster(Node):
                 else AsyncMaster
             )
 
-    def _instantiate_children(
-        self,
-        include_tasks: bool,
-        target_ids: set,
-    ) -> Dict[str, Node]:
-        """Instantiate Node objects for target_ids using current scheduler assignments."""
+    def _instantiate_children(self, target_ids: set) -> Dict[str, Node]:
+        """Instantiate Node objects for target_ids. Children are built without tasks: their
+        senders push the tasks once each child is running."""
         NodeClass = self._get_child_class()
         children = {}
         for child_id in target_ids:
-            alloc = self._scheduler.child_assignments[child_id]
+            alloc = self._scheduler.state.children[child_id]
             child_config = self._config
-            if "task_executor_name" in alloc:
+            if alloc.task_executor_name is not None:
                 child_config = self._config.model_copy(
-                    update={"task_executor_name": alloc["task_executor_name"]}
+                    update={"task_executor_name": alloc.task_executor_name}
                 )
                 self.logger.info(
-                    f"{self.node_id}: Child {child_id} using task_executor_name: {alloc['task_executor_name']}"
+                    f"{self.node_id}: Child {child_id} using task_executor_name: {alloc.task_executor_name}"
                 )
             children[child_id] = NodeClass(
                 child_id,
                 config=child_config,
-                Nodes=alloc["job_resource"],
-                tasks={
-                    task_id: self._scheduler.tasks[task_id]
-                    for task_id in alloc["task_ids"]
-                }
-                if include_tasks
-                else {},
+                Nodes=alloc.job_resource,
+                tasks=None,
                 parent=None,
             )
         return children
 
     def _apply_resource_headroom(self) -> None:
         """Reserve one CPU on the first child's head node for this master process."""
-        first_child_id = next(iter(self._scheduler.child_assignments))
-        first_job_resource = self._scheduler.get_child_assignment(first_child_id)[
-            "job_resource"
-        ]
+        first_job_resource = next(iter(self._scheduler.state.children.values())).job_resource
         first_node = first_job_resource.resources[0]
         if isinstance(first_node, NodeResourceList):
             first_job_resource.resources[0] = first_node.with_cpus(first_node.cpus[1:])
@@ -368,33 +340,24 @@ class AsyncMaster(Node):
 
     def _create_children(
         self,
-        include_tasks: bool = False,
         partial: bool = False,
         nodes: Optional[JobResource] = None,
     ) -> Dict[str, Node]:
-        """Assign tasks via the scheduler and instantiate child Node objects.
+        """Lay out children via the scheduler and instantiate their Node objects.
 
-        Uses self._scheduler.tasks as the task source.
+        Placement is not done here: queued tasks are placed by the scheduler's assigner.
         partial=True: additive — preserves running children, offsets new wids, and
             returns only newly created children.
-        nodes: restrict assignment to these nodes (e.g. recovered nodes on retry).
+        nodes: restrict the layout to these nodes (e.g. recovered nodes on retry).
         """
-        existing_ids = set(self._scheduler.children_names) if partial else set()
-
-        # Phase 1: determine resource layout and register children (no tasks yet).
-        self._scheduler.assign_resources(
+        existing_ids = set(self._scheduler.state.children) if partial else set()
+        self._scheduler.create_children(
             self.level, self.node_id, reset=not partial, nodes=nodes
         )
-
         if not partial and not self._config.overload_orchestrator_core:
             self._apply_resource_headroom()
-
-        # Phase 2: distribute tasks from the unassigned pool to registered children.
-        self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
-
-        target_ids = set(self._scheduler.child_assignments.keys()) - existing_ids
-        self.logger.info(f"{self._scheduler.child_assignments}")
-        return self._instantiate_children(include_tasks, target_ids)
+        target_ids = set(self._scheduler.state.children) - existing_ids
+        return self._instantiate_children(target_ids)
 
     async def _init_child(self, child_id: str, child: Node) -> None:
         """Register a single child and start its per-child monitoring tasks.
@@ -414,11 +377,10 @@ class AsyncMaster(Node):
         child.parent_hb_conn = child_hb_conn
         # Extend the comm's node-info so its cache gains an entry for this child.
 
-        # Per-child collect task (waits for the child's final ResultBatch).
-        task = asyncio.create_task(
-            self._collect_final_result_batch_from_child(child_id)
+        # Per-child Done wait: the child is finished once every result it sent was delivered.
+        self._child_done_task[child_id] = asyncio.create_task(
+            self._wait_for_child_done(child_id)
         )
-        self._child_result_batch_task[child_id] = task
         # Per-child status monitor (continuously drains Status messages).
         self._child_status_task[child_id] = asyncio.create_task(
             self._child_status_monitor(child_id)
@@ -427,12 +389,15 @@ class AsyncMaster(Node):
         self._child_liveness_task[child_id] = asyncio.create_task(
             self._child_liveness_monitor(child_id)
         )
-        # Per-child task request monitor (handles initial or continuous TaskRequests).
-        self._child_task_request_task[child_id] = asyncio.create_task(
-            self._monitor_single_child_task_requests(child_id)
-        )
         self._child_forwarder_task[child_id] = asyncio.create_task(
             self._child_result_monitor(child_id)
+        )
+        # Per-child task sender: sends the child's outbox once it is running.
+        self._task_window[child_id] = asyncio.Semaphore(
+            max(1, self._config.max_inflight_task_sends)
+        )
+        self._child_sender_task[child_id] = asyncio.create_task(
+            self._child_sender(child_id)
         )
 
     def _create_monitor_tasks(self) -> None:
@@ -449,19 +414,21 @@ class AsyncMaster(Node):
                 self._periodic_checkpoint_loop()
             )
 
+        self._unplaced_task = asyncio.create_task(self._unplaced_monitor())
+        if self.parent:
+            # Every sub-master listens for tasks from its parent, in every mode.
+            self._task_update_task = asyncio.create_task(
+                self._parent_task_update_monitor()
+            )
         if self._config.cluster:
             self._client_monitor_task = asyncio.create_task(
                 self._client_request_monitor()
             )
-            if self.parent:
-                self._task_update_task = asyncio.create_task(
-                    self._parent_task_update_monitor()
-                )
-            self._task_flush_task = asyncio.create_task(
-                self._periodic_task_flush_loop()
-            )
-        if self.parent or self._config.cluster:
-            self._flush_task = asyncio.create_task(self._periodic_flush_loop())
+        # Results go out as they arrive: one sender for the parent (the root keeps its
+        # parent outbox as the run's results), and one per client as clients appear.
+        if self.parent:
+            self._start_result_sender("parent", self._scheduler.parent_outbox)
+        self._new_client_task = asyncio.create_task(self._new_client_monitor())
 
     def _cpu_bind_mpi_kwargs(self, child_resource) -> dict:
         """Return mpi_kwargs that pin a child process to its allocated CPUs.
@@ -618,8 +585,8 @@ class AsyncMaster(Node):
                 ]  # , "parent_data_conn", "parent_hb_conn"]
                 if all(
                     [
-                        "task_executor_name" not in cdict
-                        for cdict in self._scheduler.child_assignments.values()
+                        cdict.task_executor_name is None
+                        for cdict in self._scheduler.state.children.values()
                     ]
                 ):
                     common_keys.append("config")
@@ -724,10 +691,6 @@ class AsyncMaster(Node):
         In order: logging, event loop capture, comm, parent sync, scheduler,
         executor, children creation/launch, and monitor task creation.
         """
-        if self._config.profile == "perfetto":
-            self._event_registry = get_registry()
-            self._event_registry.enable()
-            os.environ["EL_ENABLE_PROFILING"] = "1"
 
         # Store event loop for thread-safe event signaling from callbacks
         self._event_loop = asyncio.get_event_loop()
@@ -747,8 +710,8 @@ class AsyncMaster(Node):
             self.logger.info(
                 f"My cpu affinity: {os.sched_getaffinity(0)}, my hostname: {socket.gethostname()}"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"get affinity failed with exception: {e}")
 
         # Read checkpoint data early so both comm address and scheduler state
         # can be restored from the cached data at the appropriate points below.
@@ -780,17 +743,21 @@ class AsyncMaster(Node):
                 f"{self.node_id}: Nodes must be initialized before execution"
             )
 
-        self.logger.info(
-            f"{self.node_id}: Have {len(self.tasks)} tasks after update from parent"
-        )
+        # The root's initial tasks are just its first update. A sub-master is built without
+        # tasks; its parent pushes them -- unless its children policy needs tasks to lay out
+        # children (bin packing), in which case it takes its first update now.
+        if self._init_tasks is not None:
+            await self._scheduler.queue(self._init_tasks)
+            self._init_tasks = None  # the store owns the bytes now
+        elif self.parent and self._scheduler.policy.layout_needs_tasks:
+            await self._receive_first_task_update()
+        self._initial_queued.set()
+        self.logger.info(f"{self.node_id}: Have {len(self.tasks)} tasks queued")
 
-        # Restore scheduler state from cached checkpoint data (comm already restored).
-        # Restores the node and task assignments of the children
+        # Restore the children (and the tasks each held) from cached checkpoint data. Must
+        # come after the initial tasks are queued: each restored child claims its tasks from
+        # the pool, so the assigner only places what no child held.
         ckpt_restored = self._restore_scheduler_checkpoint()
-
-        # If there are still tasks un-assigned try to assign them
-        if ckpt_restored and len(self._scheduler.unassigned_task_ids):
-            self._scheduler.assign_task_ids(self._scheduler.unassigned_task_ids)
 
         await self._create_policy_endpoint()
 
@@ -818,9 +785,7 @@ class AsyncMaster(Node):
 
         # Create children: use restored assignment topology if available, else run policy.
         if ckpt_restored:
-            children = self._instantiate_children(
-                False, set(self._scheduler.children_names)
-            )
+            children = self._instantiate_children(set(self._scheduler.state.children))
             self.logger.info(
                 f"{self.node_id}: Recreated {len(children)} children from checkpoint: {list(children.keys())}"
             )
@@ -832,8 +797,12 @@ class AsyncMaster(Node):
         for child_id, child in children.items():
             await self._init_child(child_id, child)
 
+        # Children exist: start placing queued tasks. Each child's sender sends its share
+        # once the child is running.
+        self._scheduler.start()
+
         # Launch and sync children, retrying failures up to 2 times
-        children_names = self._scheduler.children_names
+        children_names = list(self._scheduler.state.children)
         results = await self._launch_and_sync_children(children_names)
         failed_names = [
             name for name, r in zip(children_names, results) if r is not None
@@ -859,29 +828,22 @@ class AsyncMaster(Node):
         if failed_names:
             self.logger.warning(
                 f"{self.node_id}: {len(failed_names)} children still failed after "
-                f"{max_retries} retries"
+                f"{max_retries} retries; giving up on them"
             )
+            for name in failed_names:
+                self._give_up_on_child(name)
 
-        # Start global monitors: Result flushing to parent, Task flushing to children, client/parent task updates, and status reporting
-        # Note on task flushing to children:
-        #  Any tasks received before build_init_task_update will be sent directly using req-res pattern during child_sync.
-        #  The task updates between _build_init_task_update and this point should be cached by the communicator.
+        # Start global monitors: result senders, unplaced tasks, client/parent task updates,
+        # status reporting and checkpointing.
         self._create_monitor_tasks()
 
         # All children are launched and synced — signal each one that the master
-        # is ready so they can send their final ResultBatch when done.
-        for child_id in list(self._child_result_batch_task.keys()):
+        # is ready so they can send Done when they finish.
+        for child_id in list(self._child_done_task.keys()):
             await self._comm.send_message_to_child(
                 child_id, Ready(sender=self.node_id), retries=self._config.send_retries
             )
             self.logger.info(f"{self.node_id}: Sent Ready to {child_id}")
-
-        # Create aggregate task once, after all children (including recreated ones) are registered.
-        self._aggregate_task = asyncio.create_task(
-            self._aggregate_and_send_result_batch()
-        )
-
-        return None
 
     # --------------------------------------------------------------------------
     #                               Checkpointing
@@ -904,7 +866,7 @@ class AsyncMaster(Node):
         )
         if not self._checkpointer.checkpoint_exists():
             return
-        self._ckpt_data = await self._checkpointer.read_checkpoint()
+        self._ckpt_data = await self._checkpointer.read_checkpoint(SchedulerState)
 
     async def _restore_comm_state(self) -> None:
         """Restore comm from cached checkpoint data using the comm's set_state.
@@ -941,12 +903,12 @@ class AsyncMaster(Node):
         if self._ckpt_data is None:
             return False
         ckpt_sched_state, _, _ = self._ckpt_data
-        if ckpt_sched_state is None or not ckpt_sched_state.children_task_ids:
+        if ckpt_sched_state is None or not ckpt_sched_state.children:
             return False
         self._scheduler.set_state(ckpt_sched_state)
         self.logger.info(
             f"{self.node_id}: Scheduler state restored from checkpoint "
-            f"({len(ckpt_sched_state.children_task_ids)} children)"
+            f"({len(ckpt_sched_state.children)} children)"
         )
         return True
 
@@ -985,7 +947,7 @@ class AsyncMaster(Node):
         if self._checkpointer is None:
             return
         await self._checkpointer.write_checkpoint(
-            scheduler_state=self._scheduler.get_state(self.node_id),
+            scheduler_state=self._scheduler.get_state(),
             comm_state=self._comm.get_state(),
         )
         await self._write_policy_checkpoint()
@@ -1019,60 +981,32 @@ class AsyncMaster(Node):
             self._parent_ready_monitor()
         )
 
-        async with self._timer("heartbeat_sync"):
-            if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        if not await self._comm.sync_heartbeat_with_parent(timeout=1000.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
-        max_retries = 100
-        for attempt in range(max_retries):
+        # The parent pushes our NodeUpdate after the heartbeat sync (guaranteed delivery);
+        # just wait for it. Tasks are pushed later and read by _parent_task_update_monitor.
+        self._init_nodes = (await self._recv_from_parent(NodeUpdate)).nodes
+        self.logger.info(
+            f"{self.node_id}: Received NodeUpdate with {len(self._init_nodes.nodes)} nodes"
+        )
+
+    async def _recv_from_parent(self, cls):
+        """Wait for the next ``cls`` message from the parent; raise if the parent dies."""
+        while True:
             if self._comm.parent_dead_event.is_set():
-                raise RuntimeError(
-                    f"{self.node_id}: Parent died while waiting for NodeUpdate"
-                )
-            await self._comm.send_message_to_parent(NodeRequest(sender=self.node_id))
-            node_update = await self._comm.recv_message_from_parent(
-                NodeUpdate, timeout=5.0
-            )
-            if node_update is not None and node_update.nodes:
-                self._init_nodes = node_update.nodes
-                self.logger.info(
-                    f"{self.node_id}: Received NodeUpdate with {len(self._init_nodes.nodes)} nodes"
-                )
-                break
-            self.logger.warning(
-                f"{self.node_id}: NodeRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
-            )
-        else:
-            raise RuntimeError(
-                f"{self.node_id}: Failed to receive NodeUpdate after {max_retries} retries"
-            )
+                raise RuntimeError(f"{self.node_id}: Parent died while waiting for {cls.__name__}")
+            msg = await self._comm.recv_message_from_parent(cls, timeout=5.0)
+            if msg is not None:
+                return msg
 
-        # Request initial task assignment from parent
-        max_retries = 100 if not self._config.cluster else 2
-        for attempt in range(max_retries):
-            if self._comm.parent_dead_event.is_set():
-                break
-            await self._comm.send_message_to_parent(
-                TaskRequest(
-                    sender=self.node_id, ntasks=0, free_resources=self._init_nodes
-                )
-            )
-            task_update = await self._comm.recv_message_from_parent(
-                TaskUpdate, timeout=5.0
-            )
-            if task_update is not None:
-                self.logger.info(
-                    f"{self.node_id}: Received task update from parent containing {len(task_update.added_tasks)}"
-                )
-                for task in task_update.added_tasks:
-                    self._init_tasks[task.task_id] = task
-                break
-            self.logger.warning(
-                f"{self.node_id}: TaskRequest attempt {attempt + 1}/{max_retries} failed, retrying..."
-            )
-
-        return
+    async def _receive_first_task_update(self) -> None:
+        """For children policies that lay out children from tasks (bin packing): take the
+        parent's first TaskUpdate before creating children."""
+        update = await self._recv_from_parent(TaskUpdate)
+        await self._scheduler.queue(update)
+        self.logger.info(f"{self.node_id}: Received first {update.ntasks} tasks for layout")
 
     # --------------------------------------------------------------------------
     #                               Child Synchronization
@@ -1080,20 +1014,8 @@ class AsyncMaster(Node):
 
     def _build_init_node_update(self, child_id: str) -> NodeUpdate:
         """Build the initial NodeUpdate message to send to a child at startup."""
-        child_nodes = self._scheduler.get_child_assignment(child_id)["job_resource"]
+        child_nodes = self._scheduler.state.children[child_id].job_resource
         return NodeUpdate(sender=self.node_id, nodes=child_nodes)
-
-    def _build_init_task_update(self, child_id: str) -> TaskUpdate:
-        """Build the initial TaskUpdate message containing all tasks assigned to a child."""
-        already_sent = self._routed_task_ids.get(child_id, set())
-        new_tasks = [
-            self._scheduler.tasks[task_id]
-            for task_id in self._scheduler.get_child_assignment(child_id)["task_ids"]
-            if task_id not in already_sent
-        ]
-        if not new_tasks:
-            return None
-        return TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
 
     async def _get_child_exception(self, child_id: str) -> Optional[Result]:
         """
@@ -1161,29 +1083,27 @@ class AsyncMaster(Node):
             self.logger.error(f"Failed to sync heartbeat with child {child_id}")
             return await self._get_child_exception(child_id)
         self.logger.info(f"Successfully synced heart beat with {child_id}")
-        self._scheduler.mark_child_running(child_id)
         child_dead_event = self._comm._child_dead_events.get(child_id, None)
         if child_dead_event is not None and child_dead_event.is_set():
             child_dead_event.clear()
 
-        # Wait for NodeRequest from child before sending NodeUpdate
-        node_req = await self._comm.recv_message_from_child(
-            NodeRequest, child_id=child_id, timeout=600.0
-        )
-        if node_req is None:
-            self.logger.warning(
-                f"{self.node_id}: No NodeRequest from {child_id}, sending NodeUpdate anyway"
-            )
-
-        # Send NodeUpdate (now triggered by child's request)
+        # Push the NodeUpdate and make sure it arrived; only then is the child RUNNING (and
+        # its sender free to send tasks): a child must have its nodes before its tasks.
         if node_update is not None:
-            await self._comm.send_message_to_child(
+            sent = await self._comm.send_message_to_child(
                 child_id, node_update, retries=self._config.send_retries
             )
+            if not sent:
+                self.logger.error(f"{self.node_id}: NodeUpdate to {child_id} was not delivered")
+                failure = await self._get_child_exception(child_id)
+                if failure is None:
+                    failure = Result(sender=child_id, data=[])
+                    failure.exception = f"NodeUpdate to {child_id} was not delivered"
+                return failure
             self.logger.info(
                 f"{self.node_id}: Sent node update to {child_id} containing {len(node_update.nodes.nodes)} nodes"
             )
-
+        self._scheduler.transition(child_id, ChildState.RUNNING)
         return None
 
     async def _sync_with_children(
@@ -1206,22 +1126,6 @@ class AsyncMaster(Node):
         results = await asyncio.gather(*sync_tasks, return_exceptions=True)
         return results
 
-    async def _monitor_single_child_task_requests(self, child_id: str) -> None:
-        """Base: receive initial TaskRequest from child and respond with pre-assigned tasks."""
-        task_req = await self._comm.recv_message_from_child(
-            TaskRequest, child_id=child_id, block=True
-        )
-        if task_req is not None:
-            task_update = self._build_init_task_update(child_id)
-            if task_update is not None:
-                await self._comm.send_message_to_child(
-                    child_id, task_update, retries=self._config.send_retries
-                )
-                self.logger.info(
-                    f"{self.node_id}: Sent initial task update to {child_id} "
-                    f"containing {len(task_update.added_tasks)} tasks"
-                )
-
     async def _launch_and_sync_children(
         self, child_names: List[str]
     ) -> List[Optional[Result]]:
@@ -1241,40 +1145,56 @@ class AsyncMaster(Node):
     #                               Task Routing
     # --------------------------------------------------------------------------
 
-    async def _route_tasks(
-        self, tasks: List[Task], client_id: Optional[str] = None
-    ) -> List[Optional[str]]:
-        """Route a list of tasks to the best child via scheduler policy. Returns chosen child_id."""
-        for task in tasks:
-            self._scheduler.add_task(task, client_id=client_id)
-        child_assignments, task_to_child, unassigned_tasks = (
-            self._scheduler.assign_task_ids({task.task_id for task in tasks})
-        )
+    async def _route_tasks(self, update: TaskUpdate, client_id: Optional[str] = None) -> None:
+        """Hand a TaskUpdate to the scheduler. Placement happens in its assigner; each
+        child's sender sends what lands in its outbox, and `_unplaced_monitor` fails what no
+        child could take."""
+        await self._scheduler.queue(update, client_id=client_id)
 
-        for child_id, added_tasks in child_assignments.items():
-            if len(added_tasks) == 0:
-                continue
-            await self._scheduler.wait_for_child_ready(child_id)
-            if child_id not in self._itask_q:
-                self._itask_q[child_id] = deque()
-            task_q = self._itask_q[child_id]
-            for task_id in added_tasks:
-                task_q.append(self.tasks[task_id])
-            self._routed_task_ids.setdefault(child_id, set()).update(added_tasks)
-            self.logger.debug(f"Buffering {len(added_tasks)} Tasks for {child_id}")
-            if len(task_q) >= self._config.task_buffer_size or not self._config.cluster:
-                self._schedule_task_flush(child_id)
+    async def _unplaced_monitor(self) -> None:
+        """Fail tasks the scheduler could not place on any child."""
+        while True:
+            try:
+                uids = await self._scheduler.unplaced.get()
+                self._fail_tasks(uids, f"Routing failed at {self.node_id}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"{self.node_id}: Unplaced monitor error: {e}")
 
-        for task_id in unassigned_tasks:
-            self.logger.warning(f"Can't route task {task_id} to any child")
-            result = Result(
+    def _fail_tasks(self, uids, reason: str, child_id: Optional[str] = None) -> None:
+        """Report tasks as failed, as results routed like any other (to their client or the
+        parent). ``child_id`` is the child holding them, if any."""
+        store = self._scheduler.tasks
+        failed = [
+            Result(
                 sender=self.node_id,
-                task_id=task_id,
+                uid=uid,
+                task_id=store[uid].task_id if uid in store else None,
                 success=False,
-                exception=f"Routing failed at {self.node_id}",
+                exception=reason,
             )
-            self._create_forward_task(result)
-        return [task_to_child.get(task.task_id, None) for task in tasks]
+            for uid in uids
+        ]
+        if failed:
+            self.logger.warning(f"{self.node_id}: Failing {len(failed)} tasks: {reason}")
+            self._scheduler.queue_result(IResultBatch.from_results(failed), child_id)
+
+    def wait_drained(self):
+        """Wait until every task this master was given has a result. Reports; it never stops
+        the master -- `EnsembleLauncher` uses it to end a batch run with `request_stop`."""
+
+        async def _wait():
+            await self._initial_queued.wait()
+            while self._scheduler is None:
+                await asyncio.sleep(0.05)
+            await self._scheduler.drained.wait()
+
+        return _wait()
+
+    def request_stop(self) -> None:
+        """Stop this master the same way SIGTERM does."""
+        self._stop_signal_received.set()
 
     # --------------------------------------------------------------------------
     #                               Callbacks
@@ -1296,165 +1216,143 @@ class AsyncMaster(Node):
     #                               Monitors
     # -------------------------------------------------------------------------
 
-    async def _collect_final_result_batch_from_child(self, child_id: str) -> None:
-        """Collect result and final status from a single child."""
+    async def _wait_for_child_done(self, child_id: str) -> None:
+        """Wait for the child's Done: every result it sent has been delivered (they are in
+        this master's IResultBatch buffer already), so the child is finished."""
+        child = self._scheduler.state.children.get(child_id)
+        if child is None:
+            return
+        # A child given up on (FAILED) never sends Done: stop waiting when it turns terminal.
+        recv = asyncio.ensure_future(
+            self._comm.recv_message_from_child(Done, child_id=child_id, block=True)
+        )
+        ended = asyncio.ensure_future(child.done.wait())
         try:
-            # Wait for result from child
-            result_batch: ResultBatch = await self._comm.recv_message_from_child(
-                ResultBatch, child_id=child_id, block=True
-            )
-
-            if result_batch is not None:
-                self._results[child_id] = [result_batch]
-                self.logger.info(f"{self.node_id}: Received result from {child_id}")
-                # Update task statuses from the final result batch
-                for r in result_batch.data:
-                    self._scheduler.set_task_status(
-                        r.task_id,
-                        TaskStatus.SUCCESS if r.success else TaskStatus.FAILED,
-                    )
-                # Source c (authoritative): mark SUCCESS from RUNNING or RECOVERING.
-                state = self._scheduler.get_child_state(child_id)
-                if state in {ChildState.RUNNING, ChildState.RECOVERING}:
-                    self._scheduler.mark_child_success(child_id)
+            await asyncio.wait({recv, ended}, return_when=asyncio.FIRST_COMPLETED)
+            if not recv.done():
+                self.logger.info(f"{self.node_id}: {child_id} ended ({child.state.name}) without Done")
+                return
+            msg = recv.result()
+            if msg is not None:
+                self.logger.info(f"{self.node_id}: {child_id} is done")
+                if not child.terminal:
+                    # Anything it still holds (e.g. placed after it took Stop) goes to
+                    # unplaced and is failed.
+                    self._scheduler.transition(child_id, ChildState.SUCCESS)
             else:
-                self.logger.warning(
-                    f"{self.node_id}: No result received from {child_id}"
-                )
-                self._results[child_id] = []
-            # Final status is collected by the per-child status monitor.
+                self.logger.warning(f"{self.node_id}: No Done received from {child_id}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self.logger.error(
-                f"{self.node_id}: Error collecting result from {child_id}: {e}"
-            )
-            self._results[child_id] = []
+            self.logger.error(f"{self.node_id}: Error waiting for Done from {child_id}: {e}")
+        finally:
+            for t in (recv, ended):
+                if not t.done():
+                    t.cancel()
 
-    async def _aggregate_and_send_result_batch(self) -> None:
-        """Wait for all result collection tasks, aggregate, and send to parent.
+    # -------------------------------------------------------------------------
+    #                           Stop path (_wait_for_finish)
+    # -------------------------------------------------------------------------
 
-        Dynamically tracks self._child_result_batch_task so that tasks added
-        during child recovery are also awaited before aggregation proceeds.
-        """
-        # Wait for all result collection tasks to complete, including any added
-        # during recovery (which updates self._child_result_batch_task at runtime).
-        seen_tasks: set = set()
-        while True:
-            current_tasks = set(self._child_result_batch_task.values())
-            new_tasks = current_tasks - seen_tasks
-            if new_tasks:
-                seen_tasks.update(new_tasks)
-                await asyncio.gather(*new_tasks, return_exceptions=True)
-                # Loop immediately: recovery may have added more tasks while we waited.
-                continue
-            # No new tasks this iteration — check if we are truly done.
-            # _all_children_done_event won't be set while any child is RECOVERING,
-            # so no separate guard is needed.
-            if self._all_children_done_event.is_set() and all(
-                t.done() for t in self._child_result_batch_task.values()
-            ):
-                break
-            # Children still running or recovery in progress; yield and recheck.
-            await asyncio.sleep(0.05)
-        self.logger.info(f"{self.node_id}: All result collection tasks completed")
+    async def _wait_for_children_done(self, killed: bool) -> None:
+        """Wait for every child's Done -- including children a recovery in progress adds --
+        then stop the status reporter. After a KILL, children send nothing: cancel instead."""
+        if killed:
+            tasks = list(self._child_done_task.values())
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            seen: set = set()
+            while True:
+                new = set(self._child_done_task.values()) - seen
+                if new:
+                    seen.update(new)
+                    await asyncio.gather(*new, return_exceptions=True)
+                    continue  # recovery may have added more while we waited
+                # all_done is not set while any child is RECOVERING.
+                if self._all_children_done_event.is_set() and all(
+                    t.done() for t in self._child_done_task.values()
+                ):
+                    break
+                await asyncio.sleep(0.05)
+        self.logger.info(f"{self.node_id}: All children are done")
 
-        # Wait for all forwarder tasks to finish draining IResultBatch messages.
-        # This ensures all streamed results have been forwarded/accumulated before
-        # we aggregate the final batch.
-        forwarder_tasks = list(self._child_forwarder_task.values())
-        if forwarder_tasks:
-            await asyncio.gather(*forwarder_tasks, return_exceptions=True)
-        self.logger.info(f"{self.node_id}: All forwarder tasks completed")
-
-        # Cancel the reporting task
         self._stop_reporting_event.set()
-        self._reporting_task.cancel()
-        try:
-            await self._reporting_task
-        except Exception:
-            pass
+        if self._reporting_task is not None:
+            self._reporting_task.cancel()
+            try:
+                await self._reporting_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
-        self.logger.info(f"{self.node_id}: Stopped reporting loop")
+    async def _drain_forwarders(self) -> None:
+        """Each child's result monitor drains what that child streamed before its Done."""
+        tasks = list(self._child_forwarder_task.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.logger.info(f"{self.node_id}: All forwarders drained")
 
-        # Report final status to parent (or write to file if root / parent dead)
-        async with self._timer("report_to_parent"):
-            if self.parent and (
-                self._comm.parent_dead_event is None
-                or not self._comm.parent_dead_event.is_set()
-            ):
-                final_status = self._scheduler.aggregate_status()
-                final_status.tag = "final"
-                success = await self._comm.send_message_to_parent(final_status)
-                if success:
-                    self.logger.info(
-                        f"{self.node_id}: Successfully reported final status to parent"
-                    )
-                else:
-                    self.logger.warning(
-                        f"{self.node_id}: Failed to send final status to parent"
-                    )
-            else:
-                try:
-                    status = self._scheduler.aggregate_status()
-                    status.tag = "final"
-                    fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
-                    status.to_file(fname)
-                    self.logger.info(
-                        f"{self.node_id}: Successfully dumped final status to {fname}"
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"{self.node_id}: Reporting final status failed with exception {e}"
-                    )
+    def _fail_unfinished(self) -> None:
+        """Give every task still unfinished -- in the pool, or held by a child (unsent in its
+        outbox, lost, or held by a killed child) -- a failed result, routed like any other."""
+        for child_id, uids in self._scheduler.state.unfinished():
+            self._fail_tasks(uids, f"Stopped before finishing at {self.node_id}", child_id)
 
-        # Aggregate results
-        async with self._timer("aggregate_results"):
-            if len(self._scheduler.unassigned_task_ids) > 0:
-                failed_results = [
-                    Result(
-                        sender=self.node_id,
-                        task_id=task_id,
-                        success=False,
-                        exception=f"Failed to assign to children at {self.node_id}",
-                    )
-                    for task_id in self._scheduler.unassigned_task_ids
-                ]
-            else:
-                failed_results = []
-            result_batch = ResultBatch(sender=self.node_id, data=failed_results)
-            # Include results streamed during execution (batch mode root master only)
-            for r in self._batch_streaming_results:
-                result_batch.add_result(r)
-            for child_id, child_results in self._results.items():
-                for rb in child_results:
-                    result_batch += rb
-            self.logger.info(
-                f"{self.node_id}: Aggregated results from {len(self._results)} children"
-            )
+    def _parent_alive(self) -> bool:
+        return self.parent is not None and (
+            self._comm.parent_dead_event is None or not self._comm.parent_dead_event.is_set()
+        )
 
-        # Send to parent (skip if parent is dead)
-        if self.parent and (
-            self._comm.parent_dead_event is None
-            or not self._comm.parent_dead_event.is_set()
-        ):
-            success = await self._comm.send_message_to_parent(
-                result_batch, retries=self._config.send_retries
-            )
-            if success:
-                self.logger.info(
-                    f"{self.node_id}: Successfully sent results to parent"
+    async def _send_final_status_and_done(self) -> None:
+        """Final Status, then Done (a non-root master); the root writes its status file.
+
+        Runs after `_flush_results`, so Done means every result went up. If the parent is gone
+        or a send fails, results still unsent are written to ``{node}_results.bin``."""
+        status = self._scheduler.state.aggregate_status()
+        status.tag = "final"
+        if not self.parent:
+            try:
+                fname = os.path.join(os.getcwd(), f"{self.node_id}_status.json")
+                status.to_file(fname)
+                self.logger.info(f"{self.node_id}: Dumped final status to {fname}")
+            except Exception as e:
+                self.logger.warning(f"{self.node_id}: Writing final status failed: {e}")
+            return
+
+        delivered = False
+        if self._parent_alive():
+            if not await self._comm.send_message_to_parent(status):
+                self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
+            if self._results_all_sent("parent"):
+                delivered = await self._comm.send_message_to_parent(
+                    Done(sender=self.node_id), retries=self._config.send_retries
                 )
-            else:
-                self.logger.warning(
-                    f"{self.node_id}: Failed to send results to parent"
-                )
-                fname = os.path.join(os.getcwd(), f"{self.node_id}_results.bin")
-                with open(fname, "wb") as f:
-                    f.write(result_batch.to_bytes())
-                self.logger.info(
-                    f"{self.node_id}: Checkpointed result batch to {fname}"
-                )
-        elif self.parent:
-            self.logger.warning(f"{self.node_id}: Parent is dead, skipping result send")
+                if delivered:
+                    self.logger.info(f"{self.node_id}: Sent Done to parent")
+        if not delivered:
+            self.logger.warning(f"{self.node_id}: Could not finish with parent; saving results")
+            self._save_unsent_results()
+
+    def _results_all_sent(self, dest: str) -> bool:
+        """Nothing queued for ``dest`` and every message taken for it was delivered."""
+        outbox = self._result_outbox.get(dest)
+        return (outbox is None or outbox.empty()) and not self._result_unacked.get(dest)
+
+    def _save_unsent_results(self) -> None:
+        """Write the results not delivered to the parent -- taken by its sender but not
+        ACKed, or still queued -- to ``{node}_results.bin``."""
+        outbox = self._scheduler.parent_outbox
+        pieces = [msg for msg, _ in self._result_unacked.pop("parent", [])]
+        while not outbox.empty():
+            pieces.append(outbox.get_nowait())
+        if not pieces:
+            return
+        batch = ResultBatch.concat(pieces, sender=self.node_id)
+        fname = os.path.join(os.getcwd(), f"{self.node_id}_results.bin")
+        with open(fname, "wb") as f:
+            f.write(batch.to_bytes())
+        self.logger.info(f"{self.node_id}: Saved {batch.nresults} unsent results to {fname}")
 
     async def _parent_ready_monitor(self) -> None:
         """Wait for a Ready message from parent and set the parent-ready event."""
@@ -1472,7 +1370,7 @@ class AsyncMaster(Node):
         """Periodically aggregate child status and forward to parent."""
         while not self._stop_reporting_event.is_set():
             try:
-                status = self._scheduler.aggregate_status()
+                status = self._scheduler.state.aggregate_status()
                 if self.parent:
                     await self._comm.send_message_to_parent(status)
                     self.logger.info(status)
@@ -1565,11 +1463,11 @@ class AsyncMaster(Node):
                     continue
                 client_id, msg = item
                 if isinstance(msg, TaskUpdate):
-                    self._total_received += len(msg.added_tasks)
+                    self._total_received += msg.ntasks
                     self.logger.info(
                         f"Received TaskUpdate from client. Total tasks: {self._total_received}"
                     )
-                    await self._route_tasks(msg.added_tasks, client_id=client_id)
+                    await self._route_tasks(msg, client_id=client_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1582,196 +1480,192 @@ class AsyncMaster(Node):
             return self._comm.send_message_to_child(dest_id, msg, retries=retries)
         return self._comm.send_message_to_parent(msg, retries=retries)
 
-    def _schedule_result_flush(self, dest_id: str) -> None:
-        """Start sends for dest_id's buffered results, up to max_inflight_flushes at once.
+    def _start_result_sender(self, dest: str, outbox: asyncio.Queue) -> None:
+        """Start the sender for ``dest`` ("parent" or a client id) on its result outbox."""
+        self._result_outbox[dest] = outbox
+        self._result_window[dest] = asyncio.Semaphore(max(1, self._config.max_inflight_flushes))
+        self._result_sender_task[dest] = asyncio.create_task(self._result_sender(dest))
 
-        Never awaits. Each send is its own task, so a slow destination or a dropped ACK
-        holds up only its own window, never other destinations or the caller's loop.
-        Messages are popped here, synchronously, so concurrent batches never overlap.
+    async def _new_client_monitor(self) -> None:
+        """Start a result sender for each client the scheduler announces."""
+        while True:
+            client = await self._scheduler.new_clients.get()
+            self._start_result_sender(client, self._scheduler.client_outboxes[client])
+
+    async def _result_sender(self, dest: str) -> None:
+        """Send ``dest``'s result outbox as it fills.
+
+        Takes a window slot first, then an item, then everything else already queued, and
+        sends them as one IResultBatch: whatever arrives during a send leaves together in
+        the next one. The slot is released by `_result_flush_done`.
         """
-        inflight = self._result_flush_inflight.setdefault(dest_id, set())
-        retry_q, result_q = self._result_retry_q.get(dest_id), self._iresult_q.get(dest_id)
-        while len(inflight) < self._config.max_inflight_flushes:
-            if retry_q:
-                msg = retry_q.popleft()
-            elif result_q:
-                msg = IResultBatch(sender=self.node_id, data=list(result_q))
-                result_q.clear()
-            else:
-                break
-            t = asyncio.create_task(self._send_result_batch(dest_id, msg))
-            inflight.add(t)
-            t.add_done_callback(functools.partial(self._result_flush_done, dest_id, msg))
+        outbox, window = self._result_outbox[dest], self._result_window[dest]
+        while True:
+            await window.acquire()
+            pieces = [await outbox.get()]
+            while not outbox.empty():
+                pieces.append(outbox.get_nowait())
+            msg = IResultBatch.concat(pieces, sender=self.node_id)
+            self._result_unacked.setdefault(dest, []).append((msg, len(pieces)))
+            self._schedule_result_flush(dest, msg, len(pieces), window)
+
+    def _schedule_result_flush(
+        self, dest: str, msg: IResultBatch, nitems: int, window: asyncio.Semaphore
+    ) -> None:
+        """Start one IResultBatch send to ``dest``, in a window slot the caller holds."""
+        if self._result_window.get(dest) is not window:
+            return  # the sender is gone (stopping)
+        t = asyncio.create_task(self._send_result_batch(dest, msg))
+        self._result_flush_inflight.setdefault(dest, set()).add(t)
+        t.add_done_callback(
+            functools.partial(self._result_flush_done, dest, msg, nitems, window)
+        )
 
     def _result_flush_done(
-        self, dest_id: str, msg: IResultBatch, task: asyncio.Task
+        self, dest: str, msg: IResultBatch, nitems: int, window: asyncio.Semaphore,
+        task: asyncio.Task,
     ) -> None:
-        """Free the window slot; on failure, queue the same message for the next flush."""
-        inflight = self._result_flush_inflight.get(dest_id)
+        """A result send finished: free its slot, or resend the same message in it.
+
+        The window is the one the send was started in, never looked up again, so a late
+        callback cannot release another sender's slot. The resend is the same object, so it
+        keeps its message_id and the receiver drops the copy if only the ACK was lost.
+        """
+        inflight = self._result_flush_inflight.get(dest)
         if inflight is not None:
             inflight.discard(task)
         if task.cancelled():
+            window.release()
             return
         exc = task.exception()
         if exc is None and task.result():
-            if dest_id.startswith("client-"):
-                self._total_streamed += len(msg.data)
+            if dest.startswith("client-"):
+                self._total_streamed += msg.nresults
+            unacked = self._result_unacked.get(dest)
+            if unacked is not None:
+                unacked[:] = [(m, n) for m, n in unacked if m is not msg]
+            outbox = self._result_outbox.get(dest)
+            if outbox is not None:
+                for _ in range(nitems):
+                    outbox.task_done()
+            window.release()
             return
         self.logger.warning(
-            f"Failed to send IResultBatch of size {len(msg.data)} to {dest_id}"
-            f"{f' ({exc})' if exc else ''}, re-queuing"
+            f"Failed to send IResultBatch of size {msg.nresults} to {dest}"
+            f"{f' ({exc})' if exc else ''}, resending"
         )
-        # Same object, same message_id: if only the ACK was lost, the receiver drops the copy.
-        self._result_retry_q.setdefault(dest_id, deque()).appendleft(msg)
+        # Same slot, so nothing newer overtakes it. A send that raised failed at once, so
+        # wait an ACK timeout first rather than spin.
+        delay = self._config.send_timeout if exc is not None else 0.0
+        asyncio.get_running_loop().call_later(
+            delay, self._schedule_result_flush, dest, msg, nitems, window
+        )
 
-    async def _drain_results(self, dest_id: str) -> None:
-        """Wait out in-flight result sends for dest_id, then send everything left.
+    async def _flush_results(self) -> None:
+        """Wait until every result sender has delivered everything queued for it.
 
-        Runs at teardown, where no later flush tick will come, so this is the one result
-        path that opts into comm-level retries.
+        Senders keep resending failures, so this is bounded: ``send_retries`` ACK timeouts
+        per destination, after which the stop goes on. The parent is skipped once dead.
+        (The root has no parent sender: its parent outbox is the run's results.)
         """
-        inflight = self._result_flush_inflight.get(dest_id)
-        if inflight:
-            await asyncio.gather(*list(inflight), return_exceptions=True)
-        retry_q = self._result_retry_q.pop(dest_id, None) or deque()
-        result_q = self._iresult_q.get(dest_id)
-        if result_q:
-            retry_q.append(IResultBatch(sender=self.node_id, data=list(result_q)))
-            result_q.clear()
-        for msg in retry_q:
-            success = await self._send_result_batch(
-                dest_id, msg, retries=self._config.send_retries
-            )
-            if success and dest_id.startswith("client-"):
-                self._total_streamed += len(msg.data)
-            elif not success:
-                self.logger.error(
-                    f"Failed to drain IResultBatch of size {len(msg.data)} to {dest_id}"
-                )
+        timeout = max(1, self._config.send_retries) * self._config.send_timeout
+        dests = [
+            d for d in self._result_outbox if d != "parent" or self._parent_alive()
+        ]
 
-    async def _periodic_flush_loop(self) -> None:
-        """Flush buffered results on a fixed interval with jitter.
+        async def _one(dest: str) -> None:
+            try:
+                await asyncio.wait_for(self._result_outbox[dest].join(), timeout)
+            except asyncio.TimeoutError:
+                self.logger.error(f"{self.node_id}: Results for {dest} not delivered in {timeout}s")
 
-        Only schedules sends; `_schedule_result_flush` never awaits, so one slow destination
-        cannot delay the others or the next tick. Destinations with a pending resend are
-        included so a failed batch is retried even when nothing new has arrived.
+        await asyncio.gather(*(_one(d) for d in dests))
+
+    async def _child_sender(self, child_id: str) -> None:
+        """Send this child's outbox, one item per TaskUpdate, once the child is running.
+
+        Takes a window slot *before* waiting for an item, so while sends are in flight new
+        items simply wait in the outbox. The slot is released by `_task_flush_done`. The
+        update is built on the loop, like every other store access.
         """
+        child = self._scheduler.state.children[child_id]
+        window = self._task_window[child_id]
+        build = self._scheduler.tasks.build_update
+        await child.ready.wait()  # set once its NodeUpdate was delivered
         while True:
-            jitter = random.uniform(-0.05, 0.05) * self._config.result_flush_interval
-            await asyncio.sleep(self._config.result_flush_interval + jitter)
-            for dest_id in set(self._iresult_q) | set(self._result_retry_q):
-                self._schedule_result_flush(dest_id)
+            await window.acquire()
+            uids = [uid for uid in await child.outbox.get() if uid in child]  # drop deleted ones
+            if not uids:
+                window.release()
+                continue
+            self._schedule_task_flush(child_id, build(uids, sender=self.node_id))
 
-    def _schedule_task_flush(self, child_id: str) -> None:
-        """Start sends for child_id's buffered tasks, up to max_inflight_flushes at once.
-
-        Same windowed pattern as `_schedule_result_flush`. Nothing is sent while the child
-        is RECOVERING; recovery owns its tasks then.
-        """
-        if self._scheduler.get_child_state(child_id) == ChildState.RECOVERING:
-            return
-        inflight = self._task_flush_inflight.setdefault(child_id, set())
-        retry_q, task_q = self._task_retry_q.get(child_id), self._itask_q.get(child_id)
-        while len(inflight) < self._config.max_inflight_flushes:
-            if retry_q:
-                msg = retry_q.popleft()
-            elif task_q:
-                msg = TaskUpdate(sender=self.node_id, added_tasks=list(task_q))
-                task_q.clear()
-            else:
-                break
-            t = asyncio.create_task(self._comm.send_message_to_child(child_id, msg))
-            inflight.add(t)
-            t.add_done_callback(functools.partial(self._task_flush_done, child_id, msg))
-
-    def _task_flush_done(
-        self, child_id: str, msg: TaskUpdate, task: asyncio.Task
+    def _schedule_task_flush(
+        self, child_id: str, msg: TaskUpdate, window: Optional[asyncio.Semaphore] = None
     ) -> None:
-        """Free the window slot; on failure, resend the same TaskUpdate or fail its tasks.
+        """Start one TaskUpdate send to child_id, in a window slot the caller holds.
 
-        Synchronous, so the child-state check and the requeue are atomic with respect to
-        the event loop.
+        A resend passes the window its first send held. If the child was torn down since (its
+        window dropped, or replaced by a reinstated child's), the resend is dropped: recovery
+        refilled the new child's outbox, and the new process could not dedupe the old message.
+        """
+        current = self._task_window.get(child_id)
+        if window is None:
+            window = current
+        if window is None or window is not current:
+            return
+        t = asyncio.create_task(self._comm.send_message_to_child(child_id, msg))
+        self._task_flush_inflight.setdefault(child_id, set()).add(t)
+        t.add_done_callback(functools.partial(self._task_flush_done, child_id, msg, window))
+
+    def _task_flush_done(self, child_id: str, msg: TaskUpdate, window: asyncio.Semaphore, task: asyncio.Task) -> None:
+        """A TaskUpdate send finished: free its slot, or resend the same message in it.
+
+        Synchronous, so the child-state check and the resend are atomic with respect to the
+        event loop. The resend is the same object, so it keeps its message_id and the child
+        drops the copy if only the ACK was lost.
         """
         inflight = self._task_flush_inflight.get(child_id)
         if inflight is not None:
             inflight.discard(task)
         if task.cancelled():
+            window.release()
             return
         exc = task.exception()
         if exc is None and task.result():
-            self.logger.info(
-                f"Sent TaskUpdate of size {len(msg.added_tasks)} to {child_id}"
-            )
+            self.logger.info(f"Sent TaskUpdate of size {msg.ntasks} to {child_id}")
+            self._scheduler.delivered(msg.uids())
+            window.release()
             return
-        state = self._scheduler.get_child_state(child_id)
-        if self._scheduler.is_child_terminal(child_id):
+        state = self._child_state(child_id)
+        if state in (ChildState.SUCCESS, ChildState.FAILED):
             self.logger.error(
-                f"Failed to send TaskUpdate of size {len(msg.added_tasks)} to {child_id} (state={state})"
+                f"Failed to send TaskUpdate of size {msg.ntasks} to {child_id} (state={state})"
             )
-            for t in msg.added_tasks:
-                result = Result(
-                    sender=self.node_id,
-                    task_id=t.task_id,
-                    success=False,
-                    exception=f"Send to {child_id} failed at {self.node_id}",
-                )
-                self._create_forward_task(result)
+            # Only what it still holds: a FAILED child's tasks were requeued or failed already.
+            child = self._scheduler.state.children.get(child_id)
+            held = [u for u in msg.uids() if child is not None and u in child]
+            self._fail_tasks(held, f"Send to {child_id} failed at {self.node_id}", child_id)
+        elif state in (None, ChildState.RECOVERING):
+            # Recovery owns these tasks: the reinstated child's outbox holds them again.
+            self.logger.info(f"Send to {child_id} failed while it recovers; dropping it")
+        else:
+            self.logger.info(
+                f"Send to {child_id} failed (state={state}){f' ({exc})' if exc else ''}, "
+                f"resending {msg.ntasks} tasks"
+            )
+            # Same slot, so nothing newer overtakes it. A send that raised failed at once,
+            # so wait an ACK timeout first rather than spin.
+            delay = self._config.send_timeout if exc is not None else 0.0
+            asyncio.get_running_loop().call_later(
+                delay, self._schedule_task_flush, child_id, msg, window
+            )
             return
-        self.logger.info(
-            f"Send to {child_id} failed (state={state}){f' ({exc})' if exc else ''}, "
-            f"re-queuing {len(msg.added_tasks)} tasks"
-        )
-        # Same object, same message_id: if only the ACK was lost, the child drops the
-        # copy instead of running the tasks twice.
-        self._task_retry_q.setdefault(child_id, deque()).appendleft(msg)
-
-    async def _periodic_task_flush_loop(self) -> None:
-        """Flush buffered child-bound tasks on a fixed interval with jitter.
-
-        Runs on all masters that have children (i.e. there are tasks to dispatch downward).
-        Only schedules sends, for the same reason as `_periodic_flush_loop`.
-        """
-        while True:
-            jitter = random.uniform(-0.05, 0.05) * self._config.task_flush_interval
-            await asyncio.sleep(self._config.task_flush_interval + jitter)
-            for child_id in set(self._itask_q) | set(self._task_retry_q):
-                self._schedule_task_flush(child_id)
-
-    async def _forward_result(self, result: Union[Result, IResultBatch]) -> None:
-        """Buffer a result for its destination; the periodic flush loop sends it."""
-        items = result.data if isinstance(result, IResultBatch) else [result]
-
-        for single_result in items:
-            self._scheduler.set_task_status(
-                single_result.task_id,
-                TaskStatus.SUCCESS if single_result.success else TaskStatus.FAILED,
-            )
-
-        dest_results: Dict[str, List[Result]] = {}
-        for single_result in items:
-            dest_id = self._scheduler.get_task_client(single_result.task_id) or (
-                self.parent.node_id if self.parent else None
-            )
-            if dest_id is None:
-                if not self._config.cluster:
-                    # Batch mode root master: accumulate locally
-                    self._batch_streaming_results.append(single_result)
-                else:
-                    self.logger.warning(
-                        f"Can't find a destination for task {single_result.task_id}"
-                    )
-                continue
-            dest_results.setdefault(dest_id, []).append(single_result)
-
-        for dest_id, results in dest_results.items():
-            result_q = self._iresult_q.setdefault(dest_id, deque())
-            result_q.extend(results)
-            if len(result_q) >= self._config.result_buffer_size:
-                self._schedule_result_flush(dest_id)
+        window.release()
 
     async def _child_result_monitor(self, child_id: str) -> None:
         """Receive IResultBatch messages from child and forward to client or parent."""
-        child_done = self._scheduler.get_done_event(child_id)
+        child_done = self._scheduler.state.children[child_id].done
         done_task = asyncio.create_task(child_done.wait())
         while True:
             recv_task = asyncio.create_task(
@@ -1786,7 +1680,7 @@ class AsyncMaster(Node):
                 msg = recv_task.result()
                 if msg is not None:
                     try:
-                        await self._forward_result(msg)
+                        self._scheduler.queue_result(msg, child_id)
                     except Exception as e:
                         self.logger.error(
                             f"{self.node_id}: Failed to forward result from {child_id}: {e}",
@@ -1808,26 +1702,23 @@ class AsyncMaster(Node):
             if msg is None:
                 break
             try:
-                await self._forward_result(msg)
+                self._scheduler.queue_result(msg, child_id)
             except Exception as e:
                 self.logger.error(
                     f"{self.node_id}: Failed to forward result from {child_id}: {e}",
                     exc_info=True,
                 )
-        # Flush any buffered results that didn't reach the buffer threshold.
-        for dest_id in set(self._iresult_q) | set(self._result_retry_q):
-            await self._drain_results(dest_id)
 
     async def _child_status_monitor(self, child_id: str) -> None:
         """Continuously collect status messages from a single child and update scheduler."""
-        child_done = self._scheduler.get_done_event(child_id)
+        child_done = self._scheduler.state.children[child_id].done
         try:
             while not child_done.is_set():
                 status = await self._comm.recv_message_from_child(
                     Status, child_id=child_id, block=True
                 )
                 if status is not None:
-                    self._scheduler.set_child_status(child_id, status)
+                    self._set_child_status(child_id, status)
                     if status.tag == "final":
                         self.logger.info(
                             f"Received final status from {child_id}"
@@ -1840,7 +1731,7 @@ class AsyncMaster(Node):
                 )
                 if status is None:
                     break
-                self._scheduler.set_child_status(child_id, status)
+                self._set_child_status(child_id, status)
         except asyncio.CancelledError:
             pass
 
@@ -1850,14 +1741,14 @@ class AsyncMaster(Node):
             try:
                 ev = self._comm._child_dead_events.get(child_id)
                 await ev.wait()
-                state = self._scheduler.get_child_state(child_id)
-                if state is None or self._scheduler.is_child_terminal(child_id):
+                state = self._child_state(child_id)
+                if state in (None, ChildState.SUCCESS, ChildState.FAILED):
                     return
                 self.logger.warning(
                     f"{self.node_id}: Child {child_id} declared dead by HB process"
                 )
                 if self._config.restart_children_on_failure:
-                    self._scheduler.mark_child_recovering(child_id)
+                    self._scheduler.transition(child_id, ChildState.RECOVERING)
                     max_retries = 3
                     success = False
                     for i in range(max_retries):
@@ -1875,51 +1766,59 @@ class AsyncMaster(Node):
                             self.logger.info(
                                 f"{self.node_id}: Sent Ready to recovered child {child_id}"
                             )
-                            break
+                            # _init_child started a fresh monitor for the new process.
+                            return
                     if not success:
-                        self._scheduler.mark_child_failed(child_id)
+                        self._give_up_on_child(child_id)
                         break
                 else:
-                    self._scheduler.mark_child_failed(child_id)
+                    self._give_up_on_child(child_id)
                     break
             except Exception as e:
                 self.logger.warning(f"liveness monitor failed with Exception {e}")
                 await asyncio.sleep(10.0)
+
+    def _give_up_on_child(self, child_id: str) -> None:
+        """Mark a child FAILED for good -- whether it died running or never got running (a
+        reinstated child whose relaunch failed is READY). The scheduler requeues its tasks on
+        the other children (failed through `unplaced` if none can take them), and its Done
+        wait ends, so the stop path doesn't wait on it."""
+        child = self._scheduler.state.children.get(child_id)
+        if child is None or child.terminal:
+            return
+        self.logger.warning(
+            f"{self.node_id}: Giving up on {child_id}; requeueing its {len(child)} tasks"
+        )
+        self._scheduler.transition(child_id, ChildState.FAILED, requeue=True)
 
     async def _recover_dead_child(self, child_id: str) -> bool:
         """Tear down a dead child and relaunch on the same resources."""
         try:
             self.logger.info(f"{self.node_id}: Recovering dead child {child_id}")
 
-            # Capture assignment BEFORE teardown removes it from the scheduler
-            assignment = self._scheduler.get_child_assignment(child_id)
+            # Cancels the child's futures and tasks and removes it from the scheduler and
+            # comm; the removed record keeps its resources and unfinished tasks.
+            child = await self._teardown_child(child_id)
+            if child is None:
+                raise RuntimeError(f"{child_id} is not a child of {self.node_id}")
 
-            # cancels the futures, tasks and removes all events from scheduler and comm
-            await self._teardown_child(child_id)
-
-            # Re-register child: Allocate the resources in the cluster. NOTREADY, then immediately READY so _launch_child
-            # can transition READY → RUNNING.
-            allocated, _ = self._scheduler.cluster.allocate(assignment["job_resource"])
-            if not allocated:
+            # Back on the same resources with the same tasks, READY so _launch_child can
+            # move it to RUNNING.
+            if not self._scheduler.reinstate_child(child):
                 self.logger.error(
                     "Can't allocate the identical child resources while recovering"
                 )
+                # The child can't come back: place its tasks (back in the pool) on the others.
+                self._scheduler.requeue(child.uids)
                 raise RuntimeError(
                     "Can't allocate the identical child resources while recovering"
                 )
-            else:
-                self.logger.info(
-                    f"Reallocated resources for {child_id}: {assignment['job_resource']}"
-                )
-            self._scheduler.register_child(child_id, assignment)  # → NOTREADY
-            self._scheduler.mark_child_ready(child_id)  # NOTREADY → READY
+            self.logger.info(f"Reallocated resources for {child_id}: {child.job_resource}")
 
             # Instantiate a fresh child object — never reuse the old one since it
             # carries stale asyncio.Event / comm state from the previous run, which
             # causes pickling failures or immediate early-exit in the subprocess.
-            fresh_children = self._instantiate_children(
-                include_tasks=False, target_ids={child_id}
-            )
+            fresh_children = self._instantiate_children({child_id})
             fresh_child_obj = fresh_children[child_id]
 
             await self._init_child(child_id, fresh_child_obj)
@@ -1935,9 +1834,6 @@ class AsyncMaster(Node):
                 return False
             else:
                 self.logger.info(f"Completed launching and sync with child {child_id}")
-                task_ids = self._scheduler.child_assignments[child_id]["task_ids"]
-                for task_id in task_ids:
-                    self._scheduler.discard_unassigned(task_id)
 
             return True
         except Exception as e:
@@ -1952,7 +1848,7 @@ class AsyncMaster(Node):
                     TaskUpdate, block=True
                 )
                 if task_update is not None:
-                    await self._route_tasks(task_update.added_tasks)
+                    await self._route_tasks(task_update)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1963,9 +1859,9 @@ class AsyncMaster(Node):
     #                               Teardown
     # -------------------------------------------------------------------------
 
-    async def _teardown_child(self, child_id: str) -> None:
+    async def _teardown_child(self, child_id: str) -> Optional[Child]:
         """Cancel per-child tasks, remove the child from all bookkeeping, and prune
-        the comm cache so no stale entries remain."""
+        the comm cache so no stale entries remain. Returns the scheduler's removed record."""
         # Cancel the future and wait for the scheduler to mark the child done.
         child_fut = self._children_futures.get(child_id, None)
         if child_fut is None:
@@ -1985,12 +1881,13 @@ class AsyncMaster(Node):
         # Cancel per-child monitor tasks and await them to avoid dangling coroutines.
         tasks_to_cancel = []
         task_dicts = [
-            self._child_result_batch_task,
+            self._child_done_task,
             self._child_status_task,
             self._child_forwarder_task,
             self._child_task_request_task,
+            self._child_sender_task,
         ]
-        if not self._scheduler.is_child_recovering(child_id):
+        if self._child_state(child_id) != ChildState.RECOVERING:
             task_dicts.append(self._child_liveness_task)
         for task_dict in task_dicts:
             t = task_dict.pop(child_id, None)
@@ -2003,15 +1900,13 @@ class AsyncMaster(Node):
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
-        self._scheduler.remove_child(child_id)
+        removed = self._scheduler.remove_child(child_id)
         self.remove_child(child_id)
         self._child_objs.pop(child_id, None)
         self._children_futures.pop(child_id, None)
-        self._routed_task_ids.pop(child_id, None)
-        self._iresult_q.pop(child_id, None)
-        self._itask_q.pop(child_id, None)
-        self._task_retry_q.pop(child_id, None)
+        self._task_window.pop(child_id, None)
         self._comm.update_node_info(self.info())
+        return removed
 
     async def stop(self) -> None:
         """Gracefully shut down the master in a fixed teardown order.
@@ -2037,13 +1932,24 @@ class AsyncMaster(Node):
             except asyncio.CancelledError:
                 pass
 
-        for loop_task in (self._flush_task, self._task_flush_task):
+        if self._scheduler is not None:
+            await self._scheduler.stop()  # the assigner
+
+        for loop_task in (
+            self._new_client_task,
+            self._unplaced_task,
+            *self._result_sender_task.values(),
+            *self._child_sender_task.values(),
+        ):
             if loop_task and not loop_task.done():
                 loop_task.cancel()
                 try:
                     await loop_task
                 except asyncio.CancelledError:
                     pass
+        # Senders are gone: a resend still on a timer finds no window and is dropped.
+        self._result_window.clear()
+        self._task_window.clear()
 
         inflight_flushes = [
             t
@@ -2094,7 +2000,7 @@ class AsyncMaster(Node):
             await self._policy_endpoint.stop()
 
         # Tear down children and wait for them to be done
-        for child_name in self._scheduler.children_names:
+        for child_name in list(self._scheduler.state.children):
             await self._teardown_child(child_name)
 
         # Wait for all children to complete with timeout
@@ -2120,21 +2026,10 @@ class AsyncMaster(Node):
             self._executor.shutdown()
         self.logger.info("Done Shutting down executor")
 
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            os.makedirs(os.path.join(os.getcwd(), "profiles"), exist_ok=True)
-            # Export to Perfetto format
-            fname = os.path.join(
-                os.getcwd(), "profiles", f"{self.node_id}_perfetto.json"
-            )
-            self.logger.info(f"Exporting Perfetto trace to {fname}")
-            self._event_registry.export_perfetto(fname)
+        # Drop held task bytes and delete any offloaded segment files.
+        if self._scheduler is not None:
+            self._scheduler.tasks.close()
 
-            # Also export statistics
-            stats = self._event_registry.get_statistics()
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
-            self.logger.info(f"Exporting event statistics to {fname}")
-            with open(fname, "w") as f:
-                json.dump(stats, f, indent=2)
         self.logger.info(f"Done stopping {self.node_id}")
         for handler in self.logger.handlers[:]:
             handler.close()
@@ -2145,26 +2040,36 @@ class AsyncMaster(Node):
     # -------------------------------------------------------------------------
 
     async def _wait_for_finish(self) -> None:
-        """Wait for all work to complete, then trigger result aggregation.
+        """The master's one stop path, top to bottom.
 
-        Races conditions with asyncio.FIRST_COMPLETED:
-        1. Work done — all children have returned their final ResultBatch.
-        2. Parent dead locally — consecutive send failures exceeded threshold.
-        3. SIGTERM on this process.
-        4. Stop(TERMINATE/KILL) received from parent (non-root only).
-
-        On parent-dead exit, forwards Stop(KILL) to all children. On any other
-        non-work-done exit, forwards Stop(TERMINATE) cascading the shutdown down
-        the subtree. In both cases skips sending results/status to the dead parent.
+        A master never decides by itself that it is finished. It stops on the first of: its
+        parent's Stop, its stop signal (SIGTERM, or ``request_stop()`` -- EnsembleLauncher ends a
+        batch run this way once ``wait_drained()`` resolves), or its parent dying. Then it stops
+        its children, takes in what they sent, fails whatever is left, delivers every result,
+        and reports Done.
         """
         import sys
 
+        received = await self._wait_for_stop_condition()
+        stop_type = await self._propagate_stop(received)
+        if received == StopType.KILL:
+            # Our parent wants us gone now: no result exchange, keep what we have on disk.
+            await self._wait_for_children_done(killed=True)
+            self._save_unsent_results()
+            await self.stop()
+            sys.exit(1)
+        await self._wait_for_children_done(killed=stop_type == StopType.KILL)
+        await self._drain_forwarders()
+        self._fail_unfinished()
+        await self._flush_results()
+        await self._send_final_status_and_done()
+
+    async def _wait_for_stop_condition(self) -> Optional[StopType]:
+        """Wait for the first stop condition. Returns the Stop type the parent sent, if that
+        is what happened."""
         stop_tasks: Dict[str, asyncio.Task] = {}
         received_stop_type: List[Optional[StopType]] = [None]
 
-        stop_tasks["work_done"] = asyncio.create_task(
-            self._all_children_done_event.wait()
-        )
         if self._comm.parent_dead_event is not None:
             stop_tasks["parent_dead"] = asyncio.create_task(
                 self._comm.parent_dead_event.wait()
@@ -2182,7 +2087,7 @@ class AsyncMaster(Node):
 
             stop_tasks["parent_stop"] = asyncio.create_task(_recv_stop_from_parent())
 
-        done, pending = await asyncio.wait(
+        _, pending = await asyncio.wait(
             set(stop_tasks.values()), return_when=asyncio.FIRST_COMPLETED
         )
         for t in pending:
@@ -2191,76 +2096,48 @@ class AsyncMaster(Node):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        return received_stop_type[0]
 
-        # Propagate stop to children if work didn't finish naturally.
-        # Parent dead → KILL children. Received stop from parent → mirror its type.
-        # Any other reason (SIGTERM etc.) → TERMINATE cleanly.
-        stop_type: Optional[StopType] = None
-        if not self._all_children_done_event.is_set():
-            if (
-                self._comm.parent_dead_event is not None
-                and self._comm.parent_dead_event.is_set()
-            ):
-                stop_type = StopType.KILL
-            elif received_stop_type[0] is not None:
-                stop_type = received_stop_type[0]
-            else:
-                stop_type = StopType.TERMINATE
-            self.logger.info(
-                f"{self.node_id}: Propagating {stop_type.value} to children"
-            )
-            for child_id in list(self.children.keys()):
-                try:
-                    await self._comm.send_message_to_child(
-                        child_id,
-                        Stop(sender=self.node_id, type=stop_type),
-                        retries=self._config.send_retries,
-                    )
-                except Exception:
-                    pass
-
-        # If we KILLed children they won't send results — cancel all result tasks.
-        if not self._all_children_done_event.is_set() and stop_type == StopType.KILL:
-            for t in list(self._child_result_batch_task.values()):
-                t.cancel()
-            await asyncio.gather(
-                *self._child_result_batch_task.values(),
-                return_exceptions=True,
-            )
-            self._aggregate_task.cancel()
-            try:
-                await self._aggregate_task
-            except (asyncio.CancelledError, Exception):
-                pass
+    async def _propagate_stop(self, received: Optional[StopType]) -> Optional[StopType]:
+        """Stop the children: KILL if our parent died, the type our parent sent, else
+        TERMINATE. Returns what was sent (None if every child had already finished)."""
+        if self._all_children_done_event.is_set():
+            return None
+        if self._comm.parent_dead_event is not None and self._comm.parent_dead_event.is_set():
+            stop_type = StopType.KILL
+        elif received is not None:
+            stop_type = received
         else:
-            await self._aggregate_task
-
-        # Force-exit after propagating if we received a KILL from our parent.
-        if received_stop_type[0] == StopType.KILL:
-            await self.stop()
-            sys.exit(1)
+            stop_type = StopType.TERMINATE
+        self.logger.info(f"{self.node_id}: Propagating {stop_type.value} to children")
+        for child_id in list(self.children.keys()):
+            try:
+                await self._comm.send_message_to_child(
+                    child_id,
+                    Stop(sender=self.node_id, type=stop_type),
+                    retries=self._config.send_retries,
+                )
+            except Exception:
+                pass
+        return stop_type
 
     async def run(self) -> ResultBatch:
-        """Main entry point: initialise, wait for all work to finish, stop, return results."""
-        try:
-            async with self._timer("init"):
-                await self._lazy_init()
+        """Main entry point: initialise, wait for the stop path to finish, stop, return results.
 
-            # Wait for aggregation to complete
+        The root returns every result with no client (its parent outbox, which nothing sends);
+        a sub-master has streamed everything up and returns an empty batch."""
+        try:
+            await self._lazy_init()
             await self._wait_for_finish()
         finally:
             await self.stop()
 
-        # Return aggregated results
-        result_batch = ResultBatch(sender=self.node_id)
-        for r in self._batch_streaming_results:
-            result_batch.add_result(r)
-        for child_results in self._results.values():
-            for rb in child_results:
-                result_batch += rb
-        if self.level == 0:
-            result_batch.unpack()
-        return result_batch
+        pieces = []
+        if not self.parent and self._scheduler is not None:
+            outbox = self._scheduler.parent_outbox
+            while not outbox.empty():
+                pieces.append(outbox.get_nowait())
+        return ResultBatch.concat(pieces, sender=self.node_id)
 
     def create_an_event_loop(self) -> None:
         """Entry point for a new child process: run the async event loop."""

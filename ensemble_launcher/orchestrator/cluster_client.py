@@ -4,203 +4,40 @@ import logging
 import os
 import secrets
 import threading
-import time
 import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import wait as wait_futures
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 from ensemble_launcher.checkpointing import CommCheckpointData
-from ensemble_launcher.comm import AsyncCommState, ClientConnection, transport_registry
-from ensemble_launcher.comm.messages import IResultBatch, Message, Result, TaskUpdate
+from ensemble_launcher.comm import AsyncCommState, transport_registry
+from ensemble_launcher.comm.messages import Message, Result, TaskUpdate
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator.discovery import _resolve_node_id, _wait_for_path
 
-# ---------------------------------------------------------------------------
-# Worker pipeline
-# ---------------------------------------------------------------------------
-
-
-class _WorkerPipeline:
-    """One independent send/recv pipeline: own thread, event loop, and connection."""
-
-    def __init__(
-        self,
-        worker_id: str,
-        conn: ClientConnection,
-        req_res: bool = False,
-        send_retries: int = 3,
-        send_timeout: float = 5.0,
-    ):
-        self.worker_id = worker_id
-        self.conn = conn
-        self.pending: Dict[str, ConcurrentFuture] = {}
-        self.lock = threading.Lock()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._loop_ready = threading.Event()
-        self._recv_task: Optional[asyncio.Task] = None
-        self._thread: Optional[threading.Thread] = None
-        # Profiling accumulators
-        self.recv_time = 0.0
-        self.deser_time = 0.0
-        self.set_result_time = 0.0
-        self.total_results = 0
-        self._logger = None
-        self._req_res = req_res
-        self._send_retries = send_retries
-        self._send_timeout = send_timeout
-        self._seen_message_ids: collections.OrderedDict = collections.OrderedDict()
-        self._seen_message_ids_max: int = 10000
-
-    def start(self, logger) -> None:
-        """Start the pipeline's dedicated thread and wait until its event loop is ready."""
-        self._logger = logger
-        self._thread = threading.Thread(target=self._run, args=(logger,), daemon=True)
-        self._thread.start()
-        self._loop_ready.wait()
-
-    def _run(self, logger) -> None:
-        """Thread target: create event loop, open connection, run recv loop."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self.conn.open())
-        self._loop_ready.set()
-        try:
-            self._loop.run_until_complete(self._recv_loop(logger))
-        except Exception as e:
-            logger.error(f"Pipeline {self.worker_id} exited with error: {e}")
-        finally:
-            self._loop.run_until_complete(self.conn.close())
-            self._loop.close()
-
-    async def _recv_loop(self, logger) -> None:
-        self._recv_task = asyncio.current_task()
-        try:
-            while True:
-                t0 = time.perf_counter()
-                parts = await self.conn.recv()
-                self.recv_time += time.perf_counter() - t0
-                data_frames = parts[1:]
-                asyncio.create_task(self._deserialize_and_set(data_frames))
-        except asyncio.CancelledError:
-            logger.info(
-                f"{self.worker_id} recv={self.recv_time:.3f}s "
-                f"deser={self.deser_time:.3f}s "
-                f"set_result={self.set_result_time:.3f}s"
-            )
-
-    async def _deserialize_and_set(self, frames: list) -> None:
-        t0 = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        if len(frames) == 1:
-            msg: IResultBatch = await loop.run_in_executor(
-                None, Message.from_bytes, frames[0]
-            )
-        else:
-            msg: IResultBatch = await loop.run_in_executor(
-                None, Message.from_byte_array, frames
-            )
-        if self._req_res and msg.message_id is not None:
-            if msg.message_id in self._seen_message_ids:
-                return
-            self._seen_message_ids[msg.message_id] = None
-            if len(self._seen_message_ids) > self._seen_message_ids_max:
-                self._seen_message_ids.popitem(last=False)
-        await loop.run_in_executor(None, msg.unpack)
-        t1 = time.perf_counter()
-        for result in msg.data:
-            self.set_result(result)
-        self.total_results += len(msg.data)
-        self.deser_time += t1 - t0
-        self.set_result_time += time.perf_counter() - t1
-        if self._logger is not None:
-            self._logger.info(
-                f"{self.worker_id}: received {len(msg.data)} results "
-                f"(total={self.total_results})"
-            )
-
-    def set_result(self, result: Result) -> None:
-        with self.lock:
-            fut = self.pending.pop(result.task_id, None)
-        if fut is None or fut.done():
-            return
-        if result.success:
-            fut.set_result(result.data)
-        else:
-            fut.set_exception(Exception(result.exception or "Task failed"))
-
-    def send(
-        self, data: Union[bytes, List[bytes]], task_ids: Optional[List[str]] = None,
-    ) -> None:
-        """Thread-safe send: schedules onto this pipeline's own event loop."""
-        asyncio.run_coroutine_threadsafe(
-            self._send_with_retry(data, task_ids or []), self._loop
-        )
-
-    async def _send_with_retry(
-        self, data: Union[bytes, List[bytes]], task_ids: List[str],
-    ) -> None:
-        if not self._req_res:
-            await self.conn.send(data)
-            return
-        for attempt in range(self._send_retries):
-            success = await self.conn.send(data, timeout=self._send_timeout)
-            if success:
-                return
-            if self._logger:
-                self._logger.warning(
-                    f"{self.worker_id}: send failed attempt "
-                    f"{attempt + 1}/{self._send_retries}"
-                )
-        if self._logger:
-            self._logger.error(
-                f"{self.worker_id}: send failed after {self._send_retries} retries"
-            )
-        for task_id in task_ids:
-            self.set_result(Result(
-                task_id=task_id,
-                success=False,
-                exception=f"Send failed after {self._send_retries} retries",
-            ))
-
-    def stop(self) -> None:
-        """Cancel the recv task and wait for the thread to finish.
-
-        The connection is closed inside _run()'s finally block so that
-        the ZMQ socket is always cleaned up before the event loop closes.
-        """
-        if self._loop is not None and self._recv_task is not None:
-            self._loop.call_soon_threadsafe(self._recv_task.cancel)
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-
-
-# ---------------------------------------------------------------------------
-# ClusterClient
-# ---------------------------------------------------------------------------
+_SEEN_MAX = 10000  # message ids remembered to drop resends
 
 
 class ClusterClient:
-    """Backend-agnostic client for submitting tasks to a running orchestrator.
+    """Submit tasks to a running orchestrator node and get ``concurrent.futures.Future``s.
 
-    Connects to a node by reading its comm checkpoint, which contains the
-    actual ``host:port`` address and transport backend.  Node IDs follow the
-    scheduler naming convention: ``"main"``, ``"main.w0"``, ``"main.m0.w1"``, etc.
+    Connects to a node by reading its comm checkpoint (address, transport, secret). Node ids
+    follow the scheduler naming: ``"main"``, ``"main.w0"``, ``"main.m0.w1"``, ...
 
-    Set ``n_workers > 1`` to open multiple parallel send/recv pipelines, each
-    with its own ZMQ socket and result-deserialization task.  Tasks are
-    distributed round-robin across pipelines; results are routed back to the
-    pipeline that submitted them via the ZMQ DEALER identity.
+    One connection, one background thread running one asyncio loop. The loop runs the
+    connection's front end, receives result batches, decodes them and resolves the futures
+    (keyed by task uid), and flushes the task buffer on a timer. The socket and the ACK
+    protocol live in the connection's IOProcess -- in a process of its own when
+    ``io_process`` is on (with ``req_res``) -- so decoding a large batch here never delays an
+    ACK. ``submit`` / ``map`` only buffer; ``flush`` (automatic when the buffer is full and
+    every ``task_flush_interval``) sends the buffer as one ``TaskUpdate``.
 
     Examples::
 
-        # Connect to the global master (default):
-        with ClusterClient("/scratch/ckpt") as client:
+        with ClusterClient("/scratch/ckpt") as client:     # the global master
             fut = client.submit(task)
-
-        # Four parallel pipelines:
-        with ClusterClient("/scratch/ckpt", n_workers=4) as client:
             futs = client.map(fn, items)
     """
 
@@ -209,11 +46,11 @@ class ClusterClient:
         checkpoint_dir: str,
         node_id: str = "global",
         client_id: Optional[str] = None,
-        n_workers: int = 1,
         log_level: int = logging.INFO,
         checkpoint_timeout: float = 60.0,
         task_buffer_size: int = 10000,
         task_flush_interval: float = 0.5,
+        io_process: Optional[bool] = None,
     ):
         """
         Args:
@@ -224,127 +61,250 @@ class ClusterClient:
                                  ``"main.w0"`` or ``"main.m0.w2"`` to connect directly to
                                  that node.
             client_id:           Optional client identity string; auto-generated if omitted.
-            n_workers:           Number of parallel send/recv pipelines (default 1).
             log_level:           Logging level (default ``logging.INFO``).
             checkpoint_timeout:  Seconds to wait for checkpoint files to appear before
-                                 raising ``TimeoutError`` (default 60).  Useful when the
-                                 client is started before the orchestrator has written its
-                                 first checkpoint.
-            task_buffer_size:    Flush the outgoing task buffer when it reaches this many
-                                 tasks (default 10000).
+                                 raising ``TimeoutError`` (default 60), for a client started
+                                 before the orchestrator wrote its first checkpoint.
+            task_buffer_size:    Flush the task buffer when it reaches this many tasks
+                                 (default 10000).
             task_flush_interval: Seconds between periodic flushes of the task buffer
-                                 (default 5.0).
+                                 (default 0.5).
+            io_process:          Run the connection's IOProcess in its own process. None
+                                 (default) follows the cluster's ``comm_io_process``. Only
+                                 takes effect when the cluster uses ``req_res``.
         """
         self._client_id = client_id or f"client-{secrets.token_hex(4)}"
-        self._n_workers = n_workers
         self._task_buffer_size = task_buffer_size
         self._task_flush_interval = task_flush_interval
-        self._task_buffer: Deque[
-            Tuple[Task, ConcurrentFuture, List[ConcurrentFuture]]
-        ] = deque()
-        self._task_buffer_lock = threading.Lock()
-        self._flush_stop_event = threading.Event()
-        self._flush_thread: Optional[threading.Thread] = None
-        self.logger = setup_logger(
-            __name__, self._client_id, level=log_level,
-        )
-        self._node_id = None
+        self.logger = setup_logger(__name__, self._client_id, level=log_level)
 
-        # Wait for the checkpoint directory to be populated before resolving the node id.
         self.logger.info(
             f"Waiting for checkpoint directory '{checkpoint_dir}' "
             f"(timeout={checkpoint_timeout:.0f}s)"
         )
         _wait_for_path(checkpoint_dir, timeout=checkpoint_timeout)
+        self._node_id = _resolve_node_id(checkpoint_dir, node_id)
+        node_dir = os.path.join(checkpoint_dir, *self._node_id.split("."))
 
-        resolved_id = _resolve_node_id(checkpoint_dir, node_id)
-        self._node_id = resolved_id
-        comm_path = os.path.join(
-            checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_comm.json"
-        )
-
-        # Wait for the specific comm checkpoint file to be written.
+        comm_path = os.path.join(node_dir, f"{self._node_id}_comm.json")
         self.logger.info(f"Waiting for comm checkpoint '{comm_path}'")
         _wait_for_path(comm_path, timeout=checkpoint_timeout)
         with open(comm_path, "r") as f:
             comm_data = CommCheckpointData.model_validate_json(f.read())
 
-        # Read cluster secret for authentication.
-        secret_path = os.path.join(
-            checkpoint_dir, *self._node_id.split("."), f"{resolved_id}_secret"
-        )
+        secret_path = os.path.join(node_dir, f"{self._node_id}_secret")
         cluster_secret = None
         if os.path.exists(secret_path):
             with open(secret_path, "r") as f:
                 cluster_secret = f.read().strip()
             self.logger.info("Loaded cluster secret from checkpoint")
         else:
-            self.logger.warning(
-                "No cluster secret file found — connecting without authentication"
-            )
+            self.logger.warning("No cluster secret file found — connecting without authentication")
 
         comm_state = AsyncCommState.deserialize(comm_data.comm_state_json)
         self._req_res = comm_state.req_res
         self._send_retries = comm_state.send_retries
         self._send_timeout = comm_state.send_timeout
-        self._node_address = None
-        if comm_state.data_transport_state is not None:
-            tt = comm_state.data_transport_state.transport_type
-            entry = transport_registry[tt]
-            ClientConn = entry["client_connection"]
-            for cs in comm_state.data_transport_state.server_connections.values():
-                if cs.address is not None:
-                    self._node_address = cs.address
-                    break
-
-        self._pipelines: List[_WorkerPipeline] = [
-            _WorkerPipeline(
-                worker_id=f"{self._client_id}-w{i}",
-                conn=ClientConn(
-                    identity=f"{self._client_id}-w{i}",
-                    secret_id=cluster_secret or secrets.token_hex(4),
-                    remote_address=self._node_address,
-                    req_res=self._req_res,
-                ),
-                req_res=self._req_res,
-                send_retries=self._send_retries,
-                send_timeout=self._send_timeout,
-            )
-            for i in range(n_workers)
-        ]
-
-    def start(self) -> None:
-        """Start each pipeline's dedicated thread and wait until all are connected."""
-        for pipeline in self._pipelines:
-            pipeline.start(self.logger)
-        self._flush_stop_event.clear()
-        self._flush_thread = threading.Thread(
-            target=self._flush_timer_loop, daemon=True
+        transport = comm_state.data_transport_state
+        if transport is None:
+            raise RuntimeError(f"{self._node_id} has no data transport to connect to")
+        self._node_address = next(
+            (cs.address for cs in transport.server_connections.values() if cs.address is not None),
+            None,
         )
-        self._flush_thread.start()
-        self.logger.info(
-            f"Started {self._n_workers} pipeline(s) connected to "
-            f"{self._node_id} at {self._node_address}"
+        conn_cls = transport_registry[transport.transport_type]["client_connection"]
+        self._conn = conn_cls(
+            identity=self._client_id,
+            secret_id=cluster_secret or secrets.token_hex(4),
+            remote_address=self._node_address,
+            req_res=self._req_res,
+            io_process=comm_state.io_process if io_process is None else io_process,
         )
 
-    def teardown(self) -> None:
-        """Flush remaining tasks, stop the flush timer, and stop all pipelines."""
-        self.flush()
-        self._flush_stop_event.set()
-        if self._flush_thread is not None:
-            self._flush_thread.join(timeout=5.0)
-        for pipeline in self._pipelines:
-            pipeline.stop()
+        # Shared with the loop thread, guarded by _lock.
+        self._lock = threading.Lock()
+        self._pending: Dict[bytes, ConcurrentFuture] = {}  # task uid -> future
+        self._sends: set = set()  # in-flight _send calls, waited for by teardown
+        self._buffer: Deque[Tuple[Task, ConcurrentFuture, Optional[List[ConcurrentFuture]]]] = deque()
+        # Loop thread only.
+        self._seen: collections.OrderedDict = collections.OrderedDict()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._main_task: Optional[asyncio.Task] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready = threading.Event()
+        self._start_error: Optional[BaseException] = None
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Open the connection on the background loop; returns once it is connected."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=asyncio.run, args=(self._main(),), daemon=True)
+        self._thread.start()
+        self._ready.wait()
+        if self._start_error is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+            raise self._start_error
+        self.logger.info(f"Connected to {self._node_id} at {self._node_address}")
+
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._main_task = asyncio.current_task()
+        try:
+            await self._conn.open()
+        except BaseException as e:
+            self._start_error = e
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            await asyncio.gather(self._recv_loop(), self._flush_loop())
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self._conn.close()
+
+    def teardown(self) -> None:
+        """Send what is still buffered, then close the connection and stop the thread."""
+        if self._thread is None:
+            return
+        self.flush()
+        with self._lock:
+            sends = list(self._sends)
+        wait_futures(sends, timeout=self._send_timeout * max(1, self._send_retries) + 5.0)
+        loop, task = self._loop, self._main_task
+        if loop is not None and task is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(task.cancel)
+        self._thread.join(timeout=10.0)
+        self._thread = None
+
+    def __enter__(self) -> "ClusterClient":
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.teardown()
+
+    # ------------------------------------------------------------------
+    # Loop thread
+    # ------------------------------------------------------------------
+
+    async def _recv_loop(self) -> None:
+        """Result batches -> futures. Decoded inline: the ACKs are the IOProcess's job."""
+        while True:
+            frames = await self._conn.recv()
+            try:
+                msg = Message.from_byte_array(frames[1:])  # frames[0]: the sender's identity
+                if self._req_res and msg.message_id is not None:
+                    if msg.message_id in self._seen:  # a resend after a lost ACK
+                        continue
+                    self._seen[msg.message_id] = None
+                    if len(self._seen) > _SEEN_MAX:
+                        self._seen.popitem(last=False)
+                results = msg.to_results()
+            except Exception as e:
+                self.logger.error(f"Could not decode a result message: {e!r}")
+                continue
+            for result in results:
+                self._resolve(result)
+            self.logger.debug(f"Received {len(results)} results")
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._task_flush_interval)
+            self.flush()
+
+    async def _send(self, frames: List[bytes], uids: List[bytes]) -> None:
+        """Send one TaskUpdate; with req_res retry on ACK timeout, then fail its tasks."""
+        attempts = self._send_retries if self._req_res else 1
+        for attempt in range(attempts):
+            if await self._conn.send(frames, timeout=self._send_timeout):
+                return
+            if self._req_res:
+                self.logger.warning(f"Send failed, attempt {attempt + 1}/{attempts}")
+        self.logger.error(f"Send of {len(uids)} tasks failed after {attempts} attempt(s)")
+        for uid in uids:
+            self._resolve(Result(uid=uid, success=False,
+                                 exception=f"Send failed after {attempts} attempt(s)"))  # fmt: skip
+
+    def _send_done(self, sent: ConcurrentFuture) -> None:
+        with self._lock:
+            self._sends.discard(sent)
+
+    def _resolve(self, result: Result) -> None:
+        with self._lock:
+            fut = self._pending.pop(result.uid, None)
+        if fut is None or fut.done():
+            return
+        if result.success:
+            fut.set_result(result.data)
+        else:
+            fut.set_exception(Exception(result.exception or "Task failed"))
+
+    # ------------------------------------------------------------------
+    # Buffering (any thread)
+    # ------------------------------------------------------------------
+
+    def _send_batch(
+        self,
+        tasks: List[Task],
+        dependencies: Optional[List[Optional[List[ConcurrentFuture]]]] = None,
+    ) -> List[ConcurrentFuture]:
+        """Buffer tasks and return their futures; flush when the buffer is full."""
+        futures: List[ConcurrentFuture] = []
+        deps = dependencies if dependencies is not None else [None] * len(tasks)
+        with self._lock:
+            for task, d in zip(tasks, deps):
+                fut: ConcurrentFuture = ConcurrentFuture()
+                self._buffer.append((task, fut, d))
+                futures.append(fut)
+            full = len(self._buffer) >= self._task_buffer_size
+        if full:
+            self.flush()
+        return futures
+
+    def flush(self) -> None:
+        """Send every buffered task whose dependencies are done, as one TaskUpdate. Tasks
+        still waiting on dependencies stay buffered for a later flush. Safe from any thread."""
+        if self._loop is None:
+            return  # not started; start() and the timer will send them
+        with self._lock:
+            if not self._buffer:
+                return
+            ready, waiting = [], deque()
+            for task, fut, deps in self._buffer:
+                if deps and not all(d.done() for d in deps):
+                    waiting.append((task, fut, deps))
+                    continue
+                self._pending[task.uid] = fut
+                ready.append(task)
+            self._buffer = waiting
+        if not ready:
+            return
+        msg = TaskUpdate.from_tasks(ready, sender=self._client_id)
+        if self._req_res:
+            msg.message_id = uuid.uuid4().hex
+        sent = asyncio.run_coroutine_threadsafe(
+            self._send(msg.to_byte_array(), [t.uid for t in ready]), self._loop
+        )
+        with self._lock:
+            self._sends.add(sent)
+        sent.add_done_callback(self._send_done)
+        self.logger.info(f"Flushed {len(ready)} tasks ({len(waiting)} waiting on dependencies)")
+
+    # ------------------------------------------------------------------
+    # Public API
     # ------------------------------------------------------------------
 
     def _to_task(
         self,
         task_or_callable: Union[Task, Callable, str],
         args: Tuple = (),
-        kwargs: Dict = {},
+        kwargs: Optional[Dict] = None,
         nnodes: int = 1,
         ppn: int = 1,
         ngpus_per_process: Union[int, float] = 0,
@@ -355,84 +315,18 @@ class ClusterClient:
             return task_or_callable
         if callable(task_or_callable) or isinstance(task_or_callable, str):
             return Task(
-                task_id=str(uuid.uuid4()),
+                task_id=uuid.uuid4().hex,  # 32 chars: fits META_DTYPE
                 nnodes=nnodes,
                 ppn=ppn,
                 ngpus_per_process=ngpus_per_process,
                 executable=task_or_callable,
                 args=args,
-                kwargs=kwargs,
+                kwargs=kwargs or {},
                 serialize_executable_by_value=serialize_executable_by_value,
             )
         raise TypeError(
             f"submit() expects a Task, callable, or str; got {type(task_or_callable)}"
         )
-
-    def _send_batch(
-        self,
-        tasks: List[Task],
-        dependencies: Optional[List[List[ConcurrentFuture]]] = None,
-    ) -> List[ConcurrentFuture]:
-        """Buffer tasks and return futures. Flushes immediately when buffer is full."""
-        futures: List[ConcurrentFuture] = []
-        with self._task_buffer_lock:
-            for task, d in zip(
-                tasks, dependencies if dependencies is not None else [None] * len(tasks)
-            ):
-                fut: ConcurrentFuture = ConcurrentFuture()
-                self._task_buffer.append((task, fut, d))
-                futures.append(fut)
-            if len(self._task_buffer) >= self._task_buffer_size:
-                self._flush_task_buffer()
-        return futures
-
-    def _flush_task_buffer(self) -> None:
-        """Drain the buffer and send one TaskUpdate per pipeline. Caller must hold _task_buffer_lock."""
-        if not self._task_buffer:
-            return
-        items = list(self._task_buffer)
-        self._task_buffer.clear()
-
-        remaining = []
-        pipeline_batches: List[List[Task]] = [[] for _ in self._pipelines]
-        for i, (task, fut, dependencies) in enumerate(items):
-            if dependencies and not all([d.done() for d in dependencies]):
-                remaining.append((task, fut, dependencies))
-                continue
-            pipeline = self._pipelines[i % self._n_workers]
-            with pipeline.lock:
-                pipeline.pending[task.task_id] = fut
-            pipeline_batches[i % self._n_workers].append(task)
-
-        for pipeline, batch in zip(self._pipelines, pipeline_batches):
-            if batch:
-                msg = TaskUpdate(sender=pipeline.worker_id, added_tasks=batch)
-                if self._req_res:
-                    msg.message_id = uuid.uuid4().hex
-                pipeline.send(
-                    msg.to_byte_array(),
-                    task_ids=[t.task_id for t in batch],
-                )
-        self.logger.info(
-            f"Flushed {len(items) - len(remaining)} tasks across {self._n_workers} pipeline(s)"
-        )
-        self._task_buffer.extend(remaining)
-
-    def flush(self) -> None:
-        """Force-flush all buffered tasks. Safe to call from any thread."""
-        with self._task_buffer_lock:
-            self._flush_task_buffer()
-
-    def _flush_timer_loop(self) -> None:
-        """Periodically flush the task buffer until stop event is set."""
-        while not self._flush_stop_event.is_set():
-            self._flush_stop_event.wait(self._task_flush_interval)
-            if not self._flush_stop_event.is_set():
-                self.flush()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def submit(
         self,
@@ -458,6 +352,7 @@ class ClusterClient:
             nnodes: Number of nodes to request (ignored when *task* is a Task).
             ppn: Processes per node (ignored when *task* is a Task).
             ngpus_per_process: GPUs per process (ignored when *task* is a Task).
+            dependencies: Futures that must be done before this task is sent.
             serialize_executable_by_value: When False, serialize the callable
                 by reference (module + qualname) using pickle instead of
                 cloudpickle. This preserves per-worker caches across calls.
@@ -467,13 +362,13 @@ class ClusterClient:
             [self._to_task(task, args, kwargs, nnodes, ppn, ngpus_per_process,
                            serialize_executable_by_value=serialize_executable_by_value)],
             dependencies=[dependencies],
-        )[0]
+        )[0]  # fmt: skip
 
     def submit_batch(
         self,
         tasks: List[Task],
         dependencies: Optional[List[List[ConcurrentFuture]]] = None,
-    ):
+    ) -> List[ConcurrentFuture]:
         """Submit a batch of tasks to the cluster."""
         return self._send_batch(tasks, dependencies=dependencies)
 
@@ -490,16 +385,17 @@ class ClusterClient:
     ) -> List[ConcurrentFuture]:
         """Submit *fn* applied to each element of *iterable* in a single batch.
 
-        All tasks are sent in one :class:`TaskUpdate` message per pipeline.
         Returns a list of :class:`~concurrent.futures.Future` objects in the
         same order as *iterable*.
 
         Args:
             fn: Callable or shell command string to apply to each item.
-            iterable: Items to map over; each becomes the sole positional arg.
+            iterable: Items to map over; each becomes the sole positional arg
+                (a tuple item is unpacked as the positional args).
             nnodes: Number of nodes per task.
             ppn: Processes per node per task.
             ngpus_per_process: GPUs per process per task.
+            dependencies: Futures every task must wait for.
             serialize_executable_by_value: When False, serialize the callable
                 by reference (module + qualname) using pickle instead of
                 cloudpickle. This preserves per-worker caches across calls.
@@ -525,10 +421,3 @@ class ClusterClient:
         return self._send_batch(
             tasks, dependencies=[dependencies] * len(tasks) if dependencies else None
         )
-
-    def __enter__(self) -> "ClusterClient":
-        self.start()
-        return self
-
-    def __exit__(self, *_):
-        self.teardown()

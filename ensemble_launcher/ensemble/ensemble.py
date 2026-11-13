@@ -1,26 +1,27 @@
 from __future__ import annotations
 
-import asyncio
 import enum
 import os
+import pickle
 import struct
+import warnings
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Callable,
     Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
     TypedDict,
     Union,
 )
 
-import pickle
-
 import cloudpickle
 import numpy as np
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints, ValidationInfo
 
 if TYPE_CHECKING:
     from ensemble_launcher.scheduler.resource import JobResource
@@ -34,12 +35,52 @@ class TaskStatus(enum.Enum):
     SUCCESS = "success"
 
 
-_DEEP_FIELDS = ("executable", "args", "kwargs", "env", "result")
-_DEEP_FIELDS_NO_EXEC = ("args", "kwargs", "env", "result")
+UID_BYTES = 16
+STR_BYTES = 32
 
+def _truncate(v: str, info: ValidationInfo) -> str:
+    if len(v) > STR_BYTES:
+        warnings.warn(f"{info.field_name} is longer than {STR_BYTES} characters; truncated")
+        return v[:STR_BYTES]
+    return v
+
+STR_FMT = Annotated[str, StringConstraints(min_length=1, ascii_only=True), AfterValidator(_truncate)]
+
+_DEEP_FIELDS = ("executable", 
+                "args", 
+                "kwargs", 
+                "env", 
+                "exception", 
+                "cpu_affinity", 
+                "gpu_affinity", 
+                "run_dir",  
+                "stdout_file", 
+                "stderr_file",
+                "status",
+                "result",
+                "exception",
+                "start_time",
+                "end_time",
+                "driver_only")
+
+_DEEP_FIELDS_NO_EXEC = ("args", 
+                        "kwargs", 
+                        "env", 
+                        "exception", 
+                        "cpu_affinity", 
+                        "gpu_affinity", 
+                        "run_dir",  
+                        "stdout_file", 
+                        "stderr_file",
+                        "status",
+                        "result",
+                        "exception",
+                        "start_time",
+                        "end_time",
+                        "driver_only")
 
 class Task(BaseModel):
-    task_id: str
+    task_id: STR_FMT
     nnodes: int
     ppn: int
     executable: Union[str, Callable] = None
@@ -56,8 +97,8 @@ class Task(BaseModel):
     run_dir: Optional[Union[str, os.PathLike]] = None
     start_time: Any = None
     end_time: Any = None
-    executor_name: Optional[str] = None
-    tag: Optional[str] = None
+    executor_name: Optional[STR_FMT] = None
+    tag: Optional[STR_FMT] = None
     stdout_file: Optional[str] = None
     stderr_file: Optional[str] = None
     serialize_executable_by_value: bool = True
@@ -67,151 +108,199 @@ class Task(BaseModel):
     that shells out to mpiexec). The full reservation — node list and per-node
     CPU/GPU ids — is exported to the driver through the environment."""
 
-    _packed: bool = PrivateAttr(default=False)
-    _raw_deep: Optional[bytes] = PrivateAttr(default=None)
-
-    # ------------------------------------------------------------------ #
-    #  pack / unpack                                                      #
-    # ------------------------------------------------------------------ #
-
-    @property
-    def is_packed(self) -> bool:
-        return self._packed
-
-    def _check_unpacked(self, field: str) -> None:
-        if self._packed:
-            raise RuntimeError(
-                f"Task.{field} not accessible in packed state — call unpack() first"
-            )
-
-    def pack(self) -> Task:
-        if self._packed:
-            return self
-        if self.serialize_executable_by_value:
-            self._raw_deep = cloudpickle.dumps(
-                {f: getattr(self, f) for f in _DEEP_FIELDS}
-            )
-        else:
-            exec_blob = pickle.dumps(self.executable)
-            rest_blob = cloudpickle.dumps(
-                {f: getattr(self, f) for f in _DEEP_FIELDS_NO_EXEC}
-            )
-            self._raw_deep = struct.pack("!I", len(exec_blob)) + exec_blob + rest_blob
-        for f in _DEEP_FIELDS:
-            object.__setattr__(self, f, None)
-        self._packed = True
-        return self
-
-    def unpack(self) -> None:
-        if not self._packed:
-            return
-        if self.serialize_executable_by_value:
-            deep = cloudpickle.loads(self._raw_deep)
-        else:
-            (exec_len,) = struct.unpack_from("!I", self._raw_deep, 0)
-            executable = pickle.loads(self._raw_deep[4 : 4 + exec_len])
-            deep = cloudpickle.loads(self._raw_deep[4 + exec_len :])
-            deep["executable"] = executable
-        for f in _DEEP_FIELDS:
-            object.__setattr__(self, f, deep[f])
-        self._raw_deep = None
-        self._packed = False
-
-    # ------------------------------------------------------------------ #
-    #  to_bytes / from_bytes                                              #
-    # ------------------------------------------------------------------ #
-
-    def to_byte_array(self) -> list:
-        self.pack()
-        shallow = cloudpickle.dumps(self.__dict__.copy())
-        header = struct.pack("!I", len(shallow))
-        return [header, shallow, self._raw_deep]
-
-    @classmethod
-    def from_byte_array(cls, frames: list) -> Task:
-        shallow_dict = cloudpickle.loads(frames[1])
-        deep_blob = frames[2]
-        task = cls.__new__(cls)
-        object.__setattr__(task, "__dict__", shallow_dict)
-        object.__setattr__(task, "__pydantic_fields_set__", set())
-        task.__pydantic_private__ = {"_packed": True, "_raw_deep": deep_blob}
-        return task
-
-    def to_bytes(self) -> bytes:
-        return b"".join(self.to_byte_array())
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Task:
-        (shallow_len,) = struct.unpack_from("!I", data, 0)
-        shallow_dict = cloudpickle.loads(data[4 : 4 + shallow_len])
-        deep_blob = data[4 + shallow_len :]
-        task = cls.__new__(cls)
-        object.__setattr__(task, "__dict__", shallow_dict)
-        object.__setattr__(task, "__pydantic_fields_set__", set())
-        task.__pydantic_private__ = {"_packed": True, "_raw_deep": deep_blob}
-        return task
+    uid: bytes = Field(default_factory=lambda: os.urandom(UID_BYTES))
+    """Internal 16-byte id EL routes and stores the task by. Set when the Task is created;
+    ``task_id`` stays the user's name for it and need not be unique."""
 
     def get_resource_requirements(self) -> "JobResource":
         """Build JobResource requirements from this Task."""
-        from ensemble_launcher.scheduler.resource import (
-            JobResource,
-            NodeResourceCount,
-            NodeResourceList,
+        return resource_requirements(
+            self.nnodes, self.ppn, self.ngpus_per_process, self.cpu_affinity, self.gpu_affinity
         )
 
-        req = JobResource(
-            resources=[
-                NodeResourceCount(
-                    ncpus=self.ppn, ngpus=self.ngpus_per_process * self.ppn
-                )
-                for i in range(self.nnodes)
-            ]
-        )
-        if len(self.cpu_affinity) > 0 or len(self.gpu_affinity) > 0:
-            ncpus = self.ppn * self.nnodes
-            ngpus = ncpus * self.ngpus_per_process
-            if ncpus >= 1 and ngpus > 0:
-                if self.cpu_affinity and (
-                    self.ngpus_per_process > 0 and not self.gpu_affinity
-                ):
-                    # Ignore cpu_affinity if gpu_affinity is not set
-                    return req
 
-                if self.gpu_affinity and not self.cpu_affinity:
-                    # Ignore gpu_affinity if cpu_affinity is not set
-                    return req
+def resource_requirements(
+    nnodes: int,
+    ppn: int,
+    ngpus_per_process: Union[int, float],
+    cpu_affinity: Optional[List[int]] = None,
+    gpu_affinity: Optional[List[Union[int, str]]] = None,
+) -> "JobResource":
+    """The JobResource a task with these fields needs. Shared by `Task` and `TaskMeta`."""
+    from ensemble_launcher.scheduler.resource import (
+        JobResource,
+        NodeResourceCount,
+        NodeResourceList,
+    )
 
-                # Distribute the (possibly fractional) total GPU demand evenly
-                # across the explicitly requested ids, so a fractional
-                # ngpus_per_process still works with gpu_affinity set.
-                gpu_amount_per_id = ngpus / len(self.gpu_affinity)
+    req = JobResource(
+        resources=[
+            NodeResourceCount(ncpus=ppn, ngpus=ngpus_per_process * ppn)
+            for i in range(nnodes)
+        ]
+    )
+    cpu_affinity = cpu_affinity or []
+    gpu_affinity = gpu_affinity or []
+    if len(cpu_affinity) > 0 or len(gpu_affinity) > 0:
+        ncpus = ppn * nnodes
+        ngpus = ncpus * ngpus_per_process
+        if ncpus >= 1 and ngpus > 0:
+            if cpu_affinity and (ngpus_per_process > 0 and not gpu_affinity):
+                # Ignore cpu_affinity if gpu_affinity is not set
+                return req
+
+            if gpu_affinity and not cpu_affinity:
+                # Ignore gpu_affinity if cpu_affinity is not set
+                return req
+
+            # Distribute the (possibly fractional) total GPU demand evenly
+            # across the explicitly requested ids, so a fractional
+            # ngpus_per_process still works with gpu_affinity set.
+            gpu_amount_per_id = ngpus / len(gpu_affinity)
+            req = JobResource(
+                resources=[
+                    NodeResourceList.request(
+                        cpus=tuple(cpu_affinity),
+                        gpus=gpu_affinity,
+                        gpu_fraction=gpu_amount_per_id,
+                    )
+                    for node in range(nnodes)
+                ]
+            )
+        elif ncpus >= 1 and ngpus == 0:
+            if len(cpu_affinity) == ppn:
                 req = JobResource(
                     resources=[
-                        NodeResourceList.request(
-                            cpus=tuple(self.cpu_affinity),
-                            gpus=self.gpu_affinity,
-                            gpu_fraction=gpu_amount_per_id,
-                        )
-                        for node in range(self.nnodes)
+                        NodeResourceList(cpus=tuple(cpu_affinity))
+                        for node in range(nnodes)
                     ]
                 )
-            elif ncpus >= 1 and ngpus == 0:
-                if len(self.cpu_affinity) == self.ppn:
-                    req = JobResource(
-                        resources=[
-                            NodeResourceList(
-                                cpus=tuple(self.cpu_affinity),
-                            )
-                            for node in range(self.nnodes)
-                        ]
-                    )
-                else:
-                    # This is a multi threading case where we might need more physical core per process
-                    pass
             else:
+                # This is a multi threading case where we might need more physical core per process
                 pass
+        else:
+            pass
 
-        return req
+    return req
+
+
+# --------------------------------------------------------------------------- #
+#  Per-task encoding, used by TaskUpdate (comm/messages.py)                    #
+# --------------------------------------------------------------------------- #
+
+# Every field except the deep ones and uid, in a fixed order. A task's metadata record is one
+# ``META_DTYPE`` row; policies read whole columns, or one row at a time through TaskMeta.
+META_FIELDS: Tuple[str, ...] = tuple(
+    f for f in Task.model_fields if f not in _DEEP_FIELDS and f != "uid"
+)
+
+_META_DTYPE = {
+    "nnodes": "<i4",                          # 4 bytes, little-endian int32
+    "ppn": "<i4",                             # 4 bytes
+    "ngpus_per_process": "<f8",               # 8 bytes, float64 (int or float today)
+    "estimated_runtime": "<f8",               # 8 bytes
+    "serialize_executable_by_value": "?",     # 1 byte, bool
+    "task_id": f"S{STR_BYTES}",           # 32 bytes, null-padded ASCII
+    "executor_name": f"S{STR_BYTES}",        # 32 bytes, empty means None
+    "tag": f"S{STR_BYTES}",                  # 32 bytes, empty means None
+}
+assert set(_META_DTYPE.keys()) == set(META_FIELDS), "All meta fields need a dtype"
+
+META_DTYPE = np.dtype([(d, _META_DTYPE[d]) for d in META_FIELDS])  # 153 bytes per task
+
+_OPTIONAL_STR = ("executor_name", "tag")
+_STR_INDEX = tuple(i for i, f in enumerate(META_FIELDS) if META_DTYPE[f].kind == "S")
+_OPTIONAL_INDEX = frozenset(META_FIELDS.index(f) for f in _OPTIONAL_STR)
+_NGPUS_INDEX = META_FIELDS.index("ngpus_per_process")
+
+
+def encode_meta_array(tasks: Sequence[Task]) -> np.ndarray:
+    """The tasks' metadata records as one ``META_DTYPE`` array, row i = tasks[i]."""
+    arr = np.empty(len(tasks), dtype=META_DTYPE)
+    tdict = [t.__dict__ for t in tasks]
+    for name in META_DTYPE.names:
+        col = [t[name] for t in tdict]
+        if name in _OPTIONAL_STR:
+            col = [v or "" for v in col]  # None -> "", decoded back to None
+        arr[name] = col
+    return arr
+
+
+def decode_meta_array(buf, offset: int = 0, count: int = -1) -> np.ndarray:
+    """A ``META_DTYPE`` view of ``buf`` (no copy)."""
+    return np.frombuffer(buf, dtype=META_DTYPE, count=count, offset=offset)
+
+
+def meta_row_values(arr: np.ndarray, row: int) -> tuple:
+    """One record as Python values in ``META_FIELDS`` order: str (``None`` for an empty
+    optional string), int, float, bool -- never numpy scalars or bytes."""
+    values = list(arr[row].item())
+    for i in _STR_INDEX:
+        s = values[i].decode("ascii")
+        values[i] = None if (not s and i in _OPTIONAL_INDEX) else s
+    g = values[_NGPUS_INDEX]
+    if g.is_integer():
+        values[_NGPUS_INDEX] = int(g)
+    return tuple(values)
+
+
+def encode_deep(task: Task) -> bytes:
+    """A task's deep record (executable, args, kwargs, env, result), as `Task.pack` used to."""
+    d = task.__dict__
+    if task.serialize_executable_by_value:
+        return cloudpickle.dumps({f: d[f] for f in _DEEP_FIELDS})
+    exec_blob = pickle.dumps(d["executable"])
+    rest_blob = cloudpickle.dumps({f: d[f] for f in _DEEP_FIELDS_NO_EXEC})
+    return struct.pack("!I", len(exec_blob)) + exec_blob + rest_blob
+
+
+def decode_deep(buf, by_value: bool) -> Dict[str, Any]:
+    if by_value:
+        return cloudpickle.loads(buf)
+    (exec_len,) = struct.unpack_from("!I", buf, 0)
+    executable = pickle.loads(buf[4 : 4 + exec_len])
+    deep = cloudpickle.loads(buf[4 + exec_len :])
+    deep["executable"] = executable
+    return deep
+
+
+def build_task(uid: bytes, meta_values: tuple, deep: Dict[str, Any]) -> Task:
+    """A full Task from its decoded records, skipping validation (it was validated when created)."""
+    fields = dict(zip(META_FIELDS, meta_values))
+    fields.update(deep)
+    fields["uid"] = uid
+    return Task.model_construct(**fields)
+
+
+class TaskMeta:
+    """Read-only view of one task's non-deep fields, decoded from its metadata record.
+
+    Built on demand (``store[uid]``) and meant to be dropped right after use: holding many of
+    these alive would bring back the per-task objects the blob format exists to avoid.
+    """
+
+    __slots__ = ("uid", "_values")
+
+    def __init__(self, uid: bytes, values: tuple):
+        self.uid = uid
+        self._values = values  # in META_FIELDS order; each field is a property below
+
+    def get_resource_requirements(self) -> "JobResource":
+        return resource_requirements(
+            self.nnodes, self.ppn, self.ngpus_per_process
+        )
+
+    def __repr__(self) -> str:
+        return f"TaskMeta(uid={self.uid.hex()}, task_id={self.task_id!r}, nnodes={self.nnodes}, ppn={self.ppn})"
+
+
+def _meta_property(i: int, name: str) -> property:
+    return property(lambda self: self._values[i], doc=f"Task.{name}")
+
+
+for _i, _name in enumerate(META_FIELDS):
+    setattr(TaskMeta, _name, _meta_property(_i, _name))
+del _i, _name
 
 
 _TASK_REQUIRED = {"task_id", "nnodes", "ppn", "executable"}

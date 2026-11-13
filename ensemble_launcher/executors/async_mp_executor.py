@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import loky
 
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -62,9 +61,6 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         super().submit(dummy_task)
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry: EventRegistry = get_registry()
         self.logger.info("Initialized AsyncProcessPool Executor!")
 
     def submit(
@@ -121,9 +117,17 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         return asyncio.wrap_future(future)
 
-    def shutdown(self, wait=True, **kwargs):
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        """``kill_workers=True`` kills the pool's processes first, so a running task does not
+        hold up the shutdown (the worker passes it: it has already failed its running tasks).
+        Without it, running tasks are waited for -- the master's child executor runs each child
+        node as a task here, and killing it mid-stop would orphan that child's own pool."""
         processes = dict(self._processes) if self._processes else {}
         kwargs.setdefault("cancel_futures", True)
+        if kill_workers:
+            for p in processes.values():
+                if p.is_alive():
+                    p.kill()
         super().shutdown(wait=wait, **kwargs)
         for p in processes.values():
             if p.is_alive():
@@ -145,6 +149,11 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
             self._return_stdout = kwargs["return_stdout"]
         super().__init__(max_workers=kwargs.get("max_workers", None))
         self.logger.info("Initialized threadpool executor")
+
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        # Threads cannot be killed; kill_workers is accepted so callers can pass it to any
+        # executor.
+        super().shutdown(wait=wait, **kwargs)
 
     def submit(
         self,
@@ -242,9 +251,6 @@ class AsyncLokyExecutor:
             f = self._executor.submit(dummy_task)
             f.result()
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info("Initialized AsyncLoky Executor!")
 
     def submit(
@@ -395,9 +401,6 @@ class AsyncPinnedExecutor:
         }
         self._next_pool = 0  # round-robin cursor for tasks that ask for no GPU
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info(
             f"Initialized AsyncPinned Executor! {npools} pool(s), {max_workers} worker(s), "
             f"{gpu_selector} pinned to {self._gpus or 'nothing'}"
