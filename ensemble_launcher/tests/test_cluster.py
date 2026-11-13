@@ -309,3 +309,57 @@ if __name__ == "__main__":
             task_executor="async_mpi", ntasks_per_core=10, exec=echo_stdout
         )
     )
+
+
+def _start_cluster_worker(ckpt_dir):
+    sys_info = NodeResourceList.from_config(
+        SystemConfig(name="local", ncpus=4, cpus=list(range(1, 5)))
+    )
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(
+            task_executor_name="async_processpool",
+            comm_name="async_zmq",
+            report_interval=100.0,
+            cluster=True,
+            checkpoint_dir=ckpt_dir,
+            return_stdout=True,
+            result_flush_interval=0.1,
+        ),
+        JobResource(resources=[sys_info], nodes=[socket.gethostname()]),
+    )
+    process = mp.Process(target=w.create_an_event_loop)
+    process.start()
+    return process
+
+
+@pytest.mark.parametrize("io_process", [False, True])
+def test_cluster_client_io_process(io_process):
+    """One client, its IOProcess in or out of process: submit, map and a dependency all
+    resolve, and teardown leaves no IOProcess or ipc files behind."""
+    ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
+    process = _start_cluster_worker(ckpt_dir)
+    try:
+        client = ClusterClient(
+            node_id="test", checkpoint_dir=ckpt_dir, io_process=io_process,
+            task_flush_interval=0.1,
+        )  # fmt: skip
+        with client:
+            conn = client._conn
+            assert conn.out_of_process is io_process
+            proc, paths = conn._proc, list(conn._io_paths)
+            first = client.submit(echo, "a")
+            after = client.submit(echo, "b", dependencies=[first])
+            mapped = client.map(echo, ["c", "d", "e"])
+            assert first.result(timeout=60).startswith("Hello from task a")
+            assert after.result(timeout=60).startswith("Hello from task b")
+            assert [f.result(timeout=60).split(",")[0] for f in mapped] == [
+                f"Hello from task {x}" for x in "cde"
+            ]
+        assert client._thread is None
+        if io_process:
+            assert proc is not None and not proc.is_alive()
+            assert paths and not any(os.path.exists(p) for p in paths)
+    finally:
+        process.terminate()
+        process.join(timeout=10.0)

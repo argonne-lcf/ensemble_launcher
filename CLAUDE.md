@@ -255,6 +255,10 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    - `AsyncWorker` — leaf node that executes tasks using a task executor.
    - `AsyncWorkStealingMaster` / `AsyncWorkStealingWorker` — work-stealing variant (enabled via `LauncherConfig.enable_workstealing`).
    - `ClusterClient` — connects to a running cluster via checkpoint directory to submit tasks and retrieve `concurrent.futures.Future`s.
+     One connection and one background thread running one asyncio loop (front end, result decoding,
+     buffer-flush timer); the socket and ACKs are the connection's IOProcess, out of process when
+     `io_process` (default: the cluster's `comm_io_process`) and `req_res`. Don't add threads or
+     executor hops to it: under the GIL they only add handoffs.
    - `PolicyEndpoint` / `PolicyClient` — read and retune a node's policy state while the run is in flight (see below).
    - `discovery.py` — shared checkpoint-directory lookup (`_resolve_node_id`, `read_policy_endpoint`, `discover_policy_nodes`), used by both clients.
 
