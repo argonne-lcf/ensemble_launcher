@@ -72,9 +72,12 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    sends assign msg ids and wait for the peer's ACK with the timeout. The IOProcess runs on the
    caller's loop (`LocalIOQueue.pair()`: two cross-wired `asyncio.Queue`s), or with
    `io_process=True` + `req_res=True` on a ZMQ connection, in its own spawned process
-   (`ZMQIOQueue(send_path, recv_path, bind)` on each side: a PUSH on the first path and a PULL
-   on the second; the IOProcess gets the owner's two paths reversed; built from the paths alone,
-   then `open()` / `close()`), so
+   (`SocketIOQueue(send_path, recv_path, bind)` on each side: one Unix stream socket per path,
+   items length-framed and parsed in a `BufferedProtocol`; the IOProcess gets the owner's two
+   paths reversed; built from the paths alone, then `await open()` / `await close()`;
+   `start_io_process` is a coroutine too. The bind side's `open()` only listens -- the owner
+   opens before it spawns the IOProcess -- and items put before the peer connects are kept and
+   sent in order. `ZMQIOQueue` has the same interface, kept for `benchmark_io_queue.py`), so
    a busy event loop can't delay ACKs -- the 2048-node failure in #69. `LauncherConfig.comm_io_process`
    turns that on for every node's data transport (heartbeats, `PolicyEndpoint`, clients and
    actors stay in process); it is carried in the transport and connection states, so a child's

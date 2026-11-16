@@ -128,10 +128,12 @@ class AsyncConnection(ABC):
         )
         io = self._make_io()
         if self.out_of_process:
-            self._proc, self._q, self._io_paths = start_io_process(io)
+            self._proc, self._q, self._io_paths = await start_io_process(io)
         else:
             io.logger = self.logger
             self._q, io_q = LocalIOQueue.pair()
+            await self._q.open()
+            await io_q.open()
             self._io_task = self._loop.create_task(io.run(io_q))
         address = await self._wait_ready(timeout=60.0)
         self._on_started(address)
@@ -193,7 +195,7 @@ class AsyncConnection(ABC):
             self._listen_task = None
         self._fail_pending()
         if self._q is not None:
-            self._q.close()
+            await self._q.close()
             self._q = None
         import os
 

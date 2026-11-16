@@ -9,7 +9,7 @@ from .async_connection import (
     decode_identity,
 )
 
-from .io_process import IOProcess, LocalIOQueue, SenderRule, ZMQIOQueue
+from .io_process import IOProcess, LocalIOQueue, SenderRule, SocketIOQueue, ZMQIOQueue
 from .async_transport import AsyncTransport, AsyncTransportState, get_hsn_ip_cli
 from .mp import AsyncMPConnection, AsyncMPTransport, MPIOProcess
 from .zmq import (
@@ -47,6 +47,7 @@ __all__ = [
     "decode_identity",
     "IOProcess",
     "LocalIOQueue",
+    "SocketIOQueue",
     "ZMQIOQueue",
     "SenderRule",
     "ZMQRouterIOProcess",

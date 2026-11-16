@@ -13,8 +13,10 @@ end and ``get``s what the other end put:
                             ("control", op, args)    "add_remote" / "remove_remote" / "close"
 
 The IOProcess runs either on the caller's event loop, with a `LocalIOQueue` pair (two
-`asyncio.Queue`s), or in its own process, with a `ZMQIOQueue` on each side (a PUSH and a PULL
-socket over two ``ipc://`` paths). It doesn't know which: the items are the whole contract. Out of process, a busy event loop in
+`asyncio.Queue`s), or in its own process, with a `SocketIOQueue` on each side (two Unix stream
+sockets, length-framed items, read with a `BufferedProtocol`). `ZMQIOQueue` (PUSH/PULL over
+``ipc://``) has the same interface and is kept for comparison (``benchmark_io_queue.py``). The
+IOProcess doesn't know which it has: the items are the whole contract. Out of process, a busy event loop in
 the owner can no longer delay ACKs.
 """
 
@@ -27,9 +29,11 @@ import logging
 import os
 import secrets
 import signal
+import socket
 import struct
 import tempfile
 from abc import ABC, abstractmethod
+from asyncio import BufferedProtocol
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel
@@ -111,7 +115,7 @@ class LocalIOQueue:
         a_to_b, b_to_a = asyncio.Queue(), asyncio.Queue()
         return cls(a_to_b, b_to_a), cls(b_to_a, a_to_b)
 
-    def open(self) -> None:
+    async def open(self) -> None:
         pass
 
     def put_nowait(self, item: tuple) -> None:
@@ -125,7 +129,7 @@ class LocalIOQueue:
         except (asyncio.TimeoutError, TimeoutError):
             return None
 
-    def close(self, linger: int = 0) -> None:
+    async def close(self, linger: int = 0) -> None:
         pass
 
 
@@ -189,7 +193,7 @@ class ZMQIOQueue:
         self._send_sock = None
         self._recv_sock = None
 
-    def open(self) -> None:
+    async def open(self) -> None:
         import zmq
         import zmq.asyncio
 
@@ -212,7 +216,7 @@ class ZMQIOQueue:
             return None
         return _decode(await self._recv_sock.recv_multipart())
 
-    def close(self, linger: int = 0) -> None:
+    async def close(self, linger: int = 0) -> None:
         """``linger`` (ms) lets queued puts reach the other end before the socket goes."""
         for sock in (self._send_sock, self._recv_sock):
             if sock is not None:
@@ -226,6 +230,264 @@ class ZMQIOQueue:
 def _log_send_error(fut) -> None:
     if not fut.cancelled() and fut.exception() is not None:
         logging.getLogger(__name__).warning(f"IO queue put failed: {fut.exception()}")
+
+
+# Wire format of a SocketIOQueue item: [magic 1B][nframes 4B][len 4B x nframes][frames...]
+_MAGIC = 0xE1
+_HEAD = struct.Struct("!BI")
+_MAX_ITEM = 1 << 36  # sanity cap: a header announcing more than 64 GiB means a broken stream
+_JOIN_BELOW = 4096  # items up to this many payload bytes are sent as one joined buffer
+
+
+class _Proto(BufferedProtocol):
+    """One Unix stream connection of a `SocketIOQueue`. Received bytes go straight into a
+    growable buffer (`get_buffer`); each complete item's frames go on ``items``. ``None`` on
+    ``items`` means the connection is gone."""
+
+    INITIAL = 1 << 18  # 256 KiB
+    MIN_FREE = 1 << 16  # always offer at least this much room to a read
+    SOCK_BUF = 1 << 22  # kernel socket buffers (macOS defaults to 8 KiB, Linux ~208 KiB)
+    HIGH_WATER = 1 << 22  # transport write buffer that triggers pause_writing
+
+    def __init__(self, connected: asyncio.Future):
+        super().__init__()
+        self._connected = connected
+        self.transport: Optional[asyncio.Transport] = None
+        self.items: asyncio.Queue = asyncio.Queue()
+        self._buf = bytearray(self.INITIAL)
+        self._w = 0  # end of the received bytes
+        self._r = 0  # start of the first unparsed item
+        self._need = 0  # size of the item being received, counted from _r (0: unknown yet)
+        # Send side: while the transport is paused, buffers wait here (see `send`).
+        self._paused = False
+        self._held: list = []
+        self.held_bytes = 0
+
+    def connection_made(self, transport):
+        if self._connected.done():  # only one peer per path
+            transport.abort()
+            return
+        self.transport = transport
+        sock = transport.get_extra_info("socket")
+        for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, opt, self.SOCK_BUF)
+            except OSError:
+                pass  # keep the default
+        transport.set_write_buffer_limits(high=self.HIGH_WATER)
+        self._connected.set_result(self)
+
+    # --- sending ---------------------------------------------------------- #
+
+    def send(self, buffers: list) -> None:
+        """Write ``buffers`` in order. While the transport is paused they are held here and
+        handed over in one batch on `resume_writing`: the transport sums its whole buffer on
+        every write, so writing item by item into a backed-up transport is quadratic."""
+        if self._paused or self._held:
+            self._held.extend(buffers)
+            self.held_bytes += sum(memoryview(b).nbytes for b in buffers)
+        else:
+            self.transport.writelines(buffers)
+
+    def pause_writing(self) -> None:
+        self._paused = True
+
+    def resume_writing(self) -> None:
+        self._paused = False
+        held, self._held, self.held_bytes = self._held, [], 0
+        if held and not self.transport.is_closing():
+            self.transport.writelines(held)  # may pause again; later sends are held again
+
+    # --- receiving -------------------------------------------------------- #
+
+    def get_buffer(self, sizehint: int) -> memoryview:
+        buf, r, w = self._buf, self._r, self._w
+        pending = w - r  # bytes of an incomplete item
+        want = max(self._need, pending + self.MIN_FREE)  # room needed, counted from r
+        if len(buf) - r < want:  # the tail is too short
+            if want > len(buf):  # too small even if compacted: grow
+                new = bytearray(max(want, 2 * len(buf)))
+                new[:pending] = buf[r:w]
+                self._buf = buf = new
+            else:  # big enough: slide the partial item to the front
+                buf[:pending] = buf[r:w]
+            self._r, self._w = 0, pending
+        return memoryview(buf)[self._w :]
+
+    def buffer_updated(self, nbytes: int) -> None:
+        self._w += nbytes
+        buf, r, w = self._buf, self._r, self._w
+        mv = memoryview(buf)
+        try:
+            while w - r >= _HEAD.size:
+                magic, nframes = _HEAD.unpack_from(buf, r)
+                if magic != _MAGIC:
+                    return self._fail("stream out of sync (bad magic byte)")
+                head = _HEAD.size + 4 * nframes
+                if w - r < head:
+                    self._need = head
+                    break
+                lens = struct.unpack_from(f"!{nframes}I", buf, r + _HEAD.size)
+                total = head + sum(lens)
+                if total > _MAX_ITEM:
+                    return self._fail(f"item of {total} bytes announced")
+                if w - r < total:
+                    self._need = total
+                    break
+                off, frames = r + head, []
+                for ln in lens:
+                    frames.append(bytes(mv[off : off + ln]))  # one copy, out of the reused buffer
+                    off += ln
+                self.items.put_nowait(frames)
+                r += total
+                self._need = 0
+        finally:
+            mv.release()
+        if r == w:
+            r = self._w = 0
+        self._r = r
+
+    def _fail(self, why: str) -> None:
+        logging.getLogger(__name__).error(f"SocketIOQueue: {why}; closing the connection")
+        self.transport.abort()  # connection_lost follows and wakes the reader
+
+    def eof_received(self) -> bool:
+        if self._w != self._r:
+            logging.getLogger(__name__).error(
+                f"SocketIOQueue: peer closed in the middle of an item ({self._w - self._r} bytes)"
+            )
+        return False  # close our side too
+
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        if not self._connected.done():
+            self._connected.set_exception(exc or ConnectionError("connection closed"))
+        self.items.put_nowait(None)
+
+
+def _proto_of(fut: Optional[asyncio.Future]) -> Optional[_Proto]:
+    if fut is None or not fut.done() or fut.cancelled() or fut.exception() is not None:
+        return None
+    return fut.result()
+
+
+class SocketIOQueue:
+    """One end of a cross-process two-way queue over two Unix stream sockets: items
+    ``put_nowait`` here are written to ``send_path``; ``get`` returns items read from
+    ``recv_path``. The other end is built with the two paths reversed; one end binds (listens),
+    the other connects. Items are framed with a length header and received through a
+    `BufferedProtocol`, so many items cost one read and one callback.
+
+    Lifecycle: ``await open()`` -- the bind side only starts listening, so it can be called
+    before the peer exists -- then ``put_nowait`` / ``get``, then ``await close(linger)``.
+    Nothing waits for the peer explicitly: items put before it connects are kept and written,
+    in order, once it does; ``get`` waits for it. ``get`` returns None on timeout and once the
+    connection is gone (after waiting the timeout, so a polling caller doesn't spin)."""
+
+    def __init__(self, send_path: str, recv_path: str, bind: bool):
+        self._send_path = send_path
+        self._recv_path = recv_path
+        self._bind = bind
+        self._servers: list = []
+        self._send_fut: Optional[asyncio.Future] = None
+        self._recv_fut: Optional[asyncio.Future] = None
+        self._send_proto: Optional[_Proto] = None
+        self._recv_proto: Optional[_Proto] = None
+        self._early: list = []  # items put before the peer connected, in order
+
+    async def open(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._send_fut, self._recv_fut = loop.create_future(), loop.create_future()
+        ends = ((self._send_path, self._send_fut), (self._recv_path, self._recv_fut))
+        self._send_fut.add_done_callback(self._on_connect)
+        self._recv_fut.add_done_callback(self._on_connect)
+        if self._bind:
+            for path, fut in ends:
+                self._servers.append(
+                    await loop.create_unix_server(lambda fut=fut: _Proto(fut), path)
+                )
+        else:
+            for path, fut in ends:
+                await loop.create_unix_connection(lambda fut=fut: _Proto(fut), path)
+
+    def _on_connect(self, _fut: asyncio.Future) -> None:
+        if self._send_proto is None and _proto_of(self._send_fut) is not None:
+            self._attach_send()
+        if self._send_fut.done() and self._recv_fut.done():
+            self._close_servers()  # both peers are in (or failed): stop listening
+
+    def _attach_send(self) -> None:
+        """The send connection is up: write what was put before it, in order."""
+        self._send_proto = _proto_of(self._send_fut)
+        early, self._early = self._early, []
+        for item in early:
+            self._write(item)
+
+    def put_nowait(self, item: tuple) -> None:
+        if self._send_proto is None:
+            if _proto_of(self._send_fut) is None:
+                self._early.append(item)  # written by _attach_send once the peer connects
+                return
+            self._attach_send()  # connected, but the callback hasn't run yet
+        self._write(item)
+
+    def _write(self, item: tuple) -> None:
+        if self._send_proto.transport.is_closing():
+            return  # the peer is gone; the reader side reports it
+        frames = _encode(item)
+        lens = [memoryview(f).nbytes for f in frames]
+        head = struct.pack(f"!BI{len(lens)}I", _MAGIC, len(lens), *lens)
+        if sum(lens) <= _JOIN_BELOW:  # a small item: one buffer instead of 1 + nframes
+            self._send_proto.send([b"".join([head, *frames])])
+        else:  # large frames go as they are, not copied
+            self._send_proto.send([head, *frames])
+
+    async def get(self, timeout: Optional[float] = None) -> Optional[tuple]:
+        async def next_frames():
+            if self._recv_proto is None:
+                try:
+                    self._recv_proto = await asyncio.shield(self._recv_fut)  # waits for the peer
+                except (asyncio.CancelledError, ConnectionError, OSError):
+                    if not self._recv_fut.done():
+                        raise  # our own timeout cancelled the wait
+                    return None  # never connected: closed or failed
+            return await self._recv_proto.items.get()
+
+        try:
+            frames = await asyncio.wait_for(next_frames(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None
+        if frames is None:  # connection gone: keep saying so, without spinning a poller
+            if self._recv_proto is not None:
+                self._recv_proto.items.put_nowait(None)
+            if timeout is not None:
+                await asyncio.sleep(timeout)
+            return None
+        return _decode(frames)
+
+    async def close(self, linger: int = 0) -> None:
+        """``linger`` (ms): wait up to this long for queued puts to reach the socket."""
+        self._close_servers()
+        send = self._send_proto or _proto_of(self._send_fut)
+        recv = self._recv_proto or _proto_of(self._recv_fut)
+        if send is not None and send.transport is not None:
+            deadline = asyncio.get_running_loop().time() + linger / 1000
+            while (
+                (send.held_bytes or send.transport.get_write_buffer_size())
+                and not send.transport.is_closing()
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.005)
+            send.transport.close()
+        if recv is not None and recv.transport is not None:
+            recv.transport.close()
+        for fut in (self._send_fut, self._recv_fut):
+            if fut is not None and not fut.done():
+                fut.cancel()
+
+    def _close_servers(self) -> None:
+        for server in self._servers:
+            server.close()
+        self._servers = []
 
 
 def new_ipc_path(suffix: str) -> str:
@@ -351,6 +613,9 @@ class IOProcess(ABC):
         control requests."""
         while True:
             item = await q.get()
+            if item is None:  # the queue is gone: the owner closed it or died
+                self._stop.set()
+                return
             kind = item[0]
             if kind == "send":
                 _, req_id, target, timeout, frames = item
@@ -448,8 +713,8 @@ class IOProcess(ABC):
 # --------------------------------------------------------------------------- #
 
 
-def start_io_process(io: IOProcess) -> Tuple[Any, ZMQIOQueue, List[str]]:
-    """Spawn ``io``'s class in a new process, joined to the caller by a `ZMQIOQueue`.
+async def start_io_process(io: IOProcess) -> Tuple[Any, SocketIOQueue, List[str]]:
+    """Spawn ``io``'s class in a new process, joined to the caller by a `SocketIOQueue`.
 
     Returns ``(process, q, paths)``: the caller's (bind) end of the queue, already open; on
     close the caller closes it and unlinks ``paths``.
@@ -464,8 +729,8 @@ def start_io_process(io: IOProcess) -> Tuple[Any, ZMQIOQueue, List[str]]:
             f"validator, not {type(rule).__name__}"
         )
     in_path, out_path = new_ipc_path("in"), new_ipc_path("out")  # into / out of the IOProcess
-    q = ZMQIOQueue(send_path=in_path, recv_path=out_path, bind=True)
-    q.open()
+    q = SocketIOQueue(send_path=in_path, recv_path=out_path, bind=True)
+    await q.open()  # listen before the child connects; puts until then are kept
     class_path = f"{type(io).__module__}:{type(io).__qualname__}"
     proc = mp.get_context("spawn").Process(
         target=_io_main,
@@ -491,8 +756,8 @@ def _io_main(class_path: str, kwargs: dict, send_path: str, recv_path: str, pare
     io = cls(**kwargs, logger=logger)
 
     async def main():
-        q = ZMQIOQueue(send_path, recv_path, bind=False)
-        q.open()
+        q = SocketIOQueue(send_path, recv_path, bind=False)
+        await q.open()
 
         async def watch_parent():
             while os.getppid() == parent_pid:
@@ -510,6 +775,6 @@ def _io_main(class_path: str, kwargs: dict, send_path: str, recv_path: str, pare
         finally:
             if watcher is not None:
                 watcher.cancel()
-            q.close(linger=1000)  # let the last results reach the owner
+            await q.close(linger=1000)  # let the last results reach the owner
 
     asyncio.run(main())
