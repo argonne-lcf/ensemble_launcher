@@ -1,20 +1,20 @@
-"""The socket half of a connection, joined to its front end by two queues.
+"""The socket half of a connection, joined to its front end by a queue.
 
 An `IOProcess` owns a connection's socket and everything that touches it: the receive loop,
 sender verification, the ACK protocol (sending ACKs for received messages, and waiting for the
-peer's ACK for our own sends, with the timeout) and msg ids. It reads an **input queue** (send
-requests, control) and writes an **output queue** (received messages, send results):
+peer's ACK for our own sends, with the timeout) and msg ids. The front end (`AsyncConnection`)
+and the IOProcess each hold one end of a two-way queue; each end ``put_nowait``s to the other
+end and ``get``s what the other end put:
 
-    output  ("ready", address)                   started; the actual bound address
-            ("data", frames)                     a received message, verified and ACKed
-            ("sent", req_id, ok)                 final result of one send
-    input   ("send", req_id, target, timeout, frames)
-            ("control", op, args)                "add_remote" / "remove_remote" / "close"
+    IOProcess -> front end  ("ready", address)       started; the actual bound address
+                            ("data", frames)         a received message, verified and ACKed
+                            ("sent", req_id, ok)     final result of one send
+    front end -> IOProcess  ("send", req_id, target, timeout, frames)
+                            ("control", op, args)    "add_remote" / "remove_remote" / "close"
 
-The front end (`AsyncConnection`) only puts on the input queue and listens to the output queue.
-The IOProcess runs either on the caller's event loop, with `LocalIOQueue`s (plain
-`asyncio.Queue`), or in its own process, with `ZMQIOQueue`s (ZMQ PUSH/PULL over ``ipc://``). It
-doesn't know which: the queue items are the whole contract. Out of process, a busy event loop in
+The IOProcess runs either on the caller's event loop, with a `LocalIOQueue` pair (two
+`asyncio.Queue`s), or in its own process, with a `ZMQIOQueue` on each side (a PUSH and a PULL
+socket over two ``ipc://`` paths). It doesn't know which: the items are the whole contract. Out of process, a busy event loop in
 the owner can no longer delay ACKs.
 """
 
@@ -99,19 +99,29 @@ def verify_client_sender(
 
 
 class LocalIOQueue:
-    """In-process queue: a plain `asyncio.Queue` of item tuples."""
+    """One end of an in-process two-way queue: ``put_nowait`` feeds the other end's ``get``.
+    Make both ends with `pair`."""
 
-    def __init__(self):
-        self._q: asyncio.Queue = asyncio.Queue()
+    def __init__(self, send_q: asyncio.Queue, recv_q: asyncio.Queue):
+        self._send_q = send_q
+        self._recv_q = recv_q
+
+    @classmethod
+    def pair(cls) -> Tuple["LocalIOQueue", "LocalIOQueue"]:
+        a_to_b, b_to_a = asyncio.Queue(), asyncio.Queue()
+        return cls(a_to_b, b_to_a), cls(b_to_a, a_to_b)
+
+    def open(self) -> None:
+        pass
 
     def put_nowait(self, item: tuple) -> None:
-        self._q.put_nowait(item)
+        self._send_q.put_nowait(item)
 
     async def get(self, timeout: Optional[float] = None) -> Optional[tuple]:
         if timeout is None:
-            return await self._q.get()
+            return await self._recv_q.get()
         try:
-            return await asyncio.wait_for(self._q.get(), timeout)
+            return await asyncio.wait_for(self._recv_q.get(), timeout)
         except (asyncio.TimeoutError, TimeoutError):
             return None
 
@@ -164,31 +174,53 @@ def _decode(frames: List[bytes]) -> tuple:
 
 
 class ZMQIOQueue:
-    """One direction of a cross-process queue: a ZMQ PUSH (put) or PULL (get) socket on an
-    ``ipc://`` path. HWM 0 on both ends: the hop is local, so nothing is dropped or blocks.
-    Items travel as multipart frames, data frames as they are."""
+    """One end of a cross-process two-way queue: a PUSH socket on ``send_path``
+    (``put_nowait``) and a PULL socket on ``recv_path`` (``get``). The other end is built with
+    the same two paths reversed, so each end's puts reach the other end's gets; one end binds,
+    the other connects. HWM 0: the hop is local, so nothing is dropped or blocks. Items travel
+    as multipart frames, data frames as they are. Only the paths are needed to build an end, so
+    the connect side is made from them in the spawned process."""
 
-    def __init__(self, ctx, path: str, push: bool, bind: bool):
+    def __init__(self, send_path: str, recv_path: str, bind: bool):
+        self._send_path = send_path
+        self._recv_path = recv_path
+        self._bind = bind
+        self._ctx = None
+        self._send_sock = None
+        self._recv_sock = None
+
+    def open(self) -> None:
         import zmq
+        import zmq.asyncio
 
-        self._sock = ctx.socket(zmq.PUSH if push else zmq.PULL)
-        self._sock.setsockopt(zmq.SNDHWM, 0)
-        self._sock.setsockopt(zmq.RCVHWM, 0)
-        self._sock.setsockopt(zmq.LINGER, 0)
-        (self._sock.bind if bind else self._sock.connect)(f"ipc://{path}")
+        self._ctx = zmq.asyncio.Context()
+        self._send_sock = self._ctx.socket(zmq.PUSH)
+        self._recv_sock = self._ctx.socket(zmq.PULL)
+        for path, sock in ((self._send_path, self._send_sock), (self._recv_path, self._recv_sock)):
+            sock.setsockopt(zmq.SNDHWM, 0)
+            sock.setsockopt(zmq.RCVHWM, 0)
+            sock.setsockopt(zmq.LINGER, 0)
+            (sock.bind if self._bind else sock.connect)(f"ipc://{path}")
 
     def put_nowait(self, item: tuple) -> None:
-        fut = self._sock.send_multipart(_encode(item))
+        fut = self._send_sock.send_multipart(_encode(item))
         if hasattr(fut, "add_done_callback"):
             fut.add_done_callback(_log_send_error)
 
     async def get(self, timeout: Optional[float] = None) -> Optional[tuple]:
-        if timeout is not None and not await self._sock.poll(int(timeout * 1000)):
+        if timeout is not None and not await self._recv_sock.poll(int(timeout * 1000)):
             return None
-        return _decode(await self._sock.recv_multipart())
+        return _decode(await self._recv_sock.recv_multipart())
 
     def close(self, linger: int = 0) -> None:
-        self._sock.close(linger)
+        """``linger`` (ms) lets queued puts reach the other end before the socket goes."""
+        for sock in (self._send_sock, self._recv_sock):
+            if sock is not None:
+                sock.close(linger if sock is self._send_sock else 0)
+        self._send_sock = self._recv_sock = None
+        if self._ctx is not None:
+            self._ctx.term()
+            self._ctx = None
 
 
 def _log_send_error(fut) -> None:
@@ -258,13 +290,13 @@ class IOProcess(ABC):
 
     # ------------------------------- main loop -------------------------------- #
 
-    async def run(self, in_q, out_q) -> None:
-        """Open the socket, report ``ready``, and serve both queues until ``close``."""
+    async def run(self, q) -> None:
+        """Open the socket, report ``ready``, and serve the queue until ``close``."""
         self._stop = asyncio.Event()
         await self._raw_open()
-        out_q.put_nowait(("ready", self.address))
-        recv = asyncio.create_task(self._recv_loop(out_q))
-        inp = asyncio.create_task(self._input_loop(in_q, out_q))
+        q.put_nowait(("ready", self.address))
+        recv = asyncio.create_task(self._recv_loop(q))
+        inp = asyncio.create_task(self._input_loop(q))
         try:
             await self._stop.wait()
         finally:
@@ -277,14 +309,14 @@ class IOProcess(ABC):
             self._ack_futures.clear()
             await self._raw_close()
 
-    async def _recv_loop(self, out_q) -> None:
+    async def _recv_loop(self, q) -> None:
         """Read the socket; verify the sender; resolve ACKs for our sends, ACK and forward
         everything else. Without req_res, frames are forwarded as they come."""
         while True:
             try:
                 frames = await self._raw_recv()
                 if not self._req_res:
-                    out_q.put_nowait(("data", frames))
+                    q.put_nowait(("data", frames))
                     continue
                 _, sender_id, sender_secret = decode_identity(frames[0])
                 if not self.verify_sender(sender_id, sender_secret):
@@ -308,24 +340,24 @@ class IOProcess(ABC):
                     msg_id=int.from_bytes(frames[1], "big"),
                     target_id=frames[0].decode(),
                 )
-                out_q.put_nowait(("data", [frames[0]] + frames[2:]))
+                q.put_nowait(("data", [frames[0]] + frames[2:]))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.logger.warning(f"_recv_loop failed with exception {e}")
 
-    async def _input_loop(self, in_q, out_q) -> None:
+    async def _input_loop(self, q) -> None:
         """Serve send requests (each in its own task, so a slow ACK wait blocks nothing) and
         control requests."""
         while True:
-            item = await in_q.get()
+            item = await q.get()
             kind = item[0]
             if kind == "send":
                 _, req_id, target, timeout, frames = item
                 task = asyncio.create_task(self._send(frames, target, timeout))
                 self._send_tasks.add(task)
                 task.add_done_callback(
-                    lambda t, rid=req_id: self._send_done(out_q, rid, t)
+                    lambda t, rid=req_id: self._send_done(q, rid, t)
                 )
             elif kind == "control":
                 op, args = item[1], item[2]
@@ -340,14 +372,14 @@ class IOProcess(ABC):
                     self._stop.set()
                     return
 
-    def _send_done(self, out_q, req_id: int, task: asyncio.Task) -> None:
+    def _send_done(self, q, req_id: int, task: asyncio.Task) -> None:
         self._send_tasks.discard(task)
         if task.cancelled():
             return
         ok = False if task.exception() is not None else bool(task.result())
         if task.exception() is not None:
             self.logger.warning(f"Send failed: {task.exception()}")
-        out_q.put_nowait(("sent", req_id, ok))
+        q.put_nowait(("sent", req_id, ok))
 
     async def _send(
         self, data: Union[bytes, List[bytes]], target_id: Optional[str], timeout: float
@@ -416,15 +448,13 @@ class IOProcess(ABC):
 # --------------------------------------------------------------------------- #
 
 
-def start_io_process(io: IOProcess) -> Tuple[Any, ZMQIOQueue, ZMQIOQueue, Any, List[str]]:
-    """Spawn ``io``'s class in a new process, joined by two ipc queues.
+def start_io_process(io: IOProcess) -> Tuple[Any, ZMQIOQueue, List[str]]:
+    """Spawn ``io``'s class in a new process, joined to the caller by a `ZMQIOQueue`.
 
-    Returns ``(process, in_q, out_q, ctx, paths)``; the caller puts on ``in_q``, gets from
-    ``out_q``, and on close closes both, terminates the context and unlinks ``paths``.
+    Returns ``(process, q, paths)``: the caller's (bind) end of the queue, already open; on
+    close the caller closes it and unlinks ``paths``.
     """
     import multiprocessing as mp
-
-    import zmq.asyncio
 
     kwargs = io.kwargs()
     rule = kwargs.get("sender_rule")
@@ -433,23 +463,22 @@ def start_io_process(io: IOProcess) -> Tuple[Any, ZMQIOQueue, ZMQIOQueue, Any, L
             "An out-of-process connection needs a SenderRule as its unknown-sender "
             f"validator, not {type(rule).__name__}"
         )
-    ctx = zmq.asyncio.Context()
-    in_path, out_path = new_ipc_path("in"), new_ipc_path("out")
-    in_q = ZMQIOQueue(ctx, in_path, push=True, bind=True)
-    out_q = ZMQIOQueue(ctx, out_path, push=False, bind=True)
+    in_path, out_path = new_ipc_path("in"), new_ipc_path("out")  # into / out of the IOProcess
+    q = ZMQIOQueue(send_path=in_path, recv_path=out_path, bind=True)
+    q.open()
     class_path = f"{type(io).__module__}:{type(io).__qualname__}"
     proc = mp.get_context("spawn").Process(
         target=_io_main,
-        args=(class_path, kwargs, in_path, out_path, os.getpid()),
+        args=(class_path, kwargs, out_path, in_path, os.getpid()),  # reversed: its send, its recv
         name=f"io-{kwargs['identity']}",
         daemon=True,
     )
     proc.start()
-    return proc, in_q, out_q, ctx, [in_path, out_path]
+    return proc, q, [in_path, out_path]
 
 
-def _io_main(class_path: str, kwargs: dict, in_path: str, out_path: str, parent_pid: int):
-    """Entry point of a spawned IOProcess: serve the queues until ``close`` or the owner
+def _io_main(class_path: str, kwargs: dict, send_path: str, recv_path: str, parent_pid: int):
+    """Entry point of a spawned IOProcess: serve the queue until ``close`` or the owner
     dies. Signals are left to the owner, which closes us."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -462,11 +491,8 @@ def _io_main(class_path: str, kwargs: dict, in_path: str, out_path: str, parent_
     io = cls(**kwargs, logger=logger)
 
     async def main():
-        import zmq.asyncio
-
-        ctx = zmq.asyncio.Context()
-        in_q = ZMQIOQueue(ctx, in_path, push=False, bind=False)
-        out_q = ZMQIOQueue(ctx, out_path, push=True, bind=False)
+        q = ZMQIOQueue(send_path, recv_path, bind=False)
+        q.open()
 
         async def watch_parent():
             while os.getppid() == parent_pid:
@@ -476,7 +502,7 @@ def _io_main(class_path: str, kwargs: dict, in_path: str, out_path: str, parent_
 
         watcher = None
         try:
-            run = asyncio.create_task(io.run(in_q, out_q))
+            run = asyncio.create_task(io.run(q))
             while io._stop is None and not run.done():
                 await asyncio.sleep(0)
             watcher = asyncio.create_task(watch_parent())
@@ -484,8 +510,6 @@ def _io_main(class_path: str, kwargs: dict, in_path: str, out_path: str, parent_
         finally:
             if watcher is not None:
                 watcher.cancel()
-            in_q.close()
-            out_q.close(linger=1000)  # let the last results reach the owner
-            ctx.term()
+            q.close(linger=1000)  # let the last results reach the owner
 
     asyncio.run(main())

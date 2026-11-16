@@ -4,9 +4,9 @@ This module holds the transport-independent front ends; each transport has its o
 ``<transport>_connection.py`` (front ends) and ``<transport>_io_process.py`` (IOProcesses).
 
 The front end is the API the rest of the code uses -- ``open`` / ``send`` / ``recv`` / state /
-expected remotes. It knows nothing about sockets or ACKs: ``send`` puts a request on the
-IOProcess's input queue and awaits its result; ``recv`` reads messages the IOProcess put on its
-output queue. The IOProcess (``io_process.py``) runs on the same event loop, or -- with
+expected remotes. It knows nothing about sockets or ACKs: it holds one end of a two-way queue
+to the IOProcess; ``send`` puts a request on it and awaits its result, ``recv`` reads messages
+the IOProcess put on it. The IOProcess (``io_process.py``) runs on the same event loop, or -- with
 ``io_process=True`` and ``req_res=True`` on the ZMQ connections -- in its own process, so a busy
 event loop can't delay ACKs.
 """
@@ -88,12 +88,10 @@ class AsyncConnection(ABC):
         self._loop: asyncio.AbstractEventLoop = None
         self._loop_thread: threading.Thread = None
         self.logger = None
-        # The IOProcess and the two queues to it.
-        self._in_q = None
-        self._out_q = None
+        # The IOProcess and our end of the queue to it.
+        self._q = None
         self._io_task: Optional[asyncio.Task] = None  # in process
         self._proc = None  # out of process
-        self._io_ctx = None
         self._io_paths: List[str] = []
         self._listen_task: Optional[asyncio.Task] = None
         self._pending: Dict[int, asyncio.Future] = {}  # req_id -> send result
@@ -130,13 +128,11 @@ class AsyncConnection(ABC):
         )
         io = self._make_io()
         if self.out_of_process:
-            self._proc, self._in_q, self._out_q, self._io_ctx, self._io_paths = (
-                start_io_process(io)
-            )
+            self._proc, self._q, self._io_paths = start_io_process(io)
         else:
             io.logger = self.logger
-            self._in_q, self._out_q = LocalIOQueue(), LocalIOQueue()
-            self._io_task = self._loop.create_task(io.run(self._in_q, self._out_q))
+            self._q, io_q = LocalIOQueue.pair()
+            self._io_task = self._loop.create_task(io.run(io_q))
         address = await self._wait_ready(timeout=60.0)
         self._on_started(address)
         self._is_open = True
@@ -148,7 +144,7 @@ class AsyncConnection(ABC):
         """Wait for the IOProcess's ``ready``; raise if it died first."""
         deadline = self._loop.time() + timeout
         while self._loop.time() < deadline:
-            item = await self._out_q.get(timeout=0.5)
+            item = await self._q.get(timeout=0.5)
             if item is not None:
                 if item[0] == "ready":
                     return item[1]
@@ -165,11 +161,11 @@ class AsyncConnection(ABC):
         raise TimeoutError(f"{self.identity}: IOProcess not ready after {timeout}s")
 
     async def close(self):
-        if self._in_q is None:
+        if self._q is None:
             return
         self._is_open = False
         try:
-            self._in_q.put_nowait(("control", "close", ()))
+            self._q.put_nowait(("control", "close", ()))
         except Exception:
             pass
         if self._io_task is not None and not self._io_task.done():
@@ -196,13 +192,9 @@ class AsyncConnection(ABC):
                 pass
             self._listen_task = None
         self._fail_pending()
-        for q in (self._in_q, self._out_q):
-            if q is not None:
-                q.close()
-        self._in_q = self._out_q = None
-        if self._io_ctx is not None:
-            self._io_ctx.term()
-            self._io_ctx = None
+        if self._q is not None:
+            self._q.close()
+            self._q = None
         import os
 
         for path in self._io_paths:
@@ -213,7 +205,7 @@ class AsyncConnection(ABC):
         self._io_paths = []
 
     # ------------------------------------------------------------------ #
-    #  The output queue                                                    #
+    #  What the IOProcess puts on the queue                                #
     # ------------------------------------------------------------------ #
 
     async def _listen(self) -> None:
@@ -221,7 +213,7 @@ class AsyncConnection(ABC):
         process, also notice the IOProcess dying."""
         timeout = 1.0 if self._proc is not None else None
         while True:
-            item = await self._out_q.get(timeout=timeout)
+            item = await self._q.get(timeout=timeout)
             if item is None:
                 if self._proc is not None and not self._proc.is_alive():
                     self._on_io_dead(f"IOProcess exited ({self._proc.exitcode})")
@@ -264,7 +256,7 @@ class AsyncConnection(ABC):
     ) -> bool:
         """Send ``msg``; with req_res, True once the peer ACKed it within ``timeout``. The
         IOProcess does the send and the ACK wait; this only waits for its answer."""
-        if self._in_q is None or not self._is_open:
+        if self._q is None or not self._is_open:
             if self.logger is not None:
                 self.logger.warning(f"{self.identity}: send on a closed connection")
             return False
@@ -273,12 +265,12 @@ class AsyncConnection(ABC):
         fut = self._loop.create_future()
         self._pending[req_id] = fut
         frames = msg if isinstance(msg, list) else [msg]
-        self._in_q.put_nowait(("send", req_id, target_id, timeout, frames))
+        self._q.put_nowait(("send", req_id, target_id, timeout, frames))
         return await fut
 
     def _control(self, op: str, *args) -> None:
-        if self._in_q is not None and self._is_open:
-            self._in_q.put_nowait(("control", op, args))
+        if self._q is not None and self._is_open:
+            self._q.put_nowait(("control", op, args))
 
     # ---------------------- Sync wrappers ----------------------------------
     def sopen(self):
@@ -365,7 +357,7 @@ class ServerConnection(AsyncConnection):
         """Out of process, this must be a `SenderRule` (it has to reach the IOProcess). May be
         called after ``open()``: the running IOProcess gets the new rule."""
         self._unknown_sender_validator = validator
-        if self._in_q is not None and self._is_open:
+        if self._q is not None and self._is_open:
             if self.out_of_process:
                 if not isinstance(validator, SenderRule):
                     raise TypeError(

@@ -61,17 +61,20 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    `connection.py` / `io_process.py` / `transport.py` -- `comm/pipe/zmq/`
    (`AsyncZMQRouterConnection` / `AsyncZMQDealerConnection`, `ZMQRouterIOProcess` /
    `ZMQDealerIOProcess`, `AsyncZMQTransport`) and `comm/pipe/mp/` (multiprocessing.Pipe).
-   **Connections are a front end plus an `IOProcess`, joined by two queues.**
+   **Connections are a front end plus an `IOProcess`, joined by one two-way queue.**
    `AsyncConnection` (and `ServerConnection` / `ClientConnection`, the ZMQ router/dealer and MP
-   classes) is only the API: `send` puts `("send", req_id, target, timeout, frames)` on the
-   input queue and awaits `("sent", req_id, ok)`; `recv` reads `("data", frames)` the IOProcess
-   put on the output queue; `add/remove_expected_remote` and `set_unknown_sender_validator`
+   classes) is only the API: each side holds one end of the queue (`put_nowait` reaches the
+   other end's `get`); `send` puts `("send", req_id, target, timeout, frames)` and awaits
+   `("sent", req_id, ok)`; `recv` reads `("data", frames)` the IOProcess put; `add/remove_expected_remote` and `set_unknown_sender_validator`
    become `("control", ...)` items. **All ACK handling lives in the `IOProcess`**
    (`comm/pipe/io_process.py`; the per-transport subclasses in `zmq/io_process.py` /
    `mp/io_process.py` hold the socket code): its receive loop verifies the sender, ACKs at once and forwards; its
    sends assign msg ids and wait for the peer's ACK with the timeout. The IOProcess runs on the
-   caller's loop (`LocalIOQueue` = `asyncio.Queue`), or with `io_process=True` + `req_res=True`
-   on a ZMQ connection, in its own spawned process (`ZMQIOQueue` = PUSH/PULL over `ipc://`), so
+   caller's loop (`LocalIOQueue.pair()`: two cross-wired `asyncio.Queue`s), or with
+   `io_process=True` + `req_res=True` on a ZMQ connection, in its own spawned process
+   (`ZMQIOQueue(send_path, recv_path, bind)` on each side: a PUSH on the first path and a PULL
+   on the second; the IOProcess gets the owner's two paths reversed; built from the paths alone,
+   then `open()` / `close()`), so
    a busy event loop can't delay ACKs -- the 2048-node failure in #69. `LauncherConfig.comm_io_process`
    turns that on for every node's data transport (heartbeats, `PolicyEndpoint`, clients and
    actors stay in process); it is carried in the transport and connection states, so a child's
