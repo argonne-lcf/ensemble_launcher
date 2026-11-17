@@ -26,12 +26,13 @@ def dummy_task():
     return
 
 def init_worker():
-    import sys
-    worker_id = os.getpid()
-    fname = os.path.join(os.getcwd(),"logs","worker_logs",f"worker_{worker_id}.log")
-    os.makedirs(os.path.dirname(fname),exist_ok=True)
-    sys.stdout = open(fname, "w")
-    sys.stderr = sys.stdout
+    return
+    # import sys
+    # worker_id = os.getpid()
+    # fname = os.path.join(os.getcwd(),"logs","worker_logs",f"worker_{worker_id}.log")
+    # os.makedirs(os.path.dirname(fname),exist_ok=True)
+    # sys.stdout = open(fname, "w")
+    # sys.stderr = sys.stdout
 
     
 
