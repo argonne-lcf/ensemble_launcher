@@ -356,12 +356,20 @@ class AsyncMPIExecutor(Executor):
         executable: bool = False,
         encoded: bool = False,
     ) -> bool:
-        """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
+        """Write a text file to `path` on each node in `nodes` via 1-rank-per-node MPI jobs.
+
+        Each chunk is written at its own byte offset (pwrite + ftruncate), so running a
+        chunk again is a no-op on nodes that already have it. A launch that failed on some
+        nodes is retried on all of them, and the copy resumes from that chunk instead of
+        appending the chunk twice. Each rank prints ``<hostname> ok`` on success, so a
+        failure names the nodes that did not report. The last chunk also checks the file
+        size and applies the chmod, so neither costs an extra launch.
+        """
         cfg = self._mpi_config
 
         ## remove any duplicates
         nodes = list(set(nodes))
-        
+
         base_cmd = (
             [cfg.launcher]
             + [cfg.nprocesses_flag, str(len(nodes))]
@@ -383,14 +391,15 @@ class AsyncMPIExecutor(Executor):
         else:
             base_cmd += [cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else []
 
-        # 500 chars base64-encodes to ~670 bytes, keeping the total command length
-        # well under the strict 4096-byte MPI/OS limits.
-        CHUNK_SIZE = 3000
-        chunks = (
-            [content[i : i + CHUNK_SIZE] for i in range(0, len(content), CHUNK_SIZE)]
-            if content
-            else [""]
-        )
+        data = content.encode("utf-8")
+        # Keep each chunk's literal in the command at ~3000 bytes, under the 4096-byte
+        # MPI/OS command limits. Raw chunks are base64-encoded (4/3 larger) for transport;
+        # already-encoded content is embedded as is.
+        chunk_size = 3000 if encoded else 2250
+        chunks = [
+            (offset, data[offset : offset + chunk_size])
+            for offset in range(0, len(data), chunk_size)
+        ] or [(0, b"")]
 
         # Base64 encode the path to prevent shell issues if the path contains spaces or special characters
         encoded_path = base64.b64encode(path.encode("utf-8")).decode("utf-8")
@@ -399,75 +408,71 @@ class AsyncMPIExecutor(Executor):
             f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s) in {len(chunks)} chunk(s)"
         )
 
-        for i, chunk in enumerate(chunks):
-            mode = "w" if i == 0 else "a"
+        for i, (offset, chunk) in enumerate(chunks):
             if encoded:
-                setup_code = (
-                    "import base64, os\n"
-                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
-                    f"with open(p, '{mode}') as f:\n"
-                    f"    f.write('{chunk}')\n"
-                )
+                payload = f"'{chunk.decode('ascii')}'.encode('ascii')"
             else:
-                encoded_chunk = base64.b64encode(chunk.encode("utf-8")).decode("utf-8")
-
                 # Base64 payload sidesteps all remote Bash parsing, quoting, and newline mangling.
-                setup_code = (
-                    "import base64, os\n"
-                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
-                    f"with open(p, '{mode}') as f:\n"
-                    f"    f.write(base64.b64decode('{encoded_chunk}').decode('utf-8'))\n"
-                )
-
-            cmd = base_cmd + ["python", "-c", setup_code]
-            self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
-
-            for retry in range(3):
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                _, std_err = await proc.communicate()
-                proc._transport.close()
-                if proc.returncode != 0:
-                    self.logger.warning(
-                        f"Copying chunk {i} failed!! retrying {retry + 1}/3"
-                    )
-                    self.logger.warning(f"stderr: {std_err.decode()}")
-                else:
-                    break
-            if proc.returncode != 0:
-                self.logger.warning("Copying file failed after 3 retries!")
-                return False
-
-        if executable:
-            chmod_code = (
-                "import base64, os, stat\n"
+                payload = f"base64.b64decode('{base64.b64encode(chunk).decode('ascii')}')"
+            code = (
+                "import base64, os, socket, stat, sys\n"
                 f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                "os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)\n"
+                "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+                f"d = {payload}\n"
+                "fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o644)\n"
+                "try:\n"
+                "    n = 0\n"
+                "    while n < len(d):\n"
+                f"        n += os.pwrite(fd, d[n:], {offset} + n)\n"
+                f"    os.ftruncate(fd, {offset} + len(d))\n"
+                "finally:\n"
+                "    os.close(fd)\n"
             )
-            cmd = base_cmd + ["python", "-c", chmod_code]
-            self.logger.debug(f"Executing chmod for {path}")
-
-            for retry in range(3):
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+            if i == len(chunks) - 1:
+                code += (
+                    f"if os.stat(p).st_size != {len(data)}:\n"
+                    f"    sys.exit(f'{{socket.gethostname()}}: size {{os.stat(p).st_size}} != {len(data)}')\n"
                 )
-                _, stderr = await proc.communicate()
-                proc._transport.close()
-                if proc.returncode != 0:
-                    self.logger.warning(
-                        f"Making executable failed. retrying {retry + 1}/3"
-                    )
-                    self.logger.warning(f"stderr: {std_err.decode()}")
-                else:
-                    break
-            if proc.returncode != 0:
-                self.logger.warning("Making executable failed after 3 retries!")
+                if executable:
+                    code += "os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)\n"
+            code += "print(socket.gethostname(), 'ok', flush=True)\n"
+
+            self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
+            if not await self._run_on_nodes(
+                base_cmd + ["python", "-c", code],
+                nodes,
+                f"chunk {i + 1}/{len(chunks)} of {path}",
+            ):
                 return False
 
         return True
+
+    async def _run_on_nodes(
+        self, cmd: List[str], nodes: List[str], what: str, retries: int = 3
+    ) -> bool:
+        """Run a 1-rank-per-node job whose ranks print ``<hostname> ok``; retry on failure."""
+        for attempt in range(1, retries + 1):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            proc._transport.close()
+            if proc.returncode == 0:
+                return True
+            reported = {
+                line.split()[0].split(".")[0]
+                for line in out.decode(errors="replace").splitlines()
+                if line.endswith(" ok")
+            }
+            missing = [n for n in nodes if n.split(".")[0] not in reported]
+            self.logger.warning(
+                f"[write_file_to_nodes] {what} failed (rc={proc.returncode}, "
+                f"attempt {attempt}/{retries}); {len(missing)}/{len(nodes)} node(s) "
+                f"did not report ok: {missing[:8]}{' ...' if len(missing) > 8 else ''}"
+            )
+            self.logger.warning(f"stderr: {err.decode(errors='replace')[-2000:]}")
+        self.logger.warning(f"[write_file_to_nodes] {what} failed after {retries} attempts")
+        return False
 
     async def _subprocess_task(
         self,
