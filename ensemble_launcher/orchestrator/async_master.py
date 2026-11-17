@@ -507,7 +507,8 @@ class AsyncMaster(Node):
             env = os.environ.copy()
             env["EL_CHILDID"] = str(child_idx)
 
-            mpi_kwargs = self._cpu_bind_mpi_kwargs(child_obj.init_nodes.resources[0])
+            # mpi_kwargs = self._cpu_bind_mpi_kwargs(child_obj.init_nodes.resources[0])
+            mpi_kwargs = {}
             self.logger.info(
                 f"Launching child {child_name} with mpi_kwargs={mpi_kwargs}"
             )
