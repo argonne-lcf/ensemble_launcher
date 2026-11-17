@@ -489,16 +489,12 @@ class AsyncMaster(Node):
             json_fname = os.path.join(
                 self._executor.tmp_dir, f"child_{uuid.uuid4()}.json"
             )
-            if hasattr(self._executor, "write_file_to_nodes"):
-                success = await self._executor.write_file_to_nodes(
-                    json_fname, json_str, [head_node]
-                )
-                if not success:
-                    self.logger.error("Copying file to nodes failed!!")
-                    raise RuntimeError
-            else:
-                with open(json_fname, "w") as _f:
-                    _f.write(json_str)
+            # Writes once if tmp_dir is shared, else to each node's /tmp
+            if not await self._executor.write_file_to_nodes(
+                json_fname, json_str, [head_node]
+            ):
+                self.logger.error("Copying file to nodes failed!!")
+                raise RuntimeError
             load_str_embed = async_simple_load_str_file.replace(
                 "json_file_path", f"'{json_fname}'"
             )
@@ -620,16 +616,12 @@ class AsyncMaster(Node):
                 json_fname = os.path.join(
                     self._executor.tmp_dir, f"workers_{uuid.uuid4()}.json"
                 )
-                if hasattr(self._executor, "write_file_to_nodes"):
-                    success = await self._executor.write_file_to_nodes(
-                        json_fname, json_str, child_head_nodes
-                    )
-                    if not success:
-                        self.logger.error("Copying file to nodes failed!!")
-                        raise RuntimeError
-                else:
-                    with open(json_fname, "w") as _f:
-                        _f.write(json_str)
+                # Writes once if tmp_dir is shared, else to each node's /tmp
+                if not await self._executor.write_file_to_nodes(
+                    json_fname, json_str, child_head_nodes
+                ):
+                    self.logger.error("Copying file to nodes failed!!")
+                    raise RuntimeError
                 common_keys_str = ",".join(common_keys)
                 load_str_embed = async_load_str_file.replace(
                     "json_file_path", f"'{json_fname}'"

@@ -24,33 +24,27 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-def _generate_python_exec_command(
-    tmp_fname: str,
-    node_local: bool = False,
-) -> str:
+def _is_node_local(path: str) -> bool:
+    """True if `path` is on node-local storage (under /tmp), so each node needs its own copy."""
+    path = os.path.abspath(path)
+    return path == "/tmp" or path.startswith("/tmp/")
+
+
+def _generate_python_exec_command(tmp_fname: str) -> str:
     """
-    Generates a Python command string that deserializes and executes a given function with arguments.
-    The returned string can be run using `python -c "<command>"`.
+    Generates a Python command string that reads a base64 cloudpickled (fn, args, kwargs)
+    from `tmp_fname` and calls it. The returned string can be run using `python -c "<command>"`.
     """
-    if node_local:
-        script = [
-            "import cloudpickle",
-            "import base64",
-            f"f = open('{tmp_fname}', 'r')",
-            "task_str = f.read()",
-            "f.close()",
-            "task_bytes=base64.b64decode(task_str)",
-            "fn, args, kwargs = cloudpickle.loads(task_bytes)",
-            "fn(*args, **kwargs)",
-        ]
-    else:
-        script = [
-            "import cloudpickle",
-            f"f = open('{tmp_fname}', 'rb')",
-            "fn, args, kwargs = cloudpickle.load(f)",
-            "f.close()",
-            "fn(*args, **kwargs)",
-        ]
+    script = [
+        "import cloudpickle",
+        "import base64",
+        f"f = open('{tmp_fname}', 'r')",
+        "task_str = f.read()",
+        "f.close()",
+        "task_bytes=base64.b64decode(task_str)",
+        "fn, args, kwargs = cloudpickle.loads(task_bytes)",
+        "fn(*args, **kwargs)",
+    ]
     return ";".join(script)
 
 
@@ -71,7 +65,6 @@ class AsyncMPIExecutor(Executor):
             self.tmp_dir = tmp_dir
         else:
             self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
-        self._use_local_tmp = self.tmp_dir.startswith("/tmp")
         self._processes: Dict[str, asyncio.subprocess.Process] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
@@ -84,8 +77,8 @@ class AsyncMPIExecutor(Executor):
         """Build the mpirun resource flags from the job resource and MPIConfig.
 
         Returns (launcher_cmd, env, setup_files) where setup_files maps
-        "gpu_affinity" -> script_content when self._use_local_tmp is True
-        (the caller must distribute the script via a setup MPI job).
+        path -> script content; the caller writes each one (executable) with
+        write_file_to_nodes before launching.
         """
 
         cfg = self._mpi_config
@@ -161,11 +154,7 @@ class AsyncMPIExecutor(Executor):
                     ]
                 )
                 use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
-                fname = (
-                    f"/tmp/gpu_affinity_file_{task_id}.sh"
-                    if self._use_local_tmp
-                    else os.path.join(self.tmp_dir, f"gpu_affinity_file_{task_id}.sh")
-                )
+                fname = os.path.join(self.tmp_dir, f"gpu_affinity_file_{task_id}.sh")
                 if use_common_gpus:
                     if nnodes == 1 and ppn == 1:
                         env.update(
@@ -179,14 +168,7 @@ class AsyncMPIExecutor(Executor):
                         bash_script = gen_affinity_bash_script_1(
                             num_gpu_ids, ppn, self.gpu_selector
                         )
-                        if self._use_local_tmp:
-                            setup_files["gpu_affinity"] = bash_script
-                        else:
-                            if not os.path.exists(fname):
-                                with open(fname, "w") as f:
-                                    f.write(bash_script)
-                                st = os.stat(fname)
-                                os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                        setup_files[fname] = bash_script
                         launcher_cmd.append(fname)
                         ##set environment variables
                         env.update(
@@ -200,14 +182,7 @@ class AsyncMPIExecutor(Executor):
                     bash_script = gen_affinity_bash_script_2(
                         num_gpu_ids, ppn, self.gpu_selector
                     )
-                    if self._use_local_tmp:
-                        setup_files["gpu_affinity"] = bash_script
-                    else:
-                        if not os.path.exists(fname):
-                            with open(fname, "w") as f:
-                                f.write(bash_script)
-                            st = os.stat(fname)
-                            os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                    setup_files[fname] = bash_script
                     launcher_cmd.append(fname)
                     ##Here you need to set the environment variables for each node
                     for nid, node in enumerate(job_resource.nodes):
@@ -287,28 +262,19 @@ class AsyncMPIExecutor(Executor):
 
         if callable(task):
             tmp_fname = os.path.join(self.tmp_dir, f"callable_{task_id}.pkl")
-            if tmp_fname.startswith("/tmp"):
-                # Write file to /tmp
-                task_str = base64.b64encode(
-                    cloudpickle.dumps((task, task_args, task_kwargs))
-                ).decode("utf-8")
-                await self.write_file_to_nodes(
-                    tmp_fname, content=task_str, nodes=job_resource.nodes, encoded=True
-                )
-                task_cmd = [
-                    "python",
-                    "-c",
-                    _generate_python_exec_command(tmp_fname, node_local=True),
-                ]
-            else:
-                ## Write the file to pfs
-                with open(tmp_fname, "wb") as f:
-                    cloudpickle.dump((task, task_args, task_kwargs), f)
-                task_cmd = [
-                    "python",
-                    "-c",
-                    _generate_python_exec_command(tmp_fname),
-                ]
+            task_str = base64.b64encode(
+                cloudpickle.dumps((task, task_args, task_kwargs))
+            ).decode("utf-8")
+            if not await self.write_file_to_nodes(
+                tmp_fname, content=task_str, nodes=job_resource.nodes, encoded=True
+            ):
+                self.logger.warning(f"Failed to write {tmp_fname} to the task's nodes")
+                return None
+            task_cmd = [
+                "python",
+                "-c",
+                _generate_python_exec_command(tmp_fname),
+            ]
         elif isinstance(task, str):
             task_cmd = [s.strip() for s in task.split()]
         elif isinstance(task, List):
@@ -356,7 +322,11 @@ class AsyncMPIExecutor(Executor):
         executable: bool = False,
         encoded: bool = False,
     ) -> bool:
-        """Write a text file to `path` on each node in `nodes` via 1-rank-per-node MPI jobs.
+        """Write a text file to `path` on each node in `nodes`.
+
+        A path outside /tmp is on a shared filesystem: it is written once, here, through
+        a temporary file and an atomic rename, so no node ever sees a partial file.
+        A node-local path (under /tmp) is written on each node by 1-rank-per-node MPI jobs.
 
         Each chunk is written at its own byte offset (pwrite + ftruncate), so running a
         chunk again is a no-op on nodes that already have it. A launch that failed on some
@@ -365,6 +335,24 @@ class AsyncMPIExecutor(Executor):
         failure names the nodes that did not report. The last chunk also checks the file
         size and applies the chmod, so neither costs an extra launch.
         """
+        if not _is_node_local(path):
+            tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                if executable:
+                    os.chmod(tmp_path, os.stat(tmp_path).st_mode | stat.S_IEXEC)
+                os.replace(tmp_path, path)
+            except OSError as e:
+                self.logger.warning(f"[write_file_to_nodes] writing {path} failed: {e}")
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return False
+            return True
+
         cfg = self._mpi_config
 
         ## remove any duplicates
@@ -485,11 +473,11 @@ class AsyncMPIExecutor(Executor):
         stdout_file: Optional[str] = None,
         stderr_file: Optional[str] = None,
     ):
-        if setup_files and setup_files.get("gpu_affinity") and nodes:
-            fname = f"/tmp/gpu_affinity_file_{task_id}.sh"
-            await self.write_file_to_nodes(
-                fname, setup_files["gpu_affinity"], nodes, executable=True
-            )
+        for fname, content in (setup_files or {}).items():
+            if not await self.write_file_to_nodes(
+                fname, content, nodes or [], executable=True
+            ):
+                self.logger.warning(f"Failed to write {fname} to the task's nodes")
         self.logger.info(f"executing: {' '.join(cmd)}")
 
         program = cmd[0]

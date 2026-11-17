@@ -7,7 +7,11 @@ two paths reversed and connects) and moves real queue items through it:
 - one-way throughput: the owner puts N ``("data", [identity, payload])`` items and stops the
   clock when the peer reports it has received all of them (it reports items and bytes, which
   are checked);
-- round-trip latency: put one ``("sent", i, True)`` item, wait for the peer's echo, repeat.
+- round-trip latency: put one 64 B ``("data", ...)`` item, wait for the peer's echo, repeat.
+
+``socket-routed`` is the same `SocketIOQueue` with the receiving end routing ``"data"`` to a
+queue of its own (``routes={"data": q}``), as the connection front end does: data items skip
+``get()`` and are decoded in ``buffer_updated``. Both variants consume data as it arrives.
 
     python benchmark_io_queue.py                         # every case, both queues
     python benchmark_io_queue.py --queues socket --cases small large
@@ -27,7 +31,12 @@ import numpy as np
 
 from ensemble_launcher.comm.pipe.io_process import SocketIOQueue, ZMQIOQueue, new_ipc_path
 
-QUEUES = {"socket": SocketIOQueue, "zmq": ZMQIOQueue}
+# name -> (class, receiving end routes "data" to its own queue)
+QUEUES = {
+    "zmq": (ZMQIOQueue, False),
+    "socket": (SocketIOQueue, False),
+    "socket-routed": (SocketIOQueue, True),
+}
 # name -> (number of items, payload bytes per item); "pingpong" is the latency case
 CASES = {
     "small": (200_000, 64),
@@ -36,6 +45,13 @@ CASES = {
     "pingpong": (5_000, 64),
 }
 STOP = ("control", "stop", ())
+
+
+def _make(queue: str, send_path: str, recv_path: str, bind: bool):
+    """``(queue end, data route queue or None)``."""
+    cls, routed = QUEUES[queue]
+    data_q = asyncio.Queue() if routed else None
+    return cls(send_path, recv_path, bind=bind, routes={"data": data_q} if routed else None), data_q
 
 
 def _run(coro, loop_kind: str):
@@ -56,19 +72,32 @@ def _peer(queue: str, send_path: str, recv_path: str, mode: str, loop_kind: str)
     back until STOP."""
 
     async def main():
-        q = QUEUES[queue](send_path, recv_path, bind=False)
+        q, data_q = _make(queue, send_path, recv_path, bind=False)
         await q.open()
         q.put_nowait(("ready", "peer"))  # handshake: connected and running
         n = nbytes = 0
-        while True:
-            item = await q.get(timeout=120)
-            if item is None or item == STOP:
-                break
+
+        def on_data(item):
+            nonlocal n, nbytes
             if mode == "echo":
                 q.put_nowait(item)
-            elif item[0] == "data":
+            else:
                 nbytes += sum(len(f) for f in item[1])
             n += 1
+
+        if data_q is None:  # everything through get()
+            while (item := await q.get(timeout=120)) is not None and item != STOP:
+                on_data(item)
+        else:  # data from its route queue, as it arrives; STOP still through get()
+            async def consume():
+                while True:
+                    on_data(await data_q.get())
+
+            consumer = asyncio.create_task(consume())
+            await q.get(timeout=120)  # STOP: every data item before it is already routed
+            while not data_q.empty():
+                await asyncio.sleep(0)
+            consumer.cancel()
         if mode == "sink":
             q.put_nowait(("ready", f"{n}:{nbytes}"))  # what actually arrived
         await q.close(linger=5000)
@@ -83,7 +112,7 @@ def _peer(queue: str, send_path: str, recv_path: str, mode: str, loop_kind: str)
 
 async def _with_peer(queue: str, mode: str, loop_kind: str, body):
     to_peer, from_peer = new_ipc_path("in"), new_ipc_path("out")
-    q = QUEUES[queue](to_peer, from_peer, bind=True)
+    q, data_q = _make(queue, to_peer, from_peer, bind=True)
     await q.open()  # bind before the peer exists, as start_io_process does
     proc = mp.get_context("spawn").Process(
         target=_peer, args=(queue, from_peer, to_peer, mode, loop_kind), daemon=True
@@ -92,7 +121,7 @@ async def _with_peer(queue: str, mode: str, loop_kind: str, body):
     try:
         ready = await q.get(timeout=120)
         assert ready == ("ready", "peer"), ready
-        return await body(q)
+        return await body(q, data_q)
     finally:
         await asyncio.to_thread(proc.join, 30)
         if proc.is_alive():
@@ -109,7 +138,7 @@ async def one_way(queue: str, n: int, size: int, loop_kind: str) -> dict:
     payload = np.random.default_rng(0).bytes(size)
     item = ("data", [b"client-1", payload])
 
-    async def body(q):
+    async def body(q, _data_q):
         t0 = time.perf_counter()
         for _ in range(n):
             q.put_nowait(item)
@@ -129,14 +158,20 @@ async def one_way(queue: str, n: int, size: int, loop_kind: str) -> dict:
 
 
 async def ping_pong(queue: str, n: int, size: int, loop_kind: str) -> dict:
-    async def body(q):
+    payload = np.random.default_rng(0).bytes(size)
+    item = ("data", [b"client-1", payload])
+
+    async def body(q, data_q):
         rtts = []
-        for i in range(n):
+        for _ in range(n):
             t0 = time.perf_counter()
-            q.put_nowait(("sent", i, True))
-            got = await q.get(timeout=30)
+            q.put_nowait(item)
+            if data_q is None:
+                got = await q.get(timeout=30)
+            else:
+                got = await asyncio.wait_for(data_q.get(), 30)
             rtts.append(time.perf_counter() - t0)
-            assert got == ("sent", i, True), got
+            assert got == item, got
         q.put_nowait(STOP)
         return rtts
 
@@ -170,12 +205,12 @@ def main() -> None:
             if case == "pingpong":
                 runs = [_run(ping_pong(queue, n, size, args.loop), args.loop) for _ in range(args.repeat)]
                 best = min(runs, key=lambda r: r["median_us"])
-                print(f"  {queue:7s} round trip  median {best['median_us']:7.1f} us"
+                print(f"  {queue:14s} round trip  median {best['median_us']:7.1f} us"
                       f"   p99 {best['p99_us']:7.1f} us")  # fmt: skip
             else:
                 runs = [_run(one_way(queue, n, size, args.loop), args.loop) for _ in range(args.repeat)]
                 best = min(runs, key=lambda r: r["seconds"])
-                print(f"  {queue:7s} {best['items_per_s']:>12,.0f} items/s  {best['us_per_item']:8.2f} us/item"
+                print(f"  {queue:14s} {best['items_per_s']:>12,.0f} items/s  {best['us_per_item']:8.2f} us/item"
                       f"  {best['MB_per_s']:9.1f} MB/s   (puts {best['put_seconds']:.3f}s of {best['seconds']:.3f}s)")  # fmt: skip
 
 

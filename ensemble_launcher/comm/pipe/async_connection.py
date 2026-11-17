@@ -128,10 +128,15 @@ class AsyncConnection(ABC):
         )
         io = self._make_io()
         if self.out_of_process:
-            self._proc, self._q, self._io_paths = await start_io_process(io)
+            self._proc, self._q, self._io_paths = await start_io_process(
+                io, routes={"data": self._msg_queue}  # data skips _listen
+            )
         else:
             io.logger = self.logger
-            self._q, io_q = LocalIOQueue.pair()
+            self._q, io_q = LocalIOQueue.pair(
+                a_routes={"data": self._msg_queue},  # data skips _listen
+                b_routes={"send": io.send_requests},  # sends skip _input_loop
+            )
             await self._q.open()
             await io_q.open()
             self._io_task = self._loop.create_task(io.run(io_q))
@@ -211,8 +216,8 @@ class AsyncConnection(ABC):
     # ------------------------------------------------------------------ #
 
     async def _listen(self) -> None:
-        """Received messages go to ``_msg_queue``; send results resolve their futures. Out of
-        process, also notice the IOProcess dying."""
+        """Send results resolve their futures; out of process, also notice the IOProcess
+        dying. Received messages don't pass here: the queue routes them to ``_msg_queue``."""
         timeout = 1.0 if self._proc is not None else None
         while True:
             item = await self._q.get(timeout=timeout)
@@ -222,8 +227,8 @@ class AsyncConnection(ABC):
                     return
                 continue
             kind = item[0]
-            if kind == "data":
-                self._msg_queue.put_nowait(item[1])
+            if kind == "data":  # only from a queue that doesn't route data
+                self._msg_queue.put_nowait(item)
             elif kind == "sent":
                 fut = self._pending.pop(item[1], None)
                 if fut is not None and not fut.done():
@@ -251,7 +256,8 @@ class AsyncConnection(ABC):
     # ------------------------------------------------------------------ #
 
     async def recv(self, timeout: Optional[float] = None) -> List[bytes]:
-        return await asyncio.wait_for(self._msg_queue.get(), timeout=timeout)
+        item = await asyncio.wait_for(self._msg_queue.get(), timeout=timeout)
+        return item[1]  # ("data", frames)
 
     async def send(
         self, msg: Union[bytes, List[bytes]], target_id: Optional[str] = None, timeout: float = 5.0

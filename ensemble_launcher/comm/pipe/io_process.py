@@ -12,6 +12,11 @@ end and ``get``s what the other end put:
     front end -> IOProcess  ("send", req_id, target, timeout, frames)
                             ("control", op, args)    "add_remote" / "remove_remote" / "close"
 
+Fast path: a queue end may be given ``routes={kind: asyncio.Queue}``; received items of a routed
+kind go straight into that queue, decoded (the tuple ``get`` would have returned), and never
+reach ``get``. The front end routes ``"data"`` to the connection's message queue, the IOProcess
+routes ``"send"`` to its send requests, so the bulk traffic skips the dispatch loops.
+
 The IOProcess runs either on the caller's event loop, with a `LocalIOQueue` pair (two
 `asyncio.Queue`s), or in its own process, with a `SocketIOQueue` on each side (two Unix stream
 sockets, length-framed items, read with a `BufferedProtocol`). `ZMQIOQueue` (PUSH/PULL over
@@ -102,24 +107,32 @@ def verify_client_sender(
 # --------------------------------------------------------------------------- #
 
 
-class LocalIOQueue:
-    """One end of an in-process two-way queue: ``put_nowait`` feeds the other end's ``get``.
-    Make both ends with `pair`."""
+Routes = Optional[Dict[str, asyncio.Queue]]
 
-    def __init__(self, send_q: asyncio.Queue, recv_q: asyncio.Queue):
+
+class LocalIOQueue:
+    """One end of an in-process two-way queue: ``put_nowait`` feeds the other end's ``get``,
+    or, for a kind the other end routes, its route queue. Make both ends with `pair`."""
+
+    def __init__(self, send_q: asyncio.Queue, recv_q: asyncio.Queue, peer_routes: Routes = None):
         self._send_q = send_q
         self._recv_q = recv_q
+        self._peer_routes = peer_routes or {}
 
     @classmethod
-    def pair(cls) -> Tuple["LocalIOQueue", "LocalIOQueue"]:
+    def pair(
+        cls, a_routes: Routes = None, b_routes: Routes = None
+    ) -> Tuple["LocalIOQueue", "LocalIOQueue"]:
+        """Two connected ends; ``a_routes`` / ``b_routes`` are each end's receive routes."""
         a_to_b, b_to_a = asyncio.Queue(), asyncio.Queue()
-        return cls(a_to_b, b_to_a), cls(b_to_a, a_to_b)
+        return cls(a_to_b, b_to_a, peer_routes=b_routes), cls(b_to_a, a_to_b, peer_routes=a_routes)
 
     async def open(self) -> None:
         pass
 
     def put_nowait(self, item: tuple) -> None:
-        self._send_q.put_nowait(item)
+        route = self._peer_routes.get(item[0])
+        (route if route is not None else self._send_q).put_nowait(item)
 
     async def get(self, timeout: Optional[float] = None) -> Optional[tuple]:
         if timeout is None:
@@ -185,10 +198,11 @@ class ZMQIOQueue:
     as multipart frames, data frames as they are. Only the paths are needed to build an end, so
     the connect side is made from them in the spawned process."""
 
-    def __init__(self, send_path: str, recv_path: str, bind: bool):
+    def __init__(self, send_path: str, recv_path: str, bind: bool, routes: Routes = None):
         self._send_path = send_path
         self._recv_path = recv_path
         self._bind = bind
+        self._routes = routes or {}  # applied in get(): someone must keep calling it
         self._ctx = None
         self._send_sock = None
         self._recv_sock = None
@@ -212,9 +226,14 @@ class ZMQIOQueue:
             fut.add_done_callback(_log_send_error)
 
     async def get(self, timeout: Optional[float] = None) -> Optional[tuple]:
-        if timeout is not None and not await self._recv_sock.poll(int(timeout * 1000)):
-            return None
-        return _decode(await self._recv_sock.recv_multipart())
+        while True:
+            if timeout is not None and not await self._recv_sock.poll(int(timeout * 1000)):
+                return None
+            item = _decode(await self._recv_sock.recv_multipart())
+            route = self._routes.get(item[0])
+            if route is None:
+                return item
+            route.put_nowait(item)
 
     async def close(self, linger: int = 0) -> None:
         """``linger`` (ms) lets queued puts reach the other end before the socket goes."""
@@ -249,11 +268,12 @@ class _Proto(BufferedProtocol):
     SOCK_BUF = 1 << 22  # kernel socket buffers (macOS defaults to 8 KiB, Linux ~208 KiB)
     HIGH_WATER = 1 << 22  # transport write buffer that triggers pause_writing
 
-    def __init__(self, connected: asyncio.Future):
+    def __init__(self, connected: asyncio.Future, routes: Routes = None):
         super().__init__()
         self._connected = connected
         self.transport: Optional[asyncio.Transport] = None
-        self.items: asyncio.Queue = asyncio.Queue()
+        self.items: asyncio.Queue = asyncio.Queue()  # raw frames of unrouted items; get() decodes
+        self._routes = {k.encode(): q for k, q in (routes or {}).items()}  # kind frame -> queue
         self._buf = bytearray(self.INITIAL)
         self._w = 0  # end of the received bytes
         self._r = 0  # start of the first unparsed item
@@ -338,7 +358,11 @@ class _Proto(BufferedProtocol):
                 for ln in lens:
                     frames.append(bytes(mv[off : off + ln]))  # one copy, out of the reused buffer
                     off += ln
-                self.items.put_nowait(frames)
+                route = self._routes.get(frames[0])  # the kind frame
+                if route is None:
+                    self.items.put_nowait(frames)
+                else:  # fast path: decoded, straight to its consumer
+                    route.put_nowait(_decode(frames))
                 r += total
                 self._need = 0
         finally:
@@ -383,7 +407,7 @@ class SocketIOQueue:
     in order, once it does; ``get`` waits for it. ``get`` returns None on timeout and once the
     connection is gone (after waiting the timeout, so a polling caller doesn't spin)."""
 
-    def __init__(self, send_path: str, recv_path: str, bind: bool):
+    def __init__(self, send_path: str, recv_path: str, bind: bool, routes: Routes = None):
         self._send_path = send_path
         self._recv_path = recv_path
         self._bind = bind
@@ -393,21 +417,26 @@ class SocketIOQueue:
         self._send_proto: Optional[_Proto] = None
         self._recv_proto: Optional[_Proto] = None
         self._early: list = []  # items put before the peer connected, in order
+        self._routes = routes  # receive routes, given to the receiving connection's _Proto
 
     async def open(self) -> None:
+        def factory(fut: asyncio.Future, routes: Routes):
+            return lambda: _Proto(fut, routes)
+
         loop = asyncio.get_running_loop()
         self._send_fut, self._recv_fut = loop.create_future(), loop.create_future()
-        ends = ((self._send_path, self._send_fut), (self._recv_path, self._recv_fut))
+        ends = (
+            (self._send_path, factory(self._send_fut, None)),
+            (self._recv_path, factory(self._recv_fut, self._routes)),
+        )
         self._send_fut.add_done_callback(self._on_connect)
         self._recv_fut.add_done_callback(self._on_connect)
         if self._bind:
-            for path, fut in ends:
-                self._servers.append(
-                    await loop.create_unix_server(lambda fut=fut: _Proto(fut), path)
-                )
+            for path, make in ends:
+                self._servers.append(await loop.create_unix_server(make, path))
         else:
-            for path, fut in ends:
-                await loop.create_unix_connection(lambda fut=fut: _Proto(fut), path)
+            for path, make in ends:
+                await loop.create_unix_connection(make, path)
 
     def _on_connect(self, _fut: asyncio.Future) -> None:
         if self._send_proto is None and _proto_of(self._send_fut) is not None:
@@ -535,6 +564,8 @@ class IOProcess(ABC):
         self._ack_futures: Dict[int, asyncio.Future] = {}
         self._stop: Optional[asyncio.Event] = None
         self._send_tasks: set = set()
+        # "send" items the queue routes here (the fast path) instead of to _input_loop
+        self.send_requests: asyncio.Queue = asyncio.Queue()
 
     # ---------------- what a spawned process needs to rebuild this ---------------- #
 
@@ -559,12 +590,13 @@ class IOProcess(ABC):
         q.put_nowait(("ready", self.address))
         recv = asyncio.create_task(self._recv_loop(q))
         inp = asyncio.create_task(self._input_loop(q))
+        sends = asyncio.create_task(self._send_loop(q))
         try:
             await self._stop.wait()
         finally:
-            for t in (recv, inp, *self._send_tasks):
+            for t in (recv, inp, sends, *self._send_tasks):
                 t.cancel()
-            await asyncio.gather(recv, inp, *self._send_tasks, return_exceptions=True)
+            await asyncio.gather(recv, inp, sends, *self._send_tasks, return_exceptions=True)
             for fut in self._ack_futures.values():
                 if not fut.done():
                     fut.set_result(False)
@@ -617,13 +649,8 @@ class IOProcess(ABC):
                 self._stop.set()
                 return
             kind = item[0]
-            if kind == "send":
-                _, req_id, target, timeout, frames = item
-                task = asyncio.create_task(self._send(frames, target, timeout))
-                self._send_tasks.add(task)
-                task.add_done_callback(
-                    lambda t, rid=req_id: self._send_done(q, rid, t)
-                )
+            if kind == "send":  # only when the queue doesn't route sends to _send_loop
+                self._start_send(q, item)
             elif kind == "control":
                 op, args = item[1], item[2]
                 if op == "add_remote":
@@ -636,6 +663,18 @@ class IOProcess(ABC):
                 elif op == "close":
                     self._stop.set()
                     return
+
+    async def _send_loop(self, q) -> None:
+        """Send requests routed past `_input_loop` (``routes={"send": self.send_requests}``)."""
+        while True:
+            self._start_send(q, await self.send_requests.get())
+
+    def _start_send(self, q, item: tuple) -> None:
+        """One send in its own task, so a slow ACK wait blocks nothing."""
+        _, req_id, target, timeout, frames = item
+        task = asyncio.create_task(self._send(frames, target, timeout))
+        self._send_tasks.add(task)
+        task.add_done_callback(lambda t, rid=req_id: self._send_done(q, rid, t))
 
     def _send_done(self, q, req_id: int, task: asyncio.Task) -> None:
         self._send_tasks.discard(task)
@@ -713,11 +752,12 @@ class IOProcess(ABC):
 # --------------------------------------------------------------------------- #
 
 
-async def start_io_process(io: IOProcess) -> Tuple[Any, SocketIOQueue, List[str]]:
+async def start_io_process(io: IOProcess, routes: Routes = None) -> Tuple[Any, SocketIOQueue, List[str]]:
     """Spawn ``io``'s class in a new process, joined to the caller by a `SocketIOQueue`.
 
     Returns ``(process, q, paths)``: the caller's (bind) end of the queue, already open; on
-    close the caller closes it and unlinks ``paths``.
+    close the caller closes it and unlinks ``paths``. ``routes`` are that end's receive routes;
+    the IOProcess end routes ``"send"`` to its `IOProcess.send_requests`.
     """
     import multiprocessing as mp
 
@@ -729,7 +769,7 @@ async def start_io_process(io: IOProcess) -> Tuple[Any, SocketIOQueue, List[str]
             f"validator, not {type(rule).__name__}"
         )
     in_path, out_path = new_ipc_path("in"), new_ipc_path("out")  # into / out of the IOProcess
-    q = SocketIOQueue(send_path=in_path, recv_path=out_path, bind=True)
+    q = SocketIOQueue(send_path=in_path, recv_path=out_path, bind=True, routes=routes)
     await q.open()  # listen before the child connects; puts until then are kept
     class_path = f"{type(io).__module__}:{type(io).__qualname__}"
     proc = mp.get_context("spawn").Process(
@@ -756,7 +796,7 @@ def _io_main(class_path: str, kwargs: dict, send_path: str, recv_path: str, pare
     io = cls(**kwargs, logger=logger)
 
     async def main():
-        q = SocketIOQueue(send_path, recv_path, bind=False)
+        q = SocketIOQueue(send_path, recv_path, bind=False, routes={"send": io.send_requests})
         await q.open()
 
         async def watch_parent():

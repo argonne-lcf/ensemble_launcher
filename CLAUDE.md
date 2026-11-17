@@ -77,7 +77,13 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    paths reversed; built from the paths alone, then `await open()` / `await close()`;
    `start_io_process` is a coroutine too. The bind side's `open()` only listens -- the owner
    opens before it spawns the IOProcess -- and items put before the peer connects are kept and
-   sent in order. `ZMQIOQueue` has the same interface, kept for `benchmark_io_queue.py`), so
+   sent in order. `ZMQIOQueue` has the same interface, kept for `benchmark_io_queue.py`).
+   **Fast path:** every queue takes `routes={kind: asyncio.Queue}`; received items of a routed
+   kind land in that queue already decoded and never reach `get()` (`SocketIOQueue` routes in
+   `buffer_updated` by the kind frame, `LocalIOQueue` on the peer's put, `ZMQIOQueue` inside
+   `get()`). The front end routes `"data"` to `_msg_queue` (`recv()` returns `item[1]`), so
+   `_listen` only sees `"sent"` / `"ready"` and IOProcess death; the IOProcess routes `"send"`
+   to `IOProcess.send_requests` (its `_send_loop`), so `_input_loop` only sees `"control"`), so
    a busy event loop can't delay ACKs -- the 2048-node failure in #69. `LauncherConfig.comm_io_process`
    turns that on for every node's data transport (heartbeats, `PolicyEndpoint`, clients and
    actors stay in process); it is carried in the transport and connection states, so a child's
