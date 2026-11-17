@@ -545,6 +545,34 @@ class AsyncMaster(Node):
             children[child_name] = self._child_objs[child_name]
 
         if self._config.child_executor_name == "async_mpi":
+            # A child whose head node is this master's own head node is always launched
+            # on its own, never in the one-shot mpiexec with the others.
+            parent_head = (
+                self.init_nodes.nodes[0]
+                if self.init_nodes is not None and self.init_nodes.nodes
+                else None
+            )
+            child_idxs = {name: idx for idx, name in enumerate(children)}
+            same_head = [
+                name
+                for name, child in children.items()
+                if child.init_nodes.nodes[0] == parent_head
+            ]
+            if same_head:
+                self.logger.info(
+                    f"Launching {same_head} separately (head node {parent_head} "
+                    f"same as parent)"
+                )
+                await asyncio.gather(
+                    *[
+                        self._launch_child(name, children.pop(name), child_idxs[name])
+                        for name in same_head
+                    ]
+                )
+            if not children:
+                return
+            child_names = list(children)
+
             first_headnode = next(iter(children.values())).init_nodes.resources[0]
             worker_equality = all(
                 [
@@ -664,10 +692,8 @@ class AsyncMaster(Node):
                 self.logger.info("Launching children in serial")
                 ##launch children in parallel using gather
                 launch_tasks = [
-                    self._launch_child(child_name, child_obj, child_idx)
-                    for child_idx, (child_name, child_obj) in enumerate(
-                        children.items()
-                    )
+                    self._launch_child(child_name, child_obj, child_idxs[child_name])
+                    for child_name, child_obj in children.items()
                 ]
                 await asyncio.gather(*launch_tasks)
         else:
