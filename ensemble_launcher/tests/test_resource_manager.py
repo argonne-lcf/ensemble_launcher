@@ -70,10 +70,10 @@ def test_resource_overload():
     id 0 ten times in SystemConfig-style construction. That mechanism is
     retired (see test_duplicate_gpu_ids_rejected) in favor of fractional
     ngpus_per_process requests against a single real id, which is the
-    scenario rewritten here: five 0.2-GPU requests against gpus=[0] all fit,
-    a sixth does not.
+    scenario rewritten here: four 0.25-GPU requests against gpus=[0] all fit,
+    a fifth does not.
     """
-    # A single node so a 6th request has nowhere else to go -- with two
+    # A single node so a 5th request has nowhere else to go -- with two
     # nodes the scheduler would just satisfy it from the second node's
     # independent GPU 0, which isn't the oversubscription check this test
     # wants.
@@ -85,17 +85,17 @@ def test_resource_overload():
     cluster = LocalClusterResource(logger, nodes=cluster_nodes)
 
     allocated_jobs = []
-    for _ in range(5):
-        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.2)])
+    for _ in range(4):
+        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.25)])
         allocated, allocated_job = cluster.allocate(job)
         assert allocated is True, "expected fractional GPU request to be satisfied"
         assert allocated_job.resources[0].gpus == (0,)
         allocated_jobs.append(allocated_job)
 
-    # A sixth 0.2 request would push the node's GPU 0 past 1.0 -- rejected.
-    sixth_job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.2)])
-    allocated, _ = cluster.allocate(sixth_job)
-    assert allocated is False, "sixth fractional request should not fit"
+    # A fifth 0.25 request would push the node's GPU 0 past 1.0 -- rejected.
+    fifth_job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.25)])
+    allocated, _ = cluster.allocate(fifth_job)
+    assert allocated is False, "fifth fractional request should not fit"
 
     for allocated_job in allocated_jobs:
         cluster.deallocate(allocated_job)
@@ -151,7 +151,7 @@ def test_fractional_deallocate_restores():
     cluster = LocalClusterResource(logger, nodes=cluster_nodes)
 
     for _ in range(25):
-        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.1)])
+        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.25)])
         allocated, allocated_job = cluster.allocate(job)
         assert allocated is True
         cluster.deallocate(allocated_job)
@@ -261,69 +261,86 @@ def test_request_builds_fractional_demand():
 
 
 def test_fraction_never_spans_two_devices():
-    """Regression: three 0.3 requests drain GPU 0 to 0.1, and the fourth
-    used to be stitched together as 0.1 of GPU 0 + 0.2 of GPU 1 -- handing
-    the task ZE_AFFINITY_MASK=0,1, two devices it can only partly use. A
-    fraction of a GPU lives on exactly one device."""
+    """A fraction of a GPU lives on exactly one device. After 0.75 of GPU 0 is taken,
+    0.25 is left on it: a 0.5 request must go to GPU 1, not be stitched together as
+    0.25 of GPU 0 + 0.25 of GPU 1 (ZE_AFFINITY_MASK=0,1, two devices it can only partly
+    use). A 0.25 request then goes back to GPU 0, the device with the least room that
+    still fits it."""
     sys_info = NodeResourceList(cpus=list(range(8)), gpus=[0, 1, 2, 3])
     cluster = LocalClusterResource(
         logger, nodes=JobResource(resources=[sys_info], nodes=["node:0"])
     )
 
     seen = []
-    for _ in range(4):
-        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.3)])
+    for amount in (0.75, 0.5, 0.25):
+        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=amount)])
         allocated, allocated_job = cluster.allocate(job)
         assert allocated is True
         granted = allocated_job.resources[0]
         assert len(granted.gpus) == 1, (
-            f"a 0.3 request must land on one device, got {granted.gpu_amounts}"
+            f"a {amount} request must land on one device, got {granted.gpu_amounts}"
         )
         seen.append(granted.gpus[0])
 
-    # Three fit on GPU 0 (0.9 of it); the fourth moves to GPU 1 whole.
-    assert seen == [0, 0, 0, 1]
+    assert seen == [0, 1, 0]
 
 
 def test_fragmented_capacity_is_not_allocatable():
     """The other half of the same bug: __contains__ checked total free
-    capacity, so a node with 0.1 left on each of three devices reported
-    0.3 GPUs free and accepted a 0.3 request it could not place."""
+    capacity, so a node with 0.25 left on each of three devices reported
+    0.75 GPUs free and accepted a 0.5 request it could not place."""
     sys_info = NodeResourceList(cpus=list(range(8)), gpus=[0, 1, 2])
     cluster = LocalClusterResource(
         logger, nodes=JobResource(resources=[sys_info], nodes=["node:0"])
     )
 
     for _ in range(3):
-        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.9)])
+        job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.75)])
         allocated, _ = cluster.allocate(job)
         assert allocated is True
 
-    assert cluster.free_gpus == pytest.approx(0.3)
+    assert cluster.free_gpus == pytest.approx(0.75)
 
-    # 0.3 total is free, but only as 0.1 on each of three devices.
-    job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.3)])
+    # 0.75 total is free, but only as 0.25 on each of three devices.
+    job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.5)])
     allocated, _ = cluster.allocate(job)
     assert allocated is False
 
-    # 0.1 does fit on a single device.
-    job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.1)])
+    # 0.25 does fit on a single device.
+    job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=0.25)])
     allocated, allocated_job = cluster.allocate(job)
     assert allocated is True
     assert len(allocated_job.resources[0].gpus) == 1
 
 
-def test_mixed_whole_and_fractional_request():
-    """1.5 GPUs = one whole device plus half of a second, never 0.75 on two."""
+@pytest.mark.parametrize("ngpus", [0.25, 0.5, 0.75, 1, 2, 3])
+def test_gpu_request_whole_or_quarter_accepted(ngpus):
     sys_info = NodeResourceList(cpus=list(range(8)), gpus=[0, 1, 2, 3])
     cluster = LocalClusterResource(
         logger, nodes=JobResource(resources=[sys_info], nodes=["node:0"])
     )
-
-    job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=1.5)])
-    allocated, allocated_job = cluster.allocate(job)
+    allocated, job = cluster.allocate(
+        JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=ngpus)])
+    )
     assert allocated is True
-    assert allocated_job.resources[0].gpu_amounts == {0: 1.0, 1: 0.5}
+    assert job.resources[0].gpu_count == ngpus
+
+
+@pytest.mark.parametrize("ngpus", [1.5, 2.25, 0.1, 0.3, 0.9])
+def test_gpu_request_other_amounts_rejected(ngpus):
+    """A node asks for 1, 2, 3, ... GPUs or for 0.25, 0.5 or 0.75 of one; anything else
+    raises, and the cluster is left unchanged."""
+    sys_info = NodeResourceList(cpus=list(range(8)), gpus=[0, 1, 2, 3])
+    cluster = LocalClusterResource(
+        logger, nodes=JobResource(resources=[sys_info], nodes=["node:0"])
+    )
+    with pytest.raises(ValueError, match="whole number of GPUs"):
+        cluster.allocate(JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=ngpus)]))
+    if ngpus < 1:  # the same rule for a fraction of a named GPU
+        with pytest.raises(ValueError, match="whole number of GPUs"):
+            cluster.allocate(JobResource(resources=[
+                NodeResourceList.request(cpus=(0,), gpus=[0], gpu_fraction=ngpus)]))
+    assert (cluster.free_cpus, cluster.free_gpus) == (8, 4)
 
 
 def test_task_fractional_requirements():
@@ -338,6 +355,70 @@ def test_task_fractional_requirements():
     )
     req_single = task_single.get_resource_requirements()
     assert req_single.resources[0].ngpus == 0.25
+
+
+def _brute_fits(node, req):
+    """Whether ``req`` fits ``node``, from the raw per-CPU and per-GPU state alone (not
+    the free masks or counters that ``_Node.fits`` reads)."""
+    if bin(node.cpu_mask).count("1") < req.ncpus:
+        return False
+    q = round(req.ngpus * 4)
+    if q >= 4:
+        return sum(1 for f in node.gpu_free if f == 4) >= q // 4
+    return q == 0 or any(f >= q for f in node.gpu_free)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_lowest_bits_matches_loop(seed):
+    """``_lowest`` (binary search on the cut point) takes the same bits as popping the
+    lowest set bit n times."""
+    import random
+
+    from ensemble_launcher.scheduler.resource.cluster import _lowest
+
+    rng = random.Random(seed)
+    for _ in range(200):
+        mask = rng.getrandbits(rng.choice([1, 8, 64, 130]))
+        n = rng.randint(0, mask.bit_count() + 2)
+        want, m = 0, mask
+        for _ in range(n):
+            if not m:
+                break
+            low = m & -m
+            want |= low
+            m ^= low
+        assert _lowest(mask, n) == want, (bin(mask), n)
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_heaps_find_the_lowest_fitting_nodes(seed):
+    """Nodes are found through heaps (by free CPUs, fully free GPUs, room for a
+    fraction), not by scanning. After random allocates and frees, the heap answer must
+    be the k lowest nodes that fit, and every heap must hold every node that meets its
+    threshold."""
+    import random
+
+    rng = random.Random(seed)
+    nodes = [f"n{i}" for i in range(rng.randint(1, 10))]
+    pool = JobResource(resources=[NodeResourceList(cpus=range(8), gpus=range(4))] * len(nodes),
+                       nodes=nodes)
+    cluster = LocalClusterResource(logger, nodes=pool)
+    held = []
+    for _ in range(150):
+        req = NodeResourceCount(ncpus=rng.randint(0, 4), ngpus=rng.choice([0, 0, 0.25, 0.5, 0.75, 1, 2]))
+        k = rng.randint(1, 3)
+        if rng.random() < 0.6 or not held:
+            want = [n.name for n in cluster._nodes if _brute_fits(n, req)][:k]
+            ok, job = cluster.allocate(JobResource(resources=[req] * k))
+            assert ok == (len(want) == k)
+            if ok:
+                assert job.nodes == want
+                held.append(job)
+        else:
+            cluster.deallocate(held.pop(rng.randrange(len(held))))
+        for key, heap in cluster._heaps.items():
+            meets = {n.index for n in cluster._nodes if cluster._meets(key, n)}
+            assert meets <= set(heap) and cluster._in_heap[key] == set(heap), key
 
 
 if __name__ == "__main__":

@@ -411,6 +411,16 @@ class NodeResourceList(NodeResource):
         return obj
 
     @classmethod
+    def _trusted(cls, cpus: Tuple, pairs: Tuple[Tuple[GpuId, float], ...]) -> "NodeResourceList":
+        """Build without checks, for the cluster's allocate: ``cpus`` is a tuple and
+        ``pairs`` is (id, amount) in canonical order with amounts rounded and in (0, 1]."""
+        obj = object.__new__(cls)
+        object.__setattr__(obj, "cpus", cpus)
+        object.__setattr__(obj, "_gpu_amounts", pairs)
+        object.__setattr__(obj, "gpus", tuple(gid for gid, _ in pairs))
+        return obj
+
+    @classmethod
     def request(
         cls,
         cpus: Iterable[int] = (),

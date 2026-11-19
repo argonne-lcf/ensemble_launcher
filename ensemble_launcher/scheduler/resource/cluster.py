@@ -1,23 +1,255 @@
-from typing import List, Dict, Optional
 from abc import ABC, abstractmethod
-# from SimAIBench.datastore import DataStore, ServerManager
-import os
-import contextlib
-import uuid
-import time
-import copy
+import heapq
 from logging import Logger
-from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList
-# from SimAIBench.config import server_registry
+from typing import List, Optional, Tuple
 import asyncio
 
-SUPPORTED_BACKENDS = ["redis","filesystem"]
-# Configure logging
-# self.logger = logging.getself.logger(__name__)
+from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList
+
+# GPU amounts are integers counted in quarters of a GPU: a GPU is 1.0 (4 quarters)
+# and the smallest share is 0.25 (1 quarter).
+_UNITS = 4
+
+
+def _units(amount) -> int:
+    """An amount of GPUs in quarters. Raises unless it is a whole number of quarters
+    (0.25, 0.5, 0.75, 1, 1.25, ...); quarters are exact in floating point."""
+    q = float(amount) * _UNITS
+    if q != int(q):
+        raise ValueError(f"GPU amounts must be multiples of 0.25: got {amount}")
+    return int(q)
+
+
+def _gpu_split(units: int) -> Tuple[int, int]:
+    """A node's GPU request in quarters, as (whole GPUs, quarters of one GPU): one of the
+    two is 0. A node asks for 1, 2, 3, ... whole GPUs (4, 8, 12, ... quarters) or for 1,
+    2 or 3 quarters (0.25 / 0.5 / 0.75) of one GPU; anything else raises ValueError."""
+    if units < _UNITS:
+        return 0, units
+    if units % _UNITS:
+        raise ValueError(
+            f"a node's GPU request must be a whole number of GPUs (1, 2, 3, ...) or 0.25, "
+            f"0.5 or 0.75 of one GPU: got {units / _UNITS} (per node, ppn * ngpus_per_process)"
+        )
+    return units // _UNITS, 0
+
+
+def _request_units(amount) -> int:
+    """A requested GPU amount in quarters, with the request error message."""
+    try:
+        return _units(amount)
+    except ValueError:
+        raise ValueError(
+            f"a node's GPU request must be a whole number of GPUs (1, 2, 3, ...) or 0.25, "
+            f"0.5 or 0.75 of one GPU: got {amount} (per node, ppn * ngpus_per_process)"
+        ) from None
+
+
+def _lowest(mask: int, n: int) -> int:
+    """The ``n`` lowest set bits of ``mask`` (all of them if it has fewer).
+
+    Binary-searches the cut point p, the smallest with ``n`` set bits below it, so it
+    costs O(log bits) ``bit_count`` calls instead of one loop pass per bit taken."""
+    if n <= 0:
+        return 0
+    if n == 1:
+        return mask & -mask
+    if mask.bit_count() <= n:
+        return mask
+    lo, hi = n, mask.bit_length()
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if (mask & ((1 << mid) - 1)).bit_count() >= n:
+            hi = mid
+        else:
+            lo = mid + 1
+    return mask & ((1 << lo) - 1)
+
+
+def _bit_indexes(mask: int) -> List[int]:
+    """Indexes of the set bits of ``mask``, lowest first."""
+    out = []
+    while mask:
+        low = mask & -mask
+        out.append(low.bit_length() - 1)
+        mask ^= low
+    return out
+
+
+class _Node:
+    """One node's free resources.
+
+    cpu_mask    bit c set = CPU ``cpu_ids[c]`` is free (a plain Python int)
+    gpu_free    free quarters of each GPU, 0..4 (``gpu_ids[j]`` is GPU j)
+    free_mask   free_mask[k], k = 1..4: bit j set = GPU j has exactly k quarters free.
+                free_mask[4] is the fully free GPUs. The best fit for a fraction of q
+                quarters is the lowest GPU in the first non-empty mask of q, q+1, ..., 4.
+    """
+
+    __slots__ = ("name", "index", "cpu_ids", "cpu_bit", "gpu_ids", "gpu_col",
+                 "cpu_mask", "ncpu_free", "gpu_free", "free_mask")
+
+    def __init__(self, name: str, index: int, res: NodeResourceList):
+        self.name = name
+        self.index = index  # position in the cluster's node order (first fit = lowest)
+        self.cpu_ids = tuple(res.cpus)
+        self.cpu_bit = {c: 1 << b for b, c in enumerate(self.cpu_ids)}
+        self.gpu_ids = tuple(res.gpus)
+        self.gpu_col = {g: j for j, g in enumerate(self.gpu_ids)}
+        self.cpu_mask = (1 << len(self.cpu_ids)) - 1
+        self.ncpu_free = len(self.cpu_ids)
+        self.gpu_free = [_units(a) for _, a in res._gpu_amounts]
+        self.free_mask = [0] * (_UNITS + 1)
+        for j, q in enumerate(self.gpu_free):
+            if q:
+                self.free_mask[q] |= 1 << j
+
+    @property
+    def full_mask(self) -> int:
+        """Bit j set = GPU j is fully free."""
+        return self.free_mask[_UNITS]
+
+    def has_room(self, q: int) -> bool:
+        """Whether some GPU has at least ``q`` quarters free."""
+        fm = self.free_mask
+        return any(fm[k] for k in range(q, _UNITS + 1))
+
+    def _set_gpu(self, j: int, new: int) -> None:
+        """Change GPU j's free quarters, moving its bit to the matching free_mask."""
+        old = self.gpu_free[j]
+        bit = 1 << j
+        if old:
+            self.free_mask[old] &= ~bit
+        self.gpu_free[j] = new
+        if new:
+            self.free_mask[new] |= bit
+
+    def fits_count(self, ncpus: int, whole: int, q: int) -> bool:
+        """Whether a count request fits: ``ncpus`` CPUs plus ``whole`` fully free GPUs or
+        ``q`` quarters on one GPU (``_gpu_split``). Counters only, so it is exact and cheap:
+        any free CPUs will do, and the masks say how many GPUs have room."""
+        if self.ncpu_free < ncpus:
+            return False
+        if whole:
+            return self.free_mask[_UNITS].bit_count() >= whole
+        return not q or self.has_room(q)
+
+    def _named(self, req: NodeResourceList):
+        """An id request as (cpu bits, {gpu column: units}); KeyError on unknown ids."""
+        want = 0
+        cpu_bit = self.cpu_bit
+        for c in req.cpus:
+            want |= cpu_bit[c]
+        return want, {self.gpu_col[g]: _request_units(a) for g, a in req._gpu_amounts}
+
+    def fits(self, req: NodeResource) -> bool:
+        """Whether ``req`` fits here now. Picks no ids: ``take`` does that."""
+        if isinstance(req, NodeResourceList):
+            try:
+                want, gpus = self._named(req)
+            except KeyError:
+                return False
+            return self.cpu_mask & want == want and all(
+                self.gpu_free[j] >= u for j, u in gpus.items()
+            )
+        return self.fits_count(req.ncpus, *_gpu_split(_request_units(req.ngpus)))
+
+    def take(self, req: NodeResource) -> Tuple[NodeResourceList, int, int]:
+        """Take ``req``, which must fit (``fits``). Returns (what was taken as ids, CPUs
+        taken, GPU quarters taken).
+
+        A count request gets the lowest free CPUs, then whole GPUs in id order, or the
+        fraction on the GPU with the least room that still fits it (lowest id on a tie)."""
+        if isinstance(req, NodeResourceList):
+            cpus, gpus = self._named(req)
+        else:
+            cpus = _lowest(self.cpu_mask, req.ncpus)
+            gpus = {}
+            units = _request_units(req.ngpus)
+            if units:
+                whole, q = _gpu_split(units)
+                if whole:
+                    gpus = {j: _UNITS for j in _bit_indexes(_lowest(self.free_mask[_UNITS], whole))}
+                else:
+                    for k in range(q, _UNITS + 1):
+                        m = self.free_mask[k]
+                        if m:
+                            gpus = {(m & -m).bit_length() - 1: q}
+                            break
+        ncpus = cpus.bit_count()
+        self.cpu_mask ^= cpus
+        self.ncpu_free -= ncpus
+        for j, u in gpus.items():
+            self._set_gpu(j, self.gpu_free[j] - u)
+        cpu_ids = self.cpu_ids
+        pairs = tuple((self.gpu_ids[j], u / _UNITS) for j, u in sorted(gpus.items()))
+        taken = NodeResourceList._trusted(tuple(cpu_ids[b] for b in _bit_indexes(cpus)), pairs)
+        return taken, ncpus, sum(gpus.values())
+
+    def freed(self, res: NodeResource):
+        """What deallocating ``res`` gives back: (cpu bits, {gpu column: units}).
+        Raises on unknown ids or a double free; changes nothing."""
+        if not isinstance(res, NodeResourceList):
+            raise ValueError(
+                f"cannot deallocate {res} on {self.name}: deallocate takes what allocate "
+                f"returned, which names CPU and GPU ids"
+            )
+        try:
+            cpus = 0
+            for c in res.cpus:
+                cpus |= self.cpu_bit[c]
+            gpus = {self.gpu_col[g]: _units(a) for g, a in res._gpu_amounts}
+        except KeyError:
+            raise ValueError(f"{res} names ids that node {self.name} does not have")
+        if self.cpu_mask & cpus:
+            raise ValueError(
+                f"CPUs on {self.name} are already free: the same allocation was "
+                f"deallocated twice."
+            )
+        if any(self.gpu_free[j] + u > _UNITS for j, u in gpus.items()):
+            raise ValueError(
+                f"A GPU on {self.name} would have more than 1.0 free: the same allocation "
+                f"was deallocated twice."
+            )
+        return cpus, gpus
+
+    def give(self, cpus: int, gpus: dict) -> None:
+        """Give back what ``freed`` returned."""
+        self.cpu_mask |= cpus
+        self.ncpu_free += cpus.bit_count()
+        for j, u in gpus.items():
+            self._set_gpu(j, self.gpu_free[j] + u)
+
+    def resource(self) -> NodeResourceList:
+        """What is free on this node."""
+        pairs = tuple((g, u / _UNITS) for g, u in zip(self.gpu_ids, self.gpu_free) if u > 0)
+        cpus = tuple(self.cpu_ids[b] for b in _bit_indexes(self.cpu_mask))
+        return NodeResourceList._trusted(cpus, pairs)
+
+
+def _with_ids(node: NodeResource) -> NodeResourceList:
+    """A node as ids. A NodeResourceCount (pin_resources=False) gets CPUs 0..ncpus-1 and
+    GPUs 0..: one whole GPU per whole unit of ngpus, plus one partly free GPU for any
+    quarters left (ngpus must be a multiple of 0.25)."""
+    if isinstance(node, NodeResourceList):
+        return node
+    q = _units(node.ngpus)
+    amounts = {g: 1.0 for g in range(q // _UNITS)}
+    if q % _UNITS:
+        amounts[q // _UNITS] = (q % _UNITS) / _UNITS
+    return NodeResourceList._from_amounts(range(node.ncpus), amounts)
+
 
 class ClusterResource(ABC):
     """
     Abstract base class for managing cluster resources and job allocation.
+
+    Each node's free resources are a ``_Node``: a bitmask of free CPUs, the free amount
+    of each GPU, a bitmask of fully free GPUs and a sorted list of partly used ones.
+    Nodes are kept in a list and searched in order (first fit), which is meant for
+    clusters of up to ~128 nodes. Count nodes (NodeResourceCount, pin_resources=False)
+    are given ids (``_with_ids``), so allocations always carry ids.
+
     Note:
         This is an abstract base class and cannot be instantiated directly. Concrete
         implementations must provide the allocate() and deallocate() methods.
@@ -26,36 +258,41 @@ class ClusterResource(ABC):
     def __init__(self, logger: Logger, nodes: JobResource):
         self.logger = logger
         self.update_nodes(nodes)
-        if self._nodes is not None:
-            self.logger.debug(f"Node configuration: {list(self._nodes.keys())}")
 
     def update_nodes(self, nodes: JobResource):
-        """Update the cluster nodes and their system information."""
-        try:
-            self.logger.info(f"Updating cluster nodes to {len(nodes.nodes)} nodes")
-            self._nodes = nodes.to_dict()
-            self.logger.debug(f"Updated node configuration: {list(self._nodes.keys())}")
-        except Exception as e:
-            self._nodes = None
-            self.logger.warning(f"Failed to update cluster nodes: {e}")
-            
-    
-    @property
-    def free_cpus(self) -> int:
-        return sum([node.cpu_count for node in self._nodes.values()])
+        """Replace the cluster's nodes; everything in ``nodes`` is free."""
+        self.logger.info(f"Updating cluster nodes to {len(nodes.nodes)} nodes")
+        self._nodes = [
+            _Node(name, i, _with_ids(r)) for i, (name, r) in enumerate(zip(nodes.nodes, nodes.resources))
+        ]
+        # Heaps of node indexes by what a request needs, made the first time it's needed:
+        #   ("cpu", n)   nodes with at least n free CPUs           (CPU-only requests)
+        #   ("full", k)  nodes with at least k fully free GPUs     (k whole GPUs)
+        #   ("frac", u)  nodes with a GPU with at least u free     (0.25 / 0.5 / 0.75 of one)
+        # Each holds every node that meets its threshold, and maybe some that no longer
+        # do (allocate leaves them; they are dropped when they reach the top).
+        # _in_heap[key] is the set of nodes in heap ``key``, so none is pushed twice.
+        self._heaps = {}
+        self._in_heap = {}
+        self._row = {node.name: node for node in self._nodes}
+        self._free_cpus = sum(node.ncpu_free for node in self._nodes)
+        self._free_gpu_units = sum(sum(node.gpu_free) for node in self._nodes)
 
     @property
-    def free_gpus(self) -> int:
-        return sum([node.gpu_count for node in self._nodes.values()])
-    
+    def free_cpus(self) -> int:
+        return self._free_cpus
+
+    @property
+    def free_gpus(self):
+        return self._free_gpu_units / _UNITS
+
     @property
     def nodes(self) -> Optional[JobResource]:
-        try:
-            return JobResource.from_dict(self._nodes)
-        except Exception as e:
-            self.logger.error(f"Failed to retrieve nodes: {e}")
-            return None
-    
+        return JobResource(
+            resources=[node.resource() for node in self._nodes],
+            nodes=[node.name for node in self._nodes],
+        )
+
     @abstractmethod
     def allocate(self, job_resource: JobResource):
         pass
@@ -64,162 +301,171 @@ class ClusterResource(ABC):
     def deallocate(self, job_resource: JobResource):
         pass
 
-    def _can_allocate(self, job_resource: JobResource) -> List[str]:
-        """Check if the job resource can be allocated.
-        
-        Returns:
-            List[str]: List of node names where allocation can happen. 
-                      Empty list if allocation is not possible.
+    def _place(self, job_resource: JobResource):
+        """Where the job would go: [(node, request)] per node, or None if it doesn't fit.
+        Only checks fit (``_Node.fits``); ``allocate`` picks the ids with ``_Node.take``.
+        Explicit nodes are used as given; otherwise each request takes the first node
+        after the previous one that fits (first fit, in order)."""
+        if job_resource.nodes:
+            out = []
+            for name, req in zip(job_resource.nodes, job_resource.resources):
+                node = self._row.get(name)
+                if node is None:
+                    self.logger.error(f"Node {name} not found in cluster")
+                    return None
+                if not node.fits(req):
+                    return None
+                out.append((node, req))
+            return out
+
+        reqs = job_resource.resources
+        first = reqs[0]
+        if type(first) is NodeResourceCount and all(
+            r is first or (type(r) is NodeResourceCount and r == first) for r in reqs
+        ):
+            found = self._lowest_fitting(first, len(reqs))
+            return None if found is None else [(node, first) for node in found]
+
+        # Different requests per node, or requests naming ids: scan the nodes in order.
+        out = []
+        nodes = self._nodes
+        start = 0
+        for req in reqs:
+            if isinstance(req, NodeResourceCount):
+                ncpus, (whole, rem) = req.ncpus, _gpu_split(_request_units(req.ngpus))
+                fits = lambda node: node.fits_count(ncpus, whole, rem)
+            else:
+                ncpus = req.cpu_count  # skip full nodes before resolving ids
+                fits = lambda node: node.ncpu_free >= ncpus and node.fits(req)
+            for k in range(start, len(nodes)):
+                if fits(nodes[k]):
+                    out.append((nodes[k], req))
+                    start = k + 1
+                    break
+            else:
+                return None
+        return out
+
+    @staticmethod
+    def _heap_key(req: NodeResourceCount):
+        """Which heap answers ``req``: its GPU heap if it asks for GPUs, else its CPU
+        heap. None if it asks for nothing."""
+        units = _request_units(req.ngpus)
+        if units:
+            whole, rem = _gpu_split(units)
+            return ("full", whole) if whole else ("frac", rem)
+        return ("cpu", req.ncpus) if req.ncpus else None
+
+    @staticmethod
+    def _meets(key, node: _Node) -> bool:
+        """Whether ``node`` meets heap ``key``'s threshold."""
+        kind, amount = key
+        if kind == "cpu":
+            return node.ncpu_free >= amount
+        if kind == "full":
+            return node.full_mask.bit_count() >= amount
+        return node.has_room(amount)
+
+    def _heap(self, key):
+        if key not in self._heaps:
+            heap = [node.index for node in self._nodes if self._meets(key, node)]
+            self._heaps[key] = heap  # ascending, so already a heap
+            self._in_heap[key] = set(heap)
+        return self._heaps[key], self._in_heap[key]
+
+    def _lowest_fitting(self, req: NodeResourceCount, k: int):
+        """The ``k`` lowest nodes that fit ``req``, or None.
+
+        Walks the request's heap from the top: nodes that no longer meet the threshold
+        are dropped; nodes that meet it but don't fit the rest of the request (a GPU
+        node short of CPUs) are set aside and pushed back afterwards. Every node that
+        fits ``req`` is in the heap, so the first k that fit are the k lowest.
         """
-        self.logger.debug(f"Checking allocation feasibility for job with {len(job_resource.resources)} resources")
-        
-        if not job_resource.nodes:
-            # Need to find at least len(resources) nodes to allocate
-            job_counter = 0
-            cluster_counter = 0
-            allocated_nodes = []
-            node_names = list(self._nodes.keys())
-            
-            self.logger.debug("Auto-selecting nodes for allocation")
-            
-            while True:
-                if job_counter >= len(job_resource.resources):
-                    self.logger.debug(f"Successfully found {len(allocated_nodes)} suitable nodes: {allocated_nodes}")
-                    return allocated_nodes
-                
-                if cluster_counter >= len(self._nodes):
-                    self.logger.debug(f"Insufficient resources: only found {len(allocated_nodes)} nodes, need {len(job_resource.resources)}")
-                    return []  
-                
-                resource_req = job_resource.resources[job_counter]
-                node_name = node_names[cluster_counter]
-                
-                if resource_req in self._nodes[node_name]:
-                    allocated_nodes.append(node_name)
-                    job_counter += 1
-                    self.logger.debug(f"Node {node_name} can satisfy resource requirement {job_counter}")
-                
-                cluster_counter += 1
-        else:
-            self.logger.debug(f"Checking specific nodes: {job_resource.nodes}")
-            for node_id, node_name in enumerate(job_resource.nodes):
-                if node_name not in self._nodes:
-                    self.logger.error(f"Node {node_name} not found in cluster")
-                    return []
-                
-                available = self._nodes[node_name]
-                resource_req = job_resource.resources[node_id]
-                
-                if resource_req not in available:
-                    self.logger.warning(f"Node {node_name} cannot satisfy resource requirement: need {resource_req}, available {available}")
-                    return []
-            
-            self.logger.debug("All specified nodes can satisfy requirements")
-            return job_resource.nodes
-    
+        key = self._heap_key(req)
+        nodes = self._nodes
+        if key is None:  # asks for nothing: the first k nodes
+            return nodes[:k] if len(nodes) >= k else None
+        ncpus, (whole, rem) = req.ncpus, _gpu_split(_request_units(req.ngpus))
+        heap, in_heap = self._heap(key)
+        found, set_aside = [], []
+        while heap:
+            node = nodes[heap[0]]
+            if not self._meets(key, node):
+                in_heap.discard(heapq.heappop(heap))
+                continue
+            if node.fits_count(ncpus, whole, rem):
+                found.append(node)
+                if len(found) == k:
+                    break  # leave it on top: it may well fit the next request too
+            set_aside.append(heapq.heappop(heap))
+        for i in set_aside:  # they still meet the threshold
+            heapq.heappush(heap, i)
+        return found if len(found) == k else None
+
+    def _back_in_heaps(self, node: _Node) -> None:
+        """After a deallocate: put ``node`` in every heap whose threshold it now meets."""
+        i = node.index
+        for key, heap in self._heaps.items():
+            in_heap = self._in_heap[key]
+            if i not in in_heap and self._meets(key, node):
+                in_heap.add(i)
+                heapq.heappush(heap, i)
+
+    def _can_allocate(self, job_resource: JobResource) -> List[str]:
+        """Names of the nodes the allocation would use, or [] if it doesn't fit."""
+        placed = self._place(job_resource)
+        return [node.name for node, _ in placed] if placed else []
+
     def get_status(self):
-        """Returns current free resources i.e self._nodes dict"""
-        free_cpus = sum([node.cpu_count for node in self._nodes.values()])
-        free_gpus = sum([node.gpu_count for node in self._nodes.values()])
-        return (free_cpus, free_gpus)
-    
+        """Returns current free resources: (free_cpus, free_gpus)"""
+        return (self.free_cpus, self.free_gpus)
+
     def __eq__(self, other) -> bool:
         """Check equality between two ClusterResource instances."""
         if not isinstance(other, ClusterResource):
             return False
-        
-        # Check if nodes dictionaries have same keys
-        if set(self._nodes.keys()) != set(other._nodes.keys()):
-            return False
-        
-        # Check if each node's NodeResource is equal
-        for node_name in self._nodes:
-            if self._nodes[node_name] != other._nodes[node_name]:
-                return False
-        
-        return True
-    
+        return self.nodes.to_dict() == other.nodes.to_dict()
+
     def __repr__(self) -> str:
         """Return string representation of the cluster."""
-        node_info = []
-        for node_name, resource in self._nodes.items():
-            node_info.append(f"{node_name}: {resource}")
-        
-        nodes_str = "\n  ".join(node_info)
+        nodes_str = "\n  ".join(f"{name}: {r}" for name, r in self.nodes.to_dict().items())
         return f"{self.__class__.__name__}(\n  {nodes_str}\n)"
 
 class LocalClusterResource(ClusterResource):
     """
     Manages resource allocation and deallocation for a cluster of nodes.
-    Attributes:
-        _nodes (Dict[str, NodeResource]): Mapping of node names to their available resources.
     Args:
         nodes (JobResource): Job resource containing node names and their resource configurations.
     """
 
-    def allocate(self, job_resource: JobResource) -> tuple[bool, JobResource]:
+    def allocate(self, job_resource: JobResource) -> Tuple[bool, JobResource]:
         """Allocate specific resource IDs."""
-        self.logger.debug(f"Starting allocation for job with {len(job_resource.resources)} resource requirements")
-        allocation_result = self._can_allocate(job_resource)
-        if not allocation_result:
-            self.logger.debug("Allocation failed: insufficient resources")
+        placed = self._place(job_resource)
+        if placed is None:
             return False, job_resource
+        resources = []
+        for node, req in placed:
+            taken, ncpus, gpu_units = node.take(req)
+            resources.append(taken)
+            self._free_cpus -= ncpus
+            self._free_gpu_units -= gpu_units
+        return True, JobResource(resources=resources, nodes=[node.name for node, _ in placed])
 
-        # Track original state before allocation
-        original_state = {}
-        allocated_resources = []
-
-        if not job_resource.nodes:
-            allocated_nodes = allocation_result
-            self.logger.debug(f"Allocating resources on auto-selected nodes: {allocated_nodes}")
-
-            # Capture original state and perform allocation
-            for node_id, node_name in enumerate(allocated_nodes):
-                resource_req = job_resource.resources[node_id]
-                original_state[node_name] = self._nodes[node_name]
-                self.logger.debug(f"Requesting {resource_req} from node {node_name}")
-                self._nodes[node_name] = self._nodes[node_name] - resource_req
-
-                # Calculate what was actually allocated
-                allocated_resource = original_state[node_name] - self._nodes[node_name]
-                allocated_resources.append(allocated_resource)
-                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
-                self.logger.debug(f"Remaining resources on node {node_name} {self._nodes[node_name]}")
-
-            # Return JobResource with actual allocated resources
-            self.logger.debug(f"Allocation successful.")
-            return True, JobResource(resources=allocated_resources, nodes=allocated_nodes)
-        else:
-            self.logger.debug(f"Allocating resources on specified nodes: {job_resource.nodes}")
-
-            # Handle specified nodes case
-            for node_id, node_name in enumerate(job_resource.nodes):
-                resource_req = job_resource.resources[node_id]
-                original_state[node_name] = self._nodes[node_name]
-                self._nodes[node_name] = self._nodes[node_name] - resource_req
-
-                # Calculate what was actually allocated
-                allocated_resource = original_state[node_name] - self._nodes[node_name]
-                allocated_resources.append(allocated_resource)
-                self.logger.debug(f"Allocated {allocated_resource} on node {node_name}")
-
-            self.logger.debug("Allocation successful")
-            return True, JobResource(resources=allocated_resources, nodes=job_resource.nodes)
-    
     def deallocate(self, job_resource: JobResource) -> bool:
-        """Deallocate the resources"""
+        """Deallocate the resources. Checks every node first (unknown ids, CPUs already
+        free, GPUs going past 1.0) and changes nothing if a check fails."""
         if not job_resource.nodes:
             self.logger.error("Deallocation failed: JobResource must have nodes specified")
             raise ValueError("JobResource must have nodes specified for deallocation")
-        
-        self.logger.debug(f"Starting deallocation for {len(job_resource.nodes)} nodes: {job_resource.nodes}")
-        
-        for node_id, node_name in enumerate(job_resource.nodes):
-            resource_req = job_resource.resources[node_id]
-            self._nodes[node_name] += resource_req
-            self.logger.debug(f"Deallocated {resource_req} from node {node_name}")
-
-        self.logger.debug("Deallocation successful")
+        freed = [
+            (self._row[name], *self._row[name].freed(res))
+            for name, res in zip(job_resource.nodes, job_resource.resources)
+        ]
+        for node, cpus, gpus in freed:
+            node.give(cpus, gpus)
+            self._free_cpus += cpus.bit_count()
+            self._free_gpu_units += sum(gpus.values())
+            self._back_in_heaps(node)
         return True
 
 
@@ -238,28 +484,20 @@ class AsyncLocalClusterResource(LocalClusterResource):
         """This will return only when thereare free resources"""
         self._min_resources = min_resources
         await self._resource_available.wait()
-    
+
     async def signal_resource_available(self):
         """Signal that resources might be available. Used for waking up blocked waiters."""
         self._resource_available.set()
 
     def allocate(self, job_resource):
         allocated,allocated_resource = super().allocate(job_resource)
-        
+
         if allocated:
-            # Check if we should clear the event
-            should_clear = False
-            
-            if all([node_resource.is_empty() for node_resource in self._nodes.values()]):
-                # Cluster completely empty
-                should_clear = True
-            elif self._min_resources is not None:
-                # Check if we can still satisfy minimum requirement
-                can_allocate_min = self._can_allocate(self._min_resources)
-                if not can_allocate_min:
-                    should_clear = True
-            
-            if should_clear:
+            # Clear the event when the cluster is full, or can no longer fit the
+            # smallest pending task.
+            if self._free_cpus == 0 and self._free_gpu_units == 0:
+                self._resource_available.clear()
+            elif self._min_resources is not None and self._place(self._min_resources) is None:
                 self._resource_available.clear()
 
         return allocated, allocated_resource
@@ -273,24 +511,13 @@ class AsyncLocalClusterResource(LocalClusterResource):
         set with ``call_soon_threadsafe`` let it fire after the freed slot had
         already been refilled, leaving the event set on a full cluster.
         """
-        if not job_resource.nodes:
-            self.logger.error("Deallocation failed: JobResource must have nodes specified")
-            raise ValueError("JobResource must have nodes specified for deallocation")
-
-        # Call parent's deallocate to update internal state
         result = super().deallocate(job_resource)
 
         if result:
-            if self._min_resources is None:
-                self.logger.debug("No minimum resource requirement set, setting resource available event")
+            if self._min_resources is None or self._place(self._min_resources) is not None:
                 self._resource_available.set()
-            else:
-                can_allocate = self._can_allocate(self._min_resources)
-                if can_allocate:
-                    self.logger.debug(f"Minimum resource requirement met, setting resource available event. Requirement: {self._min_resources}, Available nodes: {can_allocate}")
-                    self._resource_available.set()
         return result
-    
+
     def set_resource_available(self):
         """Set the resource available event."""
         self.logger.debug("Setting resource available event")
