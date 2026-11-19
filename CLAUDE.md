@@ -37,9 +37,12 @@ inside a test file is therefore invisible to the node. Put fixture policies in a
 module (see `tests/policy_fixtures.py`) and point the child at it with
 `EL_EXTERNAL_POLICY_PATH` / `EL_EXTERNAL_POLICY_MODULE`.
 
-Tests leave scratch directories behind in `tests/` and nothing cleans them up:
-`.actor_ckpt_*` (hundreds accumulate) and `task-N/` from `test_async_worker.py`'s
-working-directory test. The `task-N/` ones contain a *copy of the test file*, so an
+Default scratch directories clean up after themselves: a `PublicActor`'s
+`.actor_ckpt_<hex>` is made in its own process when it runs and removed when it stops,
+and `AsyncMPIExecutor`'s `.mpi_tmp_<uuid>` is removed on `shutdown` / `ashutdown`
+(directories you pass in are kept). A killed run still leaves them, and tests that drive
+an actor's internals by hand (`test_actor.py`) write their own. `task-N/` from
+`test_async_worker.py`'s working-directory test is never cleaned up. The `task-N/` ones contain a *copy of the test file*, so an
 interrupted run breaks the next collection with `import file mismatch`. Clear them with
 `rm -rf task-[0-9]*` before re-running.
 

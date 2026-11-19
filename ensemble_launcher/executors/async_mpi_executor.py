@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -61,6 +62,8 @@ class AsyncMPIExecutor(Executor):
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
+        # A tmp_dir this executor made is removed on shutdown; one passed in is kept.
+        self._owns_tmp_dir = tmp_dir is None
         if tmp_dir is None:
             # A fresh directory under the working directory: on HPC systems that is a
             # shared filesystem, so each file is written once, not copied to every node.
@@ -588,6 +591,13 @@ class AsyncMPIExecutor(Executor):
         for task in list(self._tasks.values()):
             task.cancel()
         self._tasks.clear()
+        self._remove_tmp_dir()
+
+    def _remove_tmp_dir(self) -> None:
+        """Remove the default ``.mpi_tmp_<uuid>`` directory, if this executor made it."""
+        if self._owns_tmp_dir:
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            self._owns_tmp_dir = False
 
     async def ashutdown(self, wait: bool = False) -> None:
         """Async shutdown: kill process groups and await all asyncio tasks."""
@@ -600,3 +610,4 @@ class AsyncMPIExecutor(Executor):
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._processes.clear()
         self._tasks.clear()
+        self._remove_tmp_dir()
