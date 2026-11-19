@@ -1,36 +1,48 @@
 from abc import ABC, abstractmethod
-from bisect import bisect_left, insort
 import heapq
 from logging import Logger
 from typing import List, Optional, Tuple
 import asyncio
 
-from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList, _round_amount
+from .node import NodeResource, JobResource, NodeResourceCount, NodeResourceList
 
-# GPU amounts are kept as integers: _UNITS per whole GPU (matches the 6-decimal rounding
-# in node.py), so fractional allocations never drift.
-_UNITS = 1_000_000
+# GPU amounts are integers counted in quarters of a GPU: a GPU is 1.0 (4 quarters)
+# and the smallest share is 0.25 (1 quarter).
+_UNITS = 4
 
 
 def _units(amount) -> int:
-    return int(round(float(amount) * _UNITS))
-
-
-_QUARTER = _UNITS // 4
+    """An amount of GPUs in quarters. Raises unless it is a whole number of quarters
+    (0.25, 0.5, 0.75, 1, 1.25, ...); quarters are exact in floating point."""
+    q = float(amount) * _UNITS
+    if q != int(q):
+        raise ValueError(f"GPU amounts must be multiples of 0.25: got {amount}")
+    return int(q)
 
 
 def _gpu_split(units: int) -> Tuple[int, int]:
-    """A node's GPU request as (whole GPUs, fraction of one GPU in _UNITS): one of the two
-    is 0. A node asks for 1, 2, 3, ... whole GPUs or for 0.25, 0.5 or 0.75 of one GPU;
-    anything else (1.5, 0.3, ...) raises ValueError."""
-    whole, rem = divmod(units, _UNITS)
-    if (whole and rem) or rem % _QUARTER:
+    """A node's GPU request in quarters, as (whole GPUs, quarters of one GPU): one of the
+    two is 0. A node asks for 1, 2, 3, ... whole GPUs (4, 8, 12, ... quarters) or for 1,
+    2 or 3 quarters (0.25 / 0.5 / 0.75) of one GPU; anything else raises ValueError."""
+    if units < _UNITS:
+        return 0, units
+    if units % _UNITS:
         raise ValueError(
             f"a node's GPU request must be a whole number of GPUs (1, 2, 3, ...) or 0.25, "
-            f"0.5 or 0.75 of one GPU: got {_round_amount(units / _UNITS)} "
-            f"(per node, ppn * ngpus_per_process)"
+            f"0.5 or 0.75 of one GPU: got {units / _UNITS} (per node, ppn * ngpus_per_process)"
         )
-    return whole, rem
+    return units // _UNITS, 0
+
+
+def _request_units(amount) -> int:
+    """A requested GPU amount in quarters, with the request error message."""
+    try:
+        return _units(amount)
+    except ValueError:
+        raise ValueError(
+            f"a node's GPU request must be a whole number of GPUs (1, 2, 3, ...) or 0.25, "
+            f"0.5 or 0.75 of one GPU: got {amount} (per node, ppn * ngpus_per_process)"
+        ) from None
 
 
 def _lowest(mask: int, n: int) -> int:
@@ -59,14 +71,14 @@ class _Node:
     """One node's free resources.
 
     cpu_mask    bit c set = CPU ``cpu_ids[c]`` is free (a plain Python int)
-    gpu_free    free amount of each GPU, in _UNITS (``gpu_ids[j]`` is GPU j)
-    full_mask   bit j set = GPU j is fully free
-    partial     sorted [(free amount, j)] of partly used GPUs, so the best fit for a
-                fraction (least room that still fits) is one bisect away
+    gpu_free    free quarters of each GPU, 0..4 (``gpu_ids[j]`` is GPU j)
+    free_mask   free_mask[k], k = 1..4: bit j set = GPU j has exactly k quarters free.
+                free_mask[4] is the fully free GPUs. The best fit for a fraction of q
+                quarters is the lowest GPU in the first non-empty mask of q, q+1, ..., 4.
     """
 
     __slots__ = ("name", "index", "cpu_ids", "cpu_bit", "gpu_ids", "gpu_col",
-                 "cpu_mask", "ncpu_free", "gpu_free", "full_mask", "partial")
+                 "cpu_mask", "ncpu_free", "gpu_free", "free_mask")
 
     def __init__(self, name: str, index: int, res: NodeResourceList):
         self.name = name
@@ -78,27 +90,30 @@ class _Node:
         self.cpu_mask = (1 << len(self.cpu_ids)) - 1
         self.ncpu_free = len(self.cpu_ids)
         self.gpu_free = [_units(a) for _, a in res._gpu_amounts]
-        self.full_mask = 0
-        self.partial = []
-        for j, u in enumerate(self.gpu_free):
-            if u == _UNITS:
-                self.full_mask |= 1 << j
-            elif u > 0:
-                self.partial.append((u, j))
-        self.partial.sort()
+        self.free_mask = [0] * (_UNITS + 1)
+        for j, q in enumerate(self.gpu_free):
+            if q:
+                self.free_mask[q] |= 1 << j
+
+    @property
+    def full_mask(self) -> int:
+        """Bit j set = GPU j is fully free."""
+        return self.free_mask[_UNITS]
+
+    def has_room(self, q: int) -> bool:
+        """Whether some GPU has at least ``q`` quarters free."""
+        fm = self.free_mask
+        return any(fm[k] for k in range(q, _UNITS + 1))
 
     def _set_gpu(self, j: int, new: int) -> None:
-        """Change GPU j's free amount, keeping full_mask and partial in step."""
+        """Change GPU j's free quarters, moving its bit to the matching free_mask."""
         old = self.gpu_free[j]
-        if old == _UNITS:
-            self.full_mask &= ~(1 << j)
-        elif old > 0:
-            self.partial.pop(bisect_left(self.partial, (old, j)))
+        bit = 1 << j
+        if old:
+            self.free_mask[old] &= ~bit
         self.gpu_free[j] = new
-        if new == _UNITS:
-            self.full_mask |= 1 << j
-        elif new > 0:
-            insort(self.partial, (new, j))
+        if new:
+            self.free_mask[new] |= bit
 
     def plan(self, req: NodeResource):
         """What ``req`` would take: (cpu bits, {gpu column: units}), or None if it doesn't fit."""
@@ -107,11 +122,9 @@ class _Node:
                 want = 0
                 for c in req.cpus:
                     want |= self.cpu_bit[c]
-                take = {self.gpu_col[g]: _units(a) for g, a in req._gpu_amounts}
+                take = {self.gpu_col[g]: _request_units(a) for g, a in req._gpu_amounts}
             except KeyError:
                 return None
-            for u in take.values():  # each named GPU: all of it, or 0.25 / 0.5 / 0.75
-                _gpu_split(u)
             if self.cpu_mask & want != want:
                 return None
             if any(self.gpu_free[j] < u for j, u in take.items()):
@@ -119,25 +132,24 @@ class _Node:
             return want, take
 
         # Count request: the lowest free CPUs, then whole GPUs in id order, or the
-        # fraction on the partly used GPU with the least room that still fits it, else
-        # on the lowest fully free GPU.
+        # fraction on the GPU with the least room that still fits it (lowest id on a tie).
         if self.ncpu_free < req.ncpus:
             return None
         take = {}
-        units = _units(req.ngpus)
+        units = _request_units(req.ngpus)
         if units:
-            whole, rem = _gpu_split(units)
+            whole, q = _gpu_split(units)
             if whole:
-                gpus = _lowest(self.full_mask, whole)
+                gpus = _lowest(self.free_mask[_UNITS], whole)
                 if gpus.bit_count() < whole:
                     return None
                 take = {j: _UNITS for j in _bit_indexes(gpus)}
             else:
-                k = bisect_left(self.partial, (rem, -1))
-                if k < len(self.partial):
-                    take = {self.partial[k][1]: rem}
-                elif self.full_mask:
-                    take = {(self.full_mask & -self.full_mask).bit_length() - 1: rem}
+                for k in range(q, _UNITS + 1):
+                    m = self.free_mask[k]
+                    if m:
+                        take = {(m & -m).bit_length() - 1: q}
+                        break
                 else:
                     return None
         return _lowest(self.cpu_mask, req.ncpus), take
@@ -149,9 +161,7 @@ class _Node:
         for j, u in gpus.items():
             self._set_gpu(j, self.gpu_free[j] - u)
         cpu_ids = self.cpu_ids
-        pairs = tuple(
-            (self.gpu_ids[j], _round_amount(u / _UNITS)) for j, u in sorted(gpus.items())
-        )
+        pairs = tuple((self.gpu_ids[j], u / _UNITS) for j, u in sorted(gpus.items()))
         return NodeResourceList._trusted(tuple(cpu_ids[b] for b in _bit_indexes(cpus)), pairs)
 
     def freed(self, res: NodeResource):
@@ -190,9 +200,7 @@ class _Node:
 
     def resource(self) -> NodeResourceList:
         """What is free on this node."""
-        pairs = tuple(
-            (g, _round_amount(u / _UNITS)) for g, u in zip(self.gpu_ids, self.gpu_free) if u > 0
-        )
+        pairs = tuple((g, u / _UNITS) for g, u in zip(self.gpu_ids, self.gpu_free) if u > 0)
         cpus = tuple(self.cpu_ids[b] for b in _bit_indexes(self.cpu_mask))
         return NodeResourceList._trusted(cpus, pairs)
 
@@ -200,13 +208,13 @@ class _Node:
 def _with_ids(node: NodeResource) -> NodeResourceList:
     """A node as ids. A NodeResourceCount (pin_resources=False) gets CPUs 0..ncpus-1 and
     GPUs 0..: one whole GPU per whole unit of ngpus, plus one partly free GPU for any
-    fraction (``divide`` can leave e.g. 1.333)."""
+    quarters left (ngpus must be a multiple of 0.25)."""
     if isinstance(node, NodeResourceList):
         return node
-    whole, rem = divmod(_units(node.ngpus), _UNITS)
-    amounts = {g: 1.0 for g in range(whole)}
-    if rem:
-        amounts[whole] = rem / _UNITS
+    q = _units(node.ngpus)
+    amounts = {g: 1.0 for g in range(q // _UNITS)}
+    if q % _UNITS:
+        amounts[q // _UNITS] = (q % _UNITS) / _UNITS
     return NodeResourceList._from_amounts(range(node.ncpus), amounts)
 
 
@@ -254,7 +262,7 @@ class ClusterResource(ABC):
 
     @property
     def free_gpus(self):
-        return _round_amount(self._free_gpu_units / _UNITS)
+        return self._free_gpu_units / _UNITS
 
     @property
     def nodes(self) -> Optional[JobResource]:
@@ -303,14 +311,14 @@ class ClusterResource(ABC):
         for req in reqs:
             # Cheap counters first, so full nodes are skipped without calling plan().
             ncpus = req.cpu_count
-            whole, rem = _gpu_split(_units(req.gpu_count)) if isinstance(req, NodeResourceCount) else (0, 0)
+            whole, rem = _gpu_split(_request_units(req.gpu_count)) if isinstance(req, NodeResourceCount) else (0, 0)
             for k in range(start, len(nodes)):
                 node = nodes[k]
                 if node.ncpu_free < ncpus:
                     continue
                 if whole and node.full_mask.bit_count() < whole:
                     continue
-                if rem and not node.full_mask and (not node.partial or node.partial[-1][0] < rem):
+                if rem and not node.has_room(rem):
                     continue
                 plan = node.plan(req)
                 if plan is not None:
@@ -325,7 +333,7 @@ class ClusterResource(ABC):
     def _heap_key(req: NodeResourceCount):
         """Which heap answers ``req``: its GPU heap if it asks for GPUs, else its CPU
         heap. None if it asks for nothing."""
-        units = _units(req.ngpus)
+        units = _request_units(req.ngpus)
         if units:
             whole, rem = _gpu_split(units)
             return ("full", whole) if whole else ("frac", rem)
@@ -339,7 +347,7 @@ class ClusterResource(ABC):
             return node.ncpu_free >= amount
         if kind == "full":
             return node.full_mask.bit_count() >= amount
-        return bool(node.full_mask) or bool(node.partial) and node.partial[-1][0] >= amount
+        return node.has_room(amount)
 
     def _heap(self, key):
         if key not in self._heaps:
