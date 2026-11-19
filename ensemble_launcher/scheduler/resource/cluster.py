@@ -15,14 +15,19 @@ def _units(amount) -> int:
     return int(round(float(amount) * _UNITS))
 
 
+_QUARTER = _UNITS // 4
+
+
 def _gpu_split(units: int) -> Tuple[int, int]:
     """A node's GPU request as (whole GPUs, fraction of one GPU in _UNITS): one of the two
-    is 0. A request is whole GPUs or a fraction of a single GPU, never both."""
+    is 0. A node asks for 1, 2, 3, ... whole GPUs or for 0.25, 0.5 or 0.75 of one GPU;
+    anything else (1.5, 0.3, ...) raises ValueError."""
     whole, rem = divmod(units, _UNITS)
-    if whole and rem:
+    if (whole and rem) or rem % _QUARTER:
         raise ValueError(
-            f"a node can ask for whole GPUs or a fraction of one GPU, not both: got "
-            f"{_round_amount(units / _UNITS)} (e.g. from ppn * ngpus_per_process)"
+            f"a node's GPU request must be a whole number of GPUs (1, 2, 3, ...) or 0.25, "
+            f"0.5 or 0.75 of one GPU: got {_round_amount(units / _UNITS)} "
+            f"(per node, ppn * ngpus_per_process)"
         )
     return whole, rem
 
@@ -103,6 +108,8 @@ class _Node:
                 take = {self.gpu_col[g]: _units(a) for g, a in req._gpu_amounts}
             except KeyError:
                 return None
+            for u in take.values():  # each named GPU: all of it, or 0.25 / 0.5 / 0.75
+                _gpu_split(u)
             if self.cpu_mask & want != want:
                 return None
             if any(self.gpu_free[j] < u for j, u in take.items()):
