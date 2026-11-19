@@ -313,17 +313,17 @@ def test_fragmented_capacity_is_not_allocatable():
     assert len(allocated_job.resources[0].gpus) == 1
 
 
-def test_mixed_whole_and_fractional_request():
-    """1.5 GPUs = one whole device plus half of a second, never 0.75 on two."""
+def test_mixed_whole_and_fractional_request_rejected():
+    """A node asks for whole GPUs or a fraction of one GPU; 1.5 is neither."""
     sys_info = NodeResourceList(cpus=list(range(8)), gpus=[0, 1, 2, 3])
     cluster = LocalClusterResource(
         logger, nodes=JobResource(resources=[sys_info], nodes=["node:0"])
     )
 
     job = JobResource(resources=[NodeResourceCount(ncpus=1, ngpus=1.5)])
-    allocated, allocated_job = cluster.allocate(job)
-    assert allocated is True
-    assert allocated_job.resources[0].gpu_amounts == {0: 1.0, 1: 0.5}
+    with pytest.raises(ValueError, match="whole GPUs or a fraction"):
+        cluster.allocate(job)
+    assert cluster.free_gpus == 4
 
 
 def test_task_fractional_requirements():
