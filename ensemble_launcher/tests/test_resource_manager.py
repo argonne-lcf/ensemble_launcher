@@ -357,6 +357,39 @@ def test_task_fractional_requirements():
     assert req_single.resources[0].ngpus == 0.25
 
 
+def _brute_fits(node, req):
+    """Whether ``req`` fits ``node``, from the raw per-CPU and per-GPU state alone (not
+    the free masks or counters that ``_Node.fits`` reads)."""
+    if bin(node.cpu_mask).count("1") < req.ncpus:
+        return False
+    q = round(req.ngpus * 4)
+    if q >= 4:
+        return sum(1 for f in node.gpu_free if f == 4) >= q // 4
+    return q == 0 or any(f >= q for f in node.gpu_free)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_lowest_bits_matches_loop(seed):
+    """``_lowest`` (binary search on the cut point) takes the same bits as popping the
+    lowest set bit n times."""
+    import random
+
+    from ensemble_launcher.scheduler.resource.cluster import _lowest
+
+    rng = random.Random(seed)
+    for _ in range(200):
+        mask = rng.getrandbits(rng.choice([1, 8, 64, 130]))
+        n = rng.randint(0, mask.bit_count() + 2)
+        want, m = 0, mask
+        for _ in range(n):
+            if not m:
+                break
+            low = m & -m
+            want |= low
+            m ^= low
+        assert _lowest(mask, n) == want, (bin(mask), n)
+
+
 @pytest.mark.parametrize("seed", range(30))
 def test_heaps_find_the_lowest_fitting_nodes(seed):
     """Nodes are found through heaps (by free CPUs, fully free GPUs, room for a
@@ -375,8 +408,7 @@ def test_heaps_find_the_lowest_fitting_nodes(seed):
         req = NodeResourceCount(ncpus=rng.randint(0, 4), ngpus=rng.choice([0, 0, 0.25, 0.5, 0.75, 1, 2]))
         k = rng.randint(1, 3)
         if rng.random() < 0.6 or not held:
-            want = [cluster._nodes[i].name for i in range(len(nodes))
-                    if cluster._nodes[i].plan(req) is not None][:k]
+            want = [n.name for n in cluster._nodes if _brute_fits(n, req)][:k]
             ok, job = cluster.allocate(JobResource(resources=[req] * k))
             assert ok == (len(want) == k)
             if ok:

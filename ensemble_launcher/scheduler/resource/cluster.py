@@ -46,15 +46,24 @@ def _request_units(amount) -> int:
 
 
 def _lowest(mask: int, n: int) -> int:
-    """The ``n`` lowest set bits of ``mask`` (fewer if it has fewer)."""
-    take = 0
-    for _ in range(n):
-        if not mask:
-            break
-        low = mask & -mask
-        take |= low
-        mask ^= low
-    return take
+    """The ``n`` lowest set bits of ``mask`` (all of them if it has fewer).
+
+    Binary-searches the cut point p, the smallest with ``n`` set bits below it, so it
+    costs O(log bits) ``bit_count`` calls instead of one loop pass per bit taken."""
+    if n <= 0:
+        return 0
+    if n == 1:
+        return mask & -mask
+    if mask.bit_count() <= n:
+        return mask
+    lo, hi = n, mask.bit_length()
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if (mask & ((1 << mid) - 1)).bit_count() >= n:
+            hi = mid
+        else:
+            lo = mid + 1
+    return mask & ((1 << lo) - 1)
 
 
 def _bit_indexes(mask: int) -> List[int]:
@@ -115,54 +124,67 @@ class _Node:
         if new:
             self.free_mask[new] |= bit
 
-    def plan(self, req: NodeResource):
-        """What ``req`` would take: (cpu bits, {gpu column: units}), or None if it doesn't fit."""
+    def fits_count(self, ncpus: int, whole: int, q: int) -> bool:
+        """Whether a count request fits: ``ncpus`` CPUs plus ``whole`` fully free GPUs or
+        ``q`` quarters on one GPU (``_gpu_split``). Counters only, so it is exact and cheap:
+        any free CPUs will do, and the masks say how many GPUs have room."""
+        if self.ncpu_free < ncpus:
+            return False
+        if whole:
+            return self.free_mask[_UNITS].bit_count() >= whole
+        return not q or self.has_room(q)
+
+    def _named(self, req: NodeResourceList):
+        """An id request as (cpu bits, {gpu column: units}); KeyError on unknown ids."""
+        want = 0
+        cpu_bit = self.cpu_bit
+        for c in req.cpus:
+            want |= cpu_bit[c]
+        return want, {self.gpu_col[g]: _request_units(a) for g, a in req._gpu_amounts}
+
+    def fits(self, req: NodeResource) -> bool:
+        """Whether ``req`` fits here now. Picks no ids: ``take`` does that."""
         if isinstance(req, NodeResourceList):
             try:
-                want = 0
-                for c in req.cpus:
-                    want |= self.cpu_bit[c]
-                take = {self.gpu_col[g]: _request_units(a) for g, a in req._gpu_amounts}
+                want, gpus = self._named(req)
             except KeyError:
-                return None
-            if self.cpu_mask & want != want:
-                return None
-            if any(self.gpu_free[j] < u for j, u in take.items()):
-                return None
-            return want, take
+                return False
+            return self.cpu_mask & want == want and all(
+                self.gpu_free[j] >= u for j, u in gpus.items()
+            )
+        return self.fits_count(req.ncpus, *_gpu_split(_request_units(req.ngpus)))
 
-        # Count request: the lowest free CPUs, then whole GPUs in id order, or the
-        # fraction on the GPU with the least room that still fits it (lowest id on a tie).
-        if self.ncpu_free < req.ncpus:
-            return None
-        take = {}
-        units = _request_units(req.ngpus)
-        if units:
-            whole, q = _gpu_split(units)
-            if whole:
-                gpus = _lowest(self.free_mask[_UNITS], whole)
-                if gpus.bit_count() < whole:
-                    return None
-                take = {j: _UNITS for j in _bit_indexes(gpus)}
-            else:
-                for k in range(q, _UNITS + 1):
-                    m = self.free_mask[k]
-                    if m:
-                        take = {(m & -m).bit_length() - 1: q}
-                        break
+    def take(self, req: NodeResource) -> Tuple[NodeResourceList, int, int]:
+        """Take ``req``, which must fit (``fits``). Returns (what was taken as ids, CPUs
+        taken, GPU quarters taken).
+
+        A count request gets the lowest free CPUs, then whole GPUs in id order, or the
+        fraction on the GPU with the least room that still fits it (lowest id on a tie)."""
+        if isinstance(req, NodeResourceList):
+            cpus, gpus = self._named(req)
+        else:
+            cpus = _lowest(self.cpu_mask, req.ncpus)
+            gpus = {}
+            units = _request_units(req.ngpus)
+            if units:
+                whole, q = _gpu_split(units)
+                if whole:
+                    gpus = {j: _UNITS for j in _bit_indexes(_lowest(self.free_mask[_UNITS], whole))}
                 else:
-                    return None
-        return _lowest(self.cpu_mask, req.ncpus), take
-
-    def take(self, cpus: int, gpus: dict) -> NodeResourceList:
-        """Take what ``plan`` returned; returns it as a NodeResourceList."""
+                    for k in range(q, _UNITS + 1):
+                        m = self.free_mask[k]
+                        if m:
+                            gpus = {(m & -m).bit_length() - 1: q}
+                            break
+        ncpus = cpus.bit_count()
         self.cpu_mask ^= cpus
-        self.ncpu_free -= cpus.bit_count()
+        self.ncpu_free -= ncpus
         for j, u in gpus.items():
             self._set_gpu(j, self.gpu_free[j] - u)
         cpu_ids = self.cpu_ids
         pairs = tuple((self.gpu_ids[j], u / _UNITS) for j, u in sorted(gpus.items()))
-        return NodeResourceList._trusted(tuple(cpu_ids[b] for b in _bit_indexes(cpus)), pairs)
+        taken = NodeResourceList._trusted(tuple(cpu_ids[b] for b in _bit_indexes(cpus)), pairs)
+        return taken, ncpus, sum(gpus.values())
 
     def freed(self, res: NodeResource):
         """What deallocating ``res`` gives back: (cpu bits, {gpu column: units}).
@@ -280,9 +302,10 @@ class ClusterResource(ABC):
         pass
 
     def _place(self, job_resource: JobResource):
-        """Where the job would go: [(node, cpu bits, {gpu column: units})] per node, or
-        None if it doesn't fit. Explicit nodes are used as given; otherwise each request
-        takes the first node after the previous one that fits (first fit, in order)."""
+        """Where the job would go: [(node, request)] per node, or None if it doesn't fit.
+        Only checks fit (``_Node.fits``); ``allocate`` picks the ids with ``_Node.take``.
+        Explicit nodes are used as given; otherwise each request takes the first node
+        after the previous one that fits (first fit, in order)."""
         if job_resource.nodes:
             out = []
             for name, req in zip(job_resource.nodes, job_resource.resources):
@@ -290,10 +313,9 @@ class ClusterResource(ABC):
                 if node is None:
                     self.logger.error(f"Node {name} not found in cluster")
                     return None
-                plan = node.plan(req)
-                if plan is None:
+                if not node.fits(req):
                     return None
-                out.append((node, *plan))
+                out.append((node, req))
             return out
 
         reqs = job_resource.resources
@@ -302,27 +324,22 @@ class ClusterResource(ABC):
             r is first or (type(r) is NodeResourceCount and r == first) for r in reqs
         ):
             found = self._lowest_fitting(first, len(reqs))
-            return None if found is None else [(node, *plan) for node, plan in found]
+            return None if found is None else [(node, first) for node in found]
 
         # Different requests per node, or requests naming ids: scan the nodes in order.
         out = []
         nodes = self._nodes
         start = 0
         for req in reqs:
-            # Cheap counters first, so full nodes are skipped without calling plan().
-            ncpus = req.cpu_count
-            whole, rem = _gpu_split(_request_units(req.gpu_count)) if isinstance(req, NodeResourceCount) else (0, 0)
+            if isinstance(req, NodeResourceCount):
+                ncpus, (whole, rem) = req.ncpus, _gpu_split(_request_units(req.ngpus))
+                fits = lambda node: node.fits_count(ncpus, whole, rem)
+            else:
+                ncpus = req.cpu_count  # skip full nodes before resolving ids
+                fits = lambda node: node.ncpu_free >= ncpus and node.fits(req)
             for k in range(start, len(nodes)):
-                node = nodes[k]
-                if node.ncpu_free < ncpus:
-                    continue
-                if whole and node.full_mask.bit_count() < whole:
-                    continue
-                if rem and not node.has_room(rem):
-                    continue
-                plan = node.plan(req)
-                if plan is not None:
-                    out.append((nodes[k], *plan))
+                if fits(nodes[k]):
+                    out.append((nodes[k], req))
                     start = k + 1
                     break
             else:
@@ -357,7 +374,7 @@ class ClusterResource(ABC):
         return self._heaps[key], self._in_heap[key]
 
     def _lowest_fitting(self, req: NodeResourceCount, k: int):
-        """The ``k`` lowest nodes that fit ``req``, as [(node, plan)], or None.
+        """The ``k`` lowest nodes that fit ``req``, or None.
 
         Walks the request's heap from the top: nodes that no longer meet the threshold
         are dropped; nodes that meet it but don't fit the rest of the request (a GPU
@@ -367,7 +384,8 @@ class ClusterResource(ABC):
         key = self._heap_key(req)
         nodes = self._nodes
         if key is None:  # asks for nothing: the first k nodes
-            return [(node, node.plan(req)) for node in nodes[:k]] if len(nodes) >= k else None
+            return nodes[:k] if len(nodes) >= k else None
+        ncpus, (whole, rem) = req.ncpus, _gpu_split(_request_units(req.ngpus))
         heap, in_heap = self._heap(key)
         found, set_aside = [], []
         while heap:
@@ -375,9 +393,8 @@ class ClusterResource(ABC):
             if not self._meets(key, node):
                 in_heap.discard(heapq.heappop(heap))
                 continue
-            plan = node.plan(req)
-            if plan is not None:
-                found.append((node, plan))
+            if node.fits_count(ncpus, whole, rem):
+                found.append(node)
                 if len(found) == k:
                     break  # leave it on top: it may well fit the next request too
             set_aside.append(heapq.heappop(heap))
@@ -397,7 +414,7 @@ class ClusterResource(ABC):
     def _can_allocate(self, job_resource: JobResource) -> List[str]:
         """Names of the nodes the allocation would use, or [] if it doesn't fit."""
         placed = self._place(job_resource)
-        return [node.name for node, _, _ in placed] if placed else []
+        return [node.name for node, _ in placed] if placed else []
 
     def get_status(self):
         """Returns current free resources: (free_cpus, free_gpus)"""
@@ -427,11 +444,12 @@ class LocalClusterResource(ClusterResource):
         if placed is None:
             return False, job_resource
         resources = []
-        for node, cpus, gpus in placed:
-            resources.append(node.take(cpus, gpus))
-            self._free_cpus -= cpus.bit_count()
-            self._free_gpu_units -= sum(gpus.values())
-        return True, JobResource(resources=resources, nodes=[node.name for node, _, _ in placed])
+        for node, req in placed:
+            taken, ncpus, gpu_units = node.take(req)
+            resources.append(taken)
+            self._free_cpus -= ncpus
+            self._free_gpu_units -= gpu_units
+        return True, JobResource(resources=resources, nodes=[node.name for node, _ in placed])
 
     def deallocate(self, job_resource: JobResource) -> bool:
         """Deallocate the resources. Checks every node first (unknown ids, CPUs already
