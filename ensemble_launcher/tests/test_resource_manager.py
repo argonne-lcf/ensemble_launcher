@@ -357,6 +357,38 @@ def test_task_fractional_requirements():
     assert req_single.resources[0].ngpus == 0.25
 
 
+@pytest.mark.parametrize("seed", range(30))
+def test_heaps_find_the_lowest_fitting_nodes(seed):
+    """Nodes are found through heaps (by free CPUs, fully free GPUs, room for a
+    fraction), not by scanning. After random allocates and frees, the heap answer must
+    be the k lowest nodes that fit, and every heap must hold every node that meets its
+    threshold."""
+    import random
+
+    rng = random.Random(seed)
+    nodes = [f"n{i}" for i in range(rng.randint(1, 10))]
+    pool = JobResource(resources=[NodeResourceList(cpus=range(8), gpus=range(4))] * len(nodes),
+                       nodes=nodes)
+    cluster = LocalClusterResource(logger, nodes=pool)
+    held = []
+    for _ in range(150):
+        req = NodeResourceCount(ncpus=rng.randint(0, 4), ngpus=rng.choice([0, 0, 0.25, 0.5, 0.75, 1, 2]))
+        k = rng.randint(1, 3)
+        if rng.random() < 0.6 or not held:
+            want = [cluster._nodes[i].name for i in range(len(nodes))
+                    if cluster._nodes[i].plan(req) is not None][:k]
+            ok, job = cluster.allocate(JobResource(resources=[req] * k))
+            assert ok == (len(want) == k)
+            if ok:
+                assert job.nodes == want
+                held.append(job)
+        else:
+            cluster.deallocate(held.pop(rng.randrange(len(held))))
+        for key, heap in cluster._heaps.items():
+            meets = {n.index for n in cluster._nodes if cluster._meets(key, n)}
+            assert meets <= set(heap) and cluster._in_heap[key] == set(heap), key
+
+
 if __name__ == "__main__":
     test_resource()
     test_whole_gpu_unchanged()

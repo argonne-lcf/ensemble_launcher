@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from bisect import bisect_left, insort
+import heapq
 from logging import Logger
 from typing import List, Optional, Tuple
 import asyncio
@@ -64,11 +65,12 @@ class _Node:
                 fraction (least room that still fits) is one bisect away
     """
 
-    __slots__ = ("name", "cpu_ids", "cpu_bit", "gpu_ids", "gpu_col",
+    __slots__ = ("name", "index", "cpu_ids", "cpu_bit", "gpu_ids", "gpu_col",
                  "cpu_mask", "ncpu_free", "gpu_free", "full_mask", "partial")
 
-    def __init__(self, name: str, res: NodeResourceList):
+    def __init__(self, name: str, index: int, res: NodeResourceList):
         self.name = name
+        self.index = index  # position in the cluster's node order (first fit = lowest)
         self.cpu_ids = tuple(res.cpus)
         self.cpu_bit = {c: 1 << b for b, c in enumerate(self.cpu_ids)}
         self.gpu_ids = tuple(res.gpus)
@@ -230,7 +232,18 @@ class ClusterResource(ABC):
     def update_nodes(self, nodes: JobResource):
         """Replace the cluster's nodes; everything in ``nodes`` is free."""
         self.logger.info(f"Updating cluster nodes to {len(nodes.nodes)} nodes")
-        self._nodes = [_Node(name, _with_ids(r)) for name, r in zip(nodes.nodes, nodes.resources)]
+        self._nodes = [
+            _Node(name, i, _with_ids(r)) for i, (name, r) in enumerate(zip(nodes.nodes, nodes.resources))
+        ]
+        # Heaps of node indexes by what a request needs, made the first time it's needed:
+        #   ("cpu", n)   nodes with at least n free CPUs           (CPU-only requests)
+        #   ("full", k)  nodes with at least k fully free GPUs     (k whole GPUs)
+        #   ("frac", u)  nodes with a GPU with at least u free     (0.25 / 0.5 / 0.75 of one)
+        # Each holds every node that meets its threshold, and maybe some that no longer
+        # do (allocate leaves them; they are dropped when they reach the top).
+        # _in_heap[key] is the set of nodes in heap ``key``, so none is pushed twice.
+        self._heaps = {}
+        self._in_heap = {}
         self._row = {node.name: node for node in self._nodes}
         self._free_cpus = sum(node.ncpu_free for node in self._nodes)
         self._free_gpu_units = sum(sum(node.gpu_free) for node in self._nodes)
@@ -275,10 +288,19 @@ class ClusterResource(ABC):
                 out.append((node, *plan))
             return out
 
+        reqs = job_resource.resources
+        first = reqs[0]
+        if type(first) is NodeResourceCount and all(
+            r is first or (type(r) is NodeResourceCount and r == first) for r in reqs
+        ):
+            found = self._lowest_fitting(first, len(reqs))
+            return None if found is None else [(node, *plan) for node, plan in found]
+
+        # Different requests per node, or requests naming ids: scan the nodes in order.
         out = []
         nodes = self._nodes
         start = 0
-        for req in job_resource.resources:
+        for req in reqs:
             # Cheap counters first, so full nodes are skipped without calling plan().
             ncpus = req.cpu_count
             whole, rem = _gpu_split(_units(req.gpu_count)) if isinstance(req, NodeResourceCount) else (0, 0)
@@ -298,6 +320,71 @@ class ClusterResource(ABC):
             else:
                 return None
         return out
+
+    @staticmethod
+    def _heap_key(req: NodeResourceCount):
+        """Which heap answers ``req``: its GPU heap if it asks for GPUs, else its CPU
+        heap. None if it asks for nothing."""
+        units = _units(req.ngpus)
+        if units:
+            whole, rem = _gpu_split(units)
+            return ("full", whole) if whole else ("frac", rem)
+        return ("cpu", req.ncpus) if req.ncpus else None
+
+    @staticmethod
+    def _meets(key, node: _Node) -> bool:
+        """Whether ``node`` meets heap ``key``'s threshold."""
+        kind, amount = key
+        if kind == "cpu":
+            return node.ncpu_free >= amount
+        if kind == "full":
+            return node.full_mask.bit_count() >= amount
+        return bool(node.full_mask) or bool(node.partial) and node.partial[-1][0] >= amount
+
+    def _heap(self, key):
+        if key not in self._heaps:
+            heap = [node.index for node in self._nodes if self._meets(key, node)]
+            self._heaps[key] = heap  # ascending, so already a heap
+            self._in_heap[key] = set(heap)
+        return self._heaps[key], self._in_heap[key]
+
+    def _lowest_fitting(self, req: NodeResourceCount, k: int):
+        """The ``k`` lowest nodes that fit ``req``, as [(node, plan)], or None.
+
+        Walks the request's heap from the top: nodes that no longer meet the threshold
+        are dropped; nodes that meet it but don't fit the rest of the request (a GPU
+        node short of CPUs) are set aside and pushed back afterwards. Every node that
+        fits ``req`` is in the heap, so the first k that fit are the k lowest.
+        """
+        key = self._heap_key(req)
+        nodes = self._nodes
+        if key is None:  # asks for nothing: the first k nodes
+            return [(node, node.plan(req)) for node in nodes[:k]] if len(nodes) >= k else None
+        heap, in_heap = self._heap(key)
+        found, set_aside = [], []
+        while heap:
+            node = nodes[heap[0]]
+            if not self._meets(key, node):
+                in_heap.discard(heapq.heappop(heap))
+                continue
+            plan = node.plan(req)
+            if plan is not None:
+                found.append((node, plan))
+                if len(found) == k:
+                    break  # leave it on top: it may well fit the next request too
+            set_aside.append(heapq.heappop(heap))
+        for i in set_aside:  # they still meet the threshold
+            heapq.heappush(heap, i)
+        return found if len(found) == k else None
+
+    def _back_in_heaps(self, node: _Node) -> None:
+        """After a deallocate: put ``node`` in every heap whose threshold it now meets."""
+        i = node.index
+        for key, heap in self._heaps.items():
+            in_heap = self._in_heap[key]
+            if i not in in_heap and self._meets(key, node):
+                in_heap.add(i)
+                heapq.heappush(heap, i)
 
     def _can_allocate(self, job_resource: JobResource) -> List[str]:
         """Names of the nodes the allocation would use, or [] if it doesn't fit."""
@@ -352,6 +439,7 @@ class LocalClusterResource(ClusterResource):
             node.give(cpus, gpus)
             self._free_cpus += cpus.bit_count()
             self._free_gpu_units += sum(gpus.values())
+            self._back_in_heaps(node)
         return True
 
 
