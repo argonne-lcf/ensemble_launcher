@@ -54,14 +54,18 @@ class AsyncMPIExecutor(Executor):
         self,
         logger=logger,
         gpu_selector: str = "ZE_AFFINITY_MASK",
-        tmp_dir: str = "/tmp/.mpiexec_tmp",
+        tmp_dir: Optional[str] = None,
         return_stdout: bool = True,
         mpi_config: Optional[MPIConfig] = None,
         **kwargs,
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
-        if os.path.isabs(tmp_dir):
+        if tmp_dir is None:
+            # A fresh directory under the working directory: on HPC systems that is a
+            # shared filesystem, so each file is written once, not copied to every node.
+            self.tmp_dir = os.path.join(os.getcwd(), f".mpi_tmp_{uuid.uuid4().hex}")
+        elif os.path.isabs(tmp_dir):
             self.tmp_dir = tmp_dir
         else:
             self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
