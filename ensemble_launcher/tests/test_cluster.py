@@ -275,7 +275,7 @@ async def test_stop_mid_run_fails_unfinished_client_tasks():
         assert not pending, f"{len(pending)} client futures never resolved"
         errors = [f.exception() for f in done]
         assert all(e is not None for e in errors), "a slow task reported success"
-        assert m._scheduler.state.empty()
+        assert len(m._scheduler.tasks) == 0  # nothing unfinished left in the store
     finally:
         if not run_task.done():
             m.request_stop()

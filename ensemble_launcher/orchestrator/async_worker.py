@@ -38,7 +38,7 @@ from ensemble_launcher.executors import (
 )
 from ensemble_launcher.logging import setup_logger
 from ensemble_launcher.orchestrator.policy_endpoint import KIND_TASK, PolicyEndpoint
-from ensemble_launcher.scheduler import AsyncTaskScheduler, TaskSchedulerState
+from ensemble_launcher.scheduler import AsyncTaskScheduler
 from ensemble_launcher.scheduler.async_scheduler import make_task_store
 from ensemble_launcher.scheduler.resource import (
     JobResource,
@@ -79,8 +79,8 @@ class AsyncWorker(Node):
         # worker is built with tasks; a worker under a master has them pushed by its parent
         # and reads them in _task_update_monitor.
         self._init_tasks: Optional[TaskUpdate] = as_task_update(tasks, sender=id)
-        # Every finished task's Result, by uid: feeds the final ResultBatch (minus what was
-        # streamed) and the results checkpoint.
+        # Every finished task's Result, by uid (it outlives the task in the store): feeds the
+        # final ResultBatch (minus what was streamed).
         self._results: Dict[bytes, Result] = {}
         self._init_nodes = Nodes
         self._parent_data_conn = parent_data_conn
@@ -106,14 +106,16 @@ class AsyncWorker(Node):
         self._submission_task = None
         self._reporting_task = None
 
-        self._task_futures: Dict[str, AsyncFuture] = {}
-        self._task_id_to_executor: Dict[str, str] = {}
+        # Running tasks, by store handle.
+        self._task_futures: Dict[int, AsyncFuture] = {}
+        self._task_id_to_executor: Dict[int, str] = {}
         self._event_loop = None
 
         self._checkpointer: Optional[Checkpointer] = None
         # Cached checkpoint data — populated early in _lazy_init() before sockets are set up.
-        self._ckpt_data: Optional[tuple] = None  # (sched_state, comm_state, tasks)
-        self._ckpt_results: Optional[dict] = None  # {task_id: Result}
+        # Only the comm state is used: a worker's tasks and scheduler state are runtime only
+        # (its parent resends whatever it has no result for).
+        self._ckpt_data: Optional[tuple] = None  # (_, comm_state, _)
 
         # Externally tunable task-policy state (see policy_endpoint.py).
         self._policy_endpoint: Optional[PolicyEndpoint] = None
@@ -343,9 +345,6 @@ class AsyncWorker(Node):
                 f"{self.node_id}: Nodes must be initialized before execution"
             )
 
-        # Restore scheduler state from cached checkpoint data (comm already restored).
-        self._restore_scheduler_checkpoint()
-
         await self._create_policy_endpoint()
 
         self._scheduler.start_monitoring()  # start the scheduler monitoring
@@ -476,7 +475,8 @@ class AsyncWorker(Node):
 
         Called immediately after logger setup — before comm is created and
         before any sockets are bound — so that both comm state and scheduler
-        state are available in ``self._ckpt_data`` when needed.
+        state are available in ``self._ckpt_data`` when needed. Only the comm state is
+        restored; scheduler state and results are not checkpointed.
         """
         if not self._config.checkpoint_dir:
             return
@@ -488,8 +488,7 @@ class AsyncWorker(Node):
         )
         if not self._checkpointer.checkpoint_exists():
             return
-        self._ckpt_data = await self._checkpointer.read_checkpoint(TaskSchedulerState)
-        self._ckpt_results = await self._checkpointer.read_results()
+        self._ckpt_data = await self._checkpointer.read_checkpoint()
 
     async def _restore_comm_state(self) -> None:
         """Restore comm from cached checkpoint data using the comm's set_state.
@@ -512,29 +511,6 @@ class AsyncWorker(Node):
 
         ## Don't restore the node_info. This will be updated once the scheduler is restored
         await self._comm.update_node_info(self.info())
-
-    def _restore_scheduler_checkpoint(self) -> bool:
-        """Restore scheduler state from cached checkpoint data.
-
-        Called after scheduler creation. Returns True if scheduler state was
-        successfully restored.
-        """
-        if self._ckpt_data is None:
-            return False
-        scheduler_state, _, _ = self._ckpt_data
-        if scheduler_state is None:
-            return False
-        self._scheduler.set_state(scheduler_state)
-
-        # Resend restored results; set_state brought back task_to_client, so results of
-        # client tasks go to their clients again.
-        if self._ckpt_results is not None:
-            self._results.update(self._ckpt_results)
-            for result in self._ckpt_results.values():
-                self._forward_result(result)
-
-        self.logger.info(f"{self.node_id}: Scheduler state restored from checkpoint")
-        return True
 
     async def _create_policy_endpoint(self) -> None:
         """Serve this worker's task-policy state to external ``PolicyClient``s.
@@ -585,16 +561,11 @@ class AsyncWorker(Node):
         self._policy_version_written = version
 
     async def _write_checkpoint(self) -> None:
-        """Write scheduler state, comm state, and completed results to checkpoint."""
+        """Write the comm state (and tuned policy state) to checkpoint."""
         if self._checkpointer is None:
             return
         await self._write_policy_checkpoint()
-        await self._checkpointer.write_checkpoint(
-            scheduler_state=self._scheduler.get_state(),
-            comm_state=self._comm.get_state(),
-        )
-        if self._results:
-            await self._checkpointer.write_results(dict(self._results))
+        await self._checkpointer.write_checkpoint(comm_state=self._comm.get_state())
 
     # --------------------------------------------------------------------------
     #                               Parent Synchronization
@@ -634,11 +605,11 @@ class AsyncWorker(Node):
     #                               Callbacks
     # --------------------------------------------------------------------------
 
-    def create_done_callback(self, task: Task) -> Callable[[AsyncFuture], None]:
+    def create_done_callback(self, h: int, task: Task) -> Callable[[AsyncFuture], None]:
         """Return a done-callback that dispatches _task_callback into the event loop."""
 
         def done_callback(future: AsyncFuture) -> None:
-            self._event_loop.call_soon_threadsafe(self._task_callback, task, future)
+            self._event_loop.call_soon_threadsafe(self._task_callback, h, task, future)
 
         return done_callback
 
@@ -727,15 +698,15 @@ class AsyncWorker(Node):
             for dest_id in set(self._iresult_q) | set(self._result_retry_q):
                 self._schedule_result_flush(dest_id)
 
-    def _task_callback(self, task: Task, future: AsyncFuture) -> None:
-        """Process a completed task future: record status, free resources, forward result."""
+    def _task_callback(self, h: int, task: Task, future: AsyncFuture) -> None:
+        """Process a completed task future (store handle ``h``): record status, free
+        resources, forward result."""
 
-        task_id = task.uid
         # Only running tasks need these (to cancel them); a kept future would also keep
         # this Task -- its done-callback closes over it -- alive for the rest of the run.
-        self._task_futures.pop(task_id, None)
-        self._task_id_to_executor.pop(task_id, None)
-        if task_id in self.tasks:
+        self._task_futures.pop(h, None)
+        self._task_id_to_executor.pop(h, None)
+        if h in self.tasks:
             exception = future.exception()
             task.end_time = time.time()
             if exception is None:
@@ -745,24 +716,31 @@ class AsyncWorker(Node):
                 task.status = TaskStatus.FAILED
                 task.exception = str(exception)
 
+            client = self._client_of(h)
             # Releases the task from the store: this Task object was its last copy.
-            self._scheduler.free(task_id, task.status)
+            self._scheduler.free(h, task.status)
 
             # Buffer Result in per-destination queue; flush as IResultBatch (both modes)
             task_result = Result(
                 sender=self.node_id,
-                uid=task_id,
+                uid=task.uid,
                 task_id=task.task_id,
                 data=task.result if exception is None else None,
                 success=(exception is None),
                 exception=str(exception) if exception else None,
             )
-            self._results[task_id] = task_result
-            self._forward_result(task_result)
+            self._results[task.uid] = task_result
+            self._forward_result(task_result, client)
 
-    def _forward_result(self, result: Result):
-        task_id = result.uid
-        dest_id = self._scheduler.state.task_to_client.pop(task_id, None)
+    def _client_of(self, h: int) -> Optional[str]:
+        """The client that submitted live task ``h`` (None: the parent). Read it before the
+        task is released."""
+        store = self.tasks
+        return store.client_name(int(store.clients((h,))[0])) if store.has_clients() else None
+
+    def _forward_result(self, result: Result, client: Optional[str] = None):
+        """Queue a result for ``client`` (the submitting client), or the parent if None."""
+        dest_id = client
         if dest_id is None and self.parent:
             dest_id = self.parent.node_id
 
@@ -784,8 +762,8 @@ class AsyncWorker(Node):
         state = self._scheduler.state
         return Status(
             nrunning_tasks=len(state.running_tasks),
-            nfailed_tasks=len(state.failed_tasks),
-            nsuccessful_tasks=len(state.completed_tasks),
+            nfailed_tasks=state.nfailed,
+            nsuccessful_tasks=state.ncompleted,
             nfree_cores=self._scheduler.cluster.free_cpus,
             nfree_gpus=self._scheduler.cluster.free_gpus,
         )
@@ -795,8 +773,10 @@ class AsyncWorker(Node):
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """Apply a TaskUpdate: add new tasks to the scheduler and cancel/delete removed ones.
 
-        Returns (add_status, del_status) dicts mapping uid -> success bool. A task this
-        worker cannot run is reported back right away as a failed Result.
+        Returns (add_status, del_status): add_status maps each accepted task's handle to True
+        and each rejected task's uid to False (it is gone from the store); del_status maps
+        uid -> success bool. A task this worker cannot run is reported back right away as a
+        failed Result.
         """
         ##Add the tasks to scheduler
         accepted, rejected = self._scheduler.add_tasks(taskupdate, client_id=client_id)
@@ -804,8 +784,6 @@ class AsyncWorker(Node):
         add_status = dict.fromkeys(accepted, True)
         for uid, name in rejected:
             add_status[uid] = False
-            if client_id is not None:
-                self._scheduler.state.task_to_client[uid] = client_id
             result = Result(
                 sender=self.node_id,
                 uid=uid,
@@ -814,15 +792,20 @@ class AsyncWorker(Node):
                 exception=f"Task needs more nodes than {self.node_id} has",
             )
             self._results[uid] = result
-            self._forward_result(result)
+            self._forward_result(result, client_id)
 
         ##delete tasks if needed
         del_status = {}
-        for uid in taskupdate.deleted_uids:
-            future = self._task_futures.get(uid)  # none yet if still in ready_tasks
+        deleted = taskupdate.deleted_uids
+        for uid, h in zip(deleted, self.tasks.lookup(deleted).tolist() if deleted else []):
+            if h < 0:
+                self.logger.warning(f"Unknown task to delete: {uid.hex()}")
+                del_status[uid] = False
+                continue
+            future = self._task_futures.get(h)  # none yet if still in ready_tasks
             if future is not None:
                 future.cancel()
-            del_status[uid] = self._scheduler.delete_task(uid)
+            del_status[uid] = self._scheduler.delete_task(h)
 
         return (add_status, del_status)
 
@@ -914,7 +897,7 @@ class AsyncWorker(Node):
                         self._task_id_to_executor[task_id] = task.executor_name
                     else:
                         self.logger.warning(
-                            f"Failed to submit {task_id}. {self.node_id} doesn't have {task.executor_name} executor"
+                            f"Failed to submit {task.task_id}. {self.node_id} doesn't have {task.executor_name} executor"
                         )
                         future = self._event_loop.create_future()
                         set_exception = True
@@ -935,9 +918,9 @@ class AsyncWorker(Node):
                     self._task_id_to_executor[task_id] = self._default_executor_name
 
                 self.logger.info(
-                    f"Submitted task {task_id}: {task.executable} with resources {req.resources} to {self._task_id_to_executor[task_id]} executor"
+                    f"Submitted task {task.task_id}: {task.executable} with resources {req.resources} to {self._task_id_to_executor[task_id]} executor"
                 )
-                future.add_done_callback(self.create_done_callback(task))
+                future.add_done_callback(self.create_done_callback(task_id, task))
                 self._task_futures[task_id] = future
                 if set_exception:
                     future.set_exception(
@@ -1160,23 +1143,26 @@ class AsyncWorker(Node):
         Running futures are cancelled; their done-callbacks then find the task gone from the
         store and do nothing, so no task is reported twice.
         """
-        names = {uid: self.tasks[uid].task_id for uid in self._scheduler.state.unfinished()}
-        if not names:
+        handles = [h for h in self._scheduler.state.unfinished() if h in self.tasks]
+        if not handles:
             return
-        for uid in names:
-            future = self._task_futures.pop(uid, None)
-            self._task_id_to_executor.pop(uid, None)
+        # Read what the results need before the store releases the tasks.
+        store = self.tasks
+        rows = [(store.uids((h,))[0], store[h].task_id, self._client_of(h)) for h in handles]
+        for h in handles:
+            future = self._task_futures.pop(h, None)
+            self._task_id_to_executor.pop(h, None)
             if future is not None:
                 future.cancel()
         self._scheduler.fail_unfinished()
         reason = f"{self.node_id} stopped before the task finished"
-        for uid, name in names.items():
+        for uid, name, client in rows:
             result = Result(
                 sender=self.node_id, uid=uid, task_id=name, success=False, exception=reason
             )
             self._results[uid] = result
-            self._forward_result(result)
-        self.logger.warning(f"{self.node_id}: failed {len(names)} unfinished tasks: {reason}")
+            self._forward_result(result, client)
+        self.logger.warning(f"{self.node_id}: failed {len(rows)} unfinished tasks: {reason}")
 
     async def _send_final_results_and_status(self) -> ResultBatch:
         """Finish with the parent: fail what is unfinished, deliver every result, then send

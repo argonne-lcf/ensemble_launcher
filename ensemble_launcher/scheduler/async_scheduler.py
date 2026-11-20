@@ -7,11 +7,11 @@ import numpy as np
 
 from ensemble_launcher.config import LauncherConfig, PolicyConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
-from ensemble_launcher.taskstore import TaskStore, create_task_store
+from ensemble_launcher.taskstore import NO_CLIENT, UNASSIGNED, TaskStore, create_task_store
 
 from .child_state import ChildState
 from .heap import PendingEntry, PendingTaskHeap, PendingTaskQueue
-from .policy import ChildrenPolicy, Policy, policy_registry, prefers_columns
+from .policy import ChildrenPolicy, Policy, policy_registry, prefers_columns, wids_from_groups
 from .resource import (
     AsyncLocalClusterResource,
     JobResource,
@@ -25,12 +25,16 @@ if TYPE_CHECKING:
 
 # self.logger = logging.getself.logger(__name__)
 
+def _as_handles(idx) -> np.ndarray:
+    return np.asarray(idx, dtype=np.int64).reshape(-1)
+
+
 # Task policy that is special-cased by name: unscored, deque-backed pending queue.
 FIFO_POLICY_NAME = "fifo_policy"
 
 
 def make_task_store(config: LauncherConfig, node_id: Optional[str], logger: Logger) -> TaskStore:
-    """The node's task store, as configured. Task ids throughout the schedulers are its uids."""
+    """The node's task store, as configured. Task ids throughout the schedulers are its handles."""
     return create_task_store(
         config.task_store,
         node_id=node_id or "node",
@@ -54,17 +58,19 @@ class AsyncChildrenScheduler(AsyncScheduler):
     """A master's scheduler: lays out children on its nodes, places tasks on them, and tracks
     their lifecycle.
 
-    Everything it knows lives in ``self.state`` (a `SchedulerState`: one `Child` record per
-    child plus the unassigned pool). Callers read ``self.state`` directly and report events;
-    placement happens here:
+    It owns two things and is the only code that changes both: ``self.state`` (a
+    `SchedulerState`: the children and their resource allocations) and ``self.tasks`` (the
+    `TaskStore`, which also records where each task is: `UNASSIGNED` = the pool, or the wid of
+    the child it is placed on). Everything is by store handle; uids appear only in messages.
+    Callers read both directly and report events; placement happens here:
 
-    - ``await queue(update)`` stores new tasks and, in push mode, puts them on a private input
-      queue. The assigner task places them in chunks of ``assign_chunk_size`` -- yielding to the
-      loop between chunks -- and puts **one uid list per child per input item** on that child's
-      ``outbox``. The master's per-child sender consumes the outbox.
+    - ``await queue(update)`` stores new tasks and, in push mode, puts their handles on a
+      private input queue. The assigner task places them in chunks of ``assign_chunk_size`` --
+      yielding to the loop between chunks -- and puts **one handle array per child per input
+      item** on that child's ``outbox``. The master's per-child sender consumes the outbox.
     - In pull mode (work stealing) tasks wait in the pool until ``request(child_id, n)``.
-    - Uids no child can take go on ``unplaced``; the master fails them.
-    - ``drained`` is set while no unfinished task is left anywhere.
+    - Handles no child can take go on ``unplaced``; the master fails them.
+    - ``drained`` is set while the store holds no unfinished task and nothing is being placed.
     """
 
     # Legal child-state moves: target -> allowed sources.
@@ -113,7 +119,7 @@ class AsyncChildrenScheduler(AsyncScheduler):
                 "logger": logger.getChild("policy"),
             },
         )
-        # Every task this master holds, keyed by uid.
+        # Every task this master holds (by handle), and where each one is.
         self.tasks: TaskStore = make_task_store(config, node_id, logger.getChild("taskstore"))
         self.policy.bind_tasks(self.tasks)
         # Hand the policy whole-chunk columns when it implements the column entry points.
@@ -127,11 +133,11 @@ class AsyncChildrenScheduler(AsyncScheduler):
         self.cluster.set_event_loop(self._event_loop)
 
         self.state = SchedulerState(node_id=node_id or "node", level=level)
-        # Work for the assigner: uid lists. Private -- the way in is queue().
+        # Work for the assigner: handle arrays. Private -- the way in is queue().
         self._input: asyncio.Queue = asyncio.Queue()
         self._assigner: Optional[asyncio.Task] = None
         self._placing = False  # an input item is being placed
-        # Uid lists no child could take; the master fails them.
+        # Handle arrays no child could take; the master fails them.
         self.unplaced: asyncio.Queue = asyncio.Queue()
         # Set while no unfinished task is left anywhere (input, pool, children).
         self.drained = asyncio.Event()
@@ -149,69 +155,66 @@ class AsyncChildrenScheduler(AsyncScheduler):
     # Tasks in
     # ------------------------------------------------------------------
 
-    async def queue(self, update: "TaskUpdate", client_id: Optional[str] = None) -> List[bytes]:
+    async def queue(self, update: "TaskUpdate", client_id: Optional[str] = None) -> np.ndarray:
         """Store a received TaskUpdate and queue its tasks for placement.
 
-        Storing and pooling happen now, so from here on the state accounts for every task
-        (checkpoints, ``delete_task``, totals); only placement is deferred to the assigner.
-        Returns the uids added -- tasks the store already holds (a resend) are left out.
-        Async so that a bounded input queue could apply backpressure later.
+        Storing happens now, so from here on the store accounts for every task (it is in the
+        pool: `UNASSIGNED`); only placement is deferred to the assigner. Returns the handles
+        added -- tasks the store already holds (a resend) are left out. Async so that a bounded
+        input queue could apply backpressure later.
         """
-        uids = self.tasks.add(update)
-        if not uids:
-            return uids
-        self.state.queue(uids, client_id)
+        idx = self.tasks.add(update, client_id)
+        if not len(idx):
+            return idx
+        self.state.ntasks_added += len(idx)
         self.drained.clear()
         if self.placement == self.PUSH:
-            self._input.put_nowait(uids)
-        return uids
+            self._input.put_nowait(idx)
+        return idx
 
-    def finish_tasks(
-        self, uids: List[bytes], child_id: Optional[str] = None
-    ) -> Optional[List[Optional[str]]]:
-        """These tasks have a final result: forget them.
-
-        ``child_id`` is the child the results came from -- the one the tasks were assigned
-        to, since results travel back up the same branch; None for tasks failed before they
-        reached a child (they leave the pool). Releases the tasks from the store (no status is
-        kept: how a task ended travels in its result). Returns each uid's submitting client
-        (None if it came from the parent), in order -- or None when none had a client.
-        """
-        state = self.state
-        child = state.children.get(child_id) if child_id is not None else None
-        clients = state.finish_many(uids, child)
-        self.tasks.release(uids)
+    def finish_tasks(self, idx, uids: Optional[List[bytes]] = None) -> None:
+        """These tasks have a final result: they leave the store (no status is kept: how a
+        task ended travels in its result). Unknown, finished and repeated ones are ignored.
+        ``uids`` (row for row with ``idx``) saves the store reading them back."""
+        self.tasks.release(idx, uids)
         self._check_drained()
-        return clients
 
-    def requeue(self, uids: Iterable[bytes]) -> None:
-        """Place tasks back in the pool again -- e.g. a removed child's, when it can't come
-        back. Uids no longer in the pool (finished, or claimed by a child) are skipped. In
-        pull mode they just wait in the pool for the next request."""
-        pool = self.state.unassigned
-        uids = [uid for uid in uids if uid in pool]
-        if uids and self.placement == self.PUSH:
+    def requeue(self, idx) -> None:
+        """Place pool tasks again -- e.g. a removed child's, when it can't come back. Handles
+        no longer in the pool (finished, or claimed by a child) are skipped. In pull mode they
+        just wait in the pool for the next request."""
+        idx = _as_handles(idx)
+        idx = idx[self.tasks.assigned(idx) == UNASSIGNED]
+        if len(idx) and self.placement == self.PUSH:
             self.drained.clear()
-            self._input.put_nowait(uids)
+            self._input.put_nowait(idx)
 
-    def queue_result(self, batch, child_id: Optional[str] = None) -> None:
-        """Results arrived (from ``child_id``, or made here for tasks no child holds).
+    def queue_result(self, batch, idx: Optional[np.ndarray] = None) -> None:
+        """Results arrived (from a child, or made here for tasks no child holds).
 
-        Finishes the tasks, then puts the batch -- split per destination by row, as bytes --
-        on the submitting client's outbox, or on ``parent_outbox`` for tasks with no client.
+        ``idx`` are the batch's handles, row for row, when the caller has them (the batch came
+        from `build_failed_results`); otherwise its uids are looked up. Puts the batch -- split
+        per destination by row, as bytes -- on the submitting client's outbox, or on
+        ``parent_outbox`` for tasks with no client, then finishes the tasks.
         """
-        uids = batch.uids()
-        if not uids:
+        n = batch.nresults
+        if not n:
             return
-        clients = self.finish_tasks(uids, child_id)
-        if clients is None:  # no client tasks: all of it goes up
+        uids = None
+        if idx is None:
+            uids = batch.uids()
+            idx = self.tasks.lookup(uids) if self.tasks.has_clients() else None
+        codes = self.tasks.clients(idx) if self.tasks.has_clients() else None
+        self.finish_tasks(idx, uids)
+        if codes is None or (codes == NO_CLIENT).all():  # no client tasks: all of it goes up
             self.parent_outbox.put_nowait(batch)
             return
-        groups: Dict[Optional[str], List[int]] = {}
-        for i, client in enumerate(clients):
-            groups.setdefault(client, []).append(i)
-        for client, picked in groups.items():
-            piece = batch if len(picked) == len(uids) else batch.select(picked)
+        order = np.argsort(codes, kind="stable")
+        sorted_codes = codes[order]
+        bounds = np.flatnonzero(np.diff(sorted_codes)) + 1
+        for rows in np.split(order, bounds):
+            piece = batch if len(rows) == n else batch.select(rows)
+            client = self.tasks.client_name(int(codes[rows[0]]))
             if client is None:
                 self.parent_outbox.put_nowait(piece)
                 continue
@@ -221,16 +224,25 @@ class AsyncChildrenScheduler(AsyncScheduler):
                 self.new_clients.put_nowait(client)
             outbox.put_nowait(piece)
 
-    def delete_task(self, uid: bytes) -> None:
-        """Remove a task from the scheduler entirely."""
-        self.tasks.release((uid,))
-        self.state.forget(uid)
+    def delete_tasks(self, uids: List[bytes]) -> None:
+        """Remove tasks from the scheduler entirely (they get no result)."""
+        self.tasks.release(self.tasks.lookup(uids))
         self._check_drained()
 
-    def delivered(self, uids: Iterable[bytes]) -> None:
+    def delivered(self, idx) -> None:
         """A TaskUpdate carrying these tasks reached its child: their bytes are now needed
         only for recovery, so the store may offload them first."""
-        self.tasks.mark_delivered(uids)
+        self.tasks.mark_delivered(idx)
+
+    def unfinished(self) -> List[Tuple[Optional[str], np.ndarray]]:
+        """Where the unfinished tasks are: ``(child_id, handles)`` per child holding tasks, and
+        ``(None, handles)`` for the pool (first) and for tasks of a removed child. Each
+        unfinished task appears once."""
+        out: List[Tuple[Optional[str], np.ndarray]] = []
+        for tag, idx in self.tasks.groups():
+            child = self.state.child_of(tag) if tag >= 0 else None
+            out.append((child.id if child is not None else None, idx))
+        return out
 
     # ------------------------------------------------------------------
     # Placement
@@ -253,48 +265,53 @@ class AsyncChildrenScheduler(AsyncScheduler):
 
     async def _assign_loop(self) -> None:
         while True:
-            uids = await self._input.get()
+            idx = await self._input.get()
             self._placing = True
             try:
-                await self._place_item(uids)
+                await self._place_item(idx)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.error(f"Placing {len(uids)} tasks failed: {e}", exc_info=True)
+                self.logger.error(f"Placing {len(idx)} tasks failed: {e}", exc_info=True)
             finally:
                 self._placing = False
                 self._input.task_done()
                 self._check_drained()
 
-    async def _place_item(self, uids: List[bytes]) -> None:
+    async def _place_item(self, idx: np.ndarray) -> None:
         """Place one input item in chunks, yielding between them; then give each child one
-        list for the whole item, so one incoming update is one TaskUpdate per child."""
+        array for the whole item, so one incoming update is one TaskUpdate per child."""
         size = max(1, self._config.assign_chunk_size)
-        buffers: Dict[str, List[bytes]] = {}
-        unplaced: List[bytes] = []
-        for start in range(0, len(uids), size):
-            chunk = [uid for uid in uids[start : start + size] if uid in self.state.unassigned]
-            if chunk:
+        buffers: Dict[str, List[np.ndarray]] = {}
+        unplaced: List[np.ndarray] = []
+        assigned = self.tasks.assigned
+        for start in range(0, len(idx), size):
+            chunk = idx[start : start + size]
+            chunk = chunk[assigned(chunk) == UNASSIGNED]
+            if len(chunk):
                 placed, left = self._place(chunk)
                 for child_id, got in placed.items():
-                    buffers.setdefault(child_id, []).extend(got)
-                unplaced.extend(left)
+                    buffers.setdefault(child_id, []).append(got)
+                if len(left):
+                    unplaced.append(left)
             await asyncio.sleep(0)
-        for child_id, got in buffers.items():
-            if child_id in self.state.children:
-                self.state.children[child_id].outbox.put_nowait(got)
+        for child_id, parts in buffers.items():
+            child = self.state.children.get(child_id)
+            if child is not None:
+                child.outbox.put_nowait(parts[0] if len(parts) == 1 else np.concatenate(parts))
         if unplaced:
-            self.unplaced.put_nowait(unplaced)
+            self.unplaced.put_nowait(np.concatenate(unplaced))
 
     def _place(
         self,
-        uids: List[bytes],
+        idx: np.ndarray,
         child_ids: Optional[Iterable[str]] = None,
         ntask: Optional[int] = None,
-    ) -> Tuple[Dict[str, List[bytes]], List[bytes]]:
-        """Ask the policy where ``uids`` go (all children, or ``child_ids``) and record it.
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """Ask the policy where pool tasks ``idx`` go (all children, or ``child_ids``) and tag
+        them in the store.
 
-        Returns ``(child_id -> placed uids, unplaced uids)``. Does not touch outboxes.
+        Returns ``(child_id -> placed handles, unplaced handles)``. Does not touch outboxes.
         """
         state = self.state
         if child_ids is None:
@@ -304,41 +321,53 @@ class AsyncChildrenScheduler(AsyncScheduler):
         # A finished child takes nothing more (e.g. a FAILED child's own requeued tasks).
         children = {child.wid: child for child in targets if not child.terminal}
         if not children:
-            return {}, list(uids)
+            return {}, idx
         if self._columns_place:
-            by_wid, _, unplaced = self.policy.get_children_tasks_columns(
-                uids=uids,
-                meta=self.tasks.meta_columns(uids),
+            wids = self.policy.get_children_tasks_columns(
+                idx=idx,
+                meta=self.tasks.meta_columns(idx),
                 children=children,
                 ntask=ntask,
                 level=state.level,
             )
         else:
-            by_wid, _, unplaced = self.policy.get_children_tasks(
-                uids=uids, children=children, ntask=ntask, level=state.level
+            by_wid, _, _ = self.policy.get_children_tasks(
+                idx=idx, children=children, ntask=ntask, level=state.level
             )
-        placed: Dict[str, List[bytes]] = {}
-        for wid, got in by_wid.items():
-            if got:
-                child = children[wid]
-                state.assign(child, got)
-                placed[child.id] = got
-        return placed, list(unplaced)
+            wids = wids_from_groups(idx, by_wid)
+        wids = np.asarray(wids, dtype=np.int64)
+        placed: Dict[str, np.ndarray] = {}
+        unplaced: List[np.ndarray] = []
+        order = np.argsort(wids, kind="stable")
+        bounds = np.flatnonzero(np.diff(wids[order])) + 1
+        for rows in np.split(order, bounds):
+            if not len(rows):
+                continue
+            wid = int(wids[rows[0]])
+            got = idx[np.sort(rows)]  # in the order given
+            child = children.get(wid)
+            if child is None:  # -1, or a wid the policy made up
+                unplaced.append(got)
+                continue
+            placed[child.id] = self.tasks.assign(got, wid)
+        left = np.concatenate(unplaced) if unplaced else idx[:0]
+        return placed, left
 
     def request(self, child_id: str, ntask: Optional[int]) -> int:
         """Pull mode: a child asked for up to ``ntask`` tasks. Places them from the pool and
-        puts them on its outbox as one list. Returns how many were placed."""
+        puts them on its outbox as one array. Returns how many were placed."""
         child = self.state.children.get(child_id)
-        if child is None or not self.state.unassigned:
+        if child is None or not self.tasks.count(UNASSIGNED):
             return 0
-        placed, _ = self._place(list(self.state.unassigned), child_ids=[child_id], ntask=ntask)
-        got = placed.get(child_id, [])
-        if got:
-            child.outbox.put_nowait(got)
+        placed, _ = self._place(self.tasks.assigned_to(UNASSIGNED), child_ids=[child_id], ntask=ntask)
+        got = placed.get(child_id)
+        if got is None or not len(got):
+            return 0
+        child.outbox.put_nowait(got)
         return len(got)
 
     def _check_drained(self) -> None:
-        if self._input.empty() and not self._placing and self.state.empty():
+        if self._input.empty() and not self._placing and len(self.tasks) == 0:
             self.drained.set()
         else:
             self.drained.clear()
@@ -346,6 +375,12 @@ class AsyncChildrenScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
     # Children
     # ------------------------------------------------------------------
+
+    def _reset_child(self, child_id: str) -> None:
+        """Forget a child for good: its tasks go back to the pool (not re-placed)."""
+        child = self.state.pop_child(child_id)
+        if child is not None:
+            self.tasks.reassign(child.wid, UNASSIGNED)
 
     def create_children(
         self,
@@ -363,20 +398,20 @@ class AsyncChildrenScheduler(AsyncScheduler):
         state = self.state
         if reset:
             for child_id in list(state.children):
-                state.pop_child(child_id)
+                self._reset_child(child_id)
             state.all_done.clear()
         state.level = level
         suffix = ".w" if level + 1 == self._config.policy_config.nlevels else ".m"
         wid_offset = state.next_wid()
 
-        uids = list(self.tasks)
+        idx = self.tasks.all()
         nodes = nodes if nodes is not None else self.cluster.nodes
         if self._columns_layout:
             layout = self.policy.get_children_resources_columns(
-                uids=uids, meta=self.tasks.meta_columns(uids), nodes=nodes, level=level
+                idx=idx, meta=self.tasks.meta_columns(idx), nodes=nodes, level=level
             )
         else:
-            layout = self.policy.get_children_resources(uids=uids, nodes=nodes, level=level)
+            layout = self.policy.get_children_resources(idx=idx, nodes=nodes, level=level)
         for orig_wid, job_resource in layout.items():
             wid = orig_wid + wid_offset
             allocated, resource = self.cluster.allocate(job_resource)
@@ -411,23 +446,21 @@ class AsyncChildrenScheduler(AsyncScheduler):
         elif child.terminal:
             self._free(child)
             child.done.set()
-            if child.uids:
-                # Back to the pool; the child is terminal already, so placement skips it.
-                uids = list(child.uids)
-                self.state.unassigned.update(child.uids)
-                child.uids.clear()
+            # Back to the pool; the child is terminal already, so placement skips it.
+            idx = self.tasks.reassign(child.wid, UNASSIGNED)
+            if len(idx):
                 if requeue:
-                    self.requeue(uids)
+                    self.requeue(idx)
                 else:
-                    self.unplaced.put_nowait(uids)
+                    self.unplaced.put_nowait(idx)
             if self.state.all_terminal():
                 self.state.all_done.set()
         return True
 
     def remove_child(self, child_id: str) -> Optional[Child]:
-        """Drop a child: its unfinished tasks go back to the pool and its resources back to
-        the cluster. Returns the removed record, for `reinstate_child` (or `requeue` of its
-        tasks if it can't come back)."""
+        """Drop a child for recovery: its resources go back to the cluster, while its
+        unfinished tasks keep its wid in the store, for `reinstate_child`. Returns the removed
+        record."""
         child = self.state.pop_child(child_id)
         if child is None:
             return None
@@ -435,12 +468,14 @@ class AsyncChildrenScheduler(AsyncScheduler):
         return child
 
     def reinstate_child(self, child: Child) -> bool:
-        """Put a removed child back on its own resources (READY). It claims its unfinished
-        tasks back from the pool, and its fresh outbox holds all of them, to be sent once the
-        new process is ready. Returns False if its resources can't be re-allocated."""
+        """Put a removed child back on its own resources (READY); its fresh outbox holds all
+        its unfinished tasks, to be sent once the new process is ready. If its resources can't
+        be re-allocated, its tasks go back to the pool and are placed on the other children,
+        and this returns False."""
         assert child.id not in self.state.children, "Remove the child before reinstating"
         allocated, resource = self.cluster.allocate(child.job_resource)
         if not allocated:
+            self.requeue(self.tasks.reassign(child.wid, UNASSIGNED))
             return False
         child.job_resource = resource
         child.allocated = True
@@ -449,6 +484,9 @@ class AsyncChildrenScheduler(AsyncScheduler):
         child.ready = asyncio.Event()
         child.done = asyncio.Event()
         self.state.add_child(child)
+        held = self.tasks.assigned_to(child.wid)
+        if len(held):
+            child.outbox.put_nowait(held)
         self.transition(child.id, ChildState.READY)
         return True
 
@@ -462,26 +500,23 @@ class AsyncChildrenScheduler(AsyncScheduler):
     # ------------------------------------------------------------------
 
     def get_state(self) -> str:
-        """The state as checkpoint JSON. Runs on the loop, so it never sees a half-made
-        change; the checkpointer only writes the string."""
+        """The state as checkpoint JSON (the children layout). Runs on the loop, so it never
+        sees a half-made change; the checkpointer only writes the string."""
         self.state.nodes = self.cluster.nodes
         return self.state.to_json()
 
     def set_state(self, restored: SchedulerState) -> None:
-        """Adopt the children of a checkpointed state: same ids, resources and tasks, without
-        re-running the policy.
-
-        Call after the initial tasks were queued and before ``start()``: each restored child
-        claims its tasks from the pool (``add_child``), so the assigner then only places
-        tasks no child held. A child whose resources can't be re-allocated is skipped and its
-        tasks stay in the pool.
+        """Adopt the children of a checkpointed state: same ids, wids and resources, without
+        re-running the policy. The checkpoint names no tasks (they come back from where they
+        came from: the initial tasks, or the parent's resend), so the assigner places them on
+        the restored children like any others. Call before ``start()``. A child whose
+        resources can't be re-allocated is skipped.
         """
         state = self.state
         state.level = restored.level
         for child_id in list(state.children):
-            state.pop_child(child_id)
-        state.task_to_client.update(restored.task_to_client)
-        nheld = 0
+            self._reset_child(child_id)
+        state.wid_counter = max(state.wid_counter, restored.wid_counter)
         for child in restored.children.values():
             if child.job_resource is None:
                 continue
@@ -492,11 +527,10 @@ class AsyncChildrenScheduler(AsyncScheduler):
             child.job_resource = resource
             child.allocated = True
             state.add_child(child)
-            nheld += len(child)
             self.transition(child.id, ChildState.READY)
         self.logger.info(
-            f"set_state: restored {len(state.children)} children holding {nheld} tasks, "
-            f"{len(state.unassigned)} in the pool"
+            f"set_state: restored {len(state.children)} children; "
+            f"{len(self.tasks)} tasks to place"
         )
 
 
@@ -515,7 +549,7 @@ class AsyncTaskScheduler(AsyncScheduler):
 
         Args:
             logger: Logger instance.
-            tasks: The worker's TaskStore (task ids below are its uids). A TaskUpdate, an
+            tasks: The worker's TaskStore (task ids below are its handles). A TaskUpdate, an
                 iterable of Tasks or a dict of Tasks is put into a fresh in-memory store.
             nodes: Available cluster resources for this worker.
             policy: Policy name or instance used to score/prioritise tasks.
@@ -524,7 +558,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                 into a priority heap.
             policy_config: Configuration passed to the policy constructor
                 when *policy* is given as a string.
-            node_id: The owning node's id, written into the checkpoint.
+            node_id: The owning node's id (logs, task store spill directory).
         """
         cluster = AsyncLocalClusterResource(logger.getChild("cluster"), nodes)
         super().__init__(logger, cluster)
@@ -681,37 +715,6 @@ class AsyncTaskScheduler(AsyncScheduler):
         }
         self.state.pending_tasks.rescore(scores)
         return len(scores)
-
-    def get_state(self) -> str:
-        """The checkpoint: ``self.state`` as JSON, built here on the loop because the
-        checkpointer writes on a thread. Running tasks are written as pending."""
-        self.state.nodes = self.cluster.nodes
-        return self.state.to_json()
-
-    def set_state(self, restored: TaskSchedulerState) -> None:
-        """Adopt a checkpointed state: record its finished tasks and re-queue everything
-        else the store still holds. Results of completed tasks are restored by the worker.
-
-        The pending container and ``all_done`` are kept from the current state; the
-        restored ``pending_tasks`` list is only informational -- the store decides.
-        """
-        finished = restored.completed_tasks | restored.failed_tasks
-        self.tasks.release(finished)
-
-        restored.pending_tasks = self.state.pending_tasks
-        restored.running_tasks = self.state.running_tasks
-        restored.all_done = self.state.all_done
-        restored.task_to_client = {**self.state.task_to_client, **restored.task_to_client}
-        self.state = restored
-
-        pending = [uid for uid in self.tasks if uid not in finished]
-        self._seed_pending(pending)
-        self.logger.info(
-            f"set_state: {len(finished)} tasks restored from checkpoint, "
-            f"{len(pending)} tasks pending execution"
-        )
-        # Signal completion immediately if no tasks remain
-        self._check_all_tasks_done()
 
     def _find_min_resource_req(self) -> Optional[JobResource]:
         """Per-dimension minimum resource requirement among pending tasks, in O(1).
@@ -899,16 +902,13 @@ class AsyncTaskScheduler(AsyncScheduler):
         Thread-safe — called from executor callbacks via call_soon_threadsafe.
         """
         # Fast path: called on every task completion, and the exact check below is
-        # O(total tasks). Anything still pending or running means not done.
-        # Every task is either pending, running or finished (finished ones leave the
-        # store), so nothing pending and nothing running means done.
+        # Anything still pending or running means not done.
         if self.state.running_tasks or not self.state.pending_tasks.empty():
             return
-        remaining = [
-            tid for tid in self.tasks
-            if tid not in self.state.completed_tasks and tid not in self.state.failed_tasks
-        ]
-        self.logger.debug(f"Checking completion: {len(remaining)} tasks remaining")
+        # Finished, rejected and deleted tasks all leave the store, so what it still holds is
+        # what is left to do.
+        remaining = len(self.tasks)
+        self.logger.debug(f"Checking completion: {remaining} tasks remaining")
         if not remaining:
             self.logger.info("All tasks completed")
             if self._event_loop is not None:
@@ -940,53 +940,45 @@ class AsyncTaskScheduler(AsyncScheduler):
 
     def add_tasks(
         self, update: "TaskUpdate", client_id: Optional[str] = None
-    ) -> Tuple[List[bytes], List[Tuple[bytes, str]]]:
-        """Store a received TaskUpdate and queue its tasks.
+    ) -> Tuple[List[int], List[Tuple[bytes, str]]]:
+        """Store a received TaskUpdate (from ``client_id``, or the parent) and queue its tasks.
 
-        Returns ``(accepted uids, rejected (uid, task_id) pairs)``. A task needing more
-        nodes than this worker has is rejected (and released); tasks the store already holds
-        are skipped.
+        Returns ``(accepted handles, rejected (uid, task_id) pairs)``. A task needing more
+        nodes than this worker has is rejected (and released) -- the caller reports it by uid,
+        as it will be gone from the store. Tasks the store already holds are skipped.
         """
         nnodes = len(self.cluster.nodes.nodes)
-        new = self.tasks.add(update)
+        new = self.tasks.add(update, client_id)
         meta = self.tasks.meta_columns(new)
         too_big = meta["nnodes"] > nnodes
         rejected = []
         if too_big.any():
-            for row in np.flatnonzero(too_big).tolist():
-                task = self.tasks[new[row]]
+            bad = new[too_big]
+            for h, uid in zip(bad.tolist(), self.tasks.uids(bad)):
+                task = self.tasks[h]
                 self.logger.error(
                     f"Task {task.task_id} requires {task.nnodes} nodes, but only {nnodes} are available"
                 )
-                rejected.append((new[row], task.task_id))
-            keep = np.flatnonzero(~too_big)
-            accepted = [new[row] for row in keep.tolist()]
-            meta = meta[keep]
-        else:
-            accepted = new
-        if client_id is not None:
-            to_client = self.state.task_to_client
-            for task_id in accepted:
-                to_client[task_id] = client_id
+                rejected.append((uid, task.task_id))
+            self.tasks.release(bad)
+            new, meta = new[~too_big], meta[~too_big]
+        accepted = new.tolist()
         self._enqueue(accepted, meta)
         if accepted:
             self.state.all_done.clear()  # new work: not drained any more
-        if rejected:
-            uids = [uid for uid, _ in rejected]
-            self.tasks.release(uids)
         return accepted, rejected
 
-    def delete_task(self, task_id: bytes) -> bool:
-        """Remove a task from all queues and free its resources. Returns True on success."""
+    def delete_task(self, task_id: int) -> bool:
+        """Remove a task (by handle) from all queues and free its resources. Returns True on
+        success."""
         if task_id not in self.tasks:
-            self.logger.warning(f"Unknown task: {task_id.hex()}")
+            self.logger.warning(f"Unknown task: {task_id}")
             return False
 
         task = _TaskRef(task_id)
         try:
             # Drop the task's bytes
             self.tasks.release((task_id,))
-            self.state.task_to_client.pop(task_id, None)
 
             # Remove from pending tasks
             self.state.pending_tasks.remove(task.task_id)
@@ -1014,20 +1006,17 @@ class AsyncTaskScheduler(AsyncScheduler):
             if task.task_id in self.state.running_tasks:
                 self.cluster.deallocate(self.state.running_tasks[task.task_id])
 
-            # Remove from running and status sets (a pending task was never running)
+            # Remove from running tasks (a pending task was never running)
             self.state.running_tasks.pop(task.task_id, None)
-
-            # remove from failed and succesful tasks
-            self.state.failed_tasks.discard(task.task_id)
-            self.state.completed_tasks.discard(task.task_id)
 
             return True
         except Exception as e:
             self.logger.warning(f"Failed to delete task {task.task_id}: {e}")
             return False
 
-    def free(self, task_id: str, status: TaskStatus) -> None:
-        """Deallocate resources for a completed task and record its final status."""
+    def free(self, task_id: int, status: TaskStatus) -> None:
+        """Deallocate resources for a completed task (by handle), count its final status and
+        release it from the store."""
         if task_id in self.tasks:
             if task_id not in self.state.running_tasks:
                 self.logger.error(f"{task_id} is not running")
@@ -1039,12 +1028,11 @@ class AsyncTaskScheduler(AsyncScheduler):
             # delete from running tasks
             del self.state.running_tasks[task_id]
 
-            # add to failed/successful tasks
+            # count it as failed/successful
             if status == TaskStatus.FAILED:
-                self.state.failed_tasks.add(task_id)
+                self.state.nfailed += 1
             elif status == TaskStatus.SUCCESS:
-                self.state.completed_tasks.add(task_id)
-                self.state.failed_tasks.discard(task_id)
+                self.state.ncompleted += 1
 
             self.logger.debug(f"Freed {task_id}")
 
@@ -1054,7 +1042,7 @@ class AsyncTaskScheduler(AsyncScheduler):
                 is not Policy.on_task_complete
             ):
                 self.scheduler_policy.on_task_complete(
-                    uid=task_id,
+                    handle=task_id,
                     status=status,
                     scheduler_state=self.state,
                 )
@@ -1064,28 +1052,29 @@ class AsyncTaskScheduler(AsyncScheduler):
         self._check_all_tasks_done()
         return None
 
-    def fail_unfinished(self) -> List[bytes]:
+    def fail_unfinished(self) -> List[int]:
         """Fail every pending and running task, for a worker that is stopping; returns
-        their uids. Call after `stop_monitoring`, so nothing is dispatched meanwhile.
+        their handles. All of them are released, so read anything needed from the store
+        (uids, task ids) before calling. Call after `stop_monitoring`, so nothing is dispatched meanwhile.
 
         Running tasks (including ones allocated but still in ``ready_tasks``) go through
         `free`; pending ones never ran, so they are only recorded as failed and released.
         """
-        while not self.ready_tasks.empty():  # their uids are in _running_tasks
+        while not self.ready_tasks.empty():  # their handles are in running_tasks
             self.ready_tasks.get_nowait()
         running = list(self.state.running_tasks)
-        for uid in running:
-            self.free(uid, TaskStatus.FAILED)
-        pending = [uid for uid in self.state.pending_tasks.task_ids() if uid in self.tasks]
+        for h in running:
+            self.free(h, TaskStatus.FAILED)
+        pending = [h for h in self.state.pending_tasks.task_ids() if h in self.tasks]
         self.state.pending_tasks.clear()
-        self.state.failed_tasks.update(pending)
+        self.state.nfailed += len(pending)
         self.tasks.release(pending)
         self._check_all_tasks_done()
         return running + pending
 
 
 class _TaskRef:
-    """Just the uid of a task, for code paths that used to take a Task only for its id."""
+    """Just the handle of a task, for code paths that used to take a Task only for its id."""
 
     __slots__ = ("task_id",)
 

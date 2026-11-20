@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 def prefers_columns(policy: Any, row_method: str, columns_method: str) -> bool:
     """Whether to call ``policy.<columns_method>`` (whole-chunk columns) instead of
-    ``policy.<row_method>`` (uids + ``self.tasks[uid]``): whichever of the two is defined
+    ``policy.<row_method>`` (handles + ``self.tasks[h]``): whichever of the two is defined
     furthest down the class's MRO wins. So a plugged-in policy that only implements the row
     method keeps getting it, and a subclass that overrides the row method of a columnar
     built-in is not bypassed by the inherited columns method."""
@@ -102,26 +102,19 @@ def _round_robin(n: int, order: List[int], counts: Dict[int, int], ntask: Option
     return out
 
 
-def _group_by_child(
-    uids: List[bytes], assign: np.ndarray, worker_ids: List[int]
-) -> Tuple[Dict[int, List[bytes]], List[bytes]]:
-    """``assign[i]`` is uids[i]'s child (-1: unplaced) -> per-child uid lists (in uid order)
-    and the unplaced list."""
-    by_wid: Dict[int, List[bytes]] = {wid: [] for wid in worker_ids}
-    order = np.argsort(assign, kind="stable")
-    sorted_assign = assign[order]
-    bounds = np.flatnonzero(np.diff(sorted_assign)) + 1
-    unplaced: List[bytes] = []
-    for rows in np.split(order, bounds):
-        if len(rows) == 0:
-            continue
-        wid = int(assign[rows[0]])
-        got = [uids[i] for i in rows.tolist()]
-        if wid < 0:
-            unplaced = got
-        else:
-            by_wid[wid] = got
-    return by_wid, unplaced
+def wids_from_groups(idx, by_wid: Mapping[int, Any]) -> np.ndarray:
+    """A row method's ``{wid: handles}`` as one wid per row of ``idx`` (-1 for handles no child got). Bridges row-only policies to the column
+    entry point the scheduler works with."""
+    idx = np.asarray(idx, dtype=np.int64)
+    wids = np.full(len(idx), -1, dtype=np.int64)
+    if not by_wid:
+        return wids
+    pos = {h: i for i, h in enumerate(idx.tolist())}
+    for wid, got in by_wid.items():
+        rows = [pos[h] for h in np.asarray(got, dtype=np.int64).tolist() if h in pos]
+        if rows:
+            wids[rows] = wid
+    return wids
 
 
 class PolicyStateMixin:
@@ -204,11 +197,12 @@ class Policy(PolicyStateMixin, ABC):
 
     needs_scheduler_state: ClassVar[bool] = True
 
-    # The scheduler's tasks, keyed by uid: ``self.tasks[uid]`` is a TaskMeta with every
-    # non-deep field. Bound by the scheduler (`bind_tasks`) before any call below.
-    tasks: Mapping[bytes, TaskMeta] = {}
+    # The scheduler's task store, keyed by handle: ``self.tasks[h]`` is a TaskMeta with every
+    # non-deep field. Bound by the scheduler (`bind_tasks`) before any call below. Handles are
+    # the node's local task ids (see `ensemble_launcher.taskstore`); they are not uids.
+    tasks: Mapping[int, TaskMeta] = {}
 
-    def bind_tasks(self, tasks: Mapping[bytes, TaskMeta]) -> None:
+    def bind_tasks(self, tasks: Mapping[int, TaskMeta]) -> None:
         self.tasks = tasks
 
     def __init__(
@@ -223,7 +217,7 @@ class Policy(PolicyStateMixin, ABC):
     @abstractmethod
     def get_score(
         self,
-        uid: bytes,
+        handle: int,
         scheduler_state: Optional["TaskSchedulerState"] = None,
     ) -> float:
         """
@@ -231,31 +225,32 @@ class Policy(PolicyStateMixin, ABC):
         Higher score means higher priority.
 
         Args:
-            uid: The task to score; read its fields with ``self.tasks[uid]``.
+            handle: The task to score; read its fields with ``self.tasks[handle]``.
             scheduler_state: The scheduler's live state (``pending_tasks``,
-                ``running_tasks``, ``completed_tasks``, ``failed_tasks``) for
-                state-aware prioritisation. Read-only.
+                ``running_tasks``, ``ncompleted``, ``nfailed``) for state-aware
+                prioritisation. Read-only.
         """
         pass
 
     def get_scores_columns(
         self,
-        uids: List[bytes],
+        idx,
         meta: np.ndarray,
         scheduler_state: Optional["TaskSchedulerState"] = None,
     ):
-        """Scores for many tasks at once (higher = higher priority), aligned with ``uids``.
+        """Scores for many tasks at once (higher = higher priority), aligned with ``idx``
+        (their handles).
 
         Override this instead of `get_score` to score a whole update with numpy: ``meta`` is
-        a ``META_DTYPE`` array aligned with ``uids`` (``meta["nnodes"]``, ...). The scheduler
+        a ``META_DTYPE`` array aligned with ``idx`` (``meta["nnodes"]``, ...). The scheduler
         calls whichever of the two is defined furthest down the class hierarchy. All tasks of
         one call see the same ``scheduler_state`` (taken before any of them is queued).
         """
-        return [self.get_score(uid, scheduler_state=scheduler_state) for uid in uids]
+        return [self.get_score(h, scheduler_state=scheduler_state) for h in idx]
 
     def on_task_complete(
         self,
-        uid: bytes,
+        handle: int,
         status: TaskStatus,
         scheduler_state: "TaskSchedulerState",
     ) -> None:
@@ -267,7 +262,8 @@ class Policy(PolicyStateMixin, ABC):
         re-prioritisation).
 
         Args:
-            uid: The task that just completed (``self.tasks[uid]``).
+            handle: The task that just completed (``self.tasks[handle]``; released right
+                after this returns).
             status: Final status of the task (SUCCESS or FAILED).
             scheduler_state: The scheduler's live state, after the task has been
                 marked complete and its resources freed. Read-only.
@@ -298,15 +294,19 @@ class ChildrenPolicy(PolicyStateMixin, ABC):
         self.logger = logger if logger is not None else logging.getLogger(__name__)
         self._init_policy_state(getattr(policy_config, "initial_state", None))
 
-    # The scheduler's tasks, keyed by uid (see `Policy.tasks`).
-    tasks: Mapping[bytes, TaskMeta] = {}
+    # The scheduler's task store, keyed by handle (see `Policy.tasks`).
+    tasks: Mapping[int, TaskMeta] = {}
 
-    def bind_tasks(self, tasks: Mapping[bytes, TaskMeta]) -> None:
+    def bind_tasks(self, tasks: Mapping[int, TaskMeta]) -> None:
         self.tasks = tasks
+
+    # Tasks are named by their store handle (``idx`` is an int64 array of them; read a task
+    # with ``self.tasks[h]``). How many unfinished tasks child ``wid`` holds is
+    # ``self.tasks.count(wid)``.
 
     @abstractmethod
     def get_children_resources(
-        self, uids: List[bytes], nodes: JobResource, level: int
+        self, idx, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
         """
         Decide how many child workers to create and what cluster resources each gets.
@@ -315,7 +315,7 @@ class ChildrenPolicy(PolicyStateMixin, ABC):
         nodes per worker based on task requirements) but must NOT assign tasks here.
 
         Args:
-            uids: The tasks to consider; read fields with ``self.tasks[uid]``.
+            idx: The tasks to consider (handles); read fields with ``self.tasks[h]``.
             nodes: JobResource containing the available nodes and per-node resources.
             level: Current hierarchy level (0 = root master).
 
@@ -328,54 +328,58 @@ class ChildrenPolicy(PolicyStateMixin, ABC):
     @abstractmethod
     def get_children_tasks(
         self,
-        uids: List[bytes],
+        idx,
         children: Dict[int, "Child"],
         ntask: Optional[int] = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+    ) -> Tuple[Dict[int, Any], Dict[int, int], Any]:
         """
         Distribute tasks across workers given their pre-allocated resources.
 
         Args:
-            uids: The tasks to assign; read fields with ``self.tasks[uid]``.
+            idx: The tasks to assign (handles); read fields with ``self.tasks[h]``.
             children: The children to choose from, by wid. Each `Child` has
-                ``.job_resource`` (its allocated resources), ``.uids`` / ``len(child)``
-                (its unfinished tasks), ``.status`` (its last Status message) and ``.state``.
+                ``.job_resource`` (its allocated resources), ``.status`` (its last Status
+                message) and ``.state``; its load is ``self.tasks.count(wid)``.
             ntask: Maximum tasks to assign per worker.  ``None`` means no limit.
             level: Optional current hierarchy level (0 = root master).
             **kwargs: Additional implementation-specific arguments.
 
         Returns:
             Tuple of:
-            - Dict mapping wid (int) to the list of uids assigned to them.
-            - Dict mapping uid to the wid (int) it is assigned to
-            - List of uids that could not be assigned to any worker.
+            - Dict mapping wid (int) to the handles assigned to it (a list or array).
+            - Dict mapping handle to the wid it is assigned to (may be left empty).
+            - The handles that could not be assigned to any worker.
         """
         pass
 
     # ---- Column entry points ------------------------------------------------------------
     # Override these to get a whole chunk at once: ``meta`` is a ``META_DTYPE`` structured
-    # array aligned with ``uids`` (``meta["nnodes"]``, ``meta["ppn"]``, ...), so a policy can
-    # work with numpy instead of reading ``self.tasks[uid]`` field by field (which is slow at
+    # array aligned with ``idx`` (``meta["nnodes"]``, ``meta["ppn"]``, ...), so a policy can
+    # work with numpy instead of reading ``self.tasks[h]`` field by field (which is slow at
     # scale). The scheduler calls whichever of the pair is defined furthest down the class
-    # hierarchy (`prefers_columns`). Same arguments and return values as the row methods.
+    # hierarchy (`prefers_columns`).
 
     def get_children_resources_columns(
-        self, uids: List[bytes], meta: np.ndarray, nodes: JobResource, level: int
+        self, idx, meta: np.ndarray, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
-        return self.get_children_resources(uids, nodes, level)
+        """Same as `get_children_resources`."""
+        return self.get_children_resources(idx, nodes, level)
 
     def get_children_tasks_columns(
         self,
-        uids: List[bytes],
+        idx,
         meta: np.ndarray,
         children: Dict[int, "Child"],
         ntask: Optional[int] = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
-        return self.get_children_tasks(uids, children, ntask=ntask, level=level, **kwargs)
+    ) -> np.ndarray:
+        """Like `get_children_tasks`, but returns one wid per row of ``idx`` (int64; -1 for a
+        task no child can take) instead of per-child lists."""
+        by_wid, _, _ = self.get_children_tasks(idx, children, ntask=ntask, level=level, **kwargs)
+        return wids_from_groups(idx, by_wid)
 
 
 class PolicyRegistry:
@@ -470,9 +474,9 @@ class LargeResourcePolicy(Policy):
         super().__init__(policy_config, logger)
 
     def get_score(
-        self, uid: bytes, scheduler_state: Optional["TaskSchedulerState"] = None
+        self, handle: int, scheduler_state: Optional["TaskSchedulerState"] = None
     ) -> float:
-        task = self.tasks[uid]
+        task = self.tasks[handle]
         return (
             task.nnodes
             * task.ppn
@@ -481,7 +485,7 @@ class LargeResourcePolicy(Policy):
 
     def get_scores_columns(
         self,
-        uids: List[bytes],
+        idx,
         meta: np.ndarray,
         scheduler_state: Optional["TaskSchedulerState"] = None,
     ):
@@ -516,7 +520,7 @@ class FIFOPolicy(Policy):
         super().__init__(policy_config, logger)
 
     def get_score(
-        self, uid: bytes, scheduler_state: Optional["TaskSchedulerState"] = None
+        self, handle: int, scheduler_state: Optional["TaskSchedulerState"] = None
     ) -> float:
         pending_size = (
             len(scheduler_state.pending_tasks)
@@ -558,7 +562,7 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
         )
 
     def get_children_resources(
-        self, uids: List[bytes], nodes: JobResource, level: int
+        self, idx, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
         """
         Determine the number of workers and distribute nodes among them.
@@ -568,10 +572,10 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
         simply skipped for sizing purposes — they will be caught as unassignable
         in ``get_children_tasks``.
         """
-        return self._layout([self.tasks[uid].nnodes for uid in uids], nodes, level)
+        return self._layout([self.tasks[h].nnodes for h in idx], nodes, level)
 
     def get_children_resources_columns(
-        self, uids: List[bytes], meta: np.ndarray, nodes: JobResource, level: int
+        self, idx, meta: np.ndarray, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
         return self._layout(meta["nnodes"], nodes, level)
 
@@ -635,12 +639,12 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
 
     def get_children_tasks(
         self,
-        uids: List[bytes],
+        idx,
         children: Dict[int, "Child"],
         ntask: int = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+    ) -> Tuple[Dict[int, List[int]], Dict[int, int], List[int]]:
         """
         Assign tasks to workers in round-robin order (largest tasks first).
 
@@ -654,7 +658,9 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
         worker_task_counts = {wid: 0 for wid in worker_ids}
 
         sorted_task_items = sorted(
-            ((uid, self.tasks[uid].nnodes) for uid in uids), key=lambda x: x[1], reverse=True
+            ((h, self.tasks[h].nnodes) for h in np.asarray(idx).tolist()),
+            key=lambda x: x[1],
+            reverse=True,
         )
 
         for i, (task_id, _) in enumerate(sorted_task_items):
@@ -682,29 +688,27 @@ class BinPackingChildrenPolicy(ChildrenPolicy):
 
     def get_children_tasks_columns(
         self,
-        uids: List[bytes],
+        idx,
         meta: np.ndarray,
         children: Dict[int, "Child"],
         ntask: Optional[int] = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+    ) -> np.ndarray:
         """`get_children_tasks` on columns: same assignment. Largest first; the i-th task
         goes to child ``i % k``; with ``ntask`` (every child starts the call at 0) the first
         ``ntask * k`` are dealt that way and the rest are not placed."""
         worker_ids = list(children.keys())
         k = len(worker_ids)
-        n = len(uids)
-        by_wid: Dict[int, List[bytes]] = {wid: [] for wid in worker_ids}
-        if n == 0:
-            return by_wid, {}, []
-        if k == 0:
-            return by_wid, {}, list(uids)
-        order = np.argsort(-meta["nnodes"].astype(np.int64), kind="stable").tolist()
+        n = len(idx)
+        wids = np.full(n, -1, dtype=np.int64)
+        if n == 0 or k == 0:
+            return wids
+        order = np.argsort(-meta["nnodes"].astype(np.int64), kind="stable")
         m = n if ntask is None else min(n, ntask * k)
         for j, wid in enumerate(worker_ids):
-            by_wid[wid] = [uids[i] for i in order[j:m:k]]
-        return by_wid, {}, [uids[i] for i in order[m:]]
+            wids[order[j:m:k]] = wid
+        return wids
 
 
 @policy_registry.register("simple_split_children_policy", type="children_policy")
@@ -747,7 +751,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         )
 
     def get_children_resources(
-        self, uids: List[bytes], nodes: JobResource, level: int
+        self, idx, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
         """
         Split nodes evenly among ``nchildren`` workers.
@@ -787,12 +791,12 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
 
     def get_children_tasks(
         self,
-        uids: List[bytes],
+        idx,
         children: Dict[int, "Child"],
         ntask: int = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+    ) -> Tuple[Dict[int, List[int]], Dict[int, int], List[int]]:
         """
         Assign tasks to workers in round-robin order, checking resource fit.
 
@@ -807,7 +811,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         current = worker_ids.index(
             min(
                 worker_ids,
-                key=lambda worker_id: len(children[worker_id]),
+                key=lambda worker_id: self.tasks.count(worker_id),
             )
         )
 
@@ -817,7 +821,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         # so both the requirement and "does it fit child wid" are computed once per shape.
         requirements: Dict[tuple, JobResource] = {}
         fits: Dict[tuple, bool] = {}
-        for task_id in uids:
+        for task_id in np.asarray(idx).tolist():
             task = self.tasks[task_id]
             shape = (task.nnodes, task.ppn, task.ngpus_per_process)  # fmt: skip
             task_resource = requirements.get(shape)
@@ -850,13 +854,13 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
 
     def get_children_tasks_columns(
         self,
-        uids: List[bytes],
+        idx,
         meta: np.ndarray,
         children: Dict[int, "Child"],
         ntask: Optional[int] = None,
         level: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[Dict[int, List[bytes]], Dict[bytes, int], List[bytes]]:
+    ) -> np.ndarray:
         """`get_children_tasks` on columns. Round robin per task shape, starting at the
         least-loaded child, over the children that shape fits; the pointer carries over
         from one shape to the next. A single-shape chunk is placed exactly as the row
@@ -864,10 +868,10 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
         """
         worker_ids = list(children.keys())
         nchildren = len(worker_ids)
-        n = len(uids)
+        n = len(idx)
         if n == 0 or nchildren == 0:
-            return {wid: [] for wid in worker_ids}, {}, list(uids)
-        pointer = worker_ids.index(min(worker_ids, key=lambda wid: len(children[wid])))
+            return np.full(n, -1, dtype=np.int64)
+        pointer = worker_ids.index(min(worker_ids, key=self.tasks.count))
         counts = {wid: 0 for wid in worker_ids}
         assign = np.full(n, -1, dtype=np.int64)
         shapes, inv = _shape_index(meta)
@@ -883,8 +887,7 @@ class SimpleSplitChildrenPolicy(ChildrenPolicy):
             placed = got[got >= 0]
             if len(placed):
                 pointer = (worker_ids.index(int(placed[-1])) + 1) % nchildren
-        by_wid, unplaced = _group_by_child(uids, assign, worker_ids)
-        return by_wid, {}, unplaced
+        return assign
 
 
 @policy_registry.register("fixed_leafs_children_policy", type="children_policy")
@@ -900,7 +903,7 @@ class FixedLeafNodePolicy(SimpleSplitChildrenPolicy):
         self.logger.info(f"Using FixedLeadNodePolicy")
 
     def get_children_resources(
-        self, uids: List[bytes], nodes: JobResource, level: int
+        self, idx, nodes: JobResource, level: int
     ) -> Dict[int, JobResource]:
         # Interpolate in log2 space to pick a number of workers for this level.
         nlevels = self.policy_config.nlevels

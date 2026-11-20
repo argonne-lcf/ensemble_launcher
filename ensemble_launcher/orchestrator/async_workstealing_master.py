@@ -2,6 +2,7 @@ import asyncio
 
 from ensemble_launcher.comm.messages import TaskRequest
 from ensemble_launcher.scheduler import AsyncChildrenScheduler
+from ensemble_launcher.taskstore import UNASSIGNED
 
 from .async_master import AsyncMaster
 from .node import Node
@@ -86,7 +87,7 @@ class AsyncWorkStealingMaster(AsyncMaster):
         """Base lazy init, plus a log line with the pool size."""
         await super()._lazy_init()
         self.logger.info(
-            f"{self.node_id}: Work-stealing mode — {len(self._scheduler.state.unassigned)} "
+            f"{self.node_id}: Work-stealing mode — {self._scheduler.tasks.count(UNASSIGNED)} "
             f"tasks in the pool"
         )
 

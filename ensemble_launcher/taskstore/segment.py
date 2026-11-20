@@ -1,11 +1,13 @@
 """`SegmentTaskStore`: received TaskUpdates kept as they arrived, hot in memory up to a budget,
 the rest offloaded to node-local files and read back through ``mmap``.
 
-Per task the store holds one index entry (``uid -> seg << 32 | row``: bytes key, int value), and
-only until the task is released. It is not a container, so the cyclic GC sees one dict rather
-than objects per task. The store keeps no task status: workers record outcomes in their scheduler
-state, and on a master "unfinished" is ``uid in store``. A segment's bytes are never decoded as a whole:
-`TaskMeta`s and `Task`s are built one row at a time, on demand.
+A task's handle is ``seg << 32 | row``: the segment its update became and its row there, so a
+handle finds its bytes with no lookup. Per task the store holds one inverse-map entry
+(``uid -> handle``: bytes key, int value) until the task is released, plus its row in three
+per-segment columns: ``assignment`` (int32), ``client`` (int32) and ``delivered`` (bool). Those
+live on the segment, not in the (possibly memory-mapped, read-only) update. The store is not a
+container of per-task objects, so the cyclic GC sees a few dicts and arrays. A segment's bytes
+are never decoded as a whole: `TaskMeta`s and `Task`s are built one row at a time, on demand.
 """
 
 import asyncio
@@ -15,30 +17,41 @@ import os
 import shutil
 import struct
 import tempfile
-from itertools import count
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from itertools import count, repeat
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+import cloudpickle
 import numpy as np
 
 from ensemble_launcher.ensemble import Task, TaskMeta
 from ensemble_launcher.ensemble.ensemble import META_DTYPE, decode_meta_array
 
-from .base import TaskStore, register_task_store
+from .base import NO_CLIENT, RELEASED, UNASSIGNED, TaskStore, register_task_store
 
 _ROW_BITS = 32
 _ROW_MASK = (1 << _ROW_BITS) - 1
+_UID_BYTES = 16
+_EMPTY_IDX = np.empty(0, dtype=np.int64)
 
 # Spill file: four u64 lengths, then the columns. The offset column comes first so it sits
 # 8-byte aligned right after the 32-byte header.
 _FILE_ORDER = ("_deep_off", "_uids", "_meta", "_deep")
 _HEADER = struct.Struct("!4Q")
 
+# Below this many uids, `lookup` uses a list comprehension: numpy's fixed cost per call (~2.5 us)
+# outweighs its per-uid saving until ~50-60 uids. Workers look up one task at a time.
+_SMALL_BATCH = 48
+
+
+def _as_idx(idx) -> np.ndarray:
+    return idx if isinstance(idx, np.ndarray) and idx.dtype == np.int64 else np.asarray(idx, dtype=np.int64).reshape(-1)
+
 
 def _group_locs(locs: np.ndarray):
-    """Split index locations (``seg << _ROW_BITS | row``) by segment: ``([(seg_no, rows)],
-    order)``. Rows keep their order within a segment. ``order`` is the stable argsort by
-    segment (positions in ``locs``, group after group), or None when there is at most one
-    segment, so no reordering happened."""
+    """Split handles (``seg << _ROW_BITS | row``) by segment: ``([(seg_no, rows)], order)``.
+    Rows keep their order within a segment. ``order`` is the stable argsort by segment
+    (positions in ``locs``, group after group), or None when there is at most one segment, so
+    no reordering happened."""
     if len(locs) == 0:
         return [], None
     segs = locs >> _ROW_BITS
@@ -50,36 +63,17 @@ def _group_locs(locs: np.ndarray):
     return [(int(segs[g[0]]), rows[g]) for g in np.split(order, bounds)], order
 
 
-# Below this many uids, `_rows_by_segment` groups with a dict: numpy's fixed cost per call
-# (~2.5 us) outweighs its per-uid saving until ~50-60 uids. Workers release one task at a time.
-_SMALL_BATCH = 48
-
-
-def _rows_by_segment(uids: Iterable[bytes], take) -> List[Tuple[int, np.ndarray]]:
-    """``[(seg_no, rows)]`` for the uids that ``take(uid, -1)`` (the index's ``get`` or
-    ``pop``) finds; unknown uids are skipped."""
-    uids = uids if isinstance(uids, (list, tuple)) else list(uids)
-    if len(uids) < _SMALL_BATCH:
-        out: Dict[int, List[int]] = {}
-        for uid in uids:
-            loc = take(uid, -1)
-            if loc >= 0:
-                out.setdefault(loc >> _ROW_BITS, []).append(loc & _ROW_MASK)
-        return [(s, np.asarray(rows, dtype=np.int64)) for s, rows in out.items()]
-    locs = np.fromiter((take(uid, -1) for uid in uids), dtype=np.int64, count=len(uids))
-    return _group_locs(locs[locs >= 0])[0]
-
-
 class _Segment:
-    __slots__ = ("update", "nbytes", "delivered", "released", "undelivered", "remaining",
-                 "hot", "spilling", "unspillable", "path", "mm")  # fmt: skip
+    __slots__ = ("update", "nbytes", "delivered", "assignment", "client", "undelivered",
+                 "remaining", "hot", "spilling", "unspillable", "path", "mm")  # fmt: skip
 
-    def __init__(self, update):
+    def __init__(self, update, client: int):
         n = update.ntasks
         self.update = update
         self.nbytes = update.nbytes
         self.delivered = np.zeros(n, dtype=bool)
-        self.released = np.zeros(n, dtype=bool)
+        self.assignment = np.full(n, UNASSIGNED, dtype=np.int32)  # RELEASED once finished
+        self.client = np.full(n, client, dtype=np.int32)
         self.undelivered = n
         self.remaining = n
         self.hot = True
@@ -105,122 +99,332 @@ class SegmentTaskStore(TaskStore):
         self.logger = logger or logging.getLogger(__name__)
         self._segments: Dict[int, _Segment] = {}
         self._seg_ids = count()
-        self._index: Dict[bytes, int] = {}
+        self._index: Dict[bytes, int] = {}  # uid -> handle, live tasks only
+        self._counts: Dict[int, int] = {}  # live tasks per assignment tag
+        self._client_names: List[str] = []
+        self._client_codes: Dict[str, int] = {}
         self.hot_bytes = 0
         self._pending_spills: set = set()
+
+    # ------------------------------------------------------------------ #
+    #  Handles                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _live(self, h) -> Tuple[_Segment, int]:
+        """The segment and row of a live handle; KeyError otherwise."""
+        h = int(h)
+        seg = self._segments.get(h >> _ROW_BITS)
+        row = h & _ROW_MASK
+        if seg is None or row >= len(seg.assignment) or seg.assignment[row] == RELEASED:
+            raise KeyError(h)
+        return seg, row
+
+    def _by_segment(self, idx: np.ndarray):
+        """``([(seg_no, rows)], inv)`` for working on ``idx`` one segment at a time, whatever
+        their order. Concatenating per-segment results in list order and indexing with ``inv``
+        restores the order of ``idx``; ``inv`` is None when no reordering is needed."""
+        groups, order = _group_locs(idx)
+        if order is None:
+            return groups, None
+        inv = np.empty(len(idx), dtype=np.int64)
+        inv[order] = np.arange(len(idx), dtype=np.int64)
+        return groups, inv
+
+    def _gather(self, idx, column: str, missing) -> np.ndarray:
+        """A per-segment column (``assignment`` / ``client``) at ``idx``; ``missing`` for
+        handles whose segment is gone."""
+        idx = _as_idx(idx)
+        if len(idx) == 1:  # the worker's case
+            h = int(idx[0])
+            seg = self._segments.get(h >> _ROW_BITS)
+            v = missing if seg is None else getattr(seg, column)[h & _ROW_MASK]
+            return np.array([v], dtype=np.int32)
+        groups, inv = self._by_segment(idx)
+        parts = []
+        for s, rows in groups:
+            seg = self._segments.get(s)
+            parts.append(np.full(len(rows), missing, np.int32) if seg is None else getattr(seg, column)[rows])
+        if not parts:
+            return np.empty(0, dtype=np.int32)
+        out = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        return out if inv is None else out[inv]
+
+    def _count(self, tags: np.ndarray, sign: int) -> None:
+        counts = self._counts
+        if len(tags) == 1:
+            t = int(tags[0])
+            counts[t] = counts.get(t, 0) + sign
+            return
+        vals, ns = np.unique(tags, return_counts=True)
+        for t, n in zip(vals.tolist(), ns.tolist()):
+            counts[t] = counts.get(t, 0) + sign * n
 
     # ------------------------------------------------------------------ #
     #  Mapping                                                           #
     # ------------------------------------------------------------------ #
 
-    def _locate(self, uid: bytes):
-        loc = self._index[uid]
-        return self._segments[loc >> _ROW_BITS], loc & _ROW_MASK
-
-    def __getitem__(self, uid: bytes) -> TaskMeta:
-        seg, row = self._locate(uid)
+    def __getitem__(self, h) -> TaskMeta:
+        seg, row = self._live(h)
         return seg.update.meta(row)
 
-    def __contains__(self, uid) -> bool:
-        return uid in self._index
+    def __contains__(self, h) -> bool:
+        try:
+            self._live(h)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
 
-    def __iter__(self) -> Iterator[bytes]:
-        return iter(list(self._index))
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.all().tolist())
 
     def __len__(self) -> int:
         return len(self._index)
 
     # ------------------------------------------------------------------ #
-    #  TaskStore                                                         #
+    #  Tasks in and out                                                  #
     # ------------------------------------------------------------------ #
 
-    def add(self, update) -> List[bytes]:
+    def _client_code(self, client_id: Optional[str]) -> int:
+        if client_id is None:
+            return NO_CLIENT
+        code = self._client_codes.get(client_id)
+        if code is None:
+            code = self._client_codes[client_id] = len(self._client_names)
+            self._client_names.append(client_id)
+        return code
+
+    def add(self, update, client_id: Optional[str] = None) -> np.ndarray:
         uids = update.uids()
-        fresh = [row for row, uid in enumerate(uids) if uid not in self._index]
+        index = self._index
+        fresh = [row for row, uid in enumerate(uids) if uid not in index]
         if not fresh:
-            return []
+            return _EMPTY_IDX.copy()
         if len(fresh) < len(uids):  # keep only the rows we don't have yet
             update = update.select(fresh)
             uids = [uids[r] for r in fresh]
         seg_no = next(self._seg_ids)
-        self._segments[seg_no] = _Segment(update)
+        seg = self._segments[seg_no] = _Segment(update, self._client_code(client_id))
         base = seg_no << _ROW_BITS
-        index = self._index
         for row, uid in enumerate(uids):
             index[uid] = base | row
-        self.hot_bytes += self._segments[seg_no].nbytes
+        self._counts[UNASSIGNED] = self._counts.get(UNASSIGNED, 0) + len(uids)
+        self.hot_bytes += seg.nbytes
         self._maybe_spill()
-        return uids
+        return base + np.arange(len(uids), dtype=np.int64)
 
-    def task(self, uid: bytes) -> Task:
-        seg, row = self._locate(uid)
+    def lookup(self, uids: Sequence[bytes]) -> np.ndarray:
+        get = self._index.get
+        if len(uids) < _SMALL_BATCH:
+            return np.array([get(uid, -1) for uid in uids], dtype=np.int64)
+        return np.fromiter(map(get, uids, repeat(-1)), dtype=np.int64, count=len(uids))
+
+    def _release_one(self, h: int) -> None:
+        seg_no, row = h >> _ROW_BITS, h & _ROW_MASK
+        seg = self._segments.get(seg_no)
+        if seg is None or row >= len(seg.assignment):
+            return
+        old = int(seg.assignment[row])
+        if old == RELEASED:
+            return
+        seg.assignment[row] = RELEASED
+        self._counts[old] -= 1
+        self._index.pop(seg.update.uid_at(row), None)
+        seg.remaining -= 1
+        if seg.remaining == 0:
+            self._drop(seg_no, forget=False)
+
+    def release(self, idx, uids: Optional[Sequence[bytes]] = None) -> None:
+        # A released task leaves the index at once (so ``h in store`` / `lookup` forget it);
+        # its segment's bytes go when the last of its tasks does. Every task's uid is popped
+        # from the index, and that pop is also what makes a repeat release nothing: only the
+        # first pop of a uid returns its handle.
+        pop = self._index.pop
+        if uids is not None:  # the caller has them (results): no need to read them back
+            idx = np.fromiter(map(pop, uids, repeat(-1)), dtype=np.int64, count=len(uids))
+            idx = idx[idx >= 0]
+        elif isinstance(idx, (tuple, list)) and len(idx) == 1:  # a worker: one task at a time
+            self._release_one(int(idx[0]))
+            return
+        else:
+            kept = []
+            for s, rows in _group_locs(_as_idx(idx))[0]:
+                seg = self._segments.get(s)
+                if seg is None:
+                    continue
+                base, uid_at = s << _ROW_BITS, seg.update.uid_at
+                kept.extend(base | row for row in rows.tolist()
+                            if seg.assignment[row] != RELEASED and pop(uid_at(row), None) is not None)  # fmt: skip
+            idx = np.asarray(kept, dtype=np.int64)
+        # ``idx`` now holds live, distinct handles whose uids have left the index.
+        for s, rows in _group_locs(idx)[0]:
+            seg = self._segments[s]
+            self._count(seg.assignment[rows], -1)
+            seg.assignment[rows] = RELEASED
+            seg.remaining -= len(rows)
+            if seg.remaining == 0:
+                self._drop(s, forget=False)  # its uids all left the index above or before
+
+    def mark_delivered(self, idx) -> None:
+        if isinstance(idx, (tuple, list)) and len(idx) == 1:  # a worker: one task at a time
+            h = int(idx[0])
+            seg = self._segments.get(h >> _ROW_BITS)
+            row = h & _ROW_MASK
+            if seg is not None and not seg.delivered[row]:
+                seg.delivered[row] = True
+                seg.undelivered -= 1
+                if seg.undelivered == 0:
+                    self._maybe_spill()
+            return
+        for s, rows in _group_locs(_as_idx(idx))[0]:
+            seg = self._segments.get(s)
+            if seg is None:
+                continue
+            new = rows[~seg.delivered[rows]]
+            seg.delivered[new] = True
+            seg.undelivered -= len(new)
+        self._maybe_spill()
+
+    def close(self) -> None:
+        for seg_no in list(self._segments):
+            self._drop(seg_no, delete_now=True)
+        self._index.clear()
+        self._counts.clear()
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
+
+    # ------------------------------------------------------------------ #
+    #  Reading tasks                                                     #
+    # ------------------------------------------------------------------ #
+
+    def task(self, h) -> Task:
+        seg, row = self._live(h)
         return seg.update.task(row)
 
-    def _by_segment(self, uids: List[bytes]):
-        """``([(seg_no, rows)], inv)`` for gathering ``uids`` one segment at a time, whatever
-        their order. Rows keep their requested order within a segment (so contiguous ones
-        still gather as one stretch). Concatenating the per-segment results in list order and
-        indexing with ``inv`` restores the order of ``uids``; ``inv`` is None when no
-        reordering is needed (one segment, the common case)."""
-        n = len(uids)
-        if n == 0:
-            return [], None
-        index = self._index
-        locs = np.fromiter((index[uid] for uid in uids), dtype=np.int64, count=n)
-        groups, order = _group_locs(locs)
-        if order is None:
-            return groups, None
-        inv = np.empty(n, dtype=np.int64)
-        inv[order] = np.arange(n, dtype=np.int64)
-        return groups, inv
+    def all(self) -> np.ndarray:
+        parts = []
+        for s, seg in self._segments.items():
+            rows = np.flatnonzero(seg.assignment != RELEASED)
+            if len(rows):
+                parts.append((s << _ROW_BITS) + rows.astype(np.int64))
+        return np.concatenate(parts) if parts else _EMPTY_IDX.copy()
 
-    def build_update(self, uids: Iterable[bytes], **msg_fields):
-        from ensemble_launcher.comm.messages import TaskUpdate
+    def uids(self, idx) -> List[bytes]:
+        out = []
+        for h in _as_idx(idx).tolist():
+            seg, row = self._live(h)
+            out.append(seg.update.uid_at(row))
+        return out
 
-        groups, inv = self._by_segment(list(uids))
-        if len(groups) == 1:  # the common case: no concat, so the bytes are copied once
-            (s, rows), = groups
-            return self._segments[s].update.select(rows, **msg_fields)
-        parts = [self._segments[s].update.select(rows) for s, rows in groups]
-        update = TaskUpdate.concat(parts, **msg_fields)
-        return update if inv is None else update.select(inv, **msg_fields)
-
-    def meta_columns(self, uids: Iterable[bytes]) -> np.ndarray:
-        groups, inv = self._by_segment(list(uids))
+    def meta_columns(self, idx) -> np.ndarray:
+        groups, inv = self._by_segment(_as_idx(idx))
         if not groups:
             return np.empty(0, dtype=META_DTYPE)
         parts = [self._segments[s].update.meta_columns(rows) for s, rows in groups]
         meta = parts[0] if len(parts) == 1 else np.concatenate(parts)
         return meta if inv is None else meta[inv]
 
-    def mark_delivered(self, uids: Iterable[bytes]) -> None:
-        for seg_no, rows in _rows_by_segment(uids, self._index.get):
-            seg = self._segments[seg_no]
-            new = rows[~seg.delivered[rows]]
-            seg.delivered[new] = True
-            seg.undelivered -= len(new)
-        self._maybe_spill()
+    def build_update(self, idx, **msg_fields):
+        from ensemble_launcher.comm.messages import TaskUpdate
 
-    def release(self, uids: Iterable[bytes]) -> None:
-        # A released task leaves the index at once (so ``uid in store`` means "still to run",
-        # which recovery relies on); its segment's bytes go when the last of its tasks does.
-        # One pop per uid both finds the row and forgets it; unknown or already released uids
-        # (and repeats) pop nothing.
-        for seg_no, rows in _rows_by_segment(uids, self._index.pop):
-            seg = self._segments[seg_no]
-            new = rows[~seg.released[rows]]
-            seg.released[new] = True
-            seg.remaining -= len(new)
-            if seg.remaining == 0:
-                self._drop(seg_no, forget=False)  # its uids all left the index above or before
+        groups, inv = self._by_segment(_as_idx(idx))
+        if len(groups) == 1:  # the common case: no concat, so the bytes are copied once
+            ((s, rows),) = groups
+            return self._segments[s].update.select(rows, **msg_fields)
+        parts = [self._segments[s].update.select(rows) for s, rows in groups]
+        update = TaskUpdate.concat(parts, **msg_fields)
+        return update if inv is None else update.select(inv, **msg_fields)
 
-    def close(self) -> None:
-        for seg_no in list(self._segments):
-            self._drop(seg_no, delete_now=True)
-        self._index.clear()
-        if self._dir is not None:
-            shutil.rmtree(self._dir, ignore_errors=True)
-            self._dir = None
+    def build_failed_results(self, idx, sender: str, reason: str):
+        from ensemble_launcher.comm import blob
+        from ensemble_launcher.comm.messages import IResultBatch
+
+        idx = _as_idx(idx)
+        idx = idx[self.assigned(idx) != RELEASED]
+        groups, _ = _group_locs(idx)
+        uid_parts, task_ids, handles = [], [], []
+        for s, rows in groups:  # results need no particular order: keep segment order
+            update = self._segments[s].update
+            uid_parts.append(blob.gather_fixed(update._uids, _UID_BYTES, rows))
+            for raw in update.meta_columns(rows)["task_id"].tolist():
+                task_ids.append(raw.decode("ascii"))
+            handles.append((s << _ROW_BITS) + rows)
+        batch = IResultBatch(sender=sender)
+        batch._uids = b"".join(uid_parts)
+        batch._success = bytes(len(task_ids))
+        batch._payload, batch._payload_off = blob.encode_column(
+            cloudpickle.dumps((tid, None, reason)) for tid in task_ids
+        )
+        return batch, (np.concatenate(handles) if handles else _EMPTY_IDX.copy())
+
+    # ------------------------------------------------------------------ #
+    #  Assignment                                                        #
+    # ------------------------------------------------------------------ #
+
+    def assigned(self, idx) -> np.ndarray:
+        return self._gather(idx, "assignment", RELEASED)
+
+    def assign(self, idx, tag: int) -> np.ndarray:
+        idx = _as_idx(idx)
+        if len(idx) == 0:
+            return idx
+        moved = idx[self.assigned(idx) == UNASSIGNED]
+        if len(moved):
+            for s, rows in _group_locs(moved)[0]:
+                self._segments[s].assignment[rows] = tag
+            self._counts[UNASSIGNED] -= len(moved)
+            self._counts[tag] = self._counts.get(tag, 0) + len(moved)
+        return moved
+
+    def assigned_to(self, tag: int) -> np.ndarray:
+        if not self._counts.get(tag):
+            return _EMPTY_IDX.copy()
+        parts = []
+        for s, seg in self._segments.items():
+            rows = np.flatnonzero(seg.assignment == tag)
+            if len(rows):
+                parts.append((s << _ROW_BITS) + rows.astype(np.int64))
+        return np.concatenate(parts) if parts else _EMPTY_IDX.copy()
+
+    def reassign(self, from_tag: int, to_tag: int) -> np.ndarray:
+        idx = self.assigned_to(from_tag)
+        if len(idx) and from_tag != to_tag:
+            for s, rows in _group_locs(idx)[0]:
+                self._segments[s].assignment[rows] = to_tag
+            self._counts[from_tag] -= len(idx)
+            self._counts[to_tag] = self._counts.get(to_tag, 0) + len(idx)
+        return idx
+
+    def count(self, tag: int) -> int:
+        return self._counts.get(tag, 0)
+
+    def groups(self) -> List[Tuple[int, np.ndarray]]:
+        handles, tags = [], []
+        for s, seg in self._segments.items():
+            rows = np.flatnonzero(seg.assignment != RELEASED)
+            if len(rows):
+                handles.append((s << _ROW_BITS) + rows.astype(np.int64))
+                tags.append(seg.assignment[rows])
+        if not handles:
+            return []
+        handles, tags = np.concatenate(handles), np.concatenate(tags)
+        order = np.argsort(tags, kind="stable")
+        tags, handles = tags[order], handles[order]
+        bounds = np.flatnonzero(np.diff(tags)) + 1
+        return [(int(t[0]), h) for t, h in zip(np.split(tags, bounds), np.split(handles, bounds))]
+
+    # ------------------------------------------------------------------ #
+    #  Clients                                                           #
+    # ------------------------------------------------------------------ #
+
+    def clients(self, idx) -> np.ndarray:
+        return self._gather(idx, "client", NO_CLIENT)
+
+    def client_name(self, code: int) -> Optional[str]:
+        return None if code < 0 else self._client_names[code]
+
+    def has_clients(self) -> bool:
+        return bool(self._client_names)
 
     # ------------------------------------------------------------------ #
     #  Internals                                                         #

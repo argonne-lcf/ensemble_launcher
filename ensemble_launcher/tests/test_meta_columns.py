@@ -20,6 +20,7 @@ from ensemble_launcher.scheduler.policy import (
     ChildrenPolicy,
     SimpleSplitChildrenPolicy,
     prefers_columns,
+    wids_from_groups,
 )
 from ensemble_launcher.scheduler.resource import JobResource, NodeResourceCount
 from ensemble_launcher.scheduler.state import Child
@@ -76,27 +77,27 @@ def test_nbytes_counts_meta_bytes():
 
 
 @pytest.mark.parametrize("spill", [False, True])
-def test_store_gathers_uids_in_any_order(tmp_path, spill):
+def test_store_gathers_handles_in_any_order(tmp_path, spill):
     store = create_task_store(
         "segment", node_id="t", hot_bytes=1 if spill else 1 << 30, spill_dir=str(tmp_path)
     )
     try:
-        uids = []
+        handles = []
         for seg in range(4):
             tasks = [
                 Task(task_id=f"s{seg}t{i}", nnodes=1 + i % 3, ppn=1 + seg, executable="x", args=(i,))
                 for i in range(20)
             ]
-            uids += store.add(_received(tasks))
+            handles += store.add(_received(tasks)).tolist()
         rng = random.Random(0)
         for _ in range(30):
-            sample = rng.sample(uids, rng.randint(0, len(uids)))  # interleaved segments
+            sample = rng.sample(handles, rng.randint(0, len(handles)))  # interleaved segments
             meta = store.meta_columns(sample)
             assert [meta_row_values(meta, i) for i in range(len(sample))] == [
                 store[u]._values for u in sample
             ]
             upd = store.build_update(sample, deleted_uids=[b"d" * 16])
-            assert upd.uids() == sample and upd.deleted_uids == [b"d" * 16]
+            assert upd.uids() == store.uids(sample) and upd.deleted_uids == [b"d" * 16]
             assert [upd.task(i).args for i in range(len(sample))] == [
                 store.task(u).args for u in sample
             ]
@@ -123,12 +124,16 @@ def _children(k, cpus):
 
 
 def _both(policy, tasks, children, ntask):
-    upd = _received(tasks)
-    uids = upd.uids()
-    policy.bind_tasks({u: upd.meta(i) for i, u in enumerate(uids)})
-    rows = policy.get_children_tasks(uids, children, ntask=ntask)
-    cols = policy.get_children_tasks_columns(uids, upd.meta_columns(), children, ntask=ntask)
-    return rows, cols
+    """The row method's placement and the column method's, both as one wid per task."""
+    store = create_task_store("segment", node_id="t")
+    idx = store.add(_received(tasks)) if tasks else np.empty(0, dtype=np.int64)
+    policy.bind_tasks(store)
+    by_wid, _, unplaced = policy.get_children_tasks(idx, children, ntask=ntask)
+    rows = wids_from_groups(idx, by_wid)
+    assert set(np.asarray(unplaced, dtype=np.int64).tolist()) == set(idx[rows == -1].tolist())
+    cols = policy.get_children_tasks_columns(idx, store.meta_columns(idx), children, ntask=ntask)
+    store.close()
+    return rows, np.asarray(cols, dtype=np.int64)
 
 
 @pytest.mark.parametrize("seed", range(40))
@@ -140,8 +145,8 @@ def test_simple_split_columns_match_rows(seed):
 
     # One shape: identical assignment.
     same = [Task(task_id=f"t{i}", nnodes=1, ppn=2, executable="x") for i in range(rng.randint(0, 60))]
-    (r_by, _, r_un), (c_by, _, c_un) = _both(policy, same, children, ntask)
-    assert c_by == r_by and c_un == r_un
+    rows, cols = _both(policy, same, children, ntask)
+    assert cols.tolist() == rows.tolist()
 
     # Mixed shapes: same unplaced set without a cap, nothing lost, cap respected.
     mixed = [
@@ -149,13 +154,12 @@ def test_simple_split_columns_match_rows(seed):
              ngpus_per_process=rng.choice([0, 0.5]), executable="x")
         for i in range(rng.randint(0, 60))
     ]  # fmt: skip
-    (r_by, _, r_un), (c_by, _, c_un) = _both(policy, mixed, children, ntask)
-    placed = [u for got in c_by.values() for u in got]
-    assert sorted(placed + c_un) == sorted(t.uid for t in mixed)
+    rows, cols = _both(policy, mixed, children, ntask)
+    assert len(cols) == len(mixed) and set(cols.tolist()) <= set(children) | {-1}
     if ntask is None:
-        assert set(c_un) == set(r_un)
+        assert ((cols == -1) == (rows == -1)).all()
     else:
-        assert all(len(got) <= ntask for got in c_by.values())
+        assert all(int((cols == w).sum()) <= ntask for w in children)
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -166,20 +170,20 @@ def test_bin_packing_columns_match_rows(seed):
     policy = BinPackingChildrenPolicy(PolicyConfig(nlevels=1))
     tasks = [Task(task_id=f"t{i}", nnodes=rng.randint(1, 4), ppn=1, executable="x")
              for i in range(rng.randint(0, 60))]  # fmt: skip
-    (r_by, _, r_un), (c_by, _, c_un) = _both(policy, tasks, children, ntask)
-    assert c_by == r_by and c_un == r_un
+    rows, cols = _both(policy, tasks, children, ntask)
+    assert cols.tolist() == rows.tolist()
 
 
 def test_prefers_columns_follows_the_most_derived_override():
     class RowOnly(ChildrenPolicy):
-        def get_children_resources(self, uids, nodes, level):
+        def get_children_resources(self, idx, nodes, level):
             return {}
 
-        def get_children_tasks(self, uids, children, ntask=None, level=None, **kw):
+        def get_children_tasks(self, idx, children, ntask=None, level=None, **kw):
             return {}, {}, []
 
     class RowOverrideOfColumnar(SimpleSplitChildrenPolicy):
-        def get_children_tasks(self, uids, children, ntask=None, level=None, **kw):
+        def get_children_tasks(self, idx, children, ntask=None, level=None, **kw):
             return {}, {}, []
 
     assert not prefers_columns(RowOnly(), "get_children_tasks", "get_children_tasks_columns")

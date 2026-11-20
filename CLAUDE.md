@@ -108,41 +108,57 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    - children policies (`ChildrenPolicy`) — `simple_split_children_policy` (default),
      `bin_packing_children_policy`, `fixed_leafs_children_policy`
 
-   **Tasks are uids and blobs.** Every `Task` has an internal 16-byte `uid` (set at creation;
-   `task_id` is only the user's name and need not be unique). Schedulers, policies, result
-   routing and `ClusterClient` futures all key by uid. `TaskUpdate` / `ResultBatch` /
-   `IResultBatch` carry items as columns (`comm/blob.py`: fixed-width `uids` plus
-   blob + `int64` offsets) and are built with `TaskUpdate.from_tasks` /
-   `ResultBatch.from_results`; masters split and join them with `select` / `concat` and never
-   decode them. Only workers build `Task`s (`store.task(uid)`, right before submitting) and only
-   the root / `ClusterClient` build `Result`s (`.to_results()`, `.data`). Do not reintroduce
-   per-task Python objects on masters: that was #65 (GC at 38% of `main`'s busy time at 256
-   nodes). Measure with `benchmarks/benchmark_master_routing.py` (`--hold` keeps tasks held).
+   **Uids between nodes, handles inside one.** Every `Task` has an internal 16-byte `uid` (set
+   at creation; `task_id` is only the user's name and need not be unique). The uid is how
+   *nodes* (and `ClusterClient`) name a task to each other: it travels in every `TaskUpdate`
+   and result, and `ClusterClient` futures key by it. **Inside a node everything uses the
+   store's handle** (an opaque int64, see Task store): schedulers, policies, outboxes,
+   `unplaced`, the worker's pending/running state and futures. Uids become handles in one
+   place, `store.lookup` (results arriving, `deleted_uids`); handles become uids only when the
+   store builds a message (`build_update`, `build_failed_results`) or a `Task`. Never send or
+   checkpoint a handle. `TaskUpdate` / `ResultBatch` / `IResultBatch` carry items as columns
+   (`comm/blob.py`: fixed-width `uids` plus blob + `int64` offsets) and are built with
+   `TaskUpdate.from_tasks` / `ResultBatch.from_results`; masters split and join them with
+   `select` / `concat` and never decode them. Only workers build `Task`s (`store.task(h)`,
+   right before submitting) and only the root / `ClusterClient` build `Result`s
+   (`.to_results()`, `.data`). Do not reintroduce per-task Python objects on masters: that was
+   #65 (GC at 38% of `main`'s busy time at 256 nodes). Measure with
+   `benchmarks/benchmark_master_routing.py` (`--hold` keeps tasks held).
 
-   **Task store.** `self.tasks` on both schedulers is a `TaskStore` (`taskstore/`), chosen by
-   `LauncherConfig.task_store`; policies get it via `bind_tasks` and read `self.tasks[uid]`
-   (a `TaskMeta`, decoded on demand -- don't keep them). `SegmentTaskStore` keeps received
-   updates as segments, offloads past `task_store_hot_bytes` to `task_store_dir` (mmap), and
-   `release(uids)` drops finished tasks from the index at once -- so `uid in store` means
-   "still to run", which the master's recovery resend relies on. The store forgets finished
-   tasks, so `len(scheduler.tasks)` shrinks; use `scheduler.state.ntasks_added` for totals.
-   It keeps **no task status** (no per-task record outlives the task): how a task ended
-   travels in its result, and workers record outcomes in `state.completed_tasks` /
-   `failed_tasks`. On masters, `queue_result` -> `finish_tasks(uids, child_id)` ->
-   `state.finish_many` + `store.release` is the whole result path: one pop per uid each
-   from the child's `uids` and the store index (plus `task_to_client` only when clients
-   exist), and the batch goes up untouched when no task has a client.
-   `taskstore` must not import `comm.messages` at module level (circular import via
-   `scheduler.resource`).
+   **Task store.** `self.tasks` on both schedulers is a `TaskStore` (`taskstore/base.py` has
+   the contract), chosen by `LauncherConfig.task_store`. It holds every per-task fact a node
+   has: the bytes, plus two int32 columns -- **assignment** (`UNASSIGNED` = a master's pool,
+   or a tag >= 0: the wid of the child the task is placed on) and **client** (`NO_CLIENT` =
+   from the parent, else a code for the submitting client; `client_name(code)`). A **handle**
+   is unique among live tasks, stable until `release`, increasing within one `add`, and
+   opaque (`SegmentTaskStore` uses `seg << 32 | row`, so a handle finds its row with no
+   lookup; another store could use a row counter or a `rowid`). The Mapping side is keyed by
+   handle: policies get the store via `bind_tasks` and read `self.tasks[h]` (a `TaskMeta`,
+   decoded on demand -- don't keep them). Batch ops take handle arrays: `assign(idx, tag)`
+   (only rows still `UNASSIGNED`), `assigned(idx)` (`RELEASED` for gone ones),
+   `assigned_to(tag)`, `reassign(from, to)`, `count(tag)`, `groups()`, `clients(idx)`,
+   `meta_columns`, `build_update`, `build_failed_results`, `mark_delivered`, `release`.
+   `SegmentTaskStore` keeps received updates as segments, offloads past
+   `task_store_hot_bytes` to `task_store_dir` (mmap; the assignment/client/delivered columns
+   stay in memory on the segment), and `release` drops finished tasks at once -- so
+   `h in store` means "still to run". The store forgets finished tasks, so
+   `len(scheduler.tasks)` shrinks; use `scheduler.state.ntasks_added` for totals. It keeps
+   **no task status**: how a task ended travels in its result, and workers only count
+   outcomes (`state.ncompleted` / `nfailed`). On masters, `queue_result` -> `lookup` ->
+   `clients(idx)` (only if `has_clients()`) -> `release` is the whole result path, and the
+   batch goes up untouched when no task has a client. `taskstore` must not import
+   `comm.messages` at module level (circular import via `scheduler.resource`).
 
    **Task meta is a fixed-width record** (`ensemble.META_DTYPE`, 153 B: numeric fields plus
    `task_id` / `executor_name` / `tag` as 32-byte ASCII, truncated with a warning; empty
    means `None`). `TaskUpdate._meta` is a structured array (`np.frombuffer` on receipt).
    Reading it per row is *slower* than the old pickled tuple (a numpy field read is ~300 ns),
-   so hot paths read **columns**: `store.meta_columns(uids)` returns one array aligned with
-   `uids` (any order; gathered once per segment, then reordered). Policies get it through
+   so hot paths read **columns**: `store.meta_columns(idx)` returns one array aligned with
+   `idx` (any order; gathered once per segment, then reordered). Policies get it through
    the optional column entry points `get_children_tasks_columns` /
-   `get_children_resources_columns` (children) and `get_scores_columns` (task); the
+   `get_children_resources_columns` (children) and `get_scores_columns` (task);
+   `get_children_tasks_columns` returns **one wid per row** (-1: unplaced) rather than
+   per-child lists (the default bridges to the row method via `wids_from_groups`). The
    scheduler calls whichever of a row/column pair is defined furthest down the policy's MRO
    (`policy.prefers_columns`), so row-only plugged-in policies keep working and a subclass
    overriding a row method is not bypassed. The built-ins (`SimpleSplit` -- round robin per
@@ -150,51 +166,61 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    decode one row to Python values with `meta_row_values` -- never hand numpy scalars or
    bytes to `Task`.
 
-   **Master scheduler state.** Everything `AsyncChildrenScheduler` knows is in
-   `scheduler.state`, a `SchedulerState` (`scheduler/state.py`): `children` (one `Child`
-   record each -- `wid`, `job_resource`, `state`, `status`, `allocated`, `ready`/`done` events,
-   `uids`, the ordered set of its *unfinished* tasks, and `outbox`), `unassigned` (the pool),
-   `task_to_client`, `ntasks_added`, `all_done`. Its moves (`queue`, `assign`, `finish_many`,
-   `forget`, `add_child`, `pop_child`) keep one rule: **every unfinished uid is in the pool or
-   in exactly one child's `uids`**. `add_child` claims the child's uids still in the pool and
-   gives it a fresh outbox holding all of them; `pop_child` returns its uids to the pool.
-   Orchestrators **read** the state; only the scheduler writes it. Don't add parallel
-   per-child dicts -- put fields on `Child`. `finish_tasks(uids, child_id)` gets `child_id`
-   from the loop the results arrived on, so there is no uid -> child map. `SchedulerState` is
-   also the checkpoint (`get_state()` = `to_json()`, on the loop); `set_state` adds each
-   restored child with `add_child`, so it must run **after** the initial tasks are queued and
-   **before** `start()`. Children policies receive `{wid: Child}`.
+   **Master scheduler state.** `scheduler.state` is a `SchedulerState` (`scheduler/state.py`)
+   and holds **only the children's state and resource allocations**: `children` (one `Child`
+   record each -- `wid`, `job_resource`, `state`, `status`, `allocated`, `ready`/`done`
+   events, `outbox`), `wid_counter`, `ntasks_added`, `all_done`. **No task data**: where a task
+   is lives in the store's assignment column (a child's tasks are `store.assigned_to(wid)`,
+   its load `store.count(wid)`), and its client in the client column. Each object's methods
+   change only itself (`add_child` / `pop_child` touch only the state); `AsyncChildrenScheduler`
+   is the one place a move touches both. The invariant -- **every unfinished task is in the
+   pool or on exactly one child** -- holds by construction: one assignment per row. Wids are
+   never reused (`next_wid()` is the monotonic `wid_counter`), because a child removed for
+   recovery keeps its tasks tagged with its wid until `reinstate_child` re-adds it.
+   Orchestrators **read** the state; only the scheduler writes it. Don't add parallel per-child
+   dicts -- put fields on `Child`; don't put task data on it -- that goes in the store.
+   `SchedulerState` is also the checkpoint (`get_state()` = `to_json()`, on the loop) and it
+   is **the layout only**: no task is named. A restarted master gets its tasks back from where
+   they came from (the root re-queues its initial tasks; the parent resends a sub-master's
+   unfinished ones), and `set_state` re-allocates the children (before `start()`), on which the
+   assigner then places them anew. Children policies receive `{wid: Child}`.
 
    **Task placement is event driven.** `await scheduler.queue(update, client_id)` stores the
-   tasks and puts them in the pool; in push mode it also puts the uid list on the private
+   tasks (`UNASSIGNED`: the pool); in push mode it also puts their handle array on the private
    `_input` queue. The assigner task (`start()` / `stop()`) places each item in chunks of
-   `assign_chunk_size`, yielding between chunks (so a huge update never holds the loop), and
-   puts **one uid list per child per input item** on `child.outbox`. Uids no child can take go
-   on `scheduler.unplaced` (the master fails them); `scheduler.drained` is set while nothing
-   unfinished is left. Pull mode (work stealing) only pools, and `request(child_id, n)` places
-   on demand. `child.uids` is the source of truth: queues may hold stale uids, dropped where
-   they are consumed (assigner: not in the pool; sender: not in the child). On the master,
-   `_child_sender` per child takes a window slot (`max_inflight_task_sends`, default 1) *then*
-   an outbox item and hands it straight to `_schedule_task_flush(child_id, msg)`;
-   `_task_flush_done` frees the slot, or resends the same message object in the same slot (so
-   the child can drop a duplicate). No task-flush timer: `task_flush_interval` and
-   `task_buffer_size` no longer affect masters. `reinstate_child` refills the outbox for a
-   relaunched child; if its resources can't be re-allocated, `requeue(child.uids)` places its
-   tasks on the other children (the retry loop and `_give_up_on_child` find no record to act
-   on, so nothing else would). A child given up on (restarts off, retries used up -- including
-   a reinstated child that never relaunched, so READY -- or still failing at startup) stays as
-   a FAILED record: `_give_up_on_child` is `transition(child_id, FAILED, requeue=True)`.
-   Any terminal move (SUCCESS or FAILED) empties the child -- its tasks go back to the pool,
-   then `requeue=True` places them on the other children and `requeue=False` puts them on
+   `assign_chunk_size`, yielding between chunks (so a huge update never holds the loop), tags
+   placed tasks with `store.assign(idx, wid)`, and puts **one handle array per child per input
+   item** on `child.outbox`. Handles no child can take go on `scheduler.unplaced` (the master
+   fails them); `scheduler.drained` is set while the store is empty and nothing is being
+   placed. Pull mode (work stealing) only pools, and `request(child_id, n)` places on demand.
+   The assignment column is the source of truth: queues may hold stale handles, dropped where
+   they are consumed (assigner: not `UNASSIGNED`; sender: not tagged with the child's wid). On
+   the master, `_child_sender` per child takes a window slot (`max_inflight_task_sends`,
+   default 1) *then* an outbox item and hands it straight to `_schedule_task_flush(child_id,
+   msg, idx)`; `_task_flush_done` frees the slot (and `delivered(idx)`), or resends the same
+   message object in the same slot (so the child can drop a duplicate). No task-flush timer:
+   `task_flush_interval` and `task_buffer_size` no longer affect masters. Recovery:
+   `remove_child` frees the resources but **leaves its tasks tagged with its wid**;
+   `reinstate_child` re-adds the child and refills its outbox with `assigned_to(wid)`, or, if
+   the resources can't be re-allocated, `reassign(wid, UNASSIGNED)` + `requeue` places them on
+   the other children (the retry loop and `_give_up_on_child` find no record to act on, so
+   nothing else would). A reset (`create_children(reset=True)`, `set_state`) returns a child's
+   tasks to the pool. A child given up on (restarts off, retries used up -- including a
+   reinstated child that never relaunched, so READY -- or still failing at startup) stays as a
+   FAILED record: `_give_up_on_child` is `transition(child_id, FAILED, requeue=True)`. Any
+   terminal move (SUCCESS or FAILED) empties the child -- `reassign(wid, UNASSIGNED)`, then
+   `requeue=True` places them on the other children and `requeue=False` puts them on
    `unplaced` (failed). SUCCESS is never refused: on `Done` the master moves the child to
    SUCCESS (no requeue), so tasks it still held (e.g. placed after it took `Stop`) are failed
-   instead of blocking the stop. Placement
-   skips terminal children, and `_wait_for_child_done` ends on `Done` *or* the child turning
-   terminal, so the stop path never waits on a failed child.
+   instead of blocking the stop. Placement skips terminal children, and
+   `_wait_for_child_done` ends on `Done` *or* the child turning terminal, so the stop path
+   never waits on a failed child.
 
    **Result routing is event driven on masters.** Every result batch -- streamed from a child,
-   or made by `_fail_tasks` -- goes through `scheduler.queue_result(batch, child_id)`: it
-   finishes the tasks (`finish_tasks`) and puts the batch, split by row per destination, on the
+   or made by `_fail_tasks` (`store.build_failed_results(idx, ...)`, which also returns the
+   rows' handles) -- goes through `scheduler.queue_result(batch, idx=None)`: it looks the uids
+   up (unless given `idx`), reads their client codes, finishes the tasks (`finish_tasks(idx)`
+   = `release`) and puts the batch, split by row per destination, on the
    submitting client's outbox (`client_outboxes`, made on first use and announced on the
    `new_clients` queue) or on the one `parent_outbox` (a node has one parent). Never call
    `finish_tasks` from the orchestrator. Per destination, `_result_sender` takes a window slot
@@ -222,19 +248,21 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    by itself that it is finished: every node stops on its parent's `Stop`, its stop signal
    (SIGTERM or `request_stop()`), or its parent dying. A master's `_wait_for_finish` is the
    whole stop path, in order: stop condition -> propagate `Stop` -> every child's `Done` ->
-   drain the forwarders -> `_fail_unfinished` (everything left in the pool or a child's `uids`,
-   from `state.unfinished()`, via `_fail_tasks`) -> `_flush_results` -> final status + `Done`.
+   drain the forwarders -> `_fail_unfinished` (everything still in the store, from
+   `scheduler.unfinished()`, via `_fail_tasks`) -> `_flush_results` -> final status + `Done`.
    Batch mode lives only in
    `ensemble_launcher.py`: `run_batch(node)` awaits `node.wait_drained()` then calls
    `request_stop()`. Tests that run a node directly use `run_batch` too.
 
-   **Worker scheduler state.** Same pattern on `AsyncTaskScheduler`: `scheduler.state` is a
-   `TaskSchedulerState` dataclass -- `pending_tasks` (the pending container itself),
-   `running_tasks` (uid -> resource), `completed_tasks`, `failed_tasks`, `task_to_client`,
-   `all_done`. The worker reads it directly; task policies get the object itself as
-   `scheduler_state` (read-only, no snapshot is built). `get_state()` writes running tasks as
-   pending; `set_state` keeps the current pending container (`_monitor_resources` parks on
-   its event) and re-queues what the store still holds.
+   **Worker scheduler state.** `AsyncTaskScheduler.state` is a `TaskSchedulerState` dataclass
+   -- `pending_tasks` (the pending container itself), `running_tasks` (handle -> resource),
+   `ncompleted` / `nfailed` (counters), `all_done`. The worker reads it directly; task policies
+   get the object itself as `scheduler_state` (read-only, no snapshot is built). It is
+   **runtime only**: a worker checkpoints only its comm state (and tuned policy state), not
+   its scheduler state or results -- its parent resends whatever has no result. (A restarted
+   root worker re-runs its initial tasks.) The worker keys `_task_futures` by handle, reads a
+   task's client from the store before `free` releases it, and keeps `_results` by uid
+   (results outlive the task).
 
    **Pending-task containers.** `AsyncTaskScheduler` picks its pending container by policy
    *name*: `"fifo_policy"` gets `PendingTaskQueue` (deque, tasks never scored); everything
@@ -257,7 +285,9 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
 
    Custom policies can be loaded at runtime via env vars `EL_EXTERNAL_POLICY_MODULE` /
    `EL_EXTERNAL_POLICY_PATH` (honoured by `orchestrator/__init__.py` at import time, so
-   spawned children pick them up too).
+   spawned children pick them up too). Policies of both families take **handles**:
+   `get_children_tasks(idx, children, ...)` returns `{wid: handles}`, `get_score(handle, ...)`,
+   `on_task_complete(handle=..., ...)`; a child's load is `self.tasks.count(wid)`.
 
    **Policy state.** Both families mix in `PolicyStateMixin`, giving every policy a
    `self.state` dict seeded from `PolicyConfig.initial_state` and readable/writable from

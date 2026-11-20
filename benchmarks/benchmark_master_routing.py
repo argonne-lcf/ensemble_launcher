@@ -184,9 +184,10 @@ def task_update_frames(batch: int, ntasks: int) -> list:
 def result_frames(m: AsyncMaster, uids) -> list:
     """``(child_id, frames)``: one encoded IResultBatch per child, covering its tasks."""
     wanted = set(uids)
+    store = m._scheduler.tasks
     out = []
-    for child_id, assignment in m._scheduler.state.children.items():
-        child_uids = [uid for uid in assignment.uids if uid in wanted]
+    for child_id, child in m._scheduler.state.children.items():
+        child_uids = [uid for uid in store.uids(store.assigned_to(child.wid)) if uid in wanted]
         if child_uids:
             batch = IResultBatch.from_results(
                 [Result(uid=uid, task_id=uid.hex(), data=None) for uid in child_uids],
@@ -320,7 +321,7 @@ async def run_batches(
             with timer.stage("decode_results"):
                 results = Message.from_byte_array(reply)
             with timer.stage("forward"):
-                m._scheduler.queue_result(results, child_id)
+                m._scheduler.queue_result(results)
         with timer.stage("result_flush"):
             await m._flush_results()
         del replies, results

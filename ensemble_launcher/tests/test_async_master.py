@@ -5,6 +5,7 @@ import time
 import uuid
 from collections import deque
 
+import numpy as np
 import pytest
 from utils import echo, echo_stdout
 
@@ -21,7 +22,7 @@ from ensemble_launcher.ensemble import Task
 from ensemble_launcher.orchestrator import AsyncMaster
 from ensemble_launcher.scheduler.child_state import ChildState
 from ensemble_launcher.scheduler.state import Child, SchedulerState
-from ensemble_launcher.taskstore import SegmentTaskStore
+from ensemble_launcher.taskstore import UNASSIGNED, SegmentTaskStore
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceList,
@@ -218,20 +219,20 @@ class _StubScheduler:
     def __init__(self):
         self.tasks = SegmentTaskStore()
         self.state = SchedulerState(node_id="test", children=_RunningChildren())
-        self.delivered_uids = []
-        self.queued_results = []  # (batch, child_id) handed to queue_result
+        self.delivered_idx = []
+        self.queued_results = []  # (batch, handles) handed to queue_result
         self.parent_outbox = asyncio.Queue()
         self.client_outboxes = {}
         self.new_clients = asyncio.Queue()
 
-    def queue_result(self, batch, child_id=None):
-        self.queued_results.append((batch, child_id))
+    def queue_result(self, batch, idx=None):
+        self.queued_results.append((batch, idx))
 
     def fail(self, child_id):
         self.state.children.get(child_id).state = ChildState.FAILED
 
-    def delivered(self, uids):
-        self.delivered_uids.extend(uids)
+    def delivered(self, idx):
+        self.delivered_idx.extend(np.asarray(idx).tolist())
 
 
 def _ok():
@@ -287,12 +288,12 @@ def _queue_tasks(m, child_id, *task_ids):
     """Put tasks in the master's store and on the child, as one outbox item -- what the
     scheduler's assigner does for one incoming update."""
     tasks = [Task(task_id=tid, nnodes=1, ppn=1, executable="echo") for tid in task_ids]
-    m._scheduler.tasks.add(TaskUpdate.from_tasks(tasks))
+    store = m._scheduler.tasks
+    idx = store.add(TaskUpdate.from_tasks(tasks))
     child = m._scheduler.state.children.get(child_id)
-    uids = [t.uid for t in tasks]
-    child.add(uids)
-    child.outbox.put_nowait(uids)
-    return uids
+    store.assign(idx, child.wid)
+    child.outbox.put_nowait(idx)
+    return idx
 
 
 async def _stop_senders(m):
@@ -305,7 +306,9 @@ async def _stop_senders(m):
 
 
 def _names(m, uids):
-    return [m._scheduler.tasks[u].task_id for u in uids]
+    """Task names for the uids a message carries (read through the store's inverse map)."""
+    store = m._scheduler.tasks
+    return [store[h].task_id for h in store.lookup(uids).tolist()]
 
 
 async def _wait_until(cond, timeout=5.0):
@@ -382,7 +385,7 @@ async def test_task_flush_window_cap():
     await _wait_until(lambda: len(m._comm.sent) == 5 and not m._task_flush_inflight["A"])
     assert m._comm.max_active == 2
     assert [msg.ntasks for _, msg in m._comm.sent] == [1, 1, 1, 1, 1]  # items sent as is
-    assert sorted(m._scheduler.delivered_uids) == sorted(child.uids)
+    assert sorted(m._scheduler.delivered_idx) == m._scheduler.tasks.assigned_to(child.wid).tolist()
     await _stop_senders(m)
 
 
@@ -433,8 +436,8 @@ async def test_failed_task_update_to_terminal_child_fails_tasks():
 
     await _wait_until(lambda: m._scheduler.queued_results)
 
-    ((batch, child_id),) = m._scheduler.queued_results  # routed directly, no task created
-    assert child_id == "A"
+    ((batch, idx),) = m._scheduler.queued_results  # routed directly, no task created
+    assert len(idx) == 2 and batch.uids() == m._scheduler.tasks.uids(idx)
     assert [(r.task_id, r.success) for r in batch.to_results()] == [("t0", False), ("t1", False)]
     assert len(m._comm.sent) == 1
     await _stop_senders(m)
@@ -443,9 +446,8 @@ async def test_failed_task_update_to_terminal_child_fails_tasks():
 @pytest.mark.asyncio
 async def test_deleted_task_is_not_sent():
     m = _make_flush_master({"A": _ok()})
-    child = m._scheduler.state.children.get("A")
-    uids = _queue_tasks(m, "A", "t0", "t1")
-    child.discard(uids[0])  # deleted while its item waited
+    idx = _queue_tasks(m, "A", "t0", "t1")
+    m._scheduler.tasks.release(idx[:1])  # finished / deleted while its item waited
     _start_sender(m, "A")
     await _wait_until(lambda: m._comm.sent)
     (_, msg), = m._comm.sent
@@ -614,7 +616,7 @@ async def _recovery_master(restart: bool):
 
 async def _survivor_finishes_and_stop_path_returns(m, sched, cid):
     """The surviving child finishes and sends Done; the stop path's wait must return."""
-    sched.state.children[cid].uids.clear()
+    sched.finish_tasks(sched.tasks.assigned_to(sched.state.children[cid].wid))
     m._comm.done_sent.setdefault(cid, asyncio.Event()).set()
     await asyncio.wait_for(m._wait_for_children_done(killed=False), timeout=5)
 
@@ -626,7 +628,7 @@ async def test_child_reinstated_but_never_relaunched_is_failed_and_tasks_requeue
     it."""
     m, sched = await _recovery_master(restart=True)
     (cid_a, a), (cid_b, b) = sched.state.children.items()
-    held = set(a.uids)
+    held = set(sched.tasks.uids(sched.tasks.assigned_to(a.wid)))
     attempts = []
 
     async def reinstated_but_launch_failed(child_id):
@@ -644,8 +646,9 @@ async def test_child_reinstated_but_never_relaunched_is_failed_and_tasks_requeue
 
     a = sched.state.children[cid_a]  # the reinstated record
     assert attempts == [cid_a] * 3
-    assert a.state is ChildState.FAILED and not a.uids and not a.allocated
-    assert held <= set(b.uids) and not sched.state.unassigned and sched.unplaced.empty()
+    assert a.state is ChildState.FAILED and not sched.tasks.count(a.wid) and not a.allocated
+    assert held <= set(sched.tasks.uids(sched.tasks.assigned_to(b.wid)))
+    assert not sched.tasks.count(UNASSIGNED) and sched.unplaced.empty()
     assert not any(isinstance(msg, Ready) for _, msg in m._comm.sent)
     await _survivor_finishes_and_stop_path_returns(m, sched, cid_b)
     await sched.stop()
@@ -655,13 +658,13 @@ async def test_child_reinstated_but_never_relaunched_is_failed_and_tasks_requeue
 async def test_dead_child_without_restarts_is_failed_and_stop_does_not_wait_for_its_done():
     m, sched = await _recovery_master(restart=False)
     (cid_a, a), (cid_b, b) = sched.state.children.items()
-    held = set(a.uids)
+    held = set(sched.tasks.uids(sched.tasks.assigned_to(a.wid)))
     m._comm._child_dead_events[cid_a].set()
     await asyncio.wait_for(m._child_liveness_monitor(cid_a), timeout=5)
     await sched._input.join()
 
-    assert a.state is ChildState.FAILED and not a.uids
-    assert held <= set(b.uids) and sched.unplaced.empty()
+    assert a.state is ChildState.FAILED and not sched.tasks.count(a.wid)
+    assert held <= set(sched.tasks.uids(sched.tasks.assigned_to(b.wid))) and sched.unplaced.empty()
     await asyncio.wait_for(m._child_done_task[cid_a], timeout=5)  # ended without a Done
     await _survivor_finishes_and_stop_path_returns(m, sched, cid_b)
     await sched.stop()
@@ -673,8 +676,9 @@ async def test_failed_send_to_failed_child_does_not_fail_requeued_tasks():
     the other child, so none of them gets a failed result."""
     m, sched = await _recovery_master(restart=False)
     (cid_a, a), (cid_b, b) = sched.state.children.items()
-    msg = sched.tasks.build_update(list(a.uids), sender="test")
-    m._fail_tasks = lambda uids, reason, child_id=None: failed.extend(uids)
+    idx = sched.tasks.assigned_to(a.wid)
+    msg = sched.tasks.build_update(idx, sender="test")
+    m._fail_tasks = lambda idx, reason: failed.extend(idx)
     failed = []
     sched.transition(cid_a, ChildState.FAILED, requeue=True)
 
@@ -683,7 +687,7 @@ async def test_failed_send_to_failed_child_does_not_fail_requeued_tasks():
 
     t = asyncio.create_task(nack())
     await t
-    m._task_flush_done(cid_a, msg, asyncio.Semaphore(0), t)
+    m._task_flush_done(cid_a, msg, idx, asyncio.Semaphore(0), t)
     assert failed == []
     for task in m._child_done_task.values():
         task.cancel()
@@ -696,16 +700,19 @@ async def test_done_while_holding_tasks_fails_them_and_stop_does_not_wait():
     is marked SUCCESS anyway, what it held goes to unplaced (failed), and the stop path's wait
     returns."""
     m, sched = await _recovery_master(restart=False)
-    held = {u for c in sched.state.children.values() for u in c.uids}
+    held = {h for c in sched.state.children.values() for h in sched.tasks.assigned_to(c.wid).tolist()}
     assert held
     for cid in sched.state.children:
         m._comm.done_sent.setdefault(cid, asyncio.Event()).set()
     await asyncio.wait_for(m._wait_for_children_done(killed=False), timeout=5)
 
-    assert all(c.state is ChildState.SUCCESS and not c.uids for c in sched.state.children.values())
+    assert all(
+        c.state is ChildState.SUCCESS and not sched.tasks.count(c.wid)
+        for c in sched.state.children.values()
+    )
     unplaced = set()
     while not sched.unplaced.empty():
-        unplaced.update(sched.unplaced.get_nowait())
+        unplaced.update(sched.unplaced.get_nowait().tolist())
     assert unplaced == held
     await sched.stop()
 

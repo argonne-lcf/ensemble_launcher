@@ -10,6 +10,8 @@ import uuid
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
+import numpy as np
+
 from ensemble_launcher.checkpointing import Checkpointer
 from ensemble_launcher.comm import (
     AsyncComm,
@@ -224,7 +226,7 @@ class AsyncMaster(Node):
 
     @property
     def tasks(self) -> TaskStore:
-        """All tasks this master holds, keyed by uid."""
+        """All tasks this master holds, keyed by store handle."""
         return self._scheduler.tasks
 
     @property
@@ -1174,30 +1176,21 @@ class AsyncMaster(Node):
         """Fail tasks the scheduler could not place on any child."""
         while True:
             try:
-                uids = await self._scheduler.unplaced.get()
-                self._fail_tasks(uids, f"Routing failed at {self.node_id}")
+                idx = await self._scheduler.unplaced.get()
+                self._fail_tasks(idx, f"Routing failed at {self.node_id}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error(f"{self.node_id}: Unplaced monitor error: {e}")
 
-    def _fail_tasks(self, uids, reason: str, child_id: Optional[str] = None) -> None:
-        """Report tasks as failed, as results routed like any other (to their client or the
-        parent). ``child_id`` is the child holding them, if any."""
-        store = self._scheduler.tasks
-        failed = [
-            Result(
-                sender=self.node_id,
-                uid=uid,
-                task_id=store[uid].task_id if uid in store else None,
-                success=False,
-                exception=reason,
-            )
-            for uid in uids
-        ]
-        if failed:
-            self.logger.warning(f"{self.node_id}: Failing {len(failed)} tasks: {reason}")
-            self._scheduler.queue_result(IResultBatch.from_results(failed), child_id)
+    def _fail_tasks(self, idx, reason: str) -> None:
+        """Report tasks (by handle) as failed, as results routed like any other (to their
+        client or the parent). The store builds the batch from its own columns; tasks
+        already finished are skipped."""
+        batch, done = self._scheduler.tasks.build_failed_results(idx, self.node_id, reason)
+        if len(done):
+            self.logger.warning(f"{self.node_id}: Failing {len(done)} tasks: {reason}")
+            self._scheduler.queue_result(batch, idx=done)
 
     def wait_drained(self):
         """Wait until every task this master was given has a result. Reports; it never stops
@@ -1315,8 +1308,8 @@ class AsyncMaster(Node):
     def _fail_unfinished(self) -> None:
         """Give every task still unfinished -- in the pool, or held by a child (unsent in its
         outbox, lost, or held by a killed child) -- a failed result, routed like any other."""
-        for child_id, uids in self._scheduler.state.unfinished():
-            self._fail_tasks(uids, f"Stopped before finishing at {self.node_id}", child_id)
+        for _, idx in self._scheduler.unfinished():
+            self._fail_tasks(idx, f"Stopped before finishing at {self.node_id}")
 
     def _parent_alive(self) -> bool:
         return self.parent is not None and (
@@ -1609,20 +1602,26 @@ class AsyncMaster(Node):
         """
         child = self._scheduler.state.children[child_id]
         window = self._task_window[child_id]
-        build = self._scheduler.tasks.build_update
+        store = self._scheduler.tasks
         await child.ready.wait()  # set once its NodeUpdate was delivered
         while True:
             await window.acquire()
-            uids = [uid for uid in await child.outbox.get() if uid in child]  # drop deleted ones
-            if not uids:
+            idx = await child.outbox.get()
+            idx = idx[store.assigned(idx) == child.wid]  # drop finished / moved ones
+            if not len(idx):
                 window.release()
                 continue
-            self._schedule_task_flush(child_id, build(uids, sender=self.node_id))
+            self._schedule_task_flush(child_id, store.build_update(idx, sender=self.node_id), idx)
 
     def _schedule_task_flush(
-        self, child_id: str, msg: TaskUpdate, window: Optional[asyncio.Semaphore] = None
+        self,
+        child_id: str,
+        msg: TaskUpdate,
+        idx: np.ndarray,
+        window: Optional[asyncio.Semaphore] = None,
     ) -> None:
-        """Start one TaskUpdate send to child_id, in a window slot the caller holds.
+        """Start one TaskUpdate send to child_id, in a window slot the caller holds. ``idx``
+        are the message's tasks (store handles), row for row.
 
         A resend passes the window its first send held. If the child was torn down since (its
         window dropped, or replaced by a reinstated child's), the resend is dropped: recovery
@@ -1635,9 +1634,16 @@ class AsyncMaster(Node):
             return
         t = asyncio.create_task(self._comm.send_message_to_child(child_id, msg))
         self._task_flush_inflight.setdefault(child_id, set()).add(t)
-        t.add_done_callback(functools.partial(self._task_flush_done, child_id, msg, window))
+        t.add_done_callback(functools.partial(self._task_flush_done, child_id, msg, idx, window))
 
-    def _task_flush_done(self, child_id: str, msg: TaskUpdate, window: asyncio.Semaphore, task: asyncio.Task) -> None:
+    def _task_flush_done(
+        self,
+        child_id: str,
+        msg: TaskUpdate,
+        idx: np.ndarray,
+        window: asyncio.Semaphore,
+        task: asyncio.Task,
+    ) -> None:
         """A TaskUpdate send finished: free its slot, or resend the same message in it.
 
         Synchronous, so the child-state check and the resend are atomic with respect to the
@@ -1653,7 +1659,7 @@ class AsyncMaster(Node):
         exc = task.exception()
         if exc is None and task.result():
             self.logger.info(f"Sent TaskUpdate of size {msg.ntasks} to {child_id}")
-            self._scheduler.delivered(msg.uids())
+            self._scheduler.delivered(idx)
             window.release()
             return
         state = self._child_state(child_id)
@@ -1663,8 +1669,9 @@ class AsyncMaster(Node):
             )
             # Only what it still holds: a FAILED child's tasks were requeued or failed already.
             child = self._scheduler.state.children.get(child_id)
-            held = [u for u in msg.uids() if child is not None and u in child]
-            self._fail_tasks(held, f"Send to {child_id} failed at {self.node_id}", child_id)
+            if child is not None:
+                held = idx[self._scheduler.tasks.assigned(idx) == child.wid]
+                self._fail_tasks(held, f"Send to {child_id} failed at {self.node_id}")
         elif state in (None, ChildState.RECOVERING):
             # Recovery owns these tasks: the reinstated child's outbox holds them again.
             self.logger.info(f"Send to {child_id} failed while it recovers; dropping it")
@@ -1677,7 +1684,7 @@ class AsyncMaster(Node):
             # so wait an ACK timeout first rather than spin.
             delay = self._config.send_timeout if exc is not None else 0.0
             asyncio.get_running_loop().call_later(
-                delay, self._schedule_task_flush, child_id, msg, window
+                delay, self._schedule_task_flush, child_id, msg, idx, window
             )
             return
         window.release()
@@ -1699,7 +1706,7 @@ class AsyncMaster(Node):
                 msg = recv_task.result()
                 if msg is not None:
                     try:
-                        self._scheduler.queue_result(msg, child_id)
+                        self._scheduler.queue_result(msg)
                     except Exception as e:
                         self.logger.error(
                             f"{self.node_id}: Failed to forward result from {child_id}: {e}",
@@ -1721,7 +1728,7 @@ class AsyncMaster(Node):
             if msg is None:
                 break
             try:
-                self._scheduler.queue_result(msg, child_id)
+                self._scheduler.queue_result(msg)
             except Exception as e:
                 self.logger.error(
                     f"{self.node_id}: Failed to forward result from {child_id}: {e}",
@@ -1806,7 +1813,8 @@ class AsyncMaster(Node):
         if child is None or child.terminal:
             return
         self.logger.warning(
-            f"{self.node_id}: Giving up on {child_id}; requeueing its {len(child)} tasks"
+            f"{self.node_id}: Giving up on {child_id}; requeueing its "
+            f"{self._scheduler.tasks.count(child.wid)} tasks"
         )
         self._scheduler.transition(child_id, ChildState.FAILED, requeue=True)
 
@@ -1827,8 +1835,8 @@ class AsyncMaster(Node):
                 self.logger.error(
                     "Can't allocate the identical child resources while recovering"
                 )
-                # The child can't come back: place its tasks (back in the pool) on the others.
-                self._scheduler.requeue(child.uids)
+                # The child can't come back; reinstate_child put its tasks back in the pool
+                # and placed them on the others.
                 raise RuntimeError(
                     "Can't allocate the identical child resources while recovering"
                 )
