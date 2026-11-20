@@ -3,6 +3,7 @@ import logging
 import multiprocessing as mp
 import os
 import socket
+import time
 import uuid
 
 import pytest
@@ -15,7 +16,12 @@ from ensemble_launcher.config import (
     SystemConfig,
 )
 from ensemble_launcher.ensemble import Task
-from ensemble_launcher.orchestrator import AsyncMaster, AsyncWorker, ClusterClient
+from ensemble_launcher.orchestrator import (
+    AsyncMaster,
+    AsyncWorker,
+    ClusterClient,
+    NodeConnectionLost,
+)
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceList,
@@ -362,4 +368,30 @@ def test_cluster_client_io_process(io_process):
             assert paths and not any(os.path.exists(p) for p in paths)
     finally:
         process.terminate()
+        process.join(timeout=10.0)
+
+
+@pytest.mark.parametrize("io_process", [False, True])
+def test_cluster_client_fails_tasks_when_node_dies(io_process):
+    """SIGKILL the node mid-task: the client's sent futures fail with NodeConnectionLost
+    instead of waiting forever, and teardown still works."""
+    import signal
+
+    ckpt_dir = os.path.join("/tmp", f"ckpt_{uuid.uuid4()}")
+    process = _start_cluster_worker(ckpt_dir)
+    try:
+        client = ClusterClient(
+            node_id="test", checkpoint_dir=ckpt_dir, io_process=io_process,
+            task_flush_interval=0.1,
+        )  # fmt: skip
+        with client:
+            assert client._conn.peer_liveness
+            assert client.submit(echo, "a").result(timeout=60).startswith("Hello from task a")
+            slow = client.submit(echo_sleep, "b", 5.0)
+            client.flush()
+            time.sleep(1.0)  # let it reach the node
+            os.kill(process.pid, signal.SIGKILL)
+            with pytest.raises(NodeConnectionLost):
+                slow.result(timeout=30)
+    finally:
         process.join(timeout=10.0)

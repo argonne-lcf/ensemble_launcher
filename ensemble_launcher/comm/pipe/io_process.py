@@ -9,6 +9,8 @@ end and ``get``s what the other end put:
     IOProcess -> front end  ("ready", address)       started; the actual bound address
                             ("data", frames)         a received message, verified and ACKed
                             ("sent", req_id, ok)     final result of one send
+                            ("peer", alive)          the peer was reached / lost (optional,
+                                                     see `IOProcess.provides_peer_liveness`)
     front end -> IOProcess  ("send", req_id, target, timeout, frames)
                             ("control", op, args)    "add_remote" / "remove_remote" / "close"
 
@@ -163,6 +165,8 @@ def _encode(item: tuple) -> List[Any]:
         ]
     if kind == "ready":
         return [b"ready", (item[1] or "").encode()]
+    if kind == "peer":
+        return [b"peer", b"\x01" if item[1] else b"\x00"]
     if kind == "control":
         return [b"control", item[1].encode(), json.dumps(list(item[2])).encode()]
     raise ValueError(f"Unknown queue item {kind!r}")
@@ -185,6 +189,8 @@ def _decode(frames: List[bytes]) -> tuple:
         )
     if kind == b"ready":
         return ("ready", frames[1].decode() or None)
+    if kind == b"peer":
+        return ("peer", frames[1] == b"\x01")
     if kind == b"control":
         return ("control", frames[1].decode(), tuple(json.loads(frames[2])))
     raise ValueError(f"Unknown queue item {kind!r}")
@@ -537,9 +543,17 @@ class IOProcess(ABC):
     Subclasses provide the transport (`_raw_open` / `_raw_close` / `_raw_send` / `_raw_recv`,
     `address`). ``server`` picks the sender check: servers use ``expected_remotes`` plus
     ``sender_rule``; clients use ``remote_identity`` / ``remote_secret_id``.
+
+    **Peer liveness (optional).** Not every transport can tell that its peer is gone, so this
+    is a capability: a transport that can sets `provides_peer_liveness` and implements
+    `_raw_watch_peer`, calling `_peer_up` / `_peer_down` as it learns. The IOProcess reports
+    each change as ``("peer", alive)``; the front end turns it into its ``peer_connected`` /
+    ``peer_lost`` events. A transport without it never reports anything.
     """
 
     server: bool = True
+    # Whether `_raw_watch_peer` reports the peer coming and going (see the class docstring).
+    provides_peer_liveness: bool = False
 
     def __init__(
         self,
@@ -564,6 +578,8 @@ class IOProcess(ABC):
         self._ack_futures: Dict[int, asyncio.Future] = {}
         self._stop: Optional[asyncio.Event] = None
         self._send_tasks: set = set()
+        self._q = None  # the queue to the front end, while running
+        self._peer_alive: Optional[bool] = None  # last reported peer state
         # "send" items the queue routes here (the fast path) instead of to _input_loop
         self.send_requests: asyncio.Queue = asyncio.Queue()
 
@@ -586,14 +602,19 @@ class IOProcess(ABC):
     async def run(self, q) -> None:
         """Open the socket, report ``ready``, and serve the queue until ``close``."""
         self._stop = asyncio.Event()
+        self._q = q
         await self._raw_open()
         q.put_nowait(("ready", self.address))
         recv = asyncio.create_task(self._recv_loop(q))
         inp = asyncio.create_task(self._input_loop(q))
         sends = asyncio.create_task(self._send_loop(q))
+        watch = asyncio.create_task(self._raw_watch_peer()) if self.provides_peer_liveness else None
         try:
             await self._stop.wait()
         finally:
+            if watch is not None:  # first, so our own close is never reported as the peer going
+                watch.cancel()
+                await asyncio.gather(watch, return_exceptions=True)
             for t in (recv, inp, sends, *self._send_tasks):
                 t.cancel()
             await asyncio.gather(recv, inp, sends, *self._send_tasks, return_exceptions=True)
@@ -705,6 +726,26 @@ class IOProcess(ABC):
             self._ack_futures.pop(msg_id, None)
             self.logger.warning(f"ACK timeout for msg_id={msg_id} to {target_id}")
             return False
+
+    # ------------------------------ peer liveness ----------------------------- #
+
+    def _peer_up(self) -> None:
+        """The transport reached its peer."""
+        self._report_peer(True)
+
+    def _peer_down(self) -> None:
+        """The transport lost its peer (it died, hung, or the link broke)."""
+        self._report_peer(False)
+
+    def _report_peer(self, alive: bool) -> None:
+        if alive == self._peer_alive or self._q is None:
+            return
+        self._peer_alive = alive
+        self._q.put_nowait(("peer", alive))
+
+    async def _raw_watch_peer(self) -> None:
+        """Watch the peer, calling `_peer_up` / `_peer_down` (only run when
+        `provides_peer_liveness`; cancelled before `_raw_close`)."""
 
     # ------------------------------ verification ------------------------------ #
 

@@ -93,6 +93,16 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    parent connection runs out of process in the child too. Out of process the unknown-sender
    validator must be a `SenderRule` (prefix + secret), not a closure. The IOProcess exits when
    its owner dies. Tests: `EL_TEST_COMM_IO_PROCESS=1 pytest -m core` runs the suite with it on.
+   **Peer liveness is an optional IOProcess capability**, since not every transport can tell
+   that its peer is gone (that's why nodes use `HeartBeatProcess`). A transport that can sets
+   `IOProcess.provides_peer_liveness` and implements `_raw_watch_peer`, calling `_peer_up()` /
+   `_peer_down()`; the IOProcess reports each change as `("peer", alive)`, and the front end
+   turns it into its `peer_connected` / `peer_lost` events (`conn.peer_liveness` says whether
+   they can ever change; an IOProcess dying also sets `peer_lost`). Today only the
+   non-lightweight `ZMQDealerIOProcess` provides it: a socket monitor on the ZMTP heartbeat
+   (5 s / 15 s, run by libzmq's threads, so a busy loop can't cause a false alarm). The watcher
+   is cancelled before the socket closes, so our own close is never reported. `AsyncComm` does
+   not use it yet; `ClusterClient` does.
    Messages are typed dataclasses in `comm/messages.py`: `Message`, `Status`, `Result`,
    `ResultBatch`, `IResultBatch`, `TaskUpdate`, `NodeUpdate`, `Ready`, `Stop`, `Done`, `TaskRequest`,
    `NodeRequest`. (Heartbeats are not a message type — they live in `comm/hb.py` as
@@ -303,7 +313,9 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
      One connection and one background thread running one asyncio loop (front end, result decoding,
      buffer-flush timer); the socket and ACKs are the connection's IOProcess, out of process when
      `io_process` (default: the cluster's `comm_io_process`) and `req_res`. Don't add threads or
-     executor hops to it: under the GIL they only add handoffs.
+     executor hops to it: under the GIL they only add handoffs. When the connection reports
+     peer liveness, losing the node (died, hung, restarted) fails every task already sent with
+     `NodeConnectionLost`; buffered tasks stay and go out after the reconnect.
    - `PolicyEndpoint` / `PolicyClient` — read and retune a node's policy state while the run is in flight (see below).
    - `discovery.py` — shared checkpoint-directory lookup (`_resolve_node_id`, `read_policy_endpoint`, `discover_policy_nodes`), used by both clients.
 

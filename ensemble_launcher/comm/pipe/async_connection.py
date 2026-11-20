@@ -96,6 +96,11 @@ class AsyncConnection(ABC):
         self._listen_task: Optional[asyncio.Task] = None
         self._pending: Dict[int, asyncio.Future] = {}  # req_id -> send result
         self._req_counter = 0
+        # Peer liveness, when the IOProcess's transport provides it (see `peer_liveness`).
+        # Always opposite; only this connection sets them. Made in `open()`.
+        self._peer_liveness = False
+        self.peer_connected: Optional[asyncio.Event] = None
+        self.peer_lost: Optional[asyncio.Event] = None
 
     @property
     def is_open(self) -> bool:
@@ -108,6 +113,12 @@ class AsyncConnection(ABC):
     @property
     def secret_id(self):
         return self._secret_id
+
+    @property
+    def peer_liveness(self) -> bool:
+        """Whether ``peer_connected`` / ``peer_lost`` can ever change: the transport reports
+        its peer coming and going (`IOProcess.provides_peer_liveness`). Known once open."""
+        return self._peer_liveness
 
     @property
     def out_of_process(self) -> bool:
@@ -127,6 +138,8 @@ class AsyncConnection(ABC):
             subdir="connections",
         )
         io = self._make_io()
+        self._peer_liveness = bool(io.provides_peer_liveness)
+        self.peer_connected, self.peer_lost = asyncio.Event(), asyncio.Event()
         if self.out_of_process:
             self._proc, self._q, self._io_paths = await start_io_process(
                 io, routes={"data": self._msg_queue}  # data skips _listen
@@ -233,6 +246,14 @@ class AsyncConnection(ABC):
                 fut = self._pending.pop(item[1], None)
                 if fut is not None and not fut.done():
                     fut.set_result(item[2])
+            elif kind == "peer":
+                self._set_peer(item[1])
+
+    def _set_peer(self, alive: bool) -> None:
+        if self.logger is not None:
+            self.logger.info(f"{self.identity}: peer {'connected' if alive else 'lost'}")
+        (self.peer_connected if alive else self.peer_lost).set()
+        (self.peer_lost if alive else self.peer_connected).clear()
 
     def _on_io_task_done(self, task: asyncio.Task) -> None:
         if self._is_open and not task.cancelled():
@@ -244,6 +265,8 @@ class AsyncConnection(ABC):
             self.logger.error(f"{self.identity}: {why}")
         self._is_open = False
         self._fail_pending()
+        if self.peer_lost is not None:  # no IOProcess, no peer
+            self._set_peer(False)
 
     def _fail_pending(self) -> None:
         for fut in self._pending.values():

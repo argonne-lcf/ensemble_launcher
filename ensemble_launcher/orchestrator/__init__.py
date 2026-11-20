@@ -8,7 +8,7 @@ from .async_master import AsyncMaster
 from .async_worker import AsyncWorker
 from .async_workstealing_master import AsyncWorkStealingMaster
 from .async_workstealing_worker import AsyncWorkStealingWorker
-from .cluster_client import ClusterClient
+from .cluster_client import ClusterClient, NodeConnectionLost
 from .discovery import PolicyEndpointInfo, discover_policy_nodes, read_policy_endpoint
 from .node import Node
 from .policy_client import PolicyClient, PolicyGroupClient, PolicyStateError

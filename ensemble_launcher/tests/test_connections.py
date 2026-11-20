@@ -712,3 +712,75 @@ def test_io_process_exits_when_owner_is_killed():
     while alive(helper_pid) and time.monotonic() < deadline:
         time.sleep(0.2)
     assert not alive(helper_pid), "IOProcess outlived its owner"
+
+
+# ---------------------------------------------------------------------------
+#  Peer liveness (optional, per transport)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_event(event: asyncio.Event, timeout: float = 10.0) -> None:
+    await asyncio.wait_for(event.wait(), timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_zmq_dealer_reports_peer_liveness(io_process):
+    """A dealer sees its router come, go, and come back; closing the dealer itself reports
+    nothing."""
+    server, client = await _open_zmq_pair(req_res=True, io_process=io_process)
+    try:
+        assert client.peer_liveness
+        await _wait_event(client.peer_connected)
+        assert not client.peer_lost.is_set()
+
+        address, srv_id = server.address, server.identity
+        srv_secret = server.secret_id
+        await server.close()
+        await _wait_event(client.peer_lost)
+        assert not client.peer_connected.is_set()
+
+        server = AsyncZMQRouterConnection(
+            identity=srv_id,
+            secret_id=srv_secret,
+            address=address,
+            expected_remotes={client.identity: client.secret_id},
+            req_res=True,
+            io_process=io_process,
+        )
+        await server.open()
+        await _wait_event(client.peer_connected)
+        assert not client.peer_lost.is_set()
+        assert await client.send(b"back", timeout=5.0)
+        assert (await server.recv(timeout=5.0))[-1] == b"back"
+    finally:
+        await client.close()
+        assert client.peer_connected.is_set() and not client.peer_lost.is_set()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_liveness_is_optional():
+    """Transports that can't tell (a lightweight dealer, a router, MP pipes) say so."""
+    srv_id, srv_secret, cli_id, cli_secret = _unique_ids()
+    server = AsyncZMQRouterConnection(
+        identity=srv_id, secret_id=srv_secret, address="127.0.0.1:0",
+        expected_remotes={cli_id: cli_secret},
+    )  # fmt: skip
+    await server.open()
+    client = AsyncZMQDealerConnection(
+        identity=cli_id, secret_id=cli_secret, remote_address=server.address,
+        remote_identity=srv_id, remote_secret_id=srv_secret, lightweight=True,
+    )  # fmt: skip
+    await client.open()
+    try:
+        assert not client.peer_liveness and not server.peer_liveness
+    finally:
+        await _close_pair(server, client)
+    a, b = _make_mp_pair()
+    await a.open()
+    await b.open()
+    try:
+        assert not a.peer_liveness and not b.peer_liveness
+    finally:
+        await a.close()
+        await b.close()

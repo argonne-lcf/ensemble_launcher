@@ -20,6 +20,15 @@ from ensemble_launcher.orchestrator.discovery import _resolve_node_id, _wait_for
 _SEEN_MAX = 10000  # message ids remembered to drop resends
 
 
+class NodeConnectionLost(ConnectionError):
+    """The node a `ClusterClient` was attached to died, hung or restarted before the task's
+    result came back. The task may or may not have run."""
+
+    def __init__(self, node_id: str):
+        super().__init__(f"Lost the connection to {node_id} before the result arrived")
+        self.node_id = node_id
+
+
 class ClusterClient:
     """Submit tasks to a running orchestrator node and get ``concurrent.futures.Future``s.
 
@@ -33,6 +42,10 @@ class ClusterClient:
     ``io_process`` is on (with ``req_res``) -- so decoding a large batch here never delays an
     ACK. ``submit`` / ``map`` only buffer; ``flush`` (automatic when the buffer is full and
     every ``task_flush_interval``) sends the buffer as one ``TaskUpdate``.
+
+    When the connection's transport reports peer liveness (`AsyncConnection.peer_liveness`),
+    losing the node fails every task already sent with `NodeConnectionLost`; tasks still
+    buffered stay buffered and go out once the connection is back.
 
     Examples::
 
@@ -162,7 +175,10 @@ class ClusterClient:
             return
         self._ready.set()
         try:
-            await asyncio.gather(self._recv_loop(), self._flush_loop())
+            loops = [self._recv_loop(), self._flush_loop()]
+            if self._conn.peer_liveness:
+                loops.append(self._peer_loop())
+            await asyncio.gather(*loops)
         except asyncio.CancelledError:
             pass
         finally:
@@ -212,6 +228,21 @@ class ClusterClient:
             for result in results:
                 self._resolve(result)
             self.logger.debug(f"Received {len(results)} results")
+
+    async def _peer_loop(self) -> None:
+        """Losing the node fails every task already sent: their results can't come back."""
+        while True:
+            await self._conn.peer_lost.wait()
+            with self._lock:
+                pending, self._pending = self._pending, {}
+            lost = 0
+            for fut in pending.values():
+                if not fut.done():
+                    fut.set_exception(NodeConnectionLost(self._node_id))
+                    lost += 1
+            self.logger.error(f"Lost {self._node_id}; failed {lost} pending task(s)")
+            await self._conn.peer_connected.wait()
+            self.logger.info(f"Reconnected to {self._node_id}")
 
     async def _flush_loop(self) -> None:
         while True:

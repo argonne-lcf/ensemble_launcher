@@ -143,6 +143,7 @@ class ZMQDealerIOProcess(IOProcess):
         self._lightweight = lightweight
         self._context = None
         self._socket = None
+        self._monitor = None
 
     def kwargs(self):
         return {
@@ -154,6 +155,38 @@ class ZMQDealerIOProcess(IOProcess):
     @property
     def address(self) -> Optional[str]:
         return None
+
+    @property
+    def provides_peer_liveness(self) -> bool:
+        """Non-lightweight dealers set ZMTP heartbeats, so libzmq drops a session whose peer
+        died, hung or was cut off; a socket monitor reports it (`_raw_watch_peer`)."""
+        return not self._lightweight
+
+    async def _raw_watch_peer(self) -> None:
+        import zmq
+        from zmq.utils.monitor import parse_monitor_message
+
+        try:
+            while True:
+                event = parse_monitor_message(await self._monitor.recv_multipart())["event"]
+                if event == zmq.EVENT_CONNECTED:
+                    self._peer_up()
+                elif event == zmq.EVENT_DISCONNECTED:
+                    self._peer_down()
+        finally:
+            self._close_monitor()
+
+    def _close_monitor(self) -> None:
+        import zmq
+
+        if self._monitor is None:
+            return
+        try:
+            self._socket.disable_monitor()
+        except zmq.ZMQError:
+            pass
+        self._monitor.close(linger=0)
+        self._monitor = None
 
     async def _raw_open(self) -> None:
         import zmq
@@ -181,12 +214,17 @@ class ZMQDealerIOProcess(IOProcess):
             self._socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
             self._socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
 
+        if self.provides_peer_liveness:  # before connect, so the first CONNECTED is seen
+            self._monitor = self._socket.get_monitor_socket(
+                zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
+            )
         self._socket.connect(f"tcp://{self._remote_address}")
         self.logger.info(f"Connected to {self._remote_address}")
 
     async def _raw_close(self) -> None:
         import zmq
 
+        self._close_monitor()
         if self._socket:
             self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.close()
