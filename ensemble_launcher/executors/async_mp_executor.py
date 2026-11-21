@@ -1,6 +1,8 @@
 import asyncio
 import multiprocessing as mp
 import os
+import threading
+import time
 from asyncio import Future as AsyncFuture
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
@@ -22,19 +24,35 @@ def dummy_task():
     return
 
 
-def dummy_task():
-    return
+_busy = threading.Event()  # in a pool worker: a job is running
 
-def init_worker():
-    return
-    # import sys
-    # worker_id = os.getpid()
-    # fname = os.path.join(os.getcwd(),"logs","worker_logs",f"worker_{worker_id}.log")
-    # os.makedirs(os.path.dirname(fname),exist_ok=True)
-    # sys.stdout = open(fname, "w")
-    # sys.stderr = sys.stdout
 
-    
+def _tracked(target: Callable, *args):
+    """Run one pool job, marked busy so `_exit_with_owner` lets it finish."""
+    _busy.set()
+    try:
+        return target(*args)
+    finally:
+        _busy.clear()
+
+
+def _exit_with_owner(owner_pid: int, interval: float = 1.0) -> None:
+    while os.getppid() == owner_pid:
+        time.sleep(interval)
+    while _busy.is_set():  # let a running job (e.g. a child node shutting down) finish
+        time.sleep(interval)
+    os._exit(1)
+
+
+def init_worker(owner_pid: Optional[int] = None):
+    """Pool-worker initializer: exit once the pool's owner is gone, after any running job.
+    An idle ProcessPoolExecutor worker blocks on its call queue (whose write end it holds
+    itself), so it never notices a SIGKILLed owner and would live forever."""
+    if owner_pid is not None:
+        threading.Thread(
+            target=_exit_with_owner, args=(owner_pid,), name="exit-with-owner", daemon=True
+        ).start()
+
 
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
@@ -54,10 +72,17 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         if worker_method == "spawn":
             mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
             super().__init__(
-                mp_context=mp_context, max_workers=kwargs.get("max_workers", None), initializer=init_worker
+                mp_context=mp_context,
+                max_workers=kwargs.get("max_workers", None),
+                initializer=init_worker,
+                initargs=(os.getpid(),),
             )
         else:
-            super().__init__(max_workers=kwargs.get("max_workers", None),initializer=init_worker)
+            super().__init__(
+                max_workers=kwargs.get("max_workers", None),
+                initializer=init_worker,
+                initargs=(os.getpid(),),
+            )
         # super().__init__()
 
         super().submit(dummy_task)
@@ -106,11 +131,11 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         if callable(fn):
             future = super().submit(
-                run_callable_with_affinity, *(fn, task_args, task_kwargs, cpu_id, env)
+                _tracked, run_callable_with_affinity, fn, task_args, task_kwargs, cpu_id, env
             )
         elif isinstance(fn, str):
             future = super().submit(
-                run_cmd, *(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout)
+                _tracked, run_cmd, fn, task_args, task_kwargs, cpu_id, env, self._return_stdout
             )
         else:
             self.logger.warning("Can only excute either a str or a callable")
