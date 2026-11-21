@@ -7,7 +7,6 @@ from ensemble_launcher.config import SystemConfig, LauncherConfig
 from ensemble_launcher.ensemble import Task
 from ensemble_launcher.comm import ZMQComm, MPComm, NodeInfo, Comm
 from ensemble_launcher.comm.messages import Status, Result, ResultBatch, Action, ActionType, TaskUpdate, NodeUpdate
-from ensemble_launcher.profiling import get_registry, EventRegistry
 import copy
 import logging
 from ensemble_launcher.logging import setup_logger
@@ -20,7 +19,6 @@ import cloudpickle
 import socket
 import json
 import base64
-from contextlib import contextmanager
 from collections import defaultdict
 from .utils import load_str, simple_load_str
 from dataclasses import asdict
@@ -57,18 +55,7 @@ class Master(Node):
 
         self.logger = None
         
-        # Initialize event registry for perfetto profiling
-        self._event_registry: Optional[EventRegistry] = None
     
-    @contextmanager
-    def _timer(self, event_name: str):
-        """Timer that records to event registry for Perfetto export."""
-        if self._event_registry is not None:
-            with self._event_registry.measure(event_name, "master", node_id=self.node_id, pid=os.getpid()):
-                yield
-        else:
-            yield
-
     @property
     def nodes(self):
         try:
@@ -150,9 +137,6 @@ class Master(Node):
         return children
 
     def _lazy_init(self) -> Dict[str, Node]:
-        if self._config.profile == "perfetto":
-            self._event_registry = get_registry()
-            self._event_registry.enable()
 
         #lazy logger creation
         tick = time.perf_counter()
@@ -173,12 +157,11 @@ class Master(Node):
         if self._config.comm_name == "zmq":
             self._comm.setup_zmq_sockets()
 
-        with self._timer("heartbeat_sync"):
-            self._comm.async_recv_parent() ###start the recv thread
-            ##heart beat sync with parent
-            if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
-            self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
+        self._comm.async_recv_parent() ###start the recv thread
+        ##heart beat sync with parent
+        if not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self.logger.info(f"{self.node_id}: Synced heartbeat with parent")
 
         # Receive node update from parent if it has a parent
         if self.parent:
@@ -223,117 +206,114 @@ class Master(Node):
         return children
 
     def run(self):
-        with self._timer("init"):
-            children = self._lazy_init()
+        children = self._lazy_init()
         
-        with self._timer("launch_children"):
-            if self._config.child_executor_name == "mpi":
-                if not self._config.sequential_child_launch:
-                    ##launch all children in a single shot
-                    child_head_nodes = []
-                    child_resources = []
-                    child_obj_dict = {}
+        if self._config.child_executor_name == "mpi":
+            if not self._config.sequential_child_launch:
+                ##launch all children in a single shot
+                child_head_nodes = []
+                child_resources = []
+                child_obj_dict = {}
                     
-                    for child_name, child_obj in children.items():
-                        head_node = child_obj.nodes.nodes[0]
-                        child_head_nodes.append(head_node)
-                        child_resources.append(NodeResourceCount(ncpus=1))
-                        child_obj_dict[head_node] = child_obj
+                for child_name, child_obj in children.items():
+                    head_node = child_obj.nodes.nodes[0]
+                    child_head_nodes.append(head_node)
+                    child_resources.append(NodeResourceCount(ncpus=1))
+                    child_obj_dict[head_node] = child_obj
                     
-                    # Build combined dictionary structure
-                    common_keys = ["type", "config", "parent", "parent_comm"]
-                    first_child = next(iter(child_obj_dict.values()))
-                    first_dict = first_child.asdict()
+                # Build combined dictionary structure
+                common_keys = ["type", "config", "parent", "parent_comm"]
+                first_child = next(iter(child_obj_dict.values()))
+                first_dict = first_child.asdict()
                     
-                    # Initialize with common keys from first child
-                    final_dict = {key: first_dict[key] for key in common_keys}
+                # Initialize with common keys from first child
+                final_dict = {key: first_dict[key] for key in common_keys}
                     
-                    # Initialize per-host keys as empty dicts
-                    for key in first_dict.keys():
+                # Initialize per-host keys as empty dicts
+                for key in first_dict.keys():
+                    if key not in common_keys:
+                        final_dict[key] = {}
+                    
+                # Populate per-host values
+                for hostname, child_obj in child_obj_dict.items():
+                    child_dict = child_obj.asdict()
+                    for key, value in child_dict.items():
                         if key not in common_keys:
-                            final_dict[key] = {}
+                            final_dict[key][hostname] = value
                     
-                    # Populate per-host values
-                    for hostname, child_obj in child_obj_dict.items():
-                        child_dict = child_obj.asdict()
-                        for key, value in child_dict.items():
-                            if key not in common_keys:
-                                final_dict[key][hostname] = value
+                # Create embedded command string
+                json_str = json.dumps(final_dict, default=str)
+                json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                common_keys_str = ','.join(common_keys)
+                load_str_embed = load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+                load_str_embed = load_str_embed.replace("common_keys_str", f"'{common_keys_str}'")
                     
-                    # Create embedded command string
-                    json_str = json.dumps(final_dict, default=str)
-                    json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-                    common_keys_str = ','.join(common_keys)
-                    load_str_embed = load_str.replace("json_str_b64", f"b'{json_str_b64}'")
-                    load_str_embed = load_str_embed.replace("common_keys_str", f"'{common_keys_str}'")
+                req = JobResource(resources=child_resources, nodes=child_head_nodes)
+                env = os.environ.copy()
                     
-                    req = JobResource(resources=child_resources, nodes=child_head_nodes)
-                    env = os.environ.copy()
-                    
-                    self.logger.info(f"Launching worker using one shot mpiexec")
-                    self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
-                else:
-                    ##launch children sequentially one by one
-                    for child_idx, (child_name, child_obj) in enumerate(children.items()):
-                        child_nodes = child_obj.nodes
-                        head_node = child_nodes[0]
-                        
-                        # Serialize child object
-                        child_dict = child_obj.asdict()
-                        json_str = json.dumps(child_dict, default=str)
-                        json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-                        
-                        # Create embedded command string for this child (simple version, no per-host logic)
-                        load_str_embed = simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
-                        
-                        req = JobResource(
-                                resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
-                            )
-                        env = os.environ.copy()
-                        env["EL_CHILDID"] = str(child_idx)
-                        
-                        self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
-                        self._children_exec_ids[child_name] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
+                self.logger.info(f"Launching worker using one shot mpiexec")
+                self._children_exec_ids["all"] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
             else:
-                for child_idx, (child_name,child_obj) in enumerate(children.items()):
-                    child_nodes = child_obj.nodes.nodes
+                ##launch children sequentially one by one
+                for child_idx, (child_name, child_obj) in enumerate(children.items()):
+                    child_nodes = child_obj.nodes
+                    head_node = child_nodes[0]
+                        
+                    # Serialize child object
+                    child_dict = child_obj.asdict()
+                    json_str = json.dumps(child_dict, default=str)
+                    json_str_b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                        
+                    # Create embedded command string for this child (simple version, no per-host logic)
+                    load_str_embed = simple_load_str.replace("json_str_b64", f"b'{json_str_b64}'")
+                        
                     req = JobResource(
-                            resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                            resources=[NodeResourceCount(ncpus=1)], nodes=[head_node]
                         )
                     env = os.environ.copy()
-                    
                     env["EL_CHILDID"] = str(child_idx)
+                        
+                    self.logger.info(f"Launching child {child_name} using MPI executor (sequential)")
+                    self._children_exec_ids[child_name] = self._executor.start(req, ["python", "-c", load_str_embed], env=env)
+        else:
+            for child_idx, (child_name,child_obj) in enumerate(children.items()):
+                child_nodes = child_obj.nodes.nodes
+                req = JobResource(
+                        resources=[NodeResourceCount(ncpus=1)], nodes=child_nodes[:1]
+                    )
+                env = os.environ.copy()
+                    
+                env["EL_CHILDID"] = str(child_idx)
 
-                    self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
+                self._children_exec_ids[child_name] = self._executor.start(req, child_obj.run, env = env)
 
-        with self._timer("sync_with_children"):
-            if not self._comm.sync_heartbeat_with_children(timeout=30.0):
-                self.logger.error(f"{self.node_id}: Can't connect to children.")
-                return self._get_child_exceptions() # Should return and report
+        if not self._comm.sync_heartbeat_with_children(timeout=30.0):
+            self.logger.error(f"{self.node_id}: Can't connect to children.")
+            return self._get_child_exceptions() # Should return and report
+        else:
+            self.logger.info(f"{self.node_id}: Synced heartbeat with children")
+            
+        # Send node allocation to each child
+        for child_id in self.children:
+            child_nodes = self._child_assignment[child_id]["job_resource"]
+            node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
+            success = self._comm.send_message_to_child(child_id, node_update)
+            if success:
+                self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
             else:
-                self.logger.info(f"{self.node_id}: Synced heartbeat with children")
+                self.logger.error(f"{self.node_id}: Failed to send node update to {child_id}")
             
-            # Send node allocation to each child
-            for child_id in self.children:
-                child_nodes = self._child_assignment[child_id]["job_resource"]
-                node_update = NodeUpdate(sender=self.node_id, nodes=child_nodes)
-                success = self._comm.send_message_to_child(child_id, node_update)
-                if success:
-                    self.logger.info(f"{self.node_id}: Sent node update to {child_id} containing {len(child_nodes.nodes)} nodes")
-                else:
-                    self.logger.error(f"{self.node_id}: Failed to send node update to {child_id}")
+        # Send task updates to each child
+        for child_id in self.children:
+            new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
+            task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
+            success = self._comm.send_message_to_child(child_id, task_update)
+            if success:
+                self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
+            else:
+                self.logger.error(f"{self.node_id}: Failed to send task update to {child_id}")
             
-            # Send task updates to each child
-            for child_id in self.children:
-                new_tasks = [self._tasks[task_id] for task_id in self._child_assignment[child_id]["task_ids"]]
-                task_update = TaskUpdate(sender=self.node_id, added_tasks=new_tasks)
-                success = self._comm.send_message_to_child(child_id, task_update)
-                if success:
-                    self.logger.info(f"{self.node_id}: Sent task update to {child_id} containing {len(new_tasks)} tasks")
-                else:
-                    self.logger.error(f"{self.node_id}: Failed to send task update to {child_id}")
-            
-            return self._results() #should return and report
+        return self._results() #should return and report
     
     @classmethod
     def load(cls, dirname: str):
@@ -417,111 +397,106 @@ class Master(Node):
         
         done = set()
         while True:
-            with self._timer("check_children"):
-                # Special handling for MPI executor - check once before child loop
-                if self._config.child_executor_name == "mpi":
-                    if self._executor.done(self._children_exec_ids["all"]):
-                        for child_id in self.children:
-                            done.add(child_id)
-            
-                for child_id in self.children:
-                    if child_id in done:
-                        continue
-
-                    ##look for results
-                    result = self._comm.recv_message_from_child(ResultBatch, child_id)
-                    if result is not None:
-                        self.logger.info(f"{self.node_id}: Received result from {child_id}.")
-                        ##final status of the child
-                        final_status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=5.0)
-                        if final_status is not None:
-                            children_status[child_id] = final_status
-                            self.logger.info(f"{self.node_id}: Received final status from {child_id}")
-                            self.logger.info(f"{self.node_id}: Final status {final_status}")
-                        ##
-                        results[child_id] = result
+            # Special handling for MPI executor - check once before child loop
+            if self._config.child_executor_name == "mpi":
+                if self._executor.done(self._children_exec_ids["all"]):
+                    for child_id in self.children:
                         done.add(child_id)
-                        self._comm.send_message_to_child(child_id, Action(sender=self.node_id, type=ActionType.STOP))
+            
+            for child_id in self.children:
+                if child_id in done:
+                    continue
+
+                ##look for results
+                result = self._comm.recv_message_from_child(ResultBatch, child_id)
+                if result is not None:
+                    self.logger.info(f"{self.node_id}: Received result from {child_id}.")
+                    ##final status of the child
+                    final_status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=5.0)
+                    if final_status is not None:
+                        children_status[child_id] = final_status
+                        self.logger.info(f"{self.node_id}: Received final status from {child_id}")
+                        self.logger.info(f"{self.node_id}: Final status {final_status}")
+                    ##
+                    results[child_id] = result
+                    done.add(child_id)
+                    self._comm.send_message_to_child(child_id, Action(sender=self.node_id, type=ActionType.STOP))
                     
-                    # For non-MPI executors, check individual exec_ids
-                    if self._config.child_executor_name != "mpi":
-                        if child_id not in self._children_exec_ids:
-                            self.logger.error(f"{child_id} not in exec_id map!!")
-                            raise RuntimeError
-                        else:
-                            exec_id = self._children_exec_ids[child_id]
-                            if self._executor.done(exec_id):
-                                done.add(child_id)
+                # For non-MPI executors, check individual exec_ids
+                if self._config.child_executor_name != "mpi":
+                    if child_id not in self._children_exec_ids:
+                        self.logger.error(f"{child_id} not in exec_id map!!")
+                        raise RuntimeError
+                    else:
+                        exec_id = self._children_exec_ids[child_id]
+                        if self._executor.done(exec_id):
+                            done.add(child_id)
             
             ##send status to parent
             if time.time() > next_report_time:
-                with self._timer("report_status"):
-                    ##receive status updates from ALL children
-                    for child_id in self.children:
-                        status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.1)
-                        if status is not None:
-                            children_status[child_id] = status
+                ##receive status updates from ALL children
+                for child_id in self.children:
+                    status = self._comm.recv_message_from_child(Status, child_id=child_id, timeout=0.1)
+                    if status is not None:
+                        children_status[child_id] = status
 
-                    self._status = sum(children_status.values(), Status())
-                    if self.parent:
-                        self._comm.send_message_to_parent(self._status)
-                    else:
-                        if isinstance(self._status, Status):
-                            self.logger.info(f"{self.node_id}: Status: {self._status}")
-                    next_report_time = time.time() + self._config.report_interval
+                self._status = sum(children_status.values(), Status())
+                if self.parent:
+                    self._comm.send_message_to_parent(self._status)
+                else:
+                    if isinstance(self._status, Status):
+                        self.logger.info(f"{self.node_id}: Status: {self._status}")
+                next_report_time = time.time() + self._config.report_interval
 
             time.sleep(0.1)
             if len(done) == len(self.children):
                 self.logger.info(f"{self.node_id}: All children are done")
                 break
-        with self._timer("collect_results"):
-            ##Create a new result batch from all the results
-            result_batch = ResultBatch(sender=self.node_id)
-            for child_id, child_result in results.items():
-                if isinstance(child_result, ResultBatch):
-                    result_batch.data.extend(child_result.data)
-                else:
-                    raise ValueError(f"{self.node_id}: Received unknown type result from child {child_id}")
-
-        with self._timer("report_to_parent"):
-            #report it to parent
-            if self.parent:
-                success = self._comm.send_message_to_parent(result_batch)
-
-                if not success:
-                    self.logger.warning(f"{self.node_id}: Failed to send results to parent")
-                else:
-                    self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
-                
-                ##also send the final_status
-                self._status = sum(children_status.values(), Status())
-                success = self._comm.send_message_to_parent(self._status)
-                if not success:
-                    self.logger.warning(f"{self.node_id}: Failed to send status to parent")
-                else:
-                    self.logger.info(f"{self.node_id}: Succesfully sent status to parent")
-                    fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                    self._status.to_file(fname)
+        ##Create a new result batch from all the results
+        result_batch = ResultBatch(sender=self.node_id)
+        for child_id, child_result in results.items():
+            if isinstance(child_result, ResultBatch):
+                result_batch.data.extend(child_result.data)
             else:
-                try:
-                    self._status = sum(children_status.values(), Status())
-                    #write to a json file
-                    fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                    self._status.to_file(fname)
-                    self.logger.info(f"{self.node_id}: Successfully reported final status")
-                except Exception as e:
-                    self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
+                raise ValueError(f"{self.node_id}: Received unknown type result from child {child_id}")
+
+        #report it to parent
+        if self.parent:
+            success = self._comm.send_message_to_parent(result_batch)
+
+            if not success:
+                self.logger.warning(f"{self.node_id}: Failed to send results to parent")
+            else:
+                self.logger.info(f"{self.node_id}: Succesfully sent results to parent")
+                
+            ##also send the final_status
+            self._status = sum(children_status.values(), Status())
+            success = self._comm.send_message_to_parent(self._status)
+            if not success:
+                self.logger.warning(f"{self.node_id}: Failed to send status to parent")
+            else:
+                self.logger.info(f"{self.node_id}: Succesfully sent status to parent")
+                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                self._status.to_file(fname)
+        else:
+            try:
+                self._status = sum(children_status.values(), Status())
+                #write to a json file
+                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+                self._status.to_file(fname)
+                self.logger.info(f"{self.node_id}: Successfully reported final status")
+            except Exception as e:
+                self.logger.warning(f"{self.node_id}: Reporting final status failed with excepiton {e}")
         
-        with self._timer("wait_for_stop"):
-            #wait for my parent to instruct me
-            while True and self.parent is not None:
-                msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
-                if msg is not None:
-                    if msg.type == ActionType.STOP:
-                        self.logger.info(f"{self.node_id}: Received stop from parent")
-                        break
+        #wait for my parent to instruct me
+        while True and self.parent is not None:
+            msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
+            if msg is not None:
+                if msg.type == ActionType.STOP:
+                    self.logger.info(f"{self.node_id}: Received stop from parent")
+                    break
         
-                time.sleep(1.0)
+            time.sleep(1.0)
         
         for child_id, exec_id in self._children_exec_ids.items():
             result = self._executor.result(exec_id)
@@ -531,17 +506,6 @@ class Master(Node):
         return result_batch
 
     def stop(self):
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            # Export to Perfetto format
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
-            self._event_registry.export_perfetto(fname)
-            
-            # Also export statistics
-            stats = self._event_registry.get_statistics()
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
-            with open(fname, "w") as f:
-                json.dump(stats, f, indent=2)
             
         self._comm.stop_async_recv()
         self._comm.clear_cache()

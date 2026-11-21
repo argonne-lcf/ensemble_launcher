@@ -293,7 +293,7 @@ class ELFastMCP(FastMCP):
                         "is running and interface.run() has been called."
                     )
                 task = task_cls(
-                    task_id=str(uuid.uuid4()),
+                    task_id=uuid.uuid4().hex,  # 32 chars: fits META_DTYPE
                     nnodes=nnodes,
                     ppn=ppn,
                     ngpus_per_process=gpus_per_process,
@@ -359,7 +359,7 @@ class ELFastMCP(FastMCP):
                 for param, value in kwargs.items():
                     cmd = cmd.replace(f"{{{param}}}", str(value))
                 task = Task(
-                    task_id=str(uuid.uuid4()),
+                    task_id=uuid.uuid4().hex,  # 32 chars: fits META_DTYPE
                     nnodes=nnodes,
                     ppn=ppn,
                     ngpus_per_process=gpus_per_process,

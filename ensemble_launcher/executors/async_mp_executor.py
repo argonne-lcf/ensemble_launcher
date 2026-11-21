@@ -1,6 +1,8 @@
 import asyncio
 import multiprocessing as mp
 import os
+import threading
+import time
 from asyncio import Future as AsyncFuture
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from logging import Logger
@@ -8,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import loky
 
-from ensemble_launcher.profiling import EventRegistry, get_registry
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -23,18 +24,35 @@ def dummy_task():
     return
 
 
-def dummy_task():
-    return
+_busy = threading.Event()  # in a pool worker: a job is running
 
-def init_worker():
-    import sys
-    worker_id = os.getpid()
-    fname = os.path.join(os.getcwd(),"logs","worker_logs",f"worker_{worker_id}.log")
-    os.makedirs(os.path.dirname(fname),exist_ok=True)
-    sys.stdout = open(fname, "w")
-    sys.stderr = sys.stdout
 
-    
+def _tracked(target: Callable, *args):
+    """Run one pool job, marked busy so `_exit_with_owner` lets it finish."""
+    _busy.set()
+    try:
+        return target(*args)
+    finally:
+        _busy.clear()
+
+
+def _exit_with_owner(owner_pid: int, interval: float = 1.0) -> None:
+    while os.getppid() == owner_pid:
+        time.sleep(interval)
+    while _busy.is_set():  # let a running job (e.g. a child node shutting down) finish
+        time.sleep(interval)
+    os._exit(1)
+
+
+def init_worker(owner_pid: Optional[int] = None):
+    """Pool-worker initializer: exit once the pool's owner is gone, after any running job.
+    An idle ProcessPoolExecutor worker blocks on its call queue (whose write end it holds
+    itself), so it never notices a SIGKILLed owner and would live forever."""
+    if owner_pid is not None:
+        threading.Thread(
+            target=_exit_with_owner, args=(owner_pid,), name="exit-with-owner", daemon=True
+        ).start()
+
 
 @executor_registry.register("async_processpool", type="async")
 class AsyncProcessPoolExecutor(ProcessPoolExecutor):
@@ -54,17 +72,21 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
         if worker_method == "spawn":
             mp_context = kwargs.pop("mp_context", mp.get_context("spawn"))
             super().__init__(
-                mp_context=mp_context, max_workers=kwargs.get("max_workers", None), initializer=init_worker
+                mp_context=mp_context,
+                max_workers=kwargs.get("max_workers", None),
+                initializer=init_worker,
+                initargs=(os.getpid(),),
             )
         else:
-            super().__init__(max_workers=kwargs.get("max_workers", None),initializer=init_worker)
+            super().__init__(
+                max_workers=kwargs.get("max_workers", None),
+                initializer=init_worker,
+                initargs=(os.getpid(),),
+            )
         # super().__init__()
 
         super().submit(dummy_task)
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry: EventRegistry = get_registry()
         self.logger.info("Initialized AsyncProcessPool Executor!")
 
     def submit(
@@ -109,11 +131,11 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         if callable(fn):
             future = super().submit(
-                run_callable_with_affinity, *(fn, task_args, task_kwargs, cpu_id, env)
+                _tracked, run_callable_with_affinity, fn, task_args, task_kwargs, cpu_id, env
             )
         elif isinstance(fn, str):
             future = super().submit(
-                run_cmd, *(fn, task_args, task_kwargs, cpu_id, env, self._return_stdout)
+                _tracked, run_cmd, fn, task_args, task_kwargs, cpu_id, env, self._return_stdout
             )
         else:
             self.logger.warning("Can only excute either a str or a callable")
@@ -121,9 +143,17 @@ class AsyncProcessPoolExecutor(ProcessPoolExecutor):
 
         return asyncio.wrap_future(future)
 
-    def shutdown(self, wait=True, **kwargs):
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        """``kill_workers=True`` kills the pool's processes first, so a running task does not
+        hold up the shutdown (the worker passes it: it has already failed its running tasks).
+        Without it, running tasks are waited for -- the master's child executor runs each child
+        node as a task here, and killing it mid-stop would orphan that child's own pool."""
         processes = dict(self._processes) if self._processes else {}
         kwargs.setdefault("cancel_futures", True)
+        if kill_workers:
+            for p in processes.values():
+                if p.is_alive():
+                    p.kill()
         super().shutdown(wait=wait, **kwargs)
         for p in processes.values():
             if p.is_alive():
@@ -145,6 +175,11 @@ class AsyncThreadPoolExecutor(ThreadPoolExecutor):
             self._return_stdout = kwargs["return_stdout"]
         super().__init__(max_workers=kwargs.get("max_workers", None))
         self.logger.info("Initialized threadpool executor")
+
+    def shutdown(self, wait=True, kill_workers=False, **kwargs):
+        # Threads cannot be killed; kill_workers is accepted so callers can pass it to any
+        # executor.
+        super().shutdown(wait=wait, **kwargs)
 
     def submit(
         self,
@@ -242,9 +277,6 @@ class AsyncLokyExecutor:
             f = self._executor.submit(dummy_task)
             f.result()
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info("Initialized AsyncLoky Executor!")
 
     def submit(
@@ -395,9 +427,6 @@ class AsyncPinnedExecutor:
         }
         self._next_pool = 0  # round-robin cursor for tasks that ask for no GPU
 
-        self._event_registry: Optional[EventRegistry] = None
-        if os.getenv("EL_ENABLE_PROFILING", "0") == "1":
-            self._event_registry = get_registry()
         self.logger.info(
             f"Initialized AsyncPinned Executor! {npools} pool(s), {max_workers} worker(s), "
             f"{gpu_selector} pinned to {self._gpus or 'nothing'}"

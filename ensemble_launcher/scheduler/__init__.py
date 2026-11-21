@@ -1,20 +1,20 @@
-from .child_state import ChildState
-from .policy import (
-    LargeResourcePolicy,
-    FIFOPolicy,
-    policy_registry,
-    Policy,
-    ChildrenPolicy,
-    PolicyStateMixin,
-)
-from .scheduler import WorkerScheduler, TaskScheduler, Scheduler
 from .async_scheduler import (
-    AsyncTaskScheduler,
     AsyncChildrenScheduler,
+    AsyncTaskScheduler,
     PendingTaskHeap,
     PendingTaskQueue,
 )
-from .state import SchedulerState, ChildrenAssignment
+from .child_state import ChildState
+from .policy import (
+    ChildrenPolicy,
+    FIFOPolicy,
+    LargeResourcePolicy,
+    Policy,
+    PolicyStateMixin,
+    policy_registry,
+)
+from .scheduler import Scheduler, TaskScheduler, WorkerScheduler
+from .state import Child, ChildrenAssignment, SchedulerState, TaskSchedulerState
 
 __all__ = [
     "ChildState",
@@ -32,5 +32,7 @@ __all__ = [
     "ChildrenPolicy",
     "PolicyStateMixin",
     "SchedulerState",
+    "TaskSchedulerState",
+    "Child",
     "ChildrenAssignment",
 ]

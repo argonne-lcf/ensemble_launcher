@@ -12,7 +12,7 @@ import socket
 import pytest
 from utils import echo
 
-from ensemble_launcher.config import PolicyConfig, SystemConfig
+from ensemble_launcher.config import LauncherConfig, PolicyConfig, SystemConfig
 from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.scheduler import (
     AsyncTaskScheduler,
@@ -25,6 +25,18 @@ from ensemble_launcher.scheduler.resource import JobResource, NodeResourceList
 pytestmark = pytest.mark.core
 
 
+def _make_scheduler(logger, tasks, nodes, policy="fifo_policy", policy_config=None, node_id="node"):
+    """An AsyncTaskScheduler built the way the worker builds it (policy by name, from the
+    config), seeded with ``tasks`` (a dict of Tasks)."""
+    config = LauncherConfig(
+        task_scheduler_policy=policy, policy_config=policy_config or PolicyConfig()
+    )
+    sched = AsyncTaskScheduler(logger, nodes, config, node_id=node_id)
+    for task in tasks.values():
+        sched.add_task(task)
+    return sched
+
+
 def _job_resource(ncpus: int = 4) -> JobResource:
     sys_info = NodeResourceList.from_config(
         SystemConfig(name="local", ncpus=ncpus, cpus=list(range(1, ncpus + 1)))
@@ -32,12 +44,32 @@ def _job_resource(ncpus: int = 4) -> JobResource:
     return JobResource(resources=[sys_info], nodes=[socket.gethostname()])
 
 
+def _uid(tid: str) -> bytes:
+    """Schedulers key tasks by 16-byte uid; tests derive a readable one from the name."""
+    return tid.encode().ljust(16, b"\0")
+
+
+def _name(tid, sched=None):
+    """A readable name: the task_id behind a scheduler handle (read it while the task is
+    live), or the string itself in the container-only tests."""
+    if sched is not None:
+        return sched.tasks[tid].task_id
+    return tid.rstrip(b"\0").decode() if isinstance(tid, bytes) else tid
+
+
+def _h(sched, tid: str) -> int:
+    """The scheduler's handle for the task named ``tid``."""
+    (h,) = sched.tasks.lookup([_uid(tid)]).tolist()
+    assert h >= 0, f"{tid} is not in the store"
+    return h
+
+
 def _task(tid: str, ppn: int = 1) -> Task:
-    return Task(task_id=tid, nnodes=1, ppn=ppn, executable=echo, args=(tid,))
+    return Task(task_id=tid, uid=_uid(tid), nnodes=1, ppn=ppn, executable=echo, args=(tid,))
 
 
-def _ids(entries):
-    return [tid for _p, _s, tid in entries]
+def _ids(entries, sched=None):
+    return [_name(tid, sched) for _p, _s, tid in entries]
 
 
 # ---------------------------------------------------------------------------
@@ -146,29 +178,15 @@ def test_queue_remove_and_rescore():
 
 
 def test_scheduler_default_policy_is_fifo():
-    sched = AsyncTaskScheduler(logging.getLogger("t"), {}, _job_resource())
+    sched = _make_scheduler(logging.getLogger("t"), {}, _job_resource())
     assert isinstance(sched.scheduler_policy, FIFOPolicy)
-    assert isinstance(sched._pending_tasks, PendingTaskQueue)
+    assert isinstance(sched.state.pending_tasks, PendingTaskQueue)
 
 
 def test_scheduler_picks_container_by_policy_name():
     log = logging.getLogger("t")
     assert isinstance(
-        AsyncTaskScheduler(log, {}, _job_resource(), policy="large_resource_policy")._pending_tasks,
-        PendingTaskHeap,
-    )
-    # An instance of the registered class resolves to its registered name...
-    assert isinstance(
-        AsyncTaskScheduler(log, {}, _job_resource(), policy=FIFOPolicy())._pending_tasks,
-        PendingTaskQueue,
-    )
-
-    # ...but a subclass may override get_score, so it must be scored.
-    class MyFIFO(FIFOPolicy):
-        pass
-
-    assert isinstance(
-        AsyncTaskScheduler(log, {}, _job_resource(), policy=MyFIFO())._pending_tasks,
+        _make_scheduler(log, {}, _job_resource(), policy="large_resource_policy").state.pending_tasks,
         PendingTaskHeap,
     )
 
@@ -178,42 +196,45 @@ def test_fifo_scheduler_never_scores(monkeypatch):
         raise AssertionError("get_score must not be called on the FIFO path")
 
     monkeypatch.setattr(FIFOPolicy, "get_score", boom)
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {t: _task(t) for t in ("a", "b")},
         _job_resource(),
         policy="fifo_policy",
     )
     assert sched.add_task(_task("c"))
-    assert _ids(sched._pending_tasks.sorted_items()) == ["a", "b", "c"]
+    assert _ids(sched.state.pending_tasks.sorted_items(), sched) == ["a", "b", "c"]
     assert sched.reprioritize_pending() == 3
-    assert _ids(sched._pending_tasks.sorted_items()) == ["a", "b", "c"]
+    assert _ids(sched.state.pending_tasks.sorted_items(), sched) == ["a", "b", "c"]
 
 
-def test_stateless_policy_gets_no_scheduler_state(monkeypatch):
+def test_policy_gets_the_live_scheduler_state(monkeypatch):
+    """No snapshot is built: the policy receives the scheduler's own state object.
+    (LargeResourcePolicy scores whole updates through get_scores_columns.)"""
     seen = []
-    orig = LargeResourcePolicy.get_score
+    orig = LargeResourcePolicy.get_scores_columns
 
-    def spy(self, task, scheduler_state=None):
-        seen.append(scheduler_state)
-        return orig(self, task, scheduler_state)
+    def spy(self, idx, meta, scheduler_state=None):
+        seen.append((scheduler_state, len(scheduler_state.pending_tasks)))
+        return orig(self, idx, meta, scheduler_state)
 
-    monkeypatch.setattr(LargeResourcePolicy, "get_score", spy)
-    sched = AsyncTaskScheduler(
+    monkeypatch.setattr(LargeResourcePolicy, "get_scores_columns", spy)
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {"a": _task("a")},
         _job_resource(),
         policy="large_resource_policy",
     )
     sched.add_task(_task("b"))
-    assert seen == [None, None]
+    assert all(state is sched.state for state, _ in seen)
+    assert [n for _, n in seen] == [0, 1]  # live: "a" is pending when "b" is scored
 
 
 async def _drain_in_order(sched: AsyncTaskScheduler, n: int):
     order = []
     for _ in range(n):
         tid, _res = await asyncio.wait_for(sched.ready_tasks.get(), timeout=5.0)
-        order.append(tid)
+        order.append(_name(tid, sched))
         sched.free(tid, TaskStatus.SUCCESS)
     return order
 
@@ -223,7 +244,7 @@ async def _drain_in_order(sched: AsyncTaskScheduler, n: int):
 async def test_single_slot_dispatch_order(policy):
     """One CPU: dispatch order is exactly the container's pop order."""
     ids = [f"t{i}" for i in range(20)]
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"), {}, _job_resource(ncpus=1), policy=policy
     )
     for t in ids:
@@ -232,7 +253,7 @@ async def test_single_slot_dispatch_order(policy):
     try:
         assert await _drain_in_order(sched, len(ids)) == ids
         await asyncio.wait_for(sched.wait_for_completion(), timeout=5.0)
-        assert sched._pending_tasks.empty()
+        assert sched.state.pending_tasks.empty()
     finally:
         await sched.stop_monitoring()
 
@@ -240,7 +261,7 @@ async def test_single_slot_dispatch_order(policy):
 @pytest.mark.asyncio
 async def test_priority_dispatch_order():
     """Bigger tasks first under large_resource_policy, FIFO among equals."""
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {},
         _job_resource(ncpus=2),
@@ -259,24 +280,24 @@ async def test_priority_dispatch_order():
 @pytest.mark.asyncio
 async def test_fifo_backfill_skips_head_that_does_not_fit():
     """Non-strict FIFO lets a small task pass a big one, and the big one keeps its place."""
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"), {}, _job_resource(ncpus=2), policy="fifo_policy"
     )
     sched.add_task(_task("hold", ppn=1))
     sched.start_monitoring()
     try:
         hold, _ = await asyncio.wait_for(sched.ready_tasks.get(), timeout=5.0)
-        assert hold == "hold"
+        assert _name(hold, sched) == "hold"
         # One CPU left: "big" can't start, "small" can.
         sched.add_task(_task("big", ppn=2))
         sched.add_task(_task("small", ppn=1))
         small, _ = await asyncio.wait_for(sched.ready_tasks.get(), timeout=5.0)
-        assert small == "small"
-        assert _ids(sched._pending_tasks.sorted_items()) == ["big"]
-        sched.free("hold", TaskStatus.SUCCESS)
-        sched.free("small", TaskStatus.SUCCESS)
+        assert _name(small, sched) == "small"
+        assert _ids(sched.state.pending_tasks.sorted_items(), sched) == ["big"]
+        sched.free(hold, TaskStatus.SUCCESS)
+        sched.free(small, TaskStatus.SUCCESS)
         big, _ = await asyncio.wait_for(sched.ready_tasks.get(), timeout=5.0)
-        assert big == "big"
+        assert _name(big, sched) == "big"
     finally:
         await sched.stop_monitoring()
 
@@ -291,7 +312,7 @@ async def test_free_sets_resource_event_synchronously(policy):
     failed allocate never clears the event, so the next pass tested every pending
     task -- O(pending) per completion, which made throughput fall with batch size.
     """
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"), {}, _job_resource(ncpus=2), policy=policy
     )
     sched.cluster.set_event_loop(asyncio.get_running_loop())
@@ -309,7 +330,47 @@ async def test_free_sets_resource_event_synchronously(policy):
     assert not event.is_set()
     await asyncio.sleep(0)  # run anything deferred
     assert not event.is_set()  # no late set on a full cluster
-    assert len(sched._pending_tasks) == 997
+    assert len(sched.state.pending_tasks) == 997
+
+
+def test_state_counts_and_client_column():
+    """The worker state is runtime only: finish counters, not uid sets; a task's client is
+    a store column."""
+    sched = _make_scheduler(logging.getLogger("t"), {}, _job_resource(ncpus=2))
+    from ensemble_launcher.comm.messages import TaskUpdate
+
+    accepted, rejected = sched.add_tasks(TaskUpdate.from_tasks([_task("c0")]), client_id="client-1")
+    assert not rejected and sched.tasks.client_name(int(sched.tasks.clients(accepted)[0])) == "client-1"
+    sched.add_task(_task("p0"))
+    assert sched._allocate_pending() == 2
+    sched.free(_h(sched, "c0"), TaskStatus.SUCCESS)
+    sched.free(_h(sched, "p0"), TaskStatus.FAILED)
+    assert (sched.state.ncompleted, sched.state.nfailed) == (1, 1) and len(sched.tasks) == 0
+    assert not hasattr(sched, "get_state") and not hasattr(sched, "set_state")
+
+
+@pytest.mark.asyncio
+async def test_fail_unfinished_fails_pending_running_and_ready():
+    """A stopping worker fails everything left: allocated-but-unsubmitted (still in
+    ready_tasks), running and pending tasks, and frees every resource."""
+    sched = _make_scheduler(logging.getLogger("t"), {}, _job_resource(ncpus=2))
+    sched.cluster.set_event_loop(asyncio.get_running_loop())
+    for i in range(5):
+        sched.add_task(_task(f"t{i}"))
+    assert sched._allocate_pending() == 2
+    sched.ready_tasks.get_nowait()  # t0 submitted; t1 still waits in ready_tasks
+    free_before = sched.cluster.free_cpus
+
+    handles = {_h(sched, f"t{i}") for i in range(5)}
+    failed = sched.fail_unfinished()
+
+    assert set(failed) == handles
+    assert sched.ready_tasks.empty() and sched.state.pending_tasks.empty()
+    assert not sched.state.unfinished()
+    assert sched.cluster.free_cpus == free_before + 2
+    assert sched.state.nfailed == 5
+    assert len(sched.tasks) == 0
+    await asyncio.wait_for(sched.wait_for_completion(), timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -330,7 +391,7 @@ async def test_heterogeneous_tasks(policy, strict):
     rng = random.Random(0)
     sizes = {f"t{i}": rng.choice([1, 1, 1, 2, 3, 4]) for i in range(ntasks)}
 
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {},
         _job_resource(ncpus=ncpus),
@@ -365,24 +426,24 @@ async def test_heterogeneous_tasks(policy, strict):
             if not running:
                 # Nothing running: the monitor must make progress on its own.
                 tid, _ = await asyncio.wait_for(sched.ready_tasks.get(), timeout=5.0)
-                take(tid)
+                take(_name(tid, sched))
             for _ in range(3):  # let the monitor run its pass
                 await asyncio.sleep(0)
             while not sched.ready_tasks.empty():
-                take(sched.ready_tasks.get_nowait()[0])
+                take(_name(sched.ready_tasks.get_nowait()[0], sched))
             if running:
                 victim = rng.choice(sorted(running))
                 running.discard(victim)
                 in_use -= sizes[victim]
-                sched.free(victim, TaskStatus.SUCCESS)
+                sched.free(_h(sched, victim), TaskStatus.SUCCESS)
         for tid in sorted(running):
-            sched.free(tid, TaskStatus.SUCCESS)
+            sched.free(_h(sched, tid), TaskStatus.SUCCESS)
         await asyncio.wait_for(sched.wait_for_completion(), timeout=5.0)
     finally:
         await sched.stop_monitoring()
 
     assert sorted(started) == sorted(sizes)
-    assert sched._pending_tasks.empty() and not sched._running_tasks
+    assert sched.state.pending_tasks.empty() and not sched.state.running_tasks
     assert sched.cluster.get_status()[0] == ncpus
     if strict:
         if policy == "fifo_policy":
@@ -394,7 +455,7 @@ async def test_heterogeneous_tasks(policy, strict):
 
 
 def test_min_req_running_minimum():
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"), {}, _job_resource(ncpus=8), policy="fifo_policy"
     )
     assert sched._find_min_resource_req() is None
@@ -403,20 +464,20 @@ def test_min_req_running_minimum():
     sched.add_task(_task("small", ppn=2))
     assert sched._find_min_resource_req().resources[0].cpu_count == 2
     # Removing the small one leaves a stale (too low) minimum -- safe by design.
-    assert sched.delete_task(sched.tasks["small"]) is True
+    assert sched.delete_task(_h(sched, "small")) is True
     assert sched._find_min_resource_req().resources[0].cpu_count == 2
-    assert sched.delete_task(sched.tasks["big"]) is True
-    assert sched._pending_tasks.empty()
+    assert sched.delete_task(_h(sched, "big")) is True
+    assert sched.state.pending_tasks.empty()
     assert sched._find_min_resource_req() is None
 
 
 def test_seed_pending_resets_min_req():
-    sched = AsyncTaskScheduler(
+    sched = _make_scheduler(
         logging.getLogger("t"),
         {"a": _task("a", ppn=1), "b": _task("b", ppn=3)},
         _job_resource(ncpus=8),
         policy="large_resource_policy",
     )
     assert sched._find_min_resource_req().resources[0].cpu_count == 1
-    sched._seed_pending(["b"])
+    sched._seed_pending([_h(sched, "b")])
     assert sched._find_min_resource_req().resources[0].cpu_count == 3

@@ -63,7 +63,7 @@ print_comparison(f"Result (1x {PAYLOAD_SIZE} floats = ~{PAYLOAD_SIZE*8//1_000_00
 # ------------------------------------------------------------------ #
 #  ResultBatch (100 Results, large payloads)
 # ------------------------------------------------------------------ #
-rb = ResultBatch(data=[Result(data=np.random.rand(PAYLOAD_SIZE)) for _ in range(BATCH_SIZE)])
+rb = ResultBatch.from_results([Result(uid=bytes(16), data=np.random.rand(PAYLOAD_SIZE)) for _ in range(BATCH_SIZE)])
 rb_frames = rb.to_byte_array()
 
 ba_ser, ba_deser = bench(
@@ -82,7 +82,7 @@ print_comparison(f"ResultBatch ({BATCH_SIZE}x Results, ~{BATCH_SIZE*PAYLOAD_SIZE
 # ------------------------------------------------------------------ #
 #  IResultBatch (100 Results, large payloads)
 # ------------------------------------------------------------------ #
-irb = IResultBatch(data=[Result(data=np.random.rand(PAYLOAD_SIZE)) for _ in range(BATCH_SIZE)])
+irb = IResultBatch.from_results([Result(uid=bytes(16), data=np.random.rand(PAYLOAD_SIZE)) for _ in range(BATCH_SIZE)])
 irb_frames = irb.to_byte_array()
 
 ba_ser, ba_deser = bench(
@@ -111,7 +111,7 @@ tasks = [
     )
     for i in range(BATCH_SIZE)
 ]
-tu = TaskUpdate(added_tasks=tasks, deleted_tasks=[])
+tu = TaskUpdate.from_tasks(tasks)
 tu_frames = tu.to_byte_array()
 
 ba_ser, ba_deser = bench(

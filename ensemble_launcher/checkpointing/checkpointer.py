@@ -3,7 +3,7 @@
 Each component is written to its own file so they can be updated independently:
 
   ``{node_id}_meta.json``       — CheckpointData (metadata / manifest)
-  ``{node_id}_scheduler.json``  — SchedulerState
+  ``{node_id}_scheduler.json``  — the scheduler state's own JSON (``to_json`` / ``from_json``)
   ``{node_id}_comm.json``       — CommCheckpointData (type name + serialised state)
   ``{node_id}_tasks.json``      — TasksCheckpointData (cloudpickled task dict)
   ``{node_id}_results.json``    — ResultCheckpointData (cloudpickled result dict)
@@ -32,17 +32,21 @@ import stat
 import tempfile
 import time
 from logging import Logger
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Type, Union
 
 import cloudpickle
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ensemble_launcher.comm.async_base import AsyncCommState
-from ensemble_launcher.scheduler.state import SchedulerState
 
 if TYPE_CHECKING:
     from ensemble_launcher.comm.messages import Result
     from ensemble_launcher.ensemble import Task
+
+# A scheduler state is anything with ``to_json() -> str`` and a ``from_json(str)`` classmethod
+# (`SchedulerState`, `TaskSchedulerState`). Writers may pass the JSON string itself -- a master
+# does, because its live state must be serialized on the event loop, not on the writer thread.
+SchedulerStateLike = Any
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +67,10 @@ class CheckpointData(BaseModel):
     has_scheduler: bool = False
     has_comm: bool = False
     has_tasks: bool = False
-    pid: int = os.getpid()
-    hostname: str = socket.gethostname()
+    # Factories, not plain defaults: a default is evaluated once at import, which records
+    # the importing process rather than the node writing the checkpoint.
+    pid: int = Field(default_factory=os.getpid)
+    hostname: str = Field(default_factory=socket.gethostname)
 
 
 class CommCheckpointData(BaseModel):
@@ -284,7 +290,7 @@ class Checkpointer:
 
     def _write_components_sync(
         self,
-        scheduler_state: Optional[SchedulerState],
+        scheduler_state: Union[str, SchedulerStateLike, None],
         comm_state: Optional[AsyncCommState],
         tasks: Optional[Dict[str, "Task"]],
     ) -> CheckpointData:
@@ -304,9 +310,8 @@ class Checkpointer:
         has_tasks = meta.has_tasks if meta else False
 
         if scheduler_state is not None:
-            self._write_json_atomic(
-                self.scheduler_path, scheduler_state.model_dump_json()
-            )
+            raw = scheduler_state if isinstance(scheduler_state, str) else scheduler_state.to_json()
+            self._write_json_atomic(self.scheduler_path, raw)
             has_scheduler = True
 
         if comm_state is not None:
@@ -336,9 +341,10 @@ class Checkpointer:
 
     def _read_components_sync(
         self,
+        state_cls: Optional[Type] = None,
     ) -> Optional[
         Tuple[
-            Optional[SchedulerState],
+            Optional[SchedulerStateLike],
             Optional[AsyncCommState],
             Optional[Dict[str, "Task"]],
         ]
@@ -350,11 +356,11 @@ class Checkpointer:
 
         meta = CheckpointData.model_validate_json(raw_meta)
 
-        scheduler_state: Optional[SchedulerState] = None
+        scheduler_state: Optional[SchedulerStateLike] = None
         if meta.has_scheduler:
             raw = self._read_json(self.scheduler_path)
             if raw is not None:
-                scheduler_state = SchedulerState.model_validate_json(raw)
+                scheduler_state = state_cls.from_json(raw) if state_cls is not None else raw
 
         comm_state: Optional[AsyncCommState] = None
         if meta.has_comm:
@@ -378,7 +384,7 @@ class Checkpointer:
 
     async def write_checkpoint(
         self,
-        scheduler_state: Optional[SchedulerState] = None,
+        scheduler_state: Union[str, SchedulerStateLike, None] = None,
         comm_state: Optional[AsyncCommState] = None,
         tasks: Optional[Dict[str, "Task"]] = None,
     ) -> None:
@@ -389,7 +395,9 @@ class Checkpointer:
         saved components are preserved.  The metadata file is always updated.
 
         Args:
-            scheduler_state: From ``scheduler.get_state(node_id)``.
+            scheduler_state: The scheduler state, or its JSON string (``to_json()``).
+                             An object is serialized on the writer thread, so only
+                             pass one that nothing mutates meanwhile (a snapshot).
             comm_state:      From ``comm.get_state()``.
             tasks:           ``{task_id: Task}`` dict; cloudpickled to handle
                              arbitrary ``Task.executable`` callables.
@@ -405,14 +413,20 @@ class Checkpointer:
 
     async def read_checkpoint(
         self,
+        state_cls: Optional[Type] = None,
     ) -> Optional[
         Tuple[
-            Optional[SchedulerState],
+            Optional[SchedulerStateLike],
             Optional[AsyncCommState],
             Optional[Dict[str, "Task"]],
         ]
     ]:
         """Non-blocking read of all checkpoint components from disk.
+
+        Args:
+            state_cls: Parses the scheduler file (``state_cls.from_json``): `SchedulerState`
+                       for a master, `TaskSchedulerState` for a worker. ``None`` returns
+                       the raw JSON string.
 
         Returns:
             ``(scheduler_state, comm_state, tasks)`` if a metadata file exists
@@ -420,7 +434,7 @@ class Checkpointer:
             or ``None`` if no checkpoint exists at all.
         """
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, self._read_components_sync)
+        result = await loop.run_in_executor(None, self._read_components_sync, state_cls)
         if result is None:
             self.logger.debug(f"[Checkpointer] No checkpoint found for {self.node_id}")
             return None

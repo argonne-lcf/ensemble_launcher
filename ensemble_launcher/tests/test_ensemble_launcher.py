@@ -96,3 +96,70 @@ if __name__ == "__main__":
     print("test_el_cluster_mode")
     test_el_cluster_mode()
     print("All tests passed")
+
+
+# ---------------------------------------------------------------------------
+# Task identity: EL routes by Task.uid, so user task_ids need not be unique
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_task_ids_both_run():
+    tasks = {
+        f"k{i}": Task(task_id="same", nnodes=1, ppn=1, executable=echo, args=(f"run-{i}",))
+        for i in range(2)
+    }
+    el = EnsembleLauncher(
+        ensemble_file=tasks,
+        system_config=SystemConfig(name="local", ncpus=4, cpus=list(range(4))),
+        launcher_config=LauncherConfig(
+            task_executor_name="async_processpool",
+            comm_name="async_zmq",
+            policy_config=PolicyConfig(nlevels=1, nchildren=1),
+            return_stdout=False,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
+        ),
+        Nodes=[socket.gethostname()],
+    )
+    results = el.run().data
+    assert [r.task_id for r in results] == ["same", "same"]
+    assert sorted(r.data for r in results) == ["Hello from task run-0", "Hello from task run-1"]
+
+
+def test_worker_builds_tasks_only_while_running(monkeypatch):
+    """A worker keeps tasks as bytes and builds a Task object only to run it."""
+    import gc
+    import weakref
+
+    from ensemble_launcher.taskstore import SegmentTaskStore
+
+    built = []  # weak references to every Task the worker built (Tasks are unhashable)
+    most_alive = [0]
+    real_task = SegmentTaskStore.task
+
+    def counting_task(self, uid):
+        gc.collect()
+        alive = sum(1 for ref in built if ref() is not None)
+        most_alive[0] = max(most_alive[0], alive + 1)
+        t = real_task(self, uid)
+        built.append(weakref.ref(t))
+        return t
+
+    monkeypatch.setattr(SegmentTaskStore, "task", counting_task)
+    ntasks, ncpus = 40, 2
+    el = EnsembleLauncher(
+        ensemble_file=_make_tasks(ntasks),
+        system_config=SystemConfig(name="local", ncpus=ncpus, cpus=list(range(ncpus))),
+        launcher_config=LauncherConfig(
+            task_executor_name="async_processpool",
+            comm_name="async_zmq",
+            policy_config=PolicyConfig(nlevels=0),
+            return_stdout=False,
+            task_flush_interval=0.5,
+            result_flush_interval=0.5,
+        ),
+        Nodes=[socket.gethostname()],
+    )
+    results = el.run().data  # nlevels=0: the worker runs in this process
+    assert len(results) == ntasks
+    assert most_alive[0] <= ncpus + 1, most_alive[0]

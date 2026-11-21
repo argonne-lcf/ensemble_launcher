@@ -11,7 +11,7 @@ A node's files live at ``<checkpoint_dir>/<node_id split on ".">/<node_id>_*``, 
 import os
 import time
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 
 def _wait_for_path(path: str, timeout: float, poll_interval: float = 1.0) -> None:
@@ -105,3 +105,40 @@ def discover_policy_nodes(checkpoint_dir: str) -> List[str]:
             if name.endswith("_policy.ckpt"):
                 found.append(name[: -len("_policy.ckpt")])
     return sorted(found)
+
+
+@dataclass
+class NodeProcess:
+    """Where one orchestrator node runs, as recorded in its checkpoint metadata."""
+
+    node_id: str
+    hostname: str
+    pid: int
+    timestamp: float
+
+
+def read_node_processes(checkpoint_dir: str) -> Dict[str, NodeProcess]:
+    """Host and pid of every node that has checkpointed under *checkpoint_dir*.
+
+    Read from each node's ``{node_id}_meta.json``. A file caught mid-write or otherwise
+    unreadable is skipped; the caller can poll again.
+    """
+    from ensemble_launcher.checkpointing import CheckpointData
+
+    found: Dict[str, NodeProcess] = {}
+    for dirpath, _dirnames, filenames in os.walk(checkpoint_dir):
+        for name in filenames:
+            if not name.endswith("_meta.json"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), "r") as f:
+                    meta = CheckpointData.model_validate_json(f.read())
+            except Exception:
+                continue
+            found[meta.node_id] = NodeProcess(
+                node_id=meta.node_id,
+                hostname=meta.hostname,
+                pid=meta.pid,
+                timestamp=meta.timestamp,
+            )
+    return found

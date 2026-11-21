@@ -37,9 +37,12 @@ inside a test file is therefore invisible to the node. Put fixture policies in a
 module (see `tests/policy_fixtures.py`) and point the child at it with
 `EL_EXTERNAL_POLICY_PATH` / `EL_EXTERNAL_POLICY_MODULE`.
 
-Tests leave scratch directories behind in `tests/` and nothing cleans them up:
-`.actor_ckpt_*` (hundreds accumulate) and `task-N/` from `test_async_worker.py`'s
-working-directory test. The `task-N/` ones contain a *copy of the test file*, so an
+Default scratch directories clean up after themselves: a `PublicActor`'s
+`.actor_ckpt_<hex>` is made in its own process when it runs and removed when it stops,
+and `AsyncMPIExecutor`'s `.mpi_tmp_<uuid>` is removed on `shutdown` / `ashutdown`
+(directories you pass in are kept). A killed run still leaves them, and tests that drive
+an actor's internals by hand (`test_actor.py`) write their own. `task-N/` from
+`test_async_worker.py`'s working-directory test is never cleaned up. The `task-N/` ones contain a *copy of the test file*, so an
 interrupted run breaks the next collection with `import file mismatch`. Clear them with
 `rm -rf task-[0-9]*` before re-running.
 
@@ -54,11 +57,54 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
 
 2. **Communication** (`ensemble_launcher/comm/`) — message passing between nodes.
    `AsyncComm` (`comm/async_base.py`) is the base; `AsyncZMQComm` (`comm/async_zmq.py`) is
-   the ZMQ implementation. Below it, `comm/pipe/` holds the connection layer
-   (`AsyncZMQRouterConnection` / `AsyncZMQDealerConnection`) that both the comm layer and
-   the standalone endpoints (actors, policy) build on.
+   the ZMQ implementation. Below it, `comm/pipe/` holds the connection layer that both the
+   comm layer and the standalone endpoints (actors, policy) build on: the shared bases at the
+   top (`async_connection.py` front ends, `io_process.py` IOProcess + queues,
+   `async_transport.py`, `registry.py`), and one subpackage per transport, each with
+   `connection.py` / `io_process.py` / `transport.py` -- `comm/pipe/zmq/`
+   (`AsyncZMQRouterConnection` / `AsyncZMQDealerConnection`, `ZMQRouterIOProcess` /
+   `ZMQDealerIOProcess`, `AsyncZMQTransport`) and `comm/pipe/mp/` (multiprocessing.Pipe).
+   **Connections are a front end plus an `IOProcess`, joined by one two-way queue.**
+   `AsyncConnection` (and `ServerConnection` / `ClientConnection`, the ZMQ router/dealer and MP
+   classes) is only the API: each side holds one end of the queue (`put_nowait` reaches the
+   other end's `get`); `send` puts `("send", req_id, target, timeout, frames)` and awaits
+   `("sent", req_id, ok)`; `recv` reads `("data", frames)` the IOProcess put; `add/remove_expected_remote` and `set_unknown_sender_validator`
+   become `("control", ...)` items. **All ACK handling lives in the `IOProcess`**
+   (`comm/pipe/io_process.py`; the per-transport subclasses in `zmq/io_process.py` /
+   `mp/io_process.py` hold the socket code): its receive loop verifies the sender, ACKs at once and forwards; its
+   sends assign msg ids and wait for the peer's ACK with the timeout. The IOProcess runs on the
+   caller's loop (`LocalIOQueue.pair()`: two cross-wired `asyncio.Queue`s), or with
+   `io_process=True` + `req_res=True` on a ZMQ connection, in its own spawned process
+   (`SocketIOQueue(send_path, recv_path, bind)` on each side: one Unix stream socket per path,
+   items length-framed and parsed in a `BufferedProtocol`; the IOProcess gets the owner's two
+   paths reversed; built from the paths alone, then `await open()` / `await close()`;
+   `start_io_process` is a coroutine too. The bind side's `open()` only listens -- the owner
+   opens before it spawns the IOProcess -- and items put before the peer connects are kept and
+   sent in order. `ZMQIOQueue` has the same interface, kept for `benchmark_io_queue.py`).
+   **Fast path:** every queue takes `routes={kind: asyncio.Queue}`; received items of a routed
+   kind land in that queue already decoded and never reach `get()` (`SocketIOQueue` routes in
+   `buffer_updated` by the kind frame, `LocalIOQueue` on the peer's put, `ZMQIOQueue` inside
+   `get()`). The front end routes `"data"` to `_msg_queue` (`recv()` returns `item[1]`), so
+   `_listen` only sees `"sent"` / `"ready"` and IOProcess death; the IOProcess routes `"send"`
+   to `IOProcess.send_requests` (its `_send_loop`), so `_input_loop` only sees `"control"`), so
+   a busy event loop can't delay ACKs -- the 2048-node failure in #69. `LauncherConfig.comm_io_process`
+   turns that on for every node's data transport (heartbeats, `PolicyEndpoint`, clients and
+   actors stay in process); it is carried in the transport and connection states, so a child's
+   parent connection runs out of process in the child too. Out of process the unknown-sender
+   validator must be a `SenderRule` (prefix + secret), not a closure. The IOProcess exits when
+   its owner dies. Tests: `EL_TEST_COMM_IO_PROCESS=1 pytest -m core` runs the suite with it on.
+   **Peer liveness is an optional IOProcess capability**, since not every transport can tell
+   that its peer is gone (that's why nodes use `HeartBeatProcess`). A transport that can sets
+   `IOProcess.provides_peer_liveness` and implements `_raw_watch_peer`, calling `_peer_up()` /
+   `_peer_down()`; the IOProcess reports each change as `("peer", alive)`, and the front end
+   turns it into its `peer_connected` / `peer_lost` events (`conn.peer_liveness` says whether
+   they can ever change; an IOProcess dying also sets `peer_lost`). Today only the
+   non-lightweight `ZMQDealerIOProcess` provides it: a socket monitor on the ZMTP heartbeat
+   (5 s / 15 s, run by libzmq's threads, so a busy loop can't cause a false alarm). The watcher
+   is cancelled before the socket closes, so our own close is never reported. `AsyncComm` does
+   not use it yet; `ClusterClient` does.
    Messages are typed dataclasses in `comm/messages.py`: `Message`, `Status`, `Result`,
-   `ResultBatch`, `IResultBatch`, `TaskUpdate`, `NodeUpdate`, `Ready`, `Stop`, `TaskRequest`,
+   `ResultBatch`, `IResultBatch`, `TaskUpdate`, `NodeUpdate`, `Ready`, `Stop`, `Done`, `TaskRequest`,
    `NodeRequest`. (Heartbeats are not a message type — they live in `comm/hb.py` as
    `HeartBeatProcess`.)
 
@@ -72,14 +118,170 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    - children policies (`ChildrenPolicy`) — `simple_split_children_policy` (default),
      `bin_packing_children_policy`, `fixed_leafs_children_policy`
 
+   **Uids between nodes, handles inside one.** Every `Task` has an internal 16-byte `uid` (set
+   at creation; `task_id` is only the user's name and need not be unique). The uid is how
+   *nodes* (and `ClusterClient`) name a task to each other: it travels in every `TaskUpdate`
+   and result, and `ClusterClient` futures key by it. **Inside a node everything uses the
+   store's handle** (an opaque int64, see Task store): schedulers, policies, outboxes,
+   `unplaced`, the worker's pending/running state and futures. Uids become handles in one
+   place, `store.lookup` (results arriving, `deleted_uids`); handles become uids only when the
+   store builds a message (`build_update`, `build_failed_results`) or a `Task`. Never send or
+   checkpoint a handle. `TaskUpdate` / `ResultBatch` / `IResultBatch` carry items as columns
+   (`comm/blob.py`: fixed-width `uids` plus blob + `int64` offsets) and are built with
+   `TaskUpdate.from_tasks` / `ResultBatch.from_results`; masters split and join them with
+   `select` / `concat` and never decode them. Only workers build `Task`s (`store.task(h)`,
+   right before submitting) and only the root / `ClusterClient` build `Result`s
+   (`.to_results()`, `.data`). Do not reintroduce per-task Python objects on masters: that was
+   #65 (GC at 38% of `main`'s busy time at 256 nodes). Measure with
+   `benchmarks/benchmark_master_routing.py` (`--hold` keeps tasks held).
+
+   **Task store.** `self.tasks` on both schedulers is a `TaskStore` (`taskstore/base.py` has
+   the contract), chosen by `LauncherConfig.task_store`. It holds every per-task fact a node
+   has: the bytes, plus two int32 columns -- **assignment** (`UNASSIGNED` = a master's pool,
+   or a tag >= 0: the wid of the child the task is placed on) and **client** (`NO_CLIENT` =
+   from the parent, else a code for the submitting client; `client_name(code)`). A **handle**
+   is unique among live tasks, stable until `release`, increasing within one `add`, and
+   opaque (`SegmentTaskStore` uses `seg << 32 | row`, so a handle finds its row with no
+   lookup; another store could use a row counter or a `rowid`). The Mapping side is keyed by
+   handle: policies get the store via `bind_tasks` and read `self.tasks[h]` (a `TaskMeta`,
+   decoded on demand -- don't keep them). Batch ops take handle arrays: `assign(idx, tag)`
+   (only rows still `UNASSIGNED`), `assigned(idx)` (`RELEASED` for gone ones),
+   `assigned_to(tag)`, `reassign(from, to)`, `count(tag)`, `groups()`, `clients(idx)`,
+   `meta_columns`, `build_update`, `build_failed_results`, `mark_delivered`, `release`.
+   `SegmentTaskStore` keeps received updates as segments, offloads past
+   `task_store_hot_bytes` to `task_store_dir` (mmap; the assignment/client/delivered columns
+   stay in memory on the segment), and `release` drops finished tasks at once -- so
+   `h in store` means "still to run". The store forgets finished tasks, so
+   `len(scheduler.tasks)` shrinks; use `scheduler.state.ntasks_added` for totals. It keeps
+   **no task status**: how a task ended travels in its result, and workers only count
+   outcomes (`state.ncompleted` / `nfailed`). On masters, `queue_result` -> `lookup` ->
+   `clients(idx)` (only if `has_clients()`) -> `release` is the whole result path, and the
+   batch goes up untouched when no task has a client. `taskstore` must not import
+   `comm.messages` at module level (circular import via `scheduler.resource`).
+
+   **Task meta is a fixed-width record** (`ensemble.META_DTYPE`, 153 B: numeric fields plus
+   `task_id` / `executor_name` / `tag` as 32-byte ASCII, truncated with a warning; empty
+   means `None`). `TaskUpdate._meta` is a structured array (`np.frombuffer` on receipt).
+   Reading it per row is *slower* than the old pickled tuple (a numpy field read is ~300 ns),
+   so hot paths read **columns**: `store.meta_columns(idx)` returns one array aligned with
+   `idx` (any order; gathered once per segment, then reordered). Policies get it through
+   the optional column entry points `get_children_tasks_columns` /
+   `get_children_resources_columns` (children) and `get_scores_columns` (task);
+   `get_children_tasks_columns` returns **one wid per row** (-1: unplaced) rather than
+   per-child lists (the default bridges to the row method via `wids_from_groups`). The
+   scheduler calls whichever of a row/column pair is defined furthest down the policy's MRO
+   (`policy.prefers_columns`), so row-only plugged-in policies keep working and a subclass
+   overriding a row method is not bypassed. The built-ins (`SimpleSplit` -- round robin per
+   shape, `BinPacking`, `LargeResourcePolicy`) are vectorized. `TaskMeta` / `build_task`
+   decode one row to Python values with `meta_row_values` -- never hand numpy scalars or
+   bytes to `Task`.
+
+   **Master scheduler state.** `scheduler.state` is a `SchedulerState` (`scheduler/state.py`)
+   and holds **only the children's state and resource allocations**: `children` (one `Child`
+   record each -- `wid`, `job_resource`, `state`, `status`, `allocated`, `ready`/`done`
+   events, `outbox`), `wid_counter`, `ntasks_added`, `all_done`. **No task data**: where a task
+   is lives in the store's assignment column (a child's tasks are `store.assigned_to(wid)`,
+   its load `store.count(wid)`), and its client in the client column. Each object's methods
+   change only itself (`add_child` / `pop_child` touch only the state); `AsyncChildrenScheduler`
+   is the one place a move touches both. The invariant -- **every unfinished task is in the
+   pool or on exactly one child** -- holds by construction: one assignment per row. Wids are
+   never reused (`next_wid()` is the monotonic `wid_counter`), because a child removed for
+   recovery keeps its tasks tagged with its wid until `reinstate_child` re-adds it.
+   Orchestrators **read** the state; only the scheduler writes it. Don't add parallel per-child
+   dicts -- put fields on `Child`; don't put task data on it -- that goes in the store.
+   `SchedulerState` is also the checkpoint (`get_state()` = `to_json()`, on the loop) and it
+   is **the layout only**: no task is named. A restarted master gets its tasks back from where
+   they came from (the root re-queues its initial tasks; the parent resends a sub-master's
+   unfinished ones), and `set_state` re-allocates the children (before `start()`), on which the
+   assigner then places them anew. Children policies receive `{wid: Child}`.
+
+   **Task placement is event driven.** `await scheduler.queue(update, client_id)` stores the
+   tasks (`UNASSIGNED`: the pool); in push mode it also puts their handle array on the private
+   `_input` queue. The assigner task (`start()` / `stop()`) places each item in chunks of
+   `assign_chunk_size`, yielding between chunks (so a huge update never holds the loop), tags
+   placed tasks with `store.assign(idx, wid)`, and puts **one handle array per child per input
+   item** on `child.outbox`. Handles no child can take go on `scheduler.unplaced` (the master
+   fails them); `scheduler.drained` is set while the store is empty and nothing is being
+   placed. Pull mode (work stealing) only pools, and `request(child_id, n)` places on demand.
+   The assignment column is the source of truth: queues may hold stale handles, dropped where
+   they are consumed (assigner: not `UNASSIGNED`; sender: not tagged with the child's wid). On
+   the master, `_child_sender` per child takes a window slot (`max_inflight_task_sends`,
+   default 1) *then* an outbox item and hands it straight to `_schedule_task_flush(child_id,
+   msg, idx)`; `_task_flush_done` frees the slot (and `delivered(idx)`), or resends the same
+   message object in the same slot (so the child can drop a duplicate). No task-flush timer:
+   `task_flush_interval` and `task_buffer_size` no longer affect masters. Recovery:
+   `remove_child` frees the resources but **leaves its tasks tagged with its wid**;
+   `reinstate_child` re-adds the child and refills its outbox with `assigned_to(wid)`, or, if
+   the resources can't be re-allocated, `reassign(wid, UNASSIGNED)` + `requeue` places them on
+   the other children (the retry loop and `_give_up_on_child` find no record to act on, so
+   nothing else would). A reset (`create_children(reset=True)`, `set_state`) returns a child's
+   tasks to the pool. A child given up on (restarts off, retries used up -- including a
+   reinstated child that never relaunched, so READY -- or still failing at startup) stays as a
+   FAILED record: `_give_up_on_child` is `transition(child_id, FAILED, requeue=True)`. Any
+   terminal move (SUCCESS or FAILED) empties the child -- `reassign(wid, UNASSIGNED)`, then
+   `requeue=True` places them on the other children and `requeue=False` puts them on
+   `unplaced` (failed). SUCCESS is never refused: on `Done` the master moves the child to
+   SUCCESS (no requeue), so tasks it still held (e.g. placed after it took `Stop`) are failed
+   instead of blocking the stop. Placement skips terminal children, and
+   `_wait_for_child_done` ends on `Done` *or* the child turning terminal, so the stop path
+   never waits on a failed child.
+
+   **Result routing is event driven on masters.** Every result batch -- streamed from a child,
+   or made by `_fail_tasks` (`store.build_failed_results(idx, ...)`, which also returns the
+   rows' handles) -- goes through `scheduler.queue_result(batch, idx=None)`: it looks the uids
+   up (unless given `idx`), reads their client codes, finishes the tasks (`finish_tasks(idx)`
+   = `release`) and puts the batch, split by row per destination, on the
+   submitting client's outbox (`client_outboxes`, made on first use and announced on the
+   `new_clients` queue) or on the one `parent_outbox` (a node has one parent). Never call
+   `finish_tasks` from the orchestrator. Per destination, `_result_sender` takes a window slot
+   (`max_inflight_flushes`, default 1), then an item **and everything else already queued**,
+   and sends them as one `IResultBatch`; `_result_flush_done` marks the items done on delivery
+   (so `outbox.join()` means "delivered") or resends the same message in the same slot. The
+   root has no parent sender: its `parent_outbox` is the run's results, returned by `run()`.
+   **Workers keep the timer** (`result_flush_interval`, `result_buffer_size`): results finish
+   one at a time there, and without it each would be its own message, landing on the masters.
+   Masters no longer read either setting.
+
+   **`Done`, not a final `ResultBatch`.** A node streams every result, and when it finishes it
+   delivers everything still queued (`_flush_results` / the worker's `_drain_results`), sends
+   its final `Status`, then `Done`. Results are buffered by type on the receiver, so when the
+   parent reads `Done` every result from that child is there; the parent then marks the child
+   SUCCESS (failing anything it still held). `ResultBatch` is only what `run()` returns and what the `{node}_results.bin`
+   fallback holds (results that could not be delivered; no `Done` is sent then).
+
+   **One start path, one stop path.** Only the root is built with tasks (its first
+   `queue()`). A child is started by heartbeat sync, then the parent pushes its `NodeUpdate`
+   and waits for the ACK, then `transition(RUNNING)` sets `ready` and its sender starts --
+   no `NodeRequest` / initial `TaskRequest` round trips, and every child always runs its
+   task-update monitor. A sub-master whose children policy has `layout_needs_tasks` (bin
+   packing) takes its parent's first `TaskUpdate` before laying out children. No node decides
+   by itself that it is finished: every node stops on its parent's `Stop`, its stop signal
+   (SIGTERM or `request_stop()`), or its parent dying. A master's `_wait_for_finish` is the
+   whole stop path, in order: stop condition -> propagate `Stop` -> every child's `Done` ->
+   drain the forwarders -> `_fail_unfinished` (everything still in the store, from
+   `scheduler.unfinished()`, via `_fail_tasks`) -> `_flush_results` -> final status + `Done`.
+   Batch mode lives only in
+   `ensemble_launcher.py`: `run_batch(node)` awaits `node.wait_drained()` then calls
+   `request_stop()`. Tests that run a node directly use `run_batch` too.
+
+   **Worker scheduler state.** `AsyncTaskScheduler.state` is a `TaskSchedulerState` dataclass
+   -- `pending_tasks` (the pending container itself), `running_tasks` (handle -> resource),
+   `ncompleted` / `nfailed` (counters), `all_done`. The worker reads it directly; task policies
+   get the object itself as `scheduler_state` (read-only, no snapshot is built). It is
+   **runtime only**: a worker checkpoints only its comm state (and tuned policy state), not
+   its scheduler state or results -- its parent resends whatever has no result. (A restarted
+   root worker re-runs its initial tasks.) The worker keys `_task_futures` by handle, reads a
+   task's client from the store before `free` releases it, and keeps `_results` by uid
+   (results outlive the task).
+
    **Pending-task containers.** `AsyncTaskScheduler` picks its pending container by policy
    *name*: `"fifo_policy"` gets `PendingTaskQueue` (deque, tasks never scored); everything
    else gets `PendingTaskHeap` (scored). An instance resolves to its name by exact-class
    lookup in the registry, so a `FIFOPolicy` subclass is scored like any custom policy.
    `_monitor_resources` dispatches with a synchronous `pop()` / `requeue(skipped)` pass --
    never sort or scan the whole pending set per cycle; that was O(n log n) per cycle and
-   made throughput fall as the queue grew. `Policy.needs_scheduler_state = False` skips
-   building the (pydantic, O(total tasks)) `SchedulerState` on every `get_score`.
+   made throughput fall as the queue grew. (`Policy.needs_scheduler_state` is no longer
+   read: the live state is passed, so there is nothing to skip.)
 
    The pass trusts `AsyncLocalClusterResource._resource_available`: a failed allocate never
    clears it, so if it is ever set on a full cluster, backfill tests *every* pending task.
@@ -93,7 +295,9 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
 
    Custom policies can be loaded at runtime via env vars `EL_EXTERNAL_POLICY_MODULE` /
    `EL_EXTERNAL_POLICY_PATH` (honoured by `orchestrator/__init__.py` at import time, so
-   spawned children pick them up too).
+   spawned children pick them up too). Policies of both families take **handles**:
+   `get_children_tasks(idx, children, ...)` returns `{wid: handles}`, `get_score(handle, ...)`,
+   `on_task_complete(handle=..., ...)`; a child's load is `self.tasks.count(wid)`.
 
    **Policy state.** Both families mix in `PolicyStateMixin`, giving every policy a
    `self.state` dict seeded from `PolicyConfig.initial_state` and readable/writable from
@@ -106,6 +310,12 @@ interrupted run breaks the next collection with `import file mismatch`. Clear th
    - `AsyncWorker` — leaf node that executes tasks using a task executor.
    - `AsyncWorkStealingMaster` / `AsyncWorkStealingWorker` — work-stealing variant (enabled via `LauncherConfig.enable_workstealing`).
    - `ClusterClient` — connects to a running cluster via checkpoint directory to submit tasks and retrieve `concurrent.futures.Future`s.
+     One connection and one background thread running one asyncio loop (front end, result decoding,
+     buffer-flush timer); the socket and ACKs are the connection's IOProcess, out of process when
+     `io_process` (default: the cluster's `comm_io_process`) and `req_res`. Don't add threads or
+     executor hops to it: under the GIL they only add handoffs. When the connection reports
+     peer liveness, losing the node (died, hung, restarted) fails every task already sent with
+     `NodeConnectionLost`; buffered tasks stay and go out after the reconnect.
    - `PolicyEndpoint` / `PolicyClient` — read and retune a node's policy state while the run is in flight (see below).
    - `discovery.py` — shared checkpoint-directory lookup (`_resolve_node_id`, `read_policy_endpoint`, `discover_policy_nodes`), used by both clients.
 
@@ -168,13 +378,14 @@ Gotchas worth knowing before touching this code:
 - `PendingTaskHeap.rescore` mutates `self._heap` in place rather than swapping in a fresh
   heap, because the heap owns the `asyncio.Event` that `_monitor_resources` parks on.
   Replacing the object orphans that Event and silently deadlocks dispatch.
-- `AsyncConnection._recv_loop` only runs when `req_res=True`, and in that mode it auto-ACKs
-  and strips the msg_id frame. So the policy wire format carries no msg_id, correlating
+- The IOProcess receive loop (`IOProcess._recv_loop`) only verifies and ACKs when
+  `req_res=True`, and in that mode it auto-ACKs and strips the msg_id frame. So the policy wire format carries no msg_id, correlating
   replies by an explicit `request_id` instead.
 - `ServerConnection.verify_sender` short-circuits to `True` when no expected remotes are
   configured, which is exactly this endpoint's situation — so the shared-secret check is
   enforced at the application layer in `PolicyEndpoint._handle`, not by the connection.
-- `AsyncConnection.send()` does **not** retry internally; it returns `False` on ACK timeout.
+- `AsyncConnection.send()` (really `IOProcess._send`) does **not** retry internally; it
+  returns `False` on ACK timeout.
   Retrying is the caller's job.
 
 ### Key configuration types (`ensemble_launcher/config/config.py`)
@@ -196,6 +407,8 @@ Gotchas worth knowing before touching this code:
 - `req_res`: enables ACK-based guaranteed delivery at the comm layer (default `True`)
 - `send_retries`: number of retry attempts on ACK timeout, only when `req_res=True` (default `10`)
 - `send_timeout`: per-attempt ACK timeout in seconds, only when `req_res=True` (default `1.0`)
+- `comm_io_process`: run each node's data connections (socket, ACKs, sends) in a process of
+  their own, so a busy event loop can't delay ACKs (default `False`; `req_res=True` only)
 
 ### Cluster / MCP mode
 
@@ -213,7 +426,14 @@ SSH tunnel helpers for HPC login→compute node are in `ensemble_launcher/mcp/ut
   `{node}_policy.ckpt` / `{node}_policy_secret` / `{node}_policy_state.json` for the
   policy endpoint. Secret files are written `chmod 0600`.
 - Logs written to `logs/master-*.log` and `logs/worker-*.log`
-- Profiling: set `LauncherConfig(profile="perfetto")` → outputs `profiles/*_perfetto.json` and `profiles/*_stats.json`
+- Profiling is external, via py-spy: `el profile --checkpoint-dir X --node main --node 'main.m*'`
+  (`profiling/pyspy.py`) reads each node's host/pid from `{node}_meta.json` and runs
+  `py-spy record` on that host, over ssh when remote. Traces land in
+  `profiles/{node}_pyspy.json`; `python -m ensemble_launcher.profiling.merge_traces` shifts
+  py-spy's relative timestamps by each sidecar's `start_us`, gives every node its own pid, and
+  remaps py-spy's 64-bit pthread ids to small tids named by role (`event-loop`, `thread-pool N`)
+  -- Perfetto's JSON importer folds raw ones onto a single track.
+  There is no in-process profiler (`EventRegistry` / `LauncherConfig.profile` were removed).
 
 ### Auto-configuration logic
 

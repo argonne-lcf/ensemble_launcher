@@ -2,6 +2,7 @@ import asyncio
 import collections
 import inspect
 import os
+import shutil
 import secrets
 import time
 import uuid
@@ -676,9 +677,12 @@ class PublicActor(_ActorBase):
             send_retries=send_retries,
             run_in_executor=run_in_executor,
         )
+        # A ckpt_dir this actor made is removed when it stops; one passed in is kept.
+        # It is created in _run, in the actor's own process, so an actor that is built
+        # but never run leaves nothing behind.
+        self._owns_ckpt_dir = ckpt_dir is None
         if ckpt_dir is None:
             ckpt_dir = f"{os.getcwd()}/.actor_ckpt_{uuid.uuid4().hex[:6]}"
-        os.makedirs(ckpt_dir, exist_ok=True)
         self._ckpt_dir = ckpt_dir
         self._transport_classes = transport_registry.get(transport)
         self._transport: AsyncTransport = None
@@ -757,23 +761,27 @@ class PublicActor(_ActorBase):
         await self._conn.open()
 
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        fname = f"{self.ckpt_dir}/{self.name}.ckpt"
-        with open(fname, "w") as f:
-            f.write(self._conn.get_state().serialize())
-
-        self.logger.info("Done opening the server!")
-
-        self._recv_task = asyncio.create_task(self._recv())
-        self._send_task = asyncio.create_task(self._send())
-        self._main_loop_task = asyncio.create_task(self._main_loop())
-
-        await self._stop.wait()
-
-        self._main_loop_task.cancel()
         try:
-            await self._main_loop_task
-        except asyncio.CancelledError:
-            pass
+            fname = f"{self.ckpt_dir}/{self.name}.ckpt"
+            with open(fname, "w") as f:
+                f.write(self._conn.get_state().serialize())
+
+            self.logger.info("Done opening the server!")
+
+            self._recv_task = asyncio.create_task(self._recv())
+            self._send_task = asyncio.create_task(self._send())
+            self._main_loop_task = asyncio.create_task(self._main_loop())
+
+            await self._stop.wait()
+
+            self._main_loop_task.cancel()
+            try:
+                await self._main_loop_task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            if self._owns_ckpt_dir:
+                shutil.rmtree(self.ckpt_dir, ignore_errors=True)
 
 
 class PrivateActor(_ActorBase):

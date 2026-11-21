@@ -10,6 +10,7 @@ from collections import deque
 
 import pytest
 
+from ensemble_launcher.ensemble_launcher import run_batch
 from ensemble_launcher.comm.messages import Result
 from ensemble_launcher.config import (
     LauncherConfig,
@@ -19,6 +20,7 @@ from ensemble_launcher.config import (
 )
 from ensemble_launcher.ensemble import AsyncTask, Task
 from ensemble_launcher.orchestrator import AsyncWorker
+from ensemble_launcher.scheduler import TaskSchedulerState
 from ensemble_launcher.scheduler.resource import (
     JobResource,
     NodeResourceCount,
@@ -72,7 +74,7 @@ async def test_async_worker(task_executor="async_processpool", ntasks_per_core=1
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {}
     for r in res.data:
         results[r.task_id] = r.data
@@ -137,7 +139,7 @@ async def test_async_worker_heterogeneous(policy, strict):
         tasks,
     )
 
-    res = await asyncio.wait_for(w.run(), timeout=120)
+    res = await asyncio.wait_for(run_batch(w), timeout=120)
     results = {r.task_id: r for r in res.data}
 
     assert sorted(results) == sorted(sizes)
@@ -194,7 +196,7 @@ async def test_async_mpi_worker(task_executor="async_mpi"):
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {}
     for r in res.data:
         results[r.task_id] = r.data
@@ -242,7 +244,7 @@ async def test_async_mpi_worker_stdout_file(tmp_path, task_executor="async_mpi")
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {}
     for r in res.data:
         results[r.task_id] = r.data
@@ -293,7 +295,7 @@ async def test_async_mpi_pool_worker(task_executor="async_mpi_processpool"):
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {r.task_id: r.data for r in res.data}
 
     assert len(results) > 0 and all(
@@ -340,7 +342,7 @@ async def test_async_task_worker():
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {r.task_id: r.data for r in res.data}
 
     assert len(results) == len(tasks)
@@ -388,7 +390,7 @@ async def test_run_dir():
         tasks,
     )
 
-    res = await w.run()
+    res = await run_batch(w)
     results = {}
     for r in res.data:
         results[r.task_id] = r.data
@@ -437,11 +439,15 @@ def _make_flush_worker(behavior, **config):
     return w
 
 
+def _uid(tid: str) -> bytes:
+    """A readable fixed 16-byte uid for a test task name."""
+    return tid.encode().ljust(16, b"\0")
+
+
 def _queue_results(w, dest_id, *task_ids):
     q = w._iresult_q.setdefault(dest_id, deque())
     for tid in task_ids:
-        q.append(Result(sender="test", task_id=tid, success=True))
-        w._streamed_task_ids.add(tid)
+        q.append(Result(sender="test", uid=_uid(tid), task_id=tid, success=True))
 
 
 async def _wait_until(cond, timeout=5.0):
@@ -518,17 +524,17 @@ async def test_drain_results_waits_for_inflight_flush():
 
     drain = asyncio.create_task(w._drain_results("main"))
     await asyncio.sleep(0.1)
-    assert not drain.done()  # the final ResultBatch must not go out ahead of the stream
+    assert not drain.done()  # Done must not go out ahead of the stream
 
     gate.set()
     await asyncio.wait_for(drain, 5.0)
     assert [[r.task_id for r in msg.data] for _, msg in w._comm.sent] == [["t0"], ["t1"]]
     assert not w._result_flush_inflight["main"]
-    assert w._streamed_task_ids == {"t0", "t1"}
+    assert not w._undelivered
 
 
 @pytest.mark.asyncio
-async def test_drain_failure_moves_results_to_final_batch():
+async def test_drain_failure_keeps_results_as_undelivered():
     async def nack(msg):
         return False
 
@@ -536,8 +542,118 @@ async def test_drain_failure_moves_results_to_final_batch():
     _queue_results(w, "main", "t0", "t1")
 
     await w._drain_results("main")
-    # No longer counted as streamed, so _send_final_results_and_status includes them.
-    assert w._streamed_task_ids == set()
+    # Not delivered: kept for the results file, and Done is not reported to the parent.
+    ((dest, msg),) = w._undelivered
+    assert dest == "main" and [r.task_id for r in msg.data] == ["t0", "t1"]
+
+
+
+class _StubTaskScheduler:
+    """Just what the finishing path reads: no tasks left, nothing to fail."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.state = TaskSchedulerState(node_id="test")
+        self.tasks = {}
+        self.cluster = SimpleNamespace(free_cpus=0, free_gpus=0)
+
+    async def stop_monitoring(self):
+        pass
+
+    def fail_unfinished(self):
+        return []
+
+
+def _ok():
+    async def send(msg):
+        return True
+
+    return send
+
+
+async def _finish_worker(behavior):
+    from types import SimpleNamespace
+
+    w = _make_flush_worker(behavior)
+    w.parent = SimpleNamespace(node_id="main")
+    w._scheduler = _StubTaskScheduler()
+    w._parent_ready_event.set()
+    _queue_results(w, "main", "t0", "t1")
+    await w._send_final_results_and_status()
+    return w
+
+
+@pytest.mark.asyncio
+async def test_worker_sends_done_after_its_results_and_no_result_batch():
+    w = await _finish_worker({"parent": _ok()})
+    kinds = [type(msg).__name__ for _, msg in w._comm.sent]
+    assert kinds == ["IResultBatch", "Status", "Done"]  # Done last, after every result
+    assert "ResultBatch" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_worker_withholds_done_when_results_were_not_delivered(tmp_path, monkeypatch):
+    async def nack(msg):
+        return type(msg).__name__ != "IResultBatch"  # results fail; status would succeed
+
+    monkeypatch.chdir(tmp_path)
+    w = await _finish_worker({"parent": nack})
+    kinds = [type(msg).__name__ for _, msg in w._comm.sent]
+    assert "Done" not in kinds
+    assert (tmp_path / "test_results.bin").exists()  # the undelivered results are kept
+
+
+async def async_sleep(task_id: str, seconds: float) -> str:
+    await asyncio.sleep(seconds)
+    return task_id
+
+
+SLOW = 8.0  # seconds a "slow" task sleeps
+
+
+@pytest.mark.asyncio
+async def test_stop_fails_unfinished_tasks():
+    """A worker stopped mid-run reports every task: finished ones as they were, the
+    running and pending ones as failed, without waiting for them."""
+    tasks = {"quick": AsyncTask(task_id="quick", nnodes=1, ppn=1, executable=async_echo, args=("quick",))}
+    for i in range(5):
+        tasks[f"slow-{i}"] = AsyncTask(
+            task_id=f"slow-{i}", nnodes=1, ppn=1, executable=async_sleep, args=(f"slow-{i}", SLOW)
+        )
+    sys_info = NodeResourceList.from_config(SystemConfig(name="local", ncpus=2, cpus=[1, 2]))
+    w = AsyncWorker(
+        "test",
+        LauncherConfig(task_executor_name="async_processpool", report_interval=100.0,
+                       task_flush_interval=0.5, result_flush_interval=0.5),
+        JobResource(resources=[sys_info], nodes=[socket.gethostname()]),
+        tasks,
+    )  # fmt: skip
+    quick_uid = tasks["quick"].uid
+    # Time the final results, not run(): stop() then waits for the pool's processes, and
+    # a task already running in one is not killed by cancelling its future.
+    send_final, finished_at = w._send_final_results_and_status, []
+
+    async def timed_send_final():
+        batch = await send_final()
+        finished_at.append(time.monotonic())
+        return batch
+
+    w._send_final_results_and_status = timed_send_final
+
+    run = asyncio.create_task(w.run())
+    await _wait_until(lambda: quick_uid in w._results, timeout=30.0)
+    start = time.monotonic()
+    w._stop_signal_received.set()
+    res = await asyncio.wait_for(run, timeout=60.0)
+
+    assert finished_at[0] - start < SLOW / 2  # did not wait for the running tasks
+    by_name = {r.task_id: r for r in res.data}
+    assert set(by_name) == set(tasks)
+    assert by_name["quick"].success and by_name["quick"].data == "Hello from task quick"
+    for i in range(5):
+        r = by_name[f"slow-{i}"]
+        assert not r.success and "stopped before the task finished" in r.exception
 
 
 if __name__ == "__main__":

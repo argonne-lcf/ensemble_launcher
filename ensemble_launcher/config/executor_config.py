@@ -121,7 +121,8 @@ class AsyncMPIConfig(ExecutorConfig):
     """Configuration for ``async_mpi`` (:class:`AsyncMPIExecutor`)"""
 
     tmp_dir: Optional[str] = None
-    """Directory for the hostfiles and rankfiles the executor writes per launch"""
+    """Directory for the hostfiles and rankfiles the executor writes per launch
+    (default: a fresh ``.mpi_tmp_<uuid>`` in the working directory)"""
     mpi_config: Optional[MPIConfig] = None
     """Launcher flavour and flag spellings"""
 

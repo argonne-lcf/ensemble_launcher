@@ -32,6 +32,28 @@ worker may examine every larger task queued ahead of it, so dispatch slows as th
 (about 20-35% lower throughput at 10k pending tasks in our benchmarks). With uniform task
 sizes, or with `strict_priority=True`, dispatch cost does not depend on queue length.
 
+## How policies see tasks
+
+Policies never receive `Task` objects. Every task has an internal 16-byte `uid` (set when the
+`Task` is created; your `task_id` stays its name and need not be unique), and policy methods
+receive uids. Read a task's fields through `self.tasks[uid]`, which the scheduler binds before
+calling your policy:
+
+```python
+task = self.tasks[uid]
+task.nnodes, task.ppn, task.ngpus_per_process, task.task_id, task.tag  # every field...
+task.get_resource_requirements()
+```
+
+Every field except `executable`, `args`, `kwargs`, `env` and `result` is available. On a
+master, `self.tasks[uid]` decodes that one task from the bytes it received, so read what you
+need and don't keep the returned objects: holding one per task brings back the
+garbage-collector cost this design avoids (see `architecture.md`).
+
+!!! note "Changed in 0.2"
+    `get_score(self, task, ...)` became `get_score(self, uid, ...)`, and children policies
+    receive `uids` instead of a `Dict[str, Task]`. Replace `task.x` with `self.tasks[uid].x`.
+
 ## Writing a Custom Children Policy
 
 Subclass `ChildrenPolicy` and implement two methods:
@@ -43,12 +65,12 @@ from ensemble_launcher.ensemble import Task
 
 @policy_registry.register("my_custom_policy", type="children_policy")
 class MyCustomPolicy(ChildrenPolicy):
-    def get_children_resources(self, tasks, nodes, level):
+    def get_children_resources(self, uids, nodes, level):
         """
         Decide how many child workers to create and what resources each gets.
 
         Args:
-            tasks: Dict mapping task IDs to Task objects.
+            uids: The tasks to size the layout for; fields via self.tasks[uid].
             nodes: JobResource containing available nodes and per-node resources.
             level: Current hierarchy level (0 = root master).
 
@@ -61,25 +83,24 @@ class MyCustomPolicy(ChildrenPolicy):
             result[i] = JobResource([node])
         return result
 
-    def get_children_tasks(self, tasks, children_resources, ntask=None,
-                           child_assignments=None, child_status=None,
-                           level=None, **kwargs):
+    def get_children_tasks(self, uids, children, ntask=None, level=None, **kwargs):
         """
         Distribute tasks across workers given their pre-allocated resources.
 
         Args:
-            tasks: Dict mapping task IDs to Task objects.
-            children_resources: Dict mapping worker ID to JobResource.
+            uids: The tasks to assign; fields via self.tasks[uid].
+            children: Dict mapping worker ID (wid) to that child's `Child` record:
+                .job_resource (its allocated resources), .uids / len(child) (its
+                unfinished tasks), .status (its last Status message), .state.
+                Read-only here -- the scheduler applies what you return.
             ntask: Max tasks per worker (None = no limit).
-            child_assignments: Current assignment state per worker.
-            child_status: Most recent Status message per worker.
             level: Current hierarchy level.
 
         Returns:
             Tuple of:
-            - Dict mapping worker ID to list of task IDs assigned.
-            - Dict mapping task ID to worker ID.
-            - List of task IDs that could not be assigned.
+            - Dict mapping worker ID to list of uids assigned.
+            - Dict mapping uid to worker ID.
+            - List of uids that could not be assigned.
         """
         assignments = {}
         task_to_worker = {}
@@ -87,6 +108,16 @@ class MyCustomPolicy(ChildrenPolicy):
         # Your assignment logic here
         return assignments, task_to_worker, unassigned
 ```
+
+**When the layout is decided, tasks may not have arrived yet.** The root lays out its children
+after queuing its initial tasks, but a sub-master lays out its children as soon as it has its
+nodes; its tasks are pushed by its parent afterwards. So `get_children_resources` normally
+receives no `uids` below the root. If your layout is sized from the tasks (as
+`bin_packing_children_policy` is), set `layout_needs_tasks = True` on the class: a sub-master
+using it waits for its parent's first `TaskUpdate` and lays out its children from those tasks.
+
+`get_children_tasks` is called by the master's assigner in chunks of `assign_chunk_size` uids, and
+in work-stealing mode with `ntask` set to what one child asked for.
 
 ## Writing a Custom Task Scoring Policy
 
@@ -97,31 +128,26 @@ from ensemble_launcher.scheduler import Policy, policy_registry
 
 @policy_registry.register("my_scoring_policy")
 class MyScoringPolicy(Policy):
-    def get_score(self, task, scheduler_state=None):
+    def get_score(self, uid, scheduler_state=None):
         """Return a numeric score; higher = higher priority."""
+        task = self.tasks[uid]
         return task.nnodes * task.ppn
 
-    def on_task_complete(self, task, status, scheduler_state):
+    def on_task_complete(self, uid, status, scheduler_state):
         """Optional: react to task completions."""
         pass
 ```
 
-Building the `SchedulerState` snapshot costs O(total tasks) and happens on every
-`get_score` call. If your `get_score` never reads `scheduler_state`, opt out so the worker
-passes `None` instead:
-
-```python
-class MyScoringPolicy(Policy):
-    needs_scheduler_state = False
-```
-
-The default is `True`, so existing policies are unaffected. Likewise, the snapshot for
-`on_task_complete` is only built when your policy actually overrides that method.
+`scheduler_state` is the worker scheduler's live `TaskSchedulerState`, not a copy:
+`pending_tasks`, `running_tasks`, `completed_tasks` and `failed_tasks` (uids, supporting `in`
+and `len`), plus `nodes`. Passing it costs nothing, so read whatever you need -- but never
+modify it. (`needs_scheduler_state`, which used to let a policy skip building a snapshot, is
+no longer needed; setting it is harmless.)
 
 ## Stateful / Auto-tunable Policies
 
 Every policy -- both families -- carries a mutable `self.state` dict. Policies can
-therefore react to **workflow** state, not just to the `SchedulerState` snapshot they are
+therefore react to **workflow** state, not just to the `TaskSchedulerState` they are
 handed on each call. An external process reads and updates that state while the run is in
 flight, via `PolicyClient`.
 
@@ -132,8 +158,9 @@ Seed the state from `PolicyConfig.initial_state` and read it wherever you make a
 ```python
 @policy_registry.register("gpu_weighted_policy")
 class GPUWeightedPolicy(Policy):
-    def get_score(self, task, scheduler_state=None):
+    def get_score(self, uid, scheduler_state=None):
         # self.state is live -- it reflects the most recent set_state.
+        task = self.tasks[uid]
         gpus = task.ngpus_per_process * task.ppn * task.nnodes
         return gpus * self.state.get("gpu_weight", 1.0)
 

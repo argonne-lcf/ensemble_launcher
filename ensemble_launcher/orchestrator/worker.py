@@ -9,13 +9,10 @@ from ensemble_launcher.ensemble import Task, TaskStatus
 from ensemble_launcher.comm import ZMQComm, MPComm, Comm
 from ensemble_launcher.comm import Status, Result, ResultBatch, TaskUpdate, NodeUpdate
 from ensemble_launcher.executors import executor_registry, Executor
-from ensemble_launcher.profiling import get_registry, EventRegistry
 import logging
 from ensemble_launcher.logging import setup_logger
 import cloudpickle
 import socket
-import json
-from contextlib import contextmanager
 from dataclasses import asdict
 
 
@@ -49,18 +46,7 @@ class Worker(Node):
 
         self.logger = None
 
-        # Initialize event registry for perfetto profiling
-        self._event_registry: Optional[EventRegistry] = None
     
-    @contextmanager
-    def _timer(self, event_name: str):
-        """Timer that records to event registry for Perfetto export."""
-        if self._event_registry is not None:
-            with self._event_registry.measure(event_name, "worker", node_id=self.node_id, pid=os.getpid()):
-                yield
-        else:
-            yield
-
     @property
     def nodes(self):
         try:
@@ -155,9 +141,6 @@ class Worker(Node):
             self._free_task(task_id)
 
     def _lazy_init(self):
-        if self._config.profile == "perfetto":
-            self._event_registry = get_registry()
-            self._event_registry.enable()
         #lazy logger creation
         tick = time.perf_counter()
         self._setup_logger()
@@ -197,16 +180,14 @@ class Worker(Node):
         return
 
     def run(self) -> Result:
-        with self._timer("init"):
-            ##lazy init
-            self._lazy_init()
+        ##lazy init
+        self._lazy_init()
         
-        with self._timer("heartbeat_sync"):
-            self._comm.async_recv_parent()
-            #sync with parent
-            if self.parent and not self._comm.sync_heartbeat_with_parent(timeout=30.0):
-                self.logger.error(f"{self.node_id}: Failed to connect to parent")
-                raise TimeoutError(f"{self.node_id}: Can't connect to parent")
+        self._comm.async_recv_parent()
+        #sync with parent
+        if self.parent and not self._comm.sync_heartbeat_with_parent(timeout=30.0):
+            self.logger.error(f"{self.node_id}: Failed to connect to parent")
+            raise TimeoutError(f"{self.node_id}: Can't connect to parent")
         
         # Receive node update from parent
         node_update: NodeUpdate = self._comm.recv_message_from_parent(NodeUpdate, timeout=10.0)
@@ -233,46 +214,39 @@ class Worker(Node):
         next_report_time = time.time() + self._config.report_interval
         
         while True:
-            with self._timer("submit"):
-                # Submit ready tasks synchronously
-                self._submit_ready_tasks()
-            with self._timer("poll"):
-                # Poll and free completed tasks synchronously
-                self._poll_tasks()
+            # Submit ready tasks synchronously
+            self._submit_ready_tasks()
+            # Poll and free completed tasks synchronously
+            self._poll_tasks()
             # Report status periodically
             if time.time() > next_report_time:
-                with self._timer("report_status"):
-                    status = self.get_status()
-                    if self.parent:
-                        self._comm.send_message_to_parent(status)
-                        self.logger.info(status)
-                    else:
-                        self.logger.info(status)
-                    next_report_time = time.time() + self._config.report_interval
+                status = self.get_status()
+                if self.parent:
+                    self._comm.send_message_to_parent(status)
+                    self.logger.info(status)
+                else:
+                    self.logger.info(status)
+                next_report_time = time.time() + self._config.report_interval
             # Check if all tasks are done
             if len(self._scheduler.remaining_tasks) == 0:
                 break
             
-            with self._timer("sleep"):
-                time.sleep(0.01)
+            time.sleep(0.01)
         
         self.logger.info(f"{self.node_id}: Done executing all the tasks")
 
-        with self._timer("result_collection"):
-            all_results = self._results()
+        all_results = self._results()
         
-        with self._timer("final_status"):
-            ##also send the final status
-            final_status = self.get_status()
-            success = self._comm.send_message_to_parent(final_status)
-            if success:
-                self.logger.info(f"{self.node_id}: Sent final status to parent")
-            else:
-                self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
-                fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
-                final_status.to_file(fname)
+        ##also send the final status
+        final_status = self.get_status()
+        success = self._comm.send_message_to_parent(final_status)
+        if success:
+            self.logger.info(f"{self.node_id}: Sent final status to parent")
+        else:
+            self.logger.warning(f"{self.node_id}: Failed to send final status to parent")
+            fname = os.path.join(os.getcwd(),f"{self.node_id}_status.json")
+            final_status.to_file(fname)
 
-        # with self._timer("wait_for_stop"):
         #     self.logger.info(f"{self.node_id}: Started waiting for STOP from parent")
         #     while True and self.parent is not None:
         #         msg = self._comm.recv_message_from_parent(Action,timeout=1.0)
@@ -323,17 +297,6 @@ class Worker(Node):
         return result_batch
         
     def _stop(self):
-        if self._config.profile == "perfetto" and self._event_registry is not None:
-            os.makedirs(os.path.join(os.getcwd(),"profiles"),exist_ok=True)
-            # Export to Perfetto format
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_perfetto.json")
-            self._event_registry.export_perfetto(fname)
-            
-            # Also export statistics
-            stats = self._event_registry.get_statistics()
-            fname = os.path.join(os.getcwd(), "profiles", f"{self.node_id}_stats.json")
-            with open(fname, "w") as f:
-                json.dump(stats, f, indent=2)
         
         self._comm.stop_async_recv()
         self._comm.clear_cache()

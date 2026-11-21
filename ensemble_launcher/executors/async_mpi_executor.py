@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -24,33 +25,27 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-def _generate_python_exec_command(
-    tmp_fname: str,
-    node_local: bool = False,
-) -> str:
+def _is_node_local(path: str) -> bool:
+    """True if `path` is on node-local storage (under /tmp), so each node needs its own copy."""
+    path = os.path.abspath(path)
+    return path == "/tmp" or path.startswith("/tmp/")
+
+
+def _generate_python_exec_command(tmp_fname: str) -> str:
     """
-    Generates a Python command string that deserializes and executes a given function with arguments.
-    The returned string can be run using `python -c "<command>"`.
+    Generates a Python command string that reads a base64 cloudpickled (fn, args, kwargs)
+    from `tmp_fname` and calls it. The returned string can be run using `python -c "<command>"`.
     """
-    if node_local:
-        script = [
-            "import cloudpickle",
-            "import base64",
-            f"f = open('{tmp_fname}', 'r')",
-            "task_str = f.read()",
-            "f.close()",
-            "task_bytes=base64.b64decode(task_str)",
-            "fn, args, kwargs = cloudpickle.loads(task_bytes)",
-            "fn(*args, **kwargs)",
-        ]
-    else:
-        script = [
-            "import cloudpickle",
-            f"f = open('{tmp_fname}', 'rb')",
-            "fn, args, kwargs = cloudpickle.load(f)",
-            "f.close()",
-            "fn(*args, **kwargs)",
-        ]
+    script = [
+        "import cloudpickle",
+        "import base64",
+        f"f = open('{tmp_fname}', 'r')",
+        "task_str = f.read()",
+        "f.close()",
+        "task_bytes=base64.b64decode(task_str)",
+        "fn, args, kwargs = cloudpickle.loads(task_bytes)",
+        "fn(*args, **kwargs)",
+    ]
     return ";".join(script)
 
 
@@ -60,18 +55,23 @@ class AsyncMPIExecutor(Executor):
         self,
         logger=logger,
         gpu_selector: str = "ZE_AFFINITY_MASK",
-        tmp_dir: str = "/tmp/.mpiexec_tmp",
+        tmp_dir: Optional[str] = None,
         return_stdout: bool = True,
         mpi_config: Optional[MPIConfig] = None,
         **kwargs,
     ):
         self.logger = logger
         self.gpu_selector = gpu_selector
-        if os.path.isabs(tmp_dir):
+        # A tmp_dir this executor made is removed on shutdown; one passed in is kept.
+        self._owns_tmp_dir = tmp_dir is None
+        if tmp_dir is None:
+            # A fresh directory under the working directory: on HPC systems that is a
+            # shared filesystem, so each file is written once, not copied to every node.
+            self.tmp_dir = os.path.join(os.getcwd(), f".mpi_tmp_{uuid.uuid4().hex}")
+        elif os.path.isabs(tmp_dir):
             self.tmp_dir = tmp_dir
         else:
             self.tmp_dir = os.path.join(os.getcwd(), tmp_dir)
-        self._use_local_tmp = self.tmp_dir.startswith("/tmp")
         self._processes: Dict[str, asyncio.subprocess.Process] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
@@ -84,8 +84,8 @@ class AsyncMPIExecutor(Executor):
         """Build the mpirun resource flags from the job resource and MPIConfig.
 
         Returns (launcher_cmd, env, setup_files) where setup_files maps
-        "gpu_affinity" -> script_content when self._use_local_tmp is True
-        (the caller must distribute the script via a setup MPI job).
+        path -> script content; the caller writes each one (executable) with
+        write_file_to_nodes before launching.
         """
 
         cfg = self._mpi_config
@@ -161,11 +161,7 @@ class AsyncMPIExecutor(Executor):
                     ]
                 )
                 use_common_gpus = common_gpus == set(job_resource.resources[0].gpus)
-                fname = (
-                    f"/tmp/gpu_affinity_file_{task_id}.sh"
-                    if self._use_local_tmp
-                    else os.path.join(self.tmp_dir, f"gpu_affinity_file_{task_id}.sh")
-                )
+                fname = os.path.join(self.tmp_dir, f"gpu_affinity_file_{task_id}.sh")
                 if use_common_gpus:
                     if nnodes == 1 and ppn == 1:
                         env.update(
@@ -179,14 +175,7 @@ class AsyncMPIExecutor(Executor):
                         bash_script = gen_affinity_bash_script_1(
                             num_gpu_ids, ppn, self.gpu_selector
                         )
-                        if self._use_local_tmp:
-                            setup_files["gpu_affinity"] = bash_script
-                        else:
-                            if not os.path.exists(fname):
-                                with open(fname, "w") as f:
-                                    f.write(bash_script)
-                                st = os.stat(fname)
-                                os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                        setup_files[fname] = bash_script
                         launcher_cmd.append(fname)
                         ##set environment variables
                         env.update(
@@ -200,14 +189,7 @@ class AsyncMPIExecutor(Executor):
                     bash_script = gen_affinity_bash_script_2(
                         num_gpu_ids, ppn, self.gpu_selector
                     )
-                    if self._use_local_tmp:
-                        setup_files["gpu_affinity"] = bash_script
-                    else:
-                        if not os.path.exists(fname):
-                            with open(fname, "w") as f:
-                                f.write(bash_script)
-                            st = os.stat(fname)
-                            os.chmod(fname, st.st_mode | stat.S_IEXEC)
+                    setup_files[fname] = bash_script
                     launcher_cmd.append(fname)
                     ##Here you need to set the environment variables for each node
                     for nid, node in enumerate(job_resource.nodes):
@@ -287,28 +269,19 @@ class AsyncMPIExecutor(Executor):
 
         if callable(task):
             tmp_fname = os.path.join(self.tmp_dir, f"callable_{task_id}.pkl")
-            if tmp_fname.startswith("/tmp"):
-                # Write file to /tmp
-                task_str = base64.b64encode(
-                    cloudpickle.dumps((task, task_args, task_kwargs))
-                ).decode("utf-8")
-                await self.write_file_to_nodes(
-                    tmp_fname, content=task_str, nodes=job_resource.nodes, encoded=True
-                )
-                task_cmd = [
-                    "python",
-                    "-c",
-                    _generate_python_exec_command(tmp_fname, node_local=True),
-                ]
-            else:
-                ## Write the file to pfs
-                with open(tmp_fname, "wb") as f:
-                    cloudpickle.dump((task, task_args, task_kwargs), f)
-                task_cmd = [
-                    "python",
-                    "-c",
-                    _generate_python_exec_command(tmp_fname),
-                ]
+            task_str = base64.b64encode(
+                cloudpickle.dumps((task, task_args, task_kwargs))
+            ).decode("utf-8")
+            if not await self.write_file_to_nodes(
+                tmp_fname, content=task_str, nodes=job_resource.nodes, encoded=True
+            ):
+                self.logger.warning(f"Failed to write {tmp_fname} to the task's nodes")
+                return None
+            task_cmd = [
+                "python",
+                "-c",
+                _generate_python_exec_command(tmp_fname),
+            ]
         elif isinstance(task, str):
             task_cmd = [s.strip() for s in task.split()]
         elif isinstance(task, List):
@@ -356,12 +329,42 @@ class AsyncMPIExecutor(Executor):
         executable: bool = False,
         encoded: bool = False,
     ) -> bool:
-        """Write a text file to `path` on each node in `nodes` via a 1-rank-per-node MPI job."""
+        """Write a text file to `path` on each node in `nodes`.
+
+        A path outside /tmp is on a shared filesystem: it is written once, here, through
+        a temporary file and an atomic rename, so no node ever sees a partial file.
+        A node-local path (under /tmp) is written on each node by 1-rank-per-node MPI jobs.
+
+        Each chunk is written at its own byte offset (pwrite + ftruncate), so running a
+        chunk again is a no-op on nodes that already have it. A launch that failed on some
+        nodes is retried on all of them, and the copy resumes from that chunk instead of
+        appending the chunk twice. Each rank prints ``<hostname> ok`` on success, so a
+        failure names the nodes that did not report. The last chunk also checks the file
+        size and applies the chmod, so neither costs an extra launch.
+        """
+        if not _is_node_local(path):
+            tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                if executable:
+                    os.chmod(tmp_path, os.stat(tmp_path).st_mode | stat.S_IEXEC)
+                os.replace(tmp_path, path)
+            except OSError as e:
+                self.logger.warning(f"[write_file_to_nodes] writing {path} failed: {e}")
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return False
+            return True
+
         cfg = self._mpi_config
 
         ## remove any duplicates
         nodes = list(set(nodes))
-        
+
         base_cmd = (
             [cfg.launcher]
             + [cfg.nprocesses_flag, str(len(nodes))]
@@ -383,14 +386,15 @@ class AsyncMPIExecutor(Executor):
         else:
             base_cmd += [cfg.hosts_flag, ",".join(nodes)] if cfg.hosts_flag else []
 
-        # 500 chars base64-encodes to ~670 bytes, keeping the total command length
-        # well under the strict 4096-byte MPI/OS limits.
-        CHUNK_SIZE = 3000
-        chunks = (
-            [content[i : i + CHUNK_SIZE] for i in range(0, len(content), CHUNK_SIZE)]
-            if content
-            else [""]
-        )
+        data = content.encode("utf-8")
+        # Keep each chunk's literal in the command at ~3000 bytes, under the 4096-byte
+        # MPI/OS command limits. Raw chunks are base64-encoded (4/3 larger) for transport;
+        # already-encoded content is embedded as is.
+        chunk_size = 3000 if encoded else 2250
+        chunks = [
+            (offset, data[offset : offset + chunk_size])
+            for offset in range(0, len(data), chunk_size)
+        ] or [(0, b"")]
 
         # Base64 encode the path to prevent shell issues if the path contains spaces or special characters
         encoded_path = base64.b64encode(path.encode("utf-8")).decode("utf-8")
@@ -399,75 +403,71 @@ class AsyncMPIExecutor(Executor):
             f"[write_file_to_nodes] writing {path} to {len(nodes)} node(s) in {len(chunks)} chunk(s)"
         )
 
-        for i, chunk in enumerate(chunks):
-            mode = "w" if i == 0 else "a"
+        for i, (offset, chunk) in enumerate(chunks):
             if encoded:
-                setup_code = (
-                    "import base64, os\n"
-                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
-                    f"with open(p, '{mode}') as f:\n"
-                    f"    f.write('{chunk}')\n"
-                )
+                payload = f"'{chunk.decode('ascii')}'.encode('ascii')"
             else:
-                encoded_chunk = base64.b64encode(chunk.encode("utf-8")).decode("utf-8")
-
                 # Base64 payload sidesteps all remote Bash parsing, quoting, and newline mangling.
-                setup_code = (
-                    "import base64, os\n"
-                    f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                    "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
-                    f"with open(p, '{mode}') as f:\n"
-                    f"    f.write(base64.b64decode('{encoded_chunk}').decode('utf-8'))\n"
-                )
-
-            cmd = base_cmd + ["python", "-c", setup_code]
-            self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
-
-            for retry in range(3):
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                _, std_err = await proc.communicate()
-                proc._transport.close()
-                if proc.returncode != 0:
-                    self.logger.warning(
-                        f"Copying chunk {i} failed!! retrying {retry + 1}/3"
-                    )
-                    self.logger.warning(f"stderr: {std_err.decode()}")
-                else:
-                    break
-            if proc.returncode != 0:
-                self.logger.warning("Copying file failed after 3 retries!")
-                return False
-
-        if executable:
-            chmod_code = (
-                "import base64, os, stat\n"
+                payload = f"base64.b64decode('{base64.b64encode(chunk).decode('ascii')}')"
+            code = (
+                "import base64, os, socket, stat, sys\n"
                 f"p = base64.b64decode('{encoded_path}').decode('utf-8')\n"
-                "os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)\n"
+                "os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+                f"d = {payload}\n"
+                "fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o644)\n"
+                "try:\n"
+                "    n = 0\n"
+                "    while n < len(d):\n"
+                f"        n += os.pwrite(fd, d[n:], {offset} + n)\n"
+                f"    os.ftruncate(fd, {offset} + len(d))\n"
+                "finally:\n"
+                "    os.close(fd)\n"
             )
-            cmd = base_cmd + ["python", "-c", chmod_code]
-            self.logger.debug(f"Executing chmod for {path}")
-
-            for retry in range(3):
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
+            if i == len(chunks) - 1:
+                code += (
+                    f"if os.stat(p).st_size != {len(data)}:\n"
+                    f"    sys.exit(f'{{socket.gethostname()}}: size {{os.stat(p).st_size}} != {len(data)}')\n"
                 )
-                _, stderr = await proc.communicate()
-                proc._transport.close()
-                if proc.returncode != 0:
-                    self.logger.warning(
-                        f"Making executable failed. retrying {retry + 1}/3"
-                    )
-                    self.logger.warning(f"stderr: {std_err.decode()}")
-                else:
-                    break
-            if proc.returncode != 0:
-                self.logger.warning("Making executable failed after 3 retries!")
+                if executable:
+                    code += "os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)\n"
+            code += "print(socket.gethostname(), 'ok', flush=True)\n"
+
+            self.logger.debug(f"Executing chunk {i + 1}/{len(chunks)} for {path}")
+            if not await self._run_on_nodes(
+                base_cmd + ["python", "-c", code],
+                nodes,
+                f"chunk {i + 1}/{len(chunks)} of {path}",
+            ):
                 return False
 
         return True
+
+    async def _run_on_nodes(
+        self, cmd: List[str], nodes: List[str], what: str, retries: int = 3
+    ) -> bool:
+        """Run a 1-rank-per-node job whose ranks print ``<hostname> ok``; retry on failure."""
+        for attempt in range(1, retries + 1):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            proc._transport.close()
+            if proc.returncode == 0:
+                return True
+            reported = {
+                line.split()[0].split(".")[0]
+                for line in out.decode(errors="replace").splitlines()
+                if line.endswith(" ok")
+            }
+            missing = [n for n in nodes if n.split(".")[0] not in reported]
+            self.logger.warning(
+                f"[write_file_to_nodes] {what} failed (rc={proc.returncode}, "
+                f"attempt {attempt}/{retries}); {len(missing)}/{len(nodes)} node(s) "
+                f"did not report ok: {missing[:8]}{' ...' if len(missing) > 8 else ''}"
+            )
+            self.logger.warning(f"stderr: {err.decode(errors='replace')[-2000:]}")
+        self.logger.warning(f"[write_file_to_nodes] {what} failed after {retries} attempts")
+        return False
 
     async def _subprocess_task(
         self,
@@ -480,11 +480,11 @@ class AsyncMPIExecutor(Executor):
         stdout_file: Optional[str] = None,
         stderr_file: Optional[str] = None,
     ):
-        if setup_files and setup_files.get("gpu_affinity") and nodes:
-            fname = f"/tmp/gpu_affinity_file_{task_id}.sh"
-            await self.write_file_to_nodes(
-                fname, setup_files["gpu_affinity"], nodes, executable=True
-            )
+        for fname, content in (setup_files or {}).items():
+            if not await self.write_file_to_nodes(
+                fname, content, nodes or [], executable=True
+            ):
+                self.logger.warning(f"Failed to write {fname} to the task's nodes")
         self.logger.info(f"executing: {' '.join(cmd)}")
 
         program = cmd[0]
@@ -591,6 +591,13 @@ class AsyncMPIExecutor(Executor):
         for task in list(self._tasks.values()):
             task.cancel()
         self._tasks.clear()
+        self._remove_tmp_dir()
+
+    def _remove_tmp_dir(self) -> None:
+        """Remove the default ``.mpi_tmp_<uuid>`` directory, if this executor made it."""
+        if self._owns_tmp_dir:
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            self._owns_tmp_dir = False
 
     async def ashutdown(self, wait: bool = False) -> None:
         """Async shutdown: kill process groups and await all asyncio tasks."""
@@ -603,3 +610,4 @@ class AsyncMPIExecutor(Executor):
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._processes.clear()
         self._tasks.clear()
+        self._remove_tmp_dir()

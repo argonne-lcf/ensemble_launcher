@@ -1,5 +1,11 @@
-"""Profiling and event tracking for ensemble launcher."""
+"""Profile orchestrator nodes with py-spy, located through the checkpoint directory.
 
-from .event_registry import Event, EventRegistry, get_registry
+Merging per-node traces lives in :mod:`ensemble_launcher.profiling.merge_traces`, which is
+also the command ``python -m ensemble_launcher.profiling.merge_traces``. It is deliberately
+not imported here: importing it from the package makes ``python -m`` warn about the module
+being loaded twice.
+"""
 
-__all__ = ['Event', 'EventRegistry', 'get_registry']
+from .pyspy import PySpyProfiler
+
+__all__ = ["PySpyProfiler"]

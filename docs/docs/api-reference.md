@@ -175,7 +175,6 @@ LauncherConfig(
     return_stdout: bool = False,
     worker_logs: bool = False,
     master_logs: bool = False,
-    profile: Optional[Literal["perfetto"]] = None,
     gpu_selector: str = "ZE_AFFINITY_MASK",
     cluster: bool = False,
     checkpoint_dir: Optional[str] = None,

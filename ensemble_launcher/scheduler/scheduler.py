@@ -120,7 +120,9 @@ class TaskScheduler(Scheduler):
             self.scheduler_policy: Policy = policy_registry.create_policy(policy)
         else:
             self.scheduler_policy: Policy = policy
-        self.sorted_tasks: List[str] = sorted(list(self.tasks.keys()), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
+        # Policies look tasks up by id; here the ids are task_ids and the values Tasks.
+        self.scheduler_policy.bind_tasks(self.tasks)
+        self.sorted_tasks: List[str] = sorted(list(self.tasks.keys()), key=lambda task_id: self.scheduler_policy.get_score(task_id), reverse=True)
         self.logger.debug(f"Sorted tasks {self.sorted_tasks}")
 
     def get_ready_tasks(self) -> Dict[str, JobResource]:
@@ -154,7 +156,7 @@ class TaskScheduler(Scheduler):
                 if task.nnodes > len(self.cluster.nodes.nodes):
                     raise ValueError(f"Task {task.task_id} requires {task.nnodes} nodes, but only {len(self.cluster.nodes.nodes)} are available")
                 self.tasks[task.task_id] = task
-                self.sorted_tasks = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(self.tasks[task_id]), reverse=True)
+                self.sorted_tasks = sorted(self.tasks.keys(), key=lambda task_id: self.scheduler_policy.get_score(task_id), reverse=True)
                 return True
             except Exception as e:
                 self.logger.error(f"Failed to add task {task.task_id}: {e}")

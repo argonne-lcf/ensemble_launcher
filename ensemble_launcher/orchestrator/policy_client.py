@@ -1,6 +1,6 @@
 """Read and retune a running node's scheduling-policy state from outside the run.
 
-A policy can only see ``SchedulerState`` -- queue depth, resource occupancy, what is
+A policy can only see the scheduler's state (``TaskSchedulerState``, `Child` records) -- queue depth, resource occupancy, what is
 running where. It cannot see *workflow* state: which round of an optimization loop you
 are in, how the last batch scored, which configurations turned out to matter. This
 client is how that outside knowledge gets in.
